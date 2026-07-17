@@ -87,7 +87,21 @@ app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string
 //     steal cross-origin) and the real guard is the widget key + per-key domain allowlist
 //     enforced in the handler (403), not CORS.
 //   • everything else — the app is Bearer + no cookies; restrict to our own zerops.app
-//     subdomains + localhost.
+//     subdomains + localhost, PLUS any configured custom front-end origin (WEB_BASE_URL
+//     / CORS_ALLOWED_ORIGINS) — without this, a custom-domain deploy (app.example.com →
+//     api.example.com) has its real front-end origin rejected and every browser preflight
+//     404s, which curl never surfaces (curl skips preflight).
+const corsExtraOrigins = new Set(
+  [process.env.WEB_BASE_URL, ...(process.env.CORS_ALLOWED_ORIGINS ?? "").split(",")]
+    .map((s) => {
+      try {
+        return s && s.trim() ? new URL(s.trim()).origin : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter((s): s is string => s !== null),
+);
 await app.register(
   fastifyCors,
   () =>
@@ -107,7 +121,8 @@ await app.register(
           const ok =
             !origin ||
             /^https:\/\/[a-z0-9.-]+\.zerops\.app$/.test(origin) ||
-            /^https?:\/\/localhost(:\d+)?$/.test(origin);
+            /^https?:\/\/localhost(:\d+)?$/.test(origin) ||
+            corsExtraOrigins.has(origin);
           ocb(null, ok);
         },
         methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
