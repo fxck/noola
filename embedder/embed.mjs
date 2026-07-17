@@ -14,7 +14,14 @@ export const DIM = 384;
 
 let extractorPromise = null;
 function getExtractor() {
-  if (!extractorPromise) extractorPromise = pipeline("feature-extraction", MODEL_NAME);
+  if (!extractorPromise)
+    // Pin ONNX to a single thread so onnxruntime does NOT try to set CPU affinity:
+    // pthread_setaffinity_np fails (errno 22) on cgroup-restricted / shared-CPU
+    // containers, which hangs model load and fails the healthcheck. all-MiniLM is
+    // tiny, so single-threaded inference is plenty fast.
+    extractorPromise = pipeline("feature-extraction", MODEL_NAME, {
+      session_options: { intraOpNumThreads: 1, interOpNumThreads: 1 },
+    });
   return extractorPromise;
 }
 

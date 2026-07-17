@@ -21,8 +21,11 @@ CREATE TABLE IF NOT EXISTS sources (
   CONSTRAINT sources_status_ck CHECK (status IN ('pending','syncing','ok','error'))
 );
 
--- documents.source_id already exists (slice 09/ingest); index it so delete-by-source
--- and per-source listing are cheap (re-sync replaces a source's whole doc set).
+-- Tag each document with the source it was ingested from (null for direct uploads).
+-- Add it idempotently HERE, before the index, so a from-scratch migrate has the column
+-- (older databases added it earlier in the ingest slice — this is a no-op there). Then
+-- index it so delete-by-source and per-source listing are cheap on re-sync.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_id uuid;
 CREATE INDEX IF NOT EXISTS documents_source_idx ON documents (tenant_id, source_id);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON sources TO app_user;
