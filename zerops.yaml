@@ -289,12 +289,15 @@ zerops:
         VITE_API_URL: ${api_zeropsSubdomain}
         VITE_EDGE_URL: ${edge_zeropsSubdomain}
       buildCommands:
+        # Clean install every build — do NOT cache web/node_modules. A cached node_modules
+        # from one platform poisons the next build: npm's optional-dependency bug (#4828)
+        # skips the platform-specific rollup binary (…/rollup-linux-x64-musl) when the dir
+        # already exists, so `vite build` dies with "Cannot find module @rollup/…-musl".
+        # A clean install resolves the right binary from the lockfile.
         - cd web && npm install
         - cd web && VITE_API_URL="${RUNTIME_VITE_API_URL:-$VITE_API_URL}" VITE_EDGE_URL="${RUNTIME_VITE_EDGE_URL:-$VITE_EDGE_URL}" npm run build
       deployFiles:
         - web/dist/~                   # the built SPA becomes the static document root
-      cache:
-        - web/node_modules
     run:
       base: static
 
