@@ -21,10 +21,13 @@ export function SettingsProfilePage() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [name, setName] = useState(user?.name ?? "");
+  const [email, setEmail] = useState(user?.email ?? "");
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
 
-  const dirty = name.trim() !== (user?.name ?? "") && name.trim().length > 0;
+  const nameDirty = name.trim() !== (user?.name ?? "") && name.trim().length > 0;
+  const emailDirty = email.trim().toLowerCase() !== (user?.email ?? "").toLowerCase() && email.trim().length > 0;
+  const dirty = nameDirty || emailDirty;
 
   async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -46,9 +49,12 @@ export function SettingsProfilePage() {
     if (!dirty) return;
     setSaving(true);
     try {
-      await api<{ ok: boolean; name: string }>("/me/profile", {
+      await api<{ ok: boolean }>("/me/profile", {
         method: "PATCH",
-        body: JSON.stringify({ name: name.trim() }),
+        body: JSON.stringify({
+          ...(nameDirty ? { name: name.trim() } : {}),
+          ...(emailDirty ? { email: email.trim() } : {}),
+        }),
       });
       await refresh();
       toast.success("Profile saved.");
@@ -141,13 +147,19 @@ export function SettingsProfilePage() {
                 />
               </div>
 
-              {/* Read-only identity */}
+              {/* Identity */}
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-1.5">
-                  <Label>Email</Label>
-                  <p className="rounded-md border border-input bg-background px-3 py-2 text-sm text-muted-foreground">
-                    {user?.email}
-                  </p>
+                  <Label htmlFor="email">Email</Label>
+                  <Input
+                    id="email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="you@example.com"
+                    autoComplete="email"
+                  />
+                  <p className="text-micro text-muted-foreground">Your sign-in address.</p>
                 </div>
                 <div className="space-y-1.5">
                   <Label>Role</Label>

@@ -137,17 +137,36 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
   app.patch("/me/profile", async (req, reply) => {
     const s = req.session;
     if (!s) return reply.code(401).send({ error: "unauthorized" });
-    const name = (req.body as { name?: string } | undefined)?.name?.trim();
-    if (!name) return reply.code(400).send({ error: "name is required" });
-    try {
-      await baAuth.api.updateUser({ body: { name }, headers: fromNodeHeaders(req.headers) });
-    } catch {
-      /* better-auth update failed — the app-row update below still applies */
+    const b = req.body as { name?: string; email?: string } | undefined;
+    const name = b?.name?.trim();
+    const email = b?.email ? b.email.trim().toLowerCase() : undefined;
+    if (!name && !email) return reply.code(400).send({ error: "name or email is required" });
+    if (email !== undefined && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return reply.code(400).send({ error: "invalid email" });
     }
+    // better-auth is the auth authority. Update the display name through it (so its session payload
+    // stays fresh); update the login email directly on its "user" row — email is only the lookup key,
+    // the credential account is keyed by userId, so the password + active sessions survive the change.
+    if (name) {
+      try {
+        await baAuth.api.updateUser({ body: { name }, headers: fromNodeHeaders(req.headers) });
+      } catch {
+        /* better-auth update failed — the app-row update below still applies */
+      }
+    }
+    if (email) {
+      try {
+        await authPool.query(`UPDATE "user" SET email = $2, "updatedAt" = now() WHERE id = $1`, [s.userId, email]);
+      } catch {
+        return reply.code(409).send({ error: "That email is already in use." });
+      }
+    }
+    // Mirror into the app users row (the request-path source of truth).
     await withTenant(s.tenantId, async (c) => {
-      await c.query(`UPDATE users SET name = $2 WHERE id = $1`, [s.userId, name]);
+      if (name) await c.query(`UPDATE users SET name = $2 WHERE id = $1`, [s.userId, name]);
+      if (email) await c.query(`UPDATE users SET email = $2 WHERE id = $1`, [s.userId, email]);
     }).catch(() => {});
-    return { ok: true, name };
+    return { ok: true, ...(name ? { name } : {}), ...(email ? { email } : {}) };
   });
 
   app.post("/auth/logout", async (req) => {

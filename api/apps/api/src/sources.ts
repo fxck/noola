@@ -189,8 +189,11 @@ const PRECHECKS: Partial<Record<Kind, Precheck>> = {
 
 const PAGE_TIMEOUT_MS = 10_000;
 const MAX_PAGE_BYTES = 2_000_000; // ~2MB per page
-const MAX_PAGES = 40;
-const MAX_TOTAL_BYTES = 24_000_000; // hard ceiling across a whole crawl
+// Generous page cap so a real docs site (e.g. docs.zerops.io ≈ 340 pages via llms.txt) is
+// crawled whole; MAX_TOTAL_BYTES is the true safety ceiling that bounds a pathological/huge
+// site regardless of page count.
+const MAX_PAGES = 500;
+const MAX_TOTAL_BYTES = 48_000_000; // hard ceiling across a whole crawl
 
 /**
  * SSRF guard — best-effort. Only http/https, and block obviously-internal hosts
@@ -348,6 +351,10 @@ export function parseLlmsTxt(body: string, base: URL): string[] {
     try {
       const abs = new URL(raw.trim(), base);
       abs.hash = "";
+      // Skip the llms.txt aggregates (llms.txt / llms-full.txt / llms-small.txt): they are the
+      // whole doc set concatenated into one file. Ingesting them alongside the per-page .md links
+      // this same manifest lists would duplicate every passage in retrieval. The per-page docs win.
+      if (/\/llms(-[\w-]+)?\.txt$/i.test(abs.pathname)) return;
       if (abs.origin === base.origin && (abs.protocol === "http:" || abs.protocol === "https:")) out.add(abs.toString());
     } catch {
       /* skip malformed */
