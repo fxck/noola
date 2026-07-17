@@ -20,7 +20,7 @@ import {
 } from "../discord.js";
 import { listBots, registerBot, deleteBot } from "../discord-bots.js";
 import { setDiscordClassification, upsertAgentChannelIdentity } from "../discord-classify.js";
-import { linkEmailRoute, handleInboundEmail } from "../email.js";
+import { linkEmailRoute, handleInboundEmail, tenantSupportAddress } from "../email.js";
 import { verifySlackSignature, handleSlackEvent, listSlackConnections, upsertSlackConnection, deleteSlackConnection, resolveTenantByTeam } from "../slack.js";
 import { mdToSlack } from "../channels/format.js";
 import {
@@ -400,6 +400,10 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const r = await authPool.query(`SELECT name, logo FROM "organization" WHERE id = $1`, [tenantId]);
     return { name: (r.rows[0]?.name as string) ?? "", logoUrl: ((r.rows[0]?.logo as string | null) ?? null) };
   }));
+
+  // The tenant's support/from address (outbound From for ticket replies). Read for the
+  // Settings → Channels → Email editor; POST /email/link (below) sets it.
+  app.get("/email/route", tenanted(async (tenantId) => ({ address: await tenantSupportAddress(tenantId) })));
 
   app.post("/email/link", tenanted(async (tenantId, req, reply) => {
     const parsed = EmailLinkInput.safeParse(req.body);

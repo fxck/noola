@@ -42,6 +42,7 @@ import {
   type ChannelStatus, fetchChannels,
   type ChannelConnection, fetchChannelConnections, saveTelegramConnection, saveWhatsAppConnection, deleteChannelConnection,
   type SlackConnection, fetchSlackConnections, saveSlackConnection, deleteSlackConnection,
+  fetchEmailRoute, saveEmailRoute,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -216,8 +217,11 @@ export function SettingsIntegrationsPage() {
   // workspace links, edited straight from the catalog rows below.
   const [connections, setConnections] = useState<ChannelConnection[]>([]);
   const [slackConns, setSlackConns] = useState<SlackConnection[]>([]);
-  const [connectDialog, setConnectDialog] = useState<"telegram" | "whatsapp" | "slack" | null>(null);
+  const [connectDialog, setConnectDialog] = useState<"telegram" | "whatsapp" | "slack" | "email" | null>(null);
   const [connectBusy, setConnectBusy] = useState(false);
+  // Email support/from address (email_routes) — the outbound From for ticket replies.
+  const [emailAddr, setEmailAddr] = useState<string | null>(null);
+  const [emailInput, setEmailInput] = useState("");
   const [tgToken, setTgToken] = useState("");
   const [waToken, setWaToken] = useState("");
   const [waPhoneId, setWaPhoneId] = useState("");
@@ -234,16 +238,18 @@ export function SettingsIntegrationsPage() {
   const load = useRef(async () => {
     setLoadError(false);
     try {
-      const [r, chs, conns, slacks] = await Promise.all([
+      const [r, chs, conns, slacks, emailRoute] = await Promise.all([
         fetchIntegrations(),
         fetchChannels(),
         fetchChannelConnections().catch(() => []),
         fetchSlackConnections().catch(() => []),
+        fetchEmailRoute().catch(() => ({ address: null })),
       ]);
       setIntegrations(r.integrations);
       setCatalog(chs);
       setConnections(conns);
       setSlackConns(slacks);
+      setEmailAddr(emailRoute.address);
     } catch {
       setLoadError(true);
     }
@@ -325,7 +331,7 @@ export function SettingsIntegrationsPage() {
 
   function closeConnect() {
     setConnectDialog(null);
-    setTgToken(""); setWaToken(""); setWaPhoneId(""); setWaVerify(""); setSlTeam(""); setSlToken("");
+    setTgToken(""); setWaToken(""); setWaPhoneId(""); setWaVerify(""); setSlTeam(""); setSlToken(""); setEmailInput("");
   }
 
   async function onConnectSubmit() {
@@ -340,6 +346,9 @@ export function SettingsIntegrationsPage() {
       } else if (connectDialog === "slack") {
         await saveSlackConnection({ team_id: slTeam.trim(), bot_token: slToken.trim() });
         toast.success("Slack workspace connected.");
+      } else if (connectDialog === "email") {
+        await saveEmailRoute(emailInput.trim());
+        toast.success("Support address saved — replies now send from it.");
       }
       closeConnect();
       await load();
@@ -468,6 +477,20 @@ export function SettingsIntegrationsPage() {
                                   {slackConns.length ? "Manage" : "Connect"}
                                 </Button>
                               )}
+                              {ch.id === "email" && (
+                                <>
+                                  {emailAddr && (
+                                    <span className="max-w-[12rem] truncate font-mono text-micro text-muted-foreground" title={emailAddr}>
+                                      {emailAddr}
+                                    </span>
+                                  )}
+                                  {isAdmin && (
+                                    <Button variant="outline" size="sm" className="h-7" onClick={() => { setEmailInput(emailAddr ?? ""); setConnectDialog("email"); }}>
+                                      {emailAddr ? "Edit address" : "Set address"}
+                                    </Button>
+                                  )}
+                                </>
+                              )}
                               {ch.id === "discord" && (
                                 <Link to="/settings/discord-mirror" className={cn(buttonVariants({ variant: "outline", size: "sm" }), "h-7")}>
                                   Set up
@@ -480,6 +503,22 @@ export function SettingsIntegrationsPage() {
                     </div>
 
                     {/* ── Connect dialogs (0092 self-serve creds) ── */}
+                    <FormDialog
+                      open={connectDialog === "email"}
+                      title="Support email address"
+                      description="The From address for outbound ticket replies (so a customer's reply routes back here). It must be on a domain your email provider is authorized to send from — otherwise sends are rejected."
+                      onClose={closeConnect}
+                      onSubmit={() => void onConnectSubmit()}
+                      submitLabel="Save"
+                      submitDisabled={!emailInput.trim() || !emailInput.includes("@")}
+                      busy={connectBusy}
+                    >
+                      <div className="space-y-1.5">
+                        <Label htmlFor="email-addr">Address</Label>
+                        <Input id="email-addr" autoFocus type="email" placeholder="support@yourdomain.com" value={emailInput} onChange={(e) => setEmailInput(e.target.value)} />
+                      </div>
+                    </FormDialog>
+
                     <FormDialog
                       open={connectDialog === "telegram"}
                       title="Connect Telegram"

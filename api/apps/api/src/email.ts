@@ -32,16 +32,31 @@ export async function resolveTenantByAddress(address: string): Promise<string | 
   return r.rowCount ? (r.rows[0].tenant_id as string) : null;
 }
 
-/** Bind a support address to a tenant (onboarding). */
+/** Set the tenant's support address — a single canonical value (the outbound From for
+ *  ticket replies, and the inbound recipient that routes back). REPLACES any prior binding
+ *  so setting a new address in Settings actually changes what tenantSupportAddress returns
+ *  (it reads one row); ON CONFLICT re-homes an address currently held by another tenant.
+ *  Wrapped in a txn so there's never a zero-address window. */
 export async function linkEmailRoute(address: string, tenantId: string): Promise<void> {
-  await relayPool.query(
-    "INSERT INTO email_routes (address, tenant_id) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET tenant_id = EXCLUDED.tenant_id",
-    [address.toLowerCase(), tenantId],
-  );
+  const c = await relayPool.connect();
+  try {
+    await c.query("BEGIN");
+    await c.query("DELETE FROM email_routes WHERE tenant_id = $1", [tenantId]);
+    await c.query(
+      "INSERT INTO email_routes (address, tenant_id) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET tenant_id = EXCLUDED.tenant_id",
+      [address.toLowerCase(), tenantId],
+    );
+    await c.query("COMMIT");
+  } catch (e) {
+    await c.query("ROLLBACK");
+    throw e;
+  } finally {
+    c.release();
+  }
 }
 
 /** The tenant's own support address (outbound From, so replies round-trip back). */
-async function tenantSupportAddress(tenantId: string): Promise<string | null> {
+export async function tenantSupportAddress(tenantId: string): Promise<string | null> {
   const r = await relayPool.query(
     "SELECT address FROM email_routes WHERE tenant_id = $1 ORDER BY created_at ASC LIMIT 1",
     [tenantId],

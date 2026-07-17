@@ -322,6 +322,18 @@ export async function fetchChannels(): Promise<ChannelStatus[]> {
   return (await api<{ channels: ChannelStatus[] }>("/channels")).channels;
 }
 
+// ── Email support/from address (email_routes) ────────────────────────────────
+// The tenant's support address — the outbound From for ticket replies (so a reply
+// round-trips back). Must be on a domain your ESP authorizes to send.
+
+export async function fetchEmailRoute(): Promise<{ address: string | null }> {
+  return api<{ address: string | null }>("/email/route");
+}
+
+export async function saveEmailRoute(address: string): Promise<void> {
+  await api("/email/link", { method: "POST", body: JSON.stringify({ address }) });
+}
+
 // ── Self-serve channel connections (0092) ────────────────────────────────────
 
 export interface ChannelConnection {
