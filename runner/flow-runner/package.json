@@ -1,0 +1,23 @@
+{
+  "name": "noola-flow-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ephemeral Node execution container for Studio browser/AI-browser flows (Studio\u2192Studio fold). Runs one automation graph to completion, driving a local headless Chromium via Playwright + Stagehand/Claude, writing runner_runs.result_json/node_events and publishing run.<id> progress to NATS. The deterministic item nodes + shared helpers come from @repo/flow-core (esbuild inlines them into the bundle).",
+  "scripts": {
+    "vendor:flow-core": "if [ -f ../../api/packages/flow-core/src/index.ts ]; then mkdir -p flow-core && cp ../../api/packages/flow-core/src/index.ts flow-core/index.ts; fi",
+    "build": "npm run vendor:flow-core && esbuild exec.mts --bundle --platform=node --format=esm --target=node22 --outfile=exec.mjs --packages=external --alias:@repo/flow-core=./flow-core/index.ts",
+    "start": "node exec.mjs"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^3.6.0",
+    "nats": "^2.29.3",
+    "pg": "^8.13.1",
+    "playwright": "^1.61.1",
+    "zod": "^4.4.3",
+    "@aws-sdk/client-s3": "^3.700.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}

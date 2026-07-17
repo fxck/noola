@@ -1,0 +1,9 @@
+{
+  "name": "embedder",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted embedding sidecar — all-MiniLM 384-dim, keyless, offline at runtime.",
+  "dependencies": {
+    "@huggingface/transformers": "^3.3.0"
+  }
+}

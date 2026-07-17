@@ -1,0 +1,341 @@
+# Root manifest for the Noola monorepo — one repo, one zerops.yaml, every service.
+#
+# Two setups per app service: a *dev half (self-deploys the WHOLE monorepo via
+# deployFiles: ["."] and idles on `zsc noop`, so an AI agent / developer adopts the
+# mounted tree and drives the real dev server) and a *prod half (builds a lean,
+# self-contained runtime and ships only its own build output). `embedder` and
+# `runner` are single always-on setups (no dev/prod split). Stage == prod: the
+# Stage rung reuses the *prod setups at single-node scale.
+#
+# Cross-service URLs that vary by topology — EMBED_URL, API_INTERNAL_URL, and the
+# SMTP / Mailpit endpoint — plus every signing/DB secret are PROJECT-LEVEL env, set
+# per environment in .zerops-recipe/<env>/import.yaml. Project vars + secrets are
+# auto-inherited by every service, so they are NOT wired here (re-referencing an
+# inherited var as ${VAR} would resolve to a literal string). One zerops.yaml serves
+# every rung, from a single agent-driven pair up to an HA cluster. Only genuine
+# cross-service references are wired below: managed-store wiring (${db_*}, ${cache_*},
+# ${broker_*}, ${search_*}, ${storage_*}, ${qdrant_*}) and the api/edge/web subdomains.
+zerops:
+  # ═══ api — Node 24 / Bun · apps/api + packages/{db,contracts,flow-core,sdk} ═══
+  - setup: apidev
+    build:
+      base:
+        - nodejs@24
+        - bun@1.3.9
+      buildCommands:
+        - cd api && bun install
+      deployFiles:
+        - .                            # self-deploy → the whole monorepo lands on the container
+      cache:
+        - api/node_modules
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3000
+          httpSupport: true
+      initCommands:
+        - 'zsc execOnce ${appVersionId} --retryUntilSuccessful -- bash -c "cd /var/www/api && npx tsx packages/db/src/migrate.ts"'
+      envVariables:
+        NODE_ENV: development
+        PORT: "3000"
+        EMBED_DRIVER: service
+        QDRANT_URL: http://qdrant:${qdrant_port}
+        QDRANT_API_KEY: ${qdrant_apiKey}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_SUPER_USER: ${db_superUser}
+        DB_SUPER_PASSWORD: ${db_superUserPassword}
+        APP_DB_USER: app_user
+        RELAY_DB_USER: event_relay
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        CACHE_URL: ${cache_connectionString}
+        SEARCH_HOST: search
+        SEARCH_PORT: ${search_port}
+        SEARCH_API_KEY: ${search_apiKey}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+        # WEB_BASE_URL (public web origin), EMBED_URL, API_INTERNAL_URL, MAILPIT_API_URL,
+        # SMTP_HOST, SMTP_PORT + all signing/DB secrets are project-level env — auto-inherited
+        # from import.yaml per rung, never re-referenced here (an inherited ${VAR} would resolve
+        # to a literal string). Only true cross-service refs (${db_*}, ${cache_*}, subdomains) wire here.
+      start: zsc noop --silent                   # dev: real server via zerops_dev_server (workDir /var/www/api)
+
+  - setup: apiprod
+    build:
+      base:
+        - nodejs@24
+        - bun@1.3.9
+      buildCommands:
+        # Typecheck gate — tsc across the project references. Bundlers strip types
+        # without checking them, so this is the only step that catches type errors.
+        - cd api && bun install
+        - cd api && ./node_modules/.bin/tsc --build
+        # Bundle server + migrator into self-contained ESM (workspace packages and
+        # all deps inlined) — no node_modules, no tsx, no raw source at runtime.
+        - cd api && bun build apps/api/src/server.ts --target=node --format=esm --outfile=dist/server.mjs
+        - cd api && bun build packages/db/src/migrate.ts --target=node --format=esm --outfile=dist/migrate.mjs
+        # The migrator reads its SQL files at runtime — ship them beside the bundle.
+        - cd api && cp -r packages/db/migrations dist/migrations
+      deployFiles:
+        - api/dist/~                   # ship ONLY the build output: two bundles + migrations, flattened to root
+      cache:
+        - api/node_modules
+    deploy:
+      readinessCheck:
+        httpGet:
+          port: 3000
+          path: /health
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3000
+          httpSupport: true
+      initCommands:
+        - 'zsc execOnce ${appVersionId} --retryUntilSuccessful -- node migrate.mjs'
+      envVariables:
+        NODE_ENV: production
+        PORT: "3000"
+        MIGRATIONS_DIR: /var/www/migrations
+        EMBED_DRIVER: service
+        QDRANT_URL: http://qdrant:${qdrant_port}
+        QDRANT_API_KEY: ${qdrant_apiKey}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_SUPER_USER: ${db_superUser}
+        DB_SUPER_PASSWORD: ${db_superUserPassword}
+        APP_DB_USER: app_user
+        RELAY_DB_USER: event_relay
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        CACHE_URL: ${cache_connectionString}
+        SEARCH_HOST: search
+        SEARCH_PORT: ${search_port}
+        SEARCH_API_KEY: ${search_apiKey}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+        # WEB_BASE_URL (public web origin), EMBED_URL, API_INTERNAL_URL, MAILPIT_API_URL,
+        # SMTP_HOST, SMTP_PORT + all signing/DB secrets are project-level env — auto-inherited
+        # from import.yaml per rung, never re-referenced here (an inherited ${VAR} would resolve
+        # to a literal string). Only true cross-service refs (${db_*}, ${cache_*}, subdomains) wire here.
+      start: node server.mjs
+      healthCheck:
+        httpGet:
+          port: 3000
+          path: /health
+
+  # ═══ edge — Elixir 1.16 / Phoenix Channels · edge/ ═════════════════════
+  - setup: edgedev
+    build:
+      base: elixir@1.16
+      buildCommands:
+        - cd edge && mix local.hex --force && mix local.rebar --force && mix deps.get && mix compile
+      deployFiles:
+        - .
+      cache:
+        - edge/deps
+        - edge/_build
+    run:
+      base: elixir@1.16
+      ports:
+        - port: 4000
+          httpSupport: true
+      prepareCommands:
+        - mix local.hex --force
+        - mix local.rebar --force
+      start: zsc noop --silent
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        PORT: "4000"
+        MIX_ENV: dev
+        # No scheduler busy-waiting on shared-CPU autoscaled containers — the
+        # idle-spin starves a squeezed core (the release side carries the same
+        # flags in edge/rel/vm.args.eex).
+        ELIXIR_ERL_OPTIONS: "+sbwt none +sbwtdcpu none +sbwtdio none"
+        # API_INTERNAL_URL (edge → api socket-token verify) is project-level env, auto-inherited.
+
+  - setup: edgeprod
+    build:
+      base: elixir@1.16
+      # --force + --overwrite guarantee the release reflects current source: the
+      # incremental compiler otherwise skips files whose cache-restored beams
+      # out-mtime the shipped sources. _build is deliberately NOT cached here for
+      # the same reason (a clean compile is the right trade for correctness).
+      buildCommands:
+        - cd edge && mix local.hex --force && mix local.rebar --force && mix deps.get --only prod && MIX_ENV=prod mix compile --force && MIX_ENV=prod mix release --overwrite noola_edge
+      deployFiles:
+        - edge/_build/prod/rel/noola_edge/~    # ~ strips the release prefix → bin/ at deploy root
+      cache:
+        - edge/deps
+    deploy:
+      readinessCheck:
+        httpGet:
+          port: 4000
+          path: /health
+    run:
+      base: elixir@1.16
+      ports:
+        - port: 4000
+          httpSupport: true
+      # The watchdog (release overlay, edge/rel/overlays/bin/watchdog.sh) wraps
+      # `bin/noola_edge start`: probes /health from outside the VM and exits on
+      # sustained failure so the platform restarts the container — the BEAM can
+      # wedge without crashing.
+      start: bin/watchdog.sh
+      healthCheck:
+        httpGet:
+          port: 4000
+          path: /health
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        PORT: "4000"
+        MIX_ENV: prod
+        # API_INTERNAL_URL (edge → api socket-token verify) is project-level env, auto-inherited.
+
+  # ═══ embedder — Node 24 · embedder/ (self-hosted all-MiniLM sidecar) ═════
+  # One always-on service shared across the whole project (a stateless text→vector
+  # sidecar — no per-environment state). The model is baked at build time
+  # (warmup.mjs → embedder/.cache) and shipped with the code, so the runtime is
+  # keyless + offline. The api calls POST /embed over the project network at the
+  # EMBED_URL project var (http://embedder:3001).
+  - setup: embedder
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd embedder && npm install
+        - cd embedder && node warmup.mjs        # bake all-MiniLM into embedder/.cache
+      deployFiles:
+        - embedder                     # ship the built embedder/ dir (deps + baked .cache)
+      cache:
+        - embedder/node_modules
+        - embedder/.cache
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3001
+          httpSupport: true
+      # onnxruntime + the model need real memory — the platform default (~0.12GB)
+      # OOM-kills model load. Give it a 1–4 GB envelope.
+      verticalAutoscaling:
+        minRam: 1
+        maxRam: 4
+      start: node embedder/server.mjs
+      healthCheck:
+        httpGet:
+          port: 3001
+          path: /health
+      envVariables:
+        PORT: "3001"
+
+  # ═══ web — React 19 / Vite · web/ ══════════════════════════════════════
+  - setup: webdev
+    build:
+      base: nodejs@22
+      os: ubuntu
+      buildCommands:
+        - cd web && npm install        # dev: preinstall deps only — the agent drives `vite dev`
+      deployFiles:
+        - .
+      cache:
+        - web/node_modules
+    run:
+      base: nodejs@22
+      os: ubuntu
+      ports:
+        - port: 5173
+          httpSupport: true
+      envVariables:
+        # The Vite dev server reaches the running api/edge over their public
+        # subdomains (the SPA is Bearer + cross-origin; the api sends CORS *).
+        VITE_API_URL: ${api_zeropsSubdomain}
+        VITE_EDGE_URL: ${edge_zeropsSubdomain}
+      start: zsc noop --silent          # dev: `vite dev` via zerops_dev_server (workDir /var/www/web)
+
+  - setup: webprod
+    build:
+      base: nodejs@22
+      envVariables:
+        VITE_APP_ENV: production
+        # Baked into the SPA at build time — the browser talks to api/edge over
+        # their own public subdomains (api.ts / realtime.ts throw on a prod build
+        # without these, so there is never a silent fallback).
+        VITE_API_URL: ${api_zeropsSubdomain}
+        VITE_EDGE_URL: ${edge_zeropsSubdomain}
+      buildCommands:
+        - cd web && npm install && npm run build
+      deployFiles:
+        - web/dist/~                   # the built SPA becomes the static document root
+      cache:
+        - web/node_modules
+    run:
+      base: static
+
+  # ═══ runner — agent-studio execution runner · runner/ (Docker-in-VM, Go) ══
+  # A Zerops docker service. The Go worker (a static CGO_ENABLED=0 binary) consumes
+  # run jobs from the shared `broker` NATS JetStream and launches ONE ephemeral
+  # `docker run --rm --network=host` container per job. Single always-on setup — no
+  # dev/prod split; every rung that runs flows includes it.
+  - setup: runner
+    build:
+      base: go@1.22
+      envVariables:
+        CGO_ENABLED: "0"
+      buildCommands:
+        - cd runner && go mod tidy
+        - cd runner && go build -o runnerd .
+        # Vendor the shared DB-free item-node core into the flow-runner build context so the
+        # image's esbuild inlines @repo/flow-core (real source: api/packages/flow-core).
+        - mkdir -p runner/flow-runner/flow-core && cp api/packages/flow-core/src/index.ts runner/flow-runner/flow-core/index.ts
+      deployFiles:
+        - runner/runnerd
+        - runner/flow-runner
+      cache: true
+    run:
+      base: docker@26.1.5
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        RUNNER_GLOBAL_MAX: "3"
+        RUNNER_IMAGE: alpine:3.20
+        # DB super creds (BYPASSRLS) — the worker records run lifecycle to runner_runs
+        # (any tenant's row), best-effort. Internal plain-TCP; the worker sets sslmode=disable.
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_USER: ${db_superUser}
+        DB_PASS: ${db_superUserPassword}
+        # Object storage — the flow container uploads run replays (runs/<tenant>/<id>.webm).
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+      # docker only exists on the VM at runtime (not build). Wait for the daemon, then build the
+      # single flow image worker.go launches per browser/AI flow job.
+      initCommands:
+        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker build -t noola-flow-runner:v1 runner/flow-runner"
+      start: runner/runnerd

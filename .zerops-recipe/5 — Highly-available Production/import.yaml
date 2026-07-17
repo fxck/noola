@@ -1,0 +1,105 @@
+#zeropsPreprocessor=on
+
+# HA Production — highly-available managed clusters (PostgreSQL, Valkey, NATS, Typesense
+# and Qdrant all :ha), with the api, edge and web runtimes on dedicated CPU autoscaling
+# 2→4 and a redundant runner pool. No demo seed: set BOOTSTRAP_ADMIN_EMAIL +
+# BOOTSTRAP_ADMIN_PASSWORD for the first admin. Outbound email is off until you set
+# SMTP_HOST / SMTP_USER / SMTP_PASS. Choose this when you're serving real traffic and
+# need resilience to node failures and rolling deploys.
+
+project:
+  name: noola
+  corePackage: SERIOUS
+  tags:
+    - noola
+    - support-platform
+    - production
+    - ha
+  envSecrets:
+    AUTH_SECRET: <@generateRandomString(<48>)>
+    MODEL_KEY_SECRET: <@generateRandomString(<48>)>
+    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
+    SECRET_KEY_BASE: <@generateRandomString(<64>)>
+    APP_DB_PASSWORD: <@generateRandomString(<32>)>
+    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
+    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
+    BOOTSTRAP_ADMIN_PASSWORD:                            # required — your first admin's password
+  envVariables:
+    EMBED_URL: http://embedder:3001
+    API_INTERNAL_URL: http://api:3000
+    WEB_BASE_URL: ${web_zeropsSubdomain}
+    DISABLE_DEMO_SEED: "1"                               # no demo tenant in production
+    DISABLE_WORKSPACE_SIGNUP: "1"                        # single-admin instance — no public self-signup
+    BOOTSTRAP_ADMIN_EMAIL:                               # required — your first admin's email
+    BOOTSTRAP_ORG_NAME: Noola                            # the first workspace's name
+
+services:
+  # ---- managed stores, HA clusters (start first) ----
+  - hostname: db
+    type: postgresql:ha@18
+    profile: oltp-staging
+    priority: 10
+  - hostname: cache
+    type: valkey:ha@7.2
+    profile: staging
+    priority: 10
+  - hostname: broker
+    type: nats:ha@2.12
+    priority: 10
+  - hostname: search
+    type: typesense:ha@30.2
+    priority: 10
+  - hostname: qdrant
+    type: qdrant:ha@1.12
+    priority: 10
+  - hostname: storage
+    type: object-storage
+    objectStorageSize: 25
+    priority: 10
+
+  # ---- shared always-on services (dedicated CPU) ----
+  - hostname: embedder
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: embedder
+    minContainers: 1
+    maxContainers: 2
+    verticalAutoscaling:
+      cpuMode: DEDICATED
+  - hostname: runner
+    type: docker@26.1.5
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: runner
+    minContainers: 2
+    maxContainers: 2
+    verticalAutoscaling:
+      cpuMode: DEDICATED
+
+  # ---- app services (dedicated CPU, autoscale 2→4) ----
+  - hostname: api
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: apiprod
+    enableSubdomainAccess: true
+    minContainers: 2
+    maxContainers: 4
+    verticalAutoscaling:
+      cpuMode: DEDICATED
+  - hostname: edge
+    type: elixir@1.16.3
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: edgeprod
+    enableSubdomainAccess: true
+    minContainers: 2
+    maxContainers: 4
+    verticalAutoscaling:
+      cpuMode: DEDICATED
+  - hostname: web
+    type: static@1.0
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: webprod
+    enableSubdomainAccess: true
+    minContainers: 2
+    maxContainers: 4
+    verticalAutoscaling:
+      cpuMode: DEDICATED

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Messenger widget — embed demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body{margin:0;min-height:100vh;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    background:#f6f7f9;color:#111827;display:grid;place-items:center;padding:2rem}
+  @media (prefers-color-scheme:dark){body{background:#0b0c0e;color:#e5e7eb}}
+  .card{max-width:560px;text-align:center}
+  h1{font-size:1.5rem;letter-spacing:-.02em;margin:0 0 .4rem}
+  p{color:#6b7280;line-height:1.6}
+  code{background:rgba(127,127,127,.15);padding:.15rem .4rem;border-radius:6px;font-size:.85em}
+  .hint{margin-top:1.5rem;font-size:.85rem;color:#9ca3af}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Your website</h1>
+    <p>This page is standing in for a customer's own site. The Noola messenger is embedded with a
+       single <code>&lt;script&gt;</code> tag — look for the chat bubble in the bottom-right corner.</p>
+    <p class="hint">Home / Messages / Help tabs, instant AI answers, and <b>Talk to a human</b> hand-off —
+       agent replies stream back into the same panel.</p>
+    <p style="margin-top:1.25rem">
+      <button onclick="Noola('boot',{email:'jane@acme.test',name:'Jane Doe',user_id:'u_123',plan:'Pro'})">Identify as Jane</button>
+      <button onclick="Noola('track','clicked_pricing',{plan:'Pro'})">Track event</button>
+      <button onclick="Noola('open')">Open</button>
+      <button onclick="Noola('shutdown')">Log out</button>
+    </p>
+  </div>
+
+  <!-- 1) Loader snippet: captures Noola(...) calls into a queue until widget.js loads (Intercom-style). -->
+  <script>
+    (function () { var b = window.Noola = window.Noola || function () { (b.q = b.q || []).push(arguments); }; })();
+  </script>
+
+  <!-- 2) The embeddable widget: one tag, served from the API. Personalization (accent/greeting/tabs)
+          now comes from Settings → Messenger via GET /public/config; data-attributes are fallbacks. -->
+  <script
+    src="https://YOUR-API-SUBDOMAIN.zerops.app/widget.js"
+    data-noola-key="wk_demo_acme"
+    data-noola-api="https://YOUR-API-SUBDOMAIN.zerops.app"
+    data-noola-edge="wss://YOUR-EDGE-SUBDOMAIN.zerops.app"
+    data-noola-title="Ask Noola"
+    data-noola-accent="#4f46e5"></script>
+
+  <!-- 3) Optional SDK boot to identify the visitor + start activity tracking. -->
+  <script>
+    Noola('boot', { key: 'wk_demo_acme', email: 'jane@acme.test', name: 'Jane Doe', user_id: 'u_123', plan: 'Pro' });
+  </script>
+</body>
+</html>

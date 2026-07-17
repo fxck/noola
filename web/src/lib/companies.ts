@@ -1,0 +1,62 @@
+import { api } from "@/lib/api";
+
+// Companies (account records) client. A company rolls up its contacts + email-channel tickets into a
+// health signal, computed server-side.
+
+export type HealthBand = "healthy" | "at_risk" | "critical";
+
+export interface AccountHealth {
+  score: number;
+  band: HealthBand;
+  openTickets: number;
+  negativeOpen: number;
+  totalTickets: number;
+  avgCsat: number | null;
+  lastActivity: string | null;
+}
+
+export interface Company {
+  id: string;
+  name: string;
+  domain: string;
+  plan: string;
+  attributes: Record<string, unknown>;
+  contactCount: number;
+  health: AccountHealth;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CompanyDetail extends Company {
+  contacts: { id: string; name: string; email: string | null }[];
+}
+
+export interface CompanyInput {
+  name?: string;
+  domain?: string;
+  plan?: string;
+  attributes?: Record<string, unknown>;
+}
+
+export async function fetchCompanies(q?: string): Promise<Company[]> {
+  const qs = q ? `?q=${encodeURIComponent(q)}` : "";
+  return (await api<{ companies: Company[] }>(`/companies${qs}`)).companies;
+}
+export async function fetchCompany(id: string): Promise<CompanyDetail> {
+  return (await api<{ company: CompanyDetail }>(`/companies/${id}`)).company;
+}
+export async function createCompany(input: CompanyInput): Promise<Company> {
+  return (await api<{ company: Company }>("/companies", { method: "POST", body: JSON.stringify(input) })).company;
+}
+export async function updateCompany(id: string, patch: CompanyInput): Promise<Company> {
+  return (await api<{ company: Company }>(`/companies/${id}`, { method: "PATCH", body: JSON.stringify(patch) })).company;
+}
+export async function deleteCompany(id: string): Promise<void> {
+  await api(`/companies/${id}`, { method: "DELETE" });
+}
+
+export const HEALTH_META: Record<HealthBand, { label: string; badge: "default" | "warning" | "muted"; dot: string }> = {
+  healthy: { label: "Healthy", badge: "default", dot: "var(--success)" },
+  at_risk: { label: "At risk", badge: "warning", dot: "var(--warning)" },
+  critical: { label: "Critical", badge: "warning", dot: "var(--destructive)" },
+};

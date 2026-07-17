@@ -1,0 +1,75 @@
+#zeropsPreprocessor=on
+
+# Remote CDE — one dev container carrying the whole monorepo (the `app` service uses
+# the apidev setup: deploys [.] and idles via `zsc noop`), plus the backing stores, a
+# shared embedder and Mailpit. Connect your IDE / SSH into `app` and run the api and web
+# dev servers inside it (both Node) against the shared data. The Elixir `edge` (realtime)
+# and the docker `runner` (Studio flow execution) are NOT in this single Node box — reach
+# for the AI Agent rung when you need the full realtime + flow-execution stack. The `app`
+# subdomain exposes whatever dev server you start.
+
+project:
+  name: noola-cde
+  corePackage: LIGHT
+  tags:
+    - noola
+    - support-platform
+    - remote-cde
+  envSecrets:
+    AUTH_SECRET: <@generateRandomString(<48>)>
+    MODEL_KEY_SECRET: <@generateRandomString(<48>)>
+    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
+    SECRET_KEY_BASE: <@generateRandomString(<64>)>
+    APP_DB_PASSWORD: <@generateRandomString(<32>)>
+    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
+    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
+  envVariables:
+    EMBED_URL: http://embedder:3001                     # api → shared embedder
+    API_INTERNAL_URL: http://localhost:3000             # if you also run edge in the box, it verifies against the local api
+    WEB_BASE_URL: ${app_zeropsSubdomain}                # the app box's own public origin (web runs inside it)
+    MAILPIT_API_URL: http://mailpit:8025
+    SMTP_HOST: mailpit
+    SMTP_PORT: "1025"
+
+services:
+  - hostname: db
+    type: postgresql:single@18
+    profile: oltp-hobby
+    priority: 10
+  - hostname: cache
+    type: valkey:single@7.2
+    profile: hobby
+    priority: 10
+  - hostname: broker
+    type: nats:single@2.12
+    priority: 10
+  - hostname: search
+    type: typesense:single@30.2
+    priority: 10
+  - hostname: qdrant
+    type: qdrant:single@1.12
+    priority: 10
+  - hostname: storage
+    type: object-storage
+    objectStorageSize: 5
+    priority: 10
+  - hostname: mailpit
+    type: alpine@3.20
+    buildFromGit: https://github.com/zeropsio/recipe-mailpit
+    enableSubdomainAccess: true
+    priority: 10
+
+  - hostname: embedder
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: embedder
+    minContainers: 1
+    maxContainers: 1
+
+  - hostname: app
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: apidev          # carries the whole monorepo; idles for the IDE / SSH
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1

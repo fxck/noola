@@ -1,0 +1,93 @@
+#zeropsPreprocessor=on
+
+# Small Production — single-node managed stores, app runtimes on shared CPU autoscaling
+# 1→2, a shared embedder and runner. No demo seed: set BOOTSTRAP_ADMIN_EMAIL +
+# BOOTSTRAP_ADMIN_PASSWORD and that account owns the first workspace. Outbound email is
+# off until you set SMTP_HOST / SMTP_USER / SMTP_PASS to your provider. Cheapest way to
+# run Noola for real; not redundant — a container restart briefly drops traffic.
+
+project:
+  name: noola
+  corePackage: LIGHT
+  tags:
+    - noola
+    - support-platform
+    - production
+  envSecrets:
+    AUTH_SECRET: <@generateRandomString(<48>)>
+    MODEL_KEY_SECRET: <@generateRandomString(<48>)>
+    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
+    SECRET_KEY_BASE: <@generateRandomString(<64>)>
+    APP_DB_PASSWORD: <@generateRandomString(<32>)>
+    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
+    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
+    BOOTSTRAP_ADMIN_PASSWORD:                            # required — your first admin's password
+  envVariables:
+    EMBED_URL: http://embedder:3001
+    API_INTERNAL_URL: http://api:3000
+    WEB_BASE_URL: ${web_zeropsSubdomain}
+    DISABLE_DEMO_SEED: "1"                               # no demo tenant in production
+    DISABLE_WORKSPACE_SIGNUP: "1"                        # single-admin instance — no public self-signup
+    BOOTSTRAP_ADMIN_EMAIL:                               # required — your first admin's email
+    BOOTSTRAP_ORG_NAME: Noola                            # the first workspace's name
+
+services:
+  # ---- managed stores (start first) ----
+  - hostname: db
+    type: postgresql:single@18
+    profile: oltp-staging
+    priority: 10
+  - hostname: cache
+    type: valkey:single@7.2
+    profile: staging
+    priority: 10
+  - hostname: broker
+    type: nats:single@2.12
+    priority: 10
+  - hostname: search
+    type: typesense:single@30.2
+    priority: 10
+  - hostname: qdrant
+    type: qdrant:single@1.12
+    priority: 10
+  - hostname: storage
+    type: object-storage
+    objectStorageSize: 10
+    priority: 10
+
+  # ---- shared always-on services ----
+  - hostname: embedder
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: embedder
+    minContainers: 1
+    maxContainers: 1
+  - hostname: runner
+    type: docker@26.1.5
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: runner
+    minContainers: 1
+    maxContainers: 1
+
+  # ---- app services (shared CPU, autoscale 1→2) ----
+  - hostname: api
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: apiprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 2
+  - hostname: edge
+    type: elixir@1.16.3
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: edgeprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 2
+  - hostname: web
+    type: static@1.0
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: webprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 2

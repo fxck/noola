@@ -1,0 +1,10 @@
+# Build artifacts and fetched deps (rebuilt by the platform build phase).
+/_build/
+/deps/
+/.elixir_ls/
+erl_crash.dump
+*.ez
+
+# Local env — never commit; Zerops injects env vars as OS env.
+.env
+.env.local

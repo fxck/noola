@@ -1,0 +1,14 @@
+{
+  "name": "noola-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Noola — an AI-native, self-hosted customer-support platform. Monorepo: api (Node/Fastify + Bun), edge (Elixir/Phoenix), embedder (Node), runner (Go), web (Vite/React).",
+  "license": "MIT",
+  "scripts": {
+    "install:all": "cd api && bun install && cd ../web && npm install && cd ../embedder && npm install",
+    "migrate": "cd api && npm run migrate",
+    "dev:api": "cd api && npm run dev",
+    "dev:web": "cd web && npm run dev",
+    "dev:embedder": "cd embedder && node server.mjs"
+  }
+}

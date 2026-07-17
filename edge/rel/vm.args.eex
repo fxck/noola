@@ -1,0 +1,13 @@
+## Disable scheduler busy-waiting — the 2026-07-12 wedge post-mortem.
+##
+## BEAM's default busy-wait keeps idle schedulers spin-looping "for latency".
+## This service runs on a SHARED-CPU, vertically autoscaled container: when the
+## edge idles, the platform squeezes it toward a fraction of one core (and on
+## SHARED mode the CPU scale-up thresholds don't apply), so the spin consumed
+## the entire remaining sliver and starved the accept loop and /health — the
+## recurring "process alive, zero logs, HTTP dead" wedge that only a restart
+## (fresh startCpuCoreCount) cleared. Without busy-wait an idle BEAM actually
+## sleeps, and a squeezed core is plenty for this workload.
++sbwt none
++sbwtdcpu none
++sbwtdio none

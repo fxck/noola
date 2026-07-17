@@ -1,0 +1,12 @@
+{
+  "name": "@repo/sdk",
+  "version": "1.0.0",
+  "description": "Typed client for the Noola public API (answers, tickets, CSAT).",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "UNLICENSED"
+}

@@ -1,0 +1,5 @@
+# Build artifacts — the bundled executor + the vendored @repo/flow-core source copy (the real
+# source lives in api/packages/flow-core; `npm run vendor:flow-core` re-materializes this).
+exec.mjs
+flow-core/
+node_modules/

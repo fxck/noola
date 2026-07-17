@@ -1,0 +1,95 @@
+#zeropsPreprocessor=on
+
+# Stage — a single non-HA running instance built with the *prod setups: one container
+# per service over single-node stores, with a shared embedder, runner and Mailpit. For
+# pre-production validation before Small / HA Production. The demo workspace is seeded
+# (sign in with ales@acme.test / demo1234). Cheaper than production; not redundant.
+
+project:
+  name: noola-stage
+  corePackage: LIGHT
+  tags:
+    - noola
+    - support-platform
+    - stage
+  envSecrets:
+    AUTH_SECRET: <@generateRandomString(<48>)>
+    MODEL_KEY_SECRET: <@generateRandomString(<48>)>
+    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
+    SECRET_KEY_BASE: <@generateRandomString(<64>)>
+    APP_DB_PASSWORD: <@generateRandomString(<32>)>
+    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
+    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
+  envVariables:
+    EMBED_URL: http://embedder:3001
+    API_INTERNAL_URL: http://api:3000
+    WEB_BASE_URL: ${web_zeropsSubdomain}
+    MAILPIT_API_URL: http://mailpit:8025
+    SMTP_HOST: mailpit
+    SMTP_PORT: "1025"
+
+services:
+  # ---- managed stores (start first) ----
+  - hostname: db
+    type: postgresql:single@18
+    profile: oltp-hobby
+    priority: 10
+  - hostname: cache
+    type: valkey:single@7.2
+    profile: hobby
+    priority: 10
+  - hostname: broker
+    type: nats:single@2.12
+    priority: 10
+  - hostname: search
+    type: typesense:single@30.2
+    priority: 10
+  - hostname: qdrant
+    type: qdrant:single@1.12
+    priority: 10
+  - hostname: storage
+    type: object-storage
+    objectStorageSize: 5
+    priority: 10
+  - hostname: mailpit
+    type: alpine@3.20
+    buildFromGit: https://github.com/zeropsio/recipe-mailpit
+    enableSubdomainAccess: true
+    priority: 10
+
+  # ---- shared always-on services ----
+  - hostname: embedder
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: embedder
+    minContainers: 1
+    maxContainers: 1
+  - hostname: runner
+    type: docker@26.1.5
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: runner
+    minContainers: 1
+    maxContainers: 1
+
+  # ---- app services (built from git with the *prod setups) ----
+  - hostname: api
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: apiprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+  - hostname: edge
+    type: elixir@1.16.3
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: edgeprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+  - hostname: web
+    type: static@1.0
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: webprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
