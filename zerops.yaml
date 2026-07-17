@@ -281,13 +281,16 @@ zerops:
       base: nodejs@22
       envVariables:
         VITE_APP_ENV: production
-        # Baked into the SPA at build time — the browser talks to api/edge over
-        # their own public subdomains (api.ts / realtime.ts throw on a prod build
-        # without these, so there is never a silent fallback).
+        # Baked into the SPA at build time. Default to the api/edge Zerops subdomains;
+        # to serve behind a CUSTOM DOMAIN, set project-env VITE_API_URL / VITE_EDGE_URL
+        # (e.g. https://api.example.com / wss://edge.example.com) — the build prefers those
+        # (Zerops exposes project/runtime env to the build shell as RUNTIME_*). api.ts /
+        # realtime.ts throw on a prod build with neither, so there is never a silent fallback.
         VITE_API_URL: ${api_zeropsSubdomain}
         VITE_EDGE_URL: ${edge_zeropsSubdomain}
       buildCommands:
-        - cd web && npm install && npm run build
+        - cd web && npm install
+        - cd web && VITE_API_URL="${RUNTIME_VITE_API_URL:-$VITE_API_URL}" VITE_EDGE_URL="${RUNTIME_VITE_EDGE_URL:-$VITE_EDGE_URL}" npm run build
       deployFiles:
         - web/dist/~                   # the built SPA becomes the static document root
       cache:
