@@ -62,7 +62,7 @@ export interface CrawlLog {
   pagesFetched: number;
   pagesFailed: number;
   totalBytes: number;
-  diff: { added: number; updated: number; unchanged: number; removed: number; total: number } | null;
+  diff: { added: number; updated: number; unchanged: number; removed: number; total: number; failed: number } | null;
   entries: CrawlLogEntry[];
   entriesTruncated: boolean;
 }

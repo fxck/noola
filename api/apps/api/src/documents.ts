@@ -50,8 +50,12 @@ export async function ingestDocument(
     throw Object.assign(new Error(`unsupported content type: ${contentType}`), { statusCode: 415 });
   }
 
-  // 1. keep the raw upload in object-storage (re-extractable as the pipeline grows)
-  const storageKey = `${tenantId}/docs/${crypto.randomUUID()}-${filename}`;
+  // 1. keep the raw upload in object-storage (re-extractable as the pipeline grows).
+  // The filename can be a full URL (url-connector docs are keyed by page URL) whose `:` and `/`
+  // object-storage rejects ("Object name contains unsupported characters") — so slugify it for the
+  // KEY only. The UUID guarantees uniqueness; the real (unsanitized) filename is kept in the DB row.
+  const safeName = (filename.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "").slice(0, 100)) || "doc";
+  const storageKey = `${tenantId}/docs/${crypto.randomUUID()}-${safeName}`;
   await putText(storageKey, content, contentType);
 
   // 2. extract → 3. chunk
@@ -194,7 +198,7 @@ export interface SyncUnit {
    *  content is ignored for keeps; a keep with no stored doc is dropped. */
   keep?: boolean;
 }
-export interface SyncDiff { added: number; updated: number; unchanged: number; removed: number; total: number }
+export interface SyncDiff { added: number; updated: number; unchanged: number; removed: number; total: number; failed: number }
 
 function hashContent(content: string): string {
   return crypto.createHash("sha256").update(content, "utf8").digest("hex");
@@ -223,7 +227,8 @@ export async function syncDocuments(tenantId: string, sourceId: string, units: S
   }
 
   const seen = new Set<string>();
-  let added = 0, updated = 0, unchanged = 0;
+  let added = 0, updated = 0, unchanged = 0, failed = 0;
+  const failSamples: string[] = [];
   for (const u of units) {
     if (!u.key || seen.has(u.key)) continue; // ignore keyless / duplicate units
     seen.add(u.key);
@@ -235,9 +240,16 @@ export async function syncDocuments(tenantId: string, sourceId: string, units: S
       if (ex) await deleteDocument(tenantId, ex.id); // changed → drop the old doc + its index entries
       await ingestDocument(tenantId, u.title || u.key, u.contentType, u.content, sourceId, { sourceKey: u.key, contentHash: hash });
       if (ex) updated++; else added++;
-    } catch {
-      // a single bad/unsupported unit must not fail the whole sync
+    } catch (e) {
+      // A single bad/unsupported unit must not fail the whole sync — but DON'T swallow it silently:
+      // count it and keep a few samples so a systemic failure (e.g. every page failing to index) is
+      // visible in the sync result + logs instead of masquerading as "0 added".
+      failed++;
+      if (failSamples.length < 5) failSamples.push(`${u.key}: ${(e as Error).message}`);
     }
+  }
+  if (failed > 0) {
+    console.warn(`syncDocuments: ${failed}/${units.length} units failed to ingest for source ${sourceId}`, failSamples);
   }
 
   // Prune docs whose key vanished from the source, plus the pre-hash orphans.
@@ -245,7 +257,7 @@ export async function syncDocuments(tenantId: string, sourceId: string, units: S
   for (const [key, ex] of byKey) if (!seen.has(key)) { await deleteDocument(tenantId, ex.id); removed++; }
   for (const id of orphanIds) { await deleteDocument(tenantId, id); removed++; }
 
-  return { added, updated, unchanged, removed, total: unchanged + added + updated };
+  return { added, updated, unchanged, removed, total: unchanged + added + updated, failed };
 }
 
 /**

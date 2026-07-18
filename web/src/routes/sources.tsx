@@ -1359,9 +1359,21 @@ function CrawlLogPanel({ s }: { s: SourceRow }) {
           {log.diff && (
             <span className="font-mono tabular-nums">
               +{log.diff.added} added · {log.diff.updated} updated · {log.diff.unchanged} unchanged · {log.diff.removed} removed
+              {log.diff.failed > 0 && <span className="text-destructive"> · {log.diff.failed} failed to index</span>}
             </span>
           )}
         </div>
+
+        {/* Fetched-but-not-indexed gap — the crawl pulled pages the ingest pipeline rejected. */}
+        {log.diff && log.diff.failed > 0 && (
+          <p className="flex items-start gap-2 border-b bg-amber-500/5 px-4 py-2.5 text-xs text-amber-600 dark:text-amber-400">
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              {log.diff.failed.toLocaleString()} of {log.pagesFetched.toLocaleString()} fetched pages failed to index (they
+              were crawled but didn't reach the knowledge base). Check the server logs for the cause.
+            </span>
+          </p>
+        )}
 
         {/* error, if the sync failed */}
         {!log.ok && log.error && (

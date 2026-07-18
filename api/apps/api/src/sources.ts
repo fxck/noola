@@ -183,8 +183,8 @@ export interface CrawlLog {
   pagesFetched: number;
   pagesFailed: number;
   totalBytes: number;
-  /** The incremental diff the sync produced (added/updated/unchanged/removed) — set post-ingest. */
-  diff: { added: number; updated: number; unchanged: number; removed: number; total: number } | null;
+  /** The incremental diff the sync produced (added/updated/unchanged/removed/failed) — set post-ingest. */
+  diff: { added: number; updated: number; unchanged: number; removed: number; total: number; failed: number } | null;
   entries: CrawlLogEntry[];
   entriesTruncated: boolean;
 }
@@ -1154,7 +1154,7 @@ export async function syncSource(
             added: 0, updated: 0, removed: 0, unchanged: src.doc_count,
           }))
           .catch(() => {});
-        const diff: SyncDiff = { added: 0, updated: 0, unchanged: src.doc_count, removed: 0, total: src.doc_count };
+        const diff: SyncDiff = { added: 0, updated: 0, unchanged: src.doc_count, removed: 0, total: src.doc_count, failed: 0 };
         return { status: "ok", docCount: src.doc_count, diff };
       }
     }
@@ -1175,7 +1175,7 @@ export async function syncSource(
     // and the source is never emptied up-front, so a mid-sync failure keeps the last-good docs.
     const diff = await syncDocuments(tenantId, sourceId, units);
 
-    crawl.diff = { added: diff.added, updated: diff.updated, unchanged: diff.unchanged, removed: diff.removed, total: diff.total };
+    crawl.diff = { added: diff.added, updated: diff.updated, unchanged: diff.unchanged, removed: diff.removed, total: diff.total, failed: diff.failed };
     crawl.ok = true;
     crawl.finishedAt = new Date().toISOString();
     await setStatus(tenantId, sourceId, { status: "ok", doc_count: diff.total, touchSynced: true, syncToken, crawlLog: crawl });
