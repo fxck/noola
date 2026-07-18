@@ -334,6 +334,50 @@ export async function saveEmailRoute(address: string): Promise<void> {
   await api("/email/link", { method: "POST", body: JSON.stringify({ address }) });
 }
 
+// ── Model-B: branded sending domains (Intercom "custom email domain") ─────────
+// A tenant verifies their OWN domain so replies send AS support@theirdomain with real DKIM. The
+// provider (Resend) issues the DNS records to publish; we display them + poll for verification.
+// Governs OUTBOUND identity only — inbound routing stays in the support-address (email_routes).
+
+/** One DNS record to publish (SPF/DKIM/DMARC/MX), as returned by the provider. Public config. */
+export interface DnsRecord {
+  record?: string;
+  type: string;
+  name: string;
+  value: string;
+  ttl?: string;
+  priority?: number;
+  status?: string;
+}
+
+export interface SendingDomain {
+  id: string;
+  domain: string;
+  provider: string;
+  provider_id: string | null;
+  /** pending | verifying | verified | failed | not_started (local-only, no provider object). */
+  status: string;
+  records: DnsRecord[];
+  last_checked_at: string | null;
+  created_at: string;
+}
+
+export async function fetchSendingDomains(): Promise<{ domains: SendingDomain[]; providerEnabled: boolean }> {
+  return api<{ domains: SendingDomain[]; providerEnabled: boolean }>("/email/domains");
+}
+
+export async function addSendingDomain(domain: string): Promise<SendingDomain> {
+  return (await api<{ domain: SendingDomain }>("/email/domains", { method: "POST", body: JSON.stringify({ domain }) })).domain;
+}
+
+export async function verifySendingDomain(id: string): Promise<SendingDomain> {
+  return (await api<{ domain: SendingDomain }>(`/email/domains/${id}/verify`, { method: "POST", body: "{}" })).domain;
+}
+
+export async function deleteSendingDomain(id: string): Promise<void> {
+  await api(`/email/domains/${id}`, { method: "DELETE" });
+}
+
 // ── Self-serve channel connections (0092) ────────────────────────────────────
 
 export interface ChannelConnection {

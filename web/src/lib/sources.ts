@@ -42,6 +42,31 @@ export interface SourceConfig {
   sync_interval_minutes?: number;
 }
 
+/** One page's fate during a crawl (server-side telemetry, surfaced in the detail's Crawl log). */
+export interface CrawlLogEntry {
+  url: string;
+  outcome: "ingested" | "markdown" | "failed";
+  contentType?: string;
+  bytes?: number;
+}
+
+/** A sync's crawl telemetry — what strategy it took and how each page fared. Present on the
+ *  detail read (GET /sources/:id) once a source has synced on the crawl-log schema. */
+export interface CrawlLog {
+  strategy: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  ok: boolean;
+  error: string | null;
+  llmsTxt: { found: boolean; urls: number } | null;
+  pagesFetched: number;
+  pagesFailed: number;
+  totalBytes: number;
+  diff: { added: number; updated: number; unchanged: number; removed: number; total: number } | null;
+  entries: CrawlLogEntry[];
+  entriesTruncated: boolean;
+}
+
 export interface SourceRow {
   id: string;
   kind: SourceKind;
@@ -55,6 +80,8 @@ export interface SourceRow {
   created_at: string;
   /** Auto-refresh cadence in minutes; null = manual only. A scheduler re-syncs due sources. */
   refresh_interval_minutes: number | null;
+  /** Last sync's crawl telemetry (detail read only; null until first sync on the new schema). */
+  crawl_log?: CrawlLog | null;
 }
 
 export interface CreateSourceInput {

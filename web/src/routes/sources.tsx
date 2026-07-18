@@ -27,6 +27,8 @@ import {
 } from "@/lib/documents";
 import {
   type SourceRow,
+  type CrawlLog,
+  type CrawlLogEntry,
   fetchSources,
   fetchSource,
   createSource,
@@ -1237,6 +1239,9 @@ export function SourceDetail({
               </div>
             </section>
 
+            {/* crawl log — what the last sync actually did (strategy, per-page outcome, counts) */}
+            <CrawlLogPanel s={s} />
+
             {/* facts fall back into the column when the rail is off-canvas (§5) */}
             <section className="mt-6 xl:hidden">
               <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1255,6 +1260,145 @@ export function SourceDetail({
         </aside>
       </div>
     </div>
+  );
+}
+
+// ── Crawl log ────────────────────────────────────────────────────────────────
+// The per-sync telemetry the server records (sources.crawl_log): which strategy the crawl took,
+// whether it found an llms.txt manifest, and each page's outcome. Turns "why did prod fetch 5
+// pages and dev 338?" from a guess into something you can read.
+
+const STRATEGY_LABEL: Record<string, string> = {
+  "llms.txt": "llms.txt manifest",
+  links: "same-origin link-follow",
+  sitemap: "XML sitemap",
+  sitemapindex: "sitemap index",
+  single: "single page",
+};
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function OutcomeBadge({ outcome }: { outcome: CrawlLogEntry["outcome"] }) {
+  if (outcome === "markdown") {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1 text-primary" title="Indexed the clean .md twin">
+        <FileText className="size-3" /> md
+      </span>
+    );
+  }
+  if (outcome === "failed") {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1 text-destructive" title="Fetch/parse failed — skipped">
+        <X className="size-3" /> failed
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1 text-muted-foreground" title="Indexed the HTML/text page">
+      <Check className="size-3" /> html
+    </span>
+  );
+}
+
+function CrawlLogPanel({ s }: { s: SourceRow }) {
+  const log: CrawlLog | null | undefined = s.crawl_log;
+  if (!log) return null; // no sync on the crawl-log schema yet — nothing to show
+
+  const abs = (iso: string | null) => {
+    if (!iso) return undefined;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? undefined : d.toLocaleString();
+  };
+  const stat = (label: string, value: React.ReactNode) => (
+    <div className="flex flex-col gap-0.5">
+      <dt className="text-micro uppercase tracking-wide text-muted-foreground">{label}</dt>
+      <dd className="font-mono text-sm tabular-nums text-foreground">{value}</dd>
+    </div>
+  );
+
+  return (
+    <section className="mt-6">
+      <h3 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Crawl log
+        {log.finishedAt && (
+          <span className="font-normal normal-case tracking-normal text-muted-foreground/70" title={abs(log.finishedAt)}>
+            · last run {relativeTime(log.finishedAt)}
+          </span>
+        )}
+      </h3>
+
+      <div className="rounded-lg border">
+        {/* summary strip */}
+        <div className="grid grid-cols-2 gap-3 border-b bg-muted/30 p-4 sm:grid-cols-4">
+          {stat(
+            "Strategy",
+            log.strategy ? (STRATEGY_LABEL[log.strategy] ?? log.strategy) : <span className="text-muted-foreground">—</span>,
+          )}
+          {stat("Pages fetched", log.pagesFetched.toLocaleString())}
+          {stat(
+            "Failed",
+            log.pagesFailed > 0 ? <span className="text-destructive">{log.pagesFailed.toLocaleString()}</span> : "0",
+          )}
+          {stat("Downloaded", fmtBytes(log.totalBytes))}
+        </div>
+
+        {/* llms.txt probe + diff line */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b px-4 py-2.5 text-xs text-muted-foreground">
+          <span className="inline-flex items-center gap-1.5">
+            <span className={cn("size-1.5 rounded-full", log.llmsTxt?.found ? "bg-primary" : "bg-muted-foreground/40")} />
+            {log.llmsTxt
+              ? log.llmsTxt.found
+                ? `llms.txt found — ${log.llmsTxt.urls.toLocaleString()} doc URLs`
+                : "no llms.txt — fell back to link-following"
+              : "llms.txt not probed (non-web source)"}
+          </span>
+          {log.diff && (
+            <span className="font-mono tabular-nums">
+              +{log.diff.added} added · {log.diff.updated} updated · {log.diff.unchanged} unchanged · {log.diff.removed} removed
+            </span>
+          )}
+        </div>
+
+        {/* error, if the sync failed */}
+        {!log.ok && log.error && (
+          <p className="flex items-start gap-2 border-b bg-destructive/5 px-4 py-2.5 text-xs text-destructive">
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+            <span className="break-words">{log.error}</span>
+          </p>
+        )}
+
+        {/* per-page rows */}
+        {log.entries.length > 0 ? (
+          <>
+            <ul className="max-h-80 divide-y divide-border/60 overflow-y-auto">
+              {log.entries.map((e, i) => (
+                <li key={`${e.url}-${i}`} className="flex items-center gap-3 px-4 py-1.5 text-xs">
+                  <OutcomeBadge outcome={e.outcome} />
+                  <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground" title={e.url}>
+                    {e.url.replace(/^https?:\/\//, "")}
+                  </span>
+                  {typeof e.bytes === "number" && (
+                    <span className="shrink-0 font-mono tabular-nums text-muted-foreground/60">{fmtBytes(e.bytes)}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {log.entriesTruncated && (
+              <p className="border-t px-4 py-2 text-micro text-muted-foreground">
+                Showing the first {log.entries.length.toLocaleString()} pages — the crawl fetched more (summary counts above
+                are exact).
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="px-4 py-3 text-xs text-muted-foreground">No per-page detail recorded for this sync.</p>
+        )}
+      </div>
+    </section>
   );
 }
 

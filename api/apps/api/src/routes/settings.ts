@@ -21,6 +21,10 @@ import {
 import { listBots, registerBot, deleteBot } from "../discord-bots.js";
 import { setDiscordClassification, upsertAgentChannelIdentity } from "../discord-classify.js";
 import { linkEmailRoute, handleInboundEmail, tenantSupportAddress } from "../email.js";
+import {
+  listSendingDomains, addSendingDomain, refreshSendingDomain, deleteSendingDomain,
+  sendingProviderEnabled, SendingProviderError,
+} from "../email-domains.js";
 import { verifySlackSignature, handleSlackEvent, listSlackConnections, upsertSlackConnection, deleteSlackConnection, resolveTenantByTeam } from "../slack.js";
 import { mdToSlack } from "../channels/format.js";
 import {
@@ -450,6 +454,55 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     // null = the recipient maps to no tenant route (or our own echo) — accepted, not ingested.
     return reply.code(result ? 201 : 202).send({ ok: true, ingested: !!result, ticketId: result?.ticketId ?? null });
   });
+
+  // ---- Model-B: branded sending domains (Intercom "custom email domain") ----
+  // A tenant verifies their OWN domain (e.g. zerops.io) so replies send AS support@theirdomain with
+  // real DKIM. GET lists them + whether self-serve provisioning is on (RESEND_API_KEY set); POST
+  // adds one (creating the provider domain object + returning the DNS records to publish); verify
+  // re-checks; DELETE removes. Governs OUTBOUND identity only — inbound routing stays in email_routes.
+  app.get("/email/domains", tenanted(async (tenantId) => ({
+    domains: await listSendingDomains(tenantId),
+    providerEnabled: sendingProviderEnabled(),
+  })));
+
+  app.post("/email/domains", tenanted(async (tenantId, req, reply) => {
+    const domain = String((req.body as { domain?: string } | undefined)?.domain ?? "").trim().toLowerCase();
+    if (!/^(?=.{1,253}$)([a-z0-9](-?[a-z0-9])*\.)+[a-z]{2,}$/.test(domain)) {
+      return reply.code(400).send({ error: "Enter a valid domain like zerops.io (no https://, no path)." });
+    }
+    try {
+      const d = await addSendingDomain(tenantId, domain);
+      return reply.code(201).send({ domain: d });
+    } catch (e) {
+      if ((e as { code?: string }).code === "23505") {
+        return reply.code(409).send({ error: "That domain is already added." });
+      }
+      if (e instanceof SendingProviderError) return reply.code(502).send({ error: e.message });
+      throw e;
+    }
+  }));
+
+  app.post("/email/domains/:id/verify", tenanted(async (tenantId, req, reply) => {
+    try {
+      const d = await refreshSendingDomain(tenantId, (req.params as { id: string }).id);
+      if (!d) return reply.code(404).send({ error: "not found" });
+      return { domain: d };
+    } catch (e) {
+      if (e instanceof SendingProviderError) return reply.code(502).send({ error: e.message });
+      throw e;
+    }
+  }));
+
+  app.delete("/email/domains/:id", tenanted(async (tenantId, req, reply) => {
+    try {
+      const gone = await deleteSendingDomain(tenantId, (req.params as { id: string }).id);
+      if (!gone) return reply.code(404).send({ error: "not found" });
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof SendingProviderError) return reply.code(502).send({ error: e.message });
+      throw e;
+    }
+  }));
 
   // ---- Slack channel --------------------------------------------------------
   // The Slack Events API entrypoint (PUBLIC lane). Slack signs the RAW body (v0 HMAC-SHA256); we

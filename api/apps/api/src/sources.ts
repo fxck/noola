@@ -29,6 +29,9 @@ export interface SourceRow {
   // Opaque upstream-revision token (github head SHA today); lets a resync short-circuit when nothing
   // moved. null = no token recorded (always full sync). Reset on config change. See syncSource.
   last_sync_token: string | null;
+  // Last sync's crawl telemetry (detail read only — never selected in the list query). null until
+  // the first sync on this schema.
+  crawl_log?: CrawlLog | null;
 }
 
 const SOURCE_COLS =
@@ -45,7 +48,8 @@ export async function listSources(tenantId: string): Promise<SourceRow[]> {
 
 export async function getSource(tenantId: string, id: string): Promise<SourceRow | null> {
   return withTenant(tenantId, async (c) => {
-    const r = await c.query(`SELECT ${SOURCE_COLS} FROM sources WHERE id = $1`, [id]);
+    // Detail read pulls the crawl_log jsonb too (the list query omits it — it's heavy and per-detail).
+    const r = await c.query(`SELECT ${SOURCE_COLS}, crawl_log FROM sources WHERE id = $1`, [id]);
     return r.rowCount ? (r.rows[0] as SourceRow) : null;
   });
 }
@@ -147,9 +151,65 @@ export async function deleteSource(tenantId: string, id: string): Promise<boolea
  *  keep:true = "unchanged upstream, keep the stored doc" (content ignored — lets connectors skip
  *  expensive regeneration like model distillation on re-crawls). */
 export type ConnectorUnit = { key: string; title: string; contentType: string; content: string; keep?: boolean };
-/** Sync context handed to connectors: tenant (model seam for distillation) + stored doc keys. */
-export interface ConnectorCtx { tenantId: string; existingKeys: Set<string> }
+/** Sync context handed to connectors: tenant (model seam for distillation) + stored doc keys +
+ *  an optional crawl-telemetry sink the connector fills as it fetches (surfaced in the source
+ *  detail's "Crawl log" panel). */
+export interface ConnectorCtx { tenantId: string; existingKeys: Set<string>; crawl?: CrawlLog }
 export type Connector = (config: Record<string, unknown>, ctx?: ConnectorCtx) => Promise<ConnectorUnit[]>;
+
+// ---- crawl telemetry ------------------------------------------------------
+// A serializable record of what one sync actually did — stored on sources.crawl_log (jsonb) and
+// rendered in the UI so an operator can see WHY a crawl fetched N pages (strategy taken, llms.txt
+// hit/miss, per-page outcome), rather than guessing from a bare page count.
+
+/** One page's fate during a crawl. `markdown` = the clean `.md` twin was indexed; `ingested` =
+ *  the HTML/text page itself; `failed` = fetch/parse returned nothing (skipped). */
+export interface CrawlLogEntry {
+  url: string;
+  outcome: "ingested" | "markdown" | "failed";
+  contentType?: string;
+  bytes?: number;
+}
+
+export interface CrawlLog {
+  /** How the crawl enumerated pages: sitemap | sitemapindex | llms.txt | links | single | null. */
+  strategy: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  ok: boolean;
+  error: string | null;
+  /** URL-connector /llms.txt probe: whether one was found and how many doc URLs it listed. */
+  llmsTxt: { found: boolean; urls: number } | null;
+  pagesFetched: number;
+  pagesFailed: number;
+  totalBytes: number;
+  /** The incremental diff the sync produced (added/updated/unchanged/removed) — set post-ingest. */
+  diff: { added: number; updated: number; unchanged: number; removed: number; total: number } | null;
+  entries: CrawlLogEntry[];
+  entriesTruncated: boolean;
+}
+
+// A pathological sitemap could list tens of thousands of URLs; cap the per-page detail we persist
+// (the summary counts stay exact) so the jsonb blob can't grow unbounded.
+const CRAWL_LOG_MAX_ENTRIES = 600;
+
+export function newCrawlLog(): CrawlLog {
+  return {
+    strategy: null, startedAt: new Date().toISOString(), finishedAt: null, ok: false, error: null,
+    llmsTxt: null, pagesFetched: 0, pagesFailed: 0, totalBytes: 0, diff: null, entries: [], entriesTruncated: false,
+  };
+}
+
+/** Record one page outcome into the crawl log (no-op when no sink — e.g. a direct connector call in
+ *  tests). Summary counters stay exact even past the per-entry cap. */
+function logCrawlPage(crawl: CrawlLog | undefined, e: CrawlLogEntry): void {
+  if (!crawl) return;
+  if (e.outcome === "failed") crawl.pagesFailed += 1;
+  else crawl.pagesFetched += 1;
+  if (e.bytes) crawl.totalBytes += e.bytes;
+  if (crawl.entries.length < CRAWL_LOG_MAX_ENTRIES) crawl.entries.push(e);
+  else crawl.entriesTruncated = true;
+}
 
 function connectorError(msg: string, statusCode: number): Error & { statusCode?: number } {
   return Object.assign(new Error(msg), { statusCode });
@@ -437,7 +497,8 @@ async function discoverLlmsTxt(origin: URL): Promise<string[]> {
  *    level deep (up to MAX_PAGES total).
  * Only html/markdown/plain responses are kept (binaries skipped). Total bytes bounded.
  */
-export async function fetchUrlUnits(config: Record<string, unknown>): Promise<ConnectorUnit[]> {
+export async function fetchUrlUnits(config: Record<string, unknown>, ctx?: ConnectorCtx): Promise<ConnectorUnit[]> {
+  const crawl = ctx?.crawl;
   const entry = typeof config.url === "string" ? config.url : "";
   const start = isAllowedUrl(entry);
   if (!start) {
@@ -450,6 +511,12 @@ export async function fetchUrlUnits(config: Record<string, unknown>): Promise<Co
 
   const ingestPage = (p: Fetched): void => {
     totalBytes += p.body.length;
+    logCrawlPage(crawl, {
+      url: p.url,
+      outcome: p.contentType === "text/markdown" ? "markdown" : "ingested",
+      contentType: p.contentType,
+      bytes: p.body.length,
+    });
     units.push({
       key: p.url,
       title: p.contentType === "text/html" ? titleOf(p.body, p.url) : p.url,
@@ -465,6 +532,7 @@ export async function fetchUrlUnits(config: Record<string, unknown>): Promise<Co
   // ---- sitemap path ----
   if (isSitemap(root.body, root.rawType)) {
     const isIndex = /<sitemapindex[\s>]/i.test(root.body);
+    if (crawl) crawl.strategy = isIndex ? "sitemapindex" : "sitemap";
     let pageUrls: string[] = [];
     if (isIndex) {
       // one level of child sitemaps → collect their <loc> page urls
@@ -488,7 +556,9 @@ export async function fetchUrlUnits(config: Record<string, unknown>): Promise<Co
       seen.add(key);
       const p = await fetchPagePreferMarkdown(lu);
       if (p) ingestPage(p);
+      else logCrawlPage(crawl, { url: key, outcome: "failed" });
     }
+    if (crawl) crawl.totalBytes = totalBytes;
     return units;
   }
 
@@ -498,6 +568,10 @@ export async function fetchUrlUnits(config: Record<string, unknown>): Promise<Co
     // Prefer a curated /llms.txt manifest (clean list of the canonical doc URLs) over blind
     // same-origin link-following; fall back to <a href> discovery when the site has none.
     const llms = await discoverLlmsTxt(start);
+    if (crawl) {
+      crawl.llmsTxt = { found: llms.length > 0, urls: llms.length };
+      crawl.strategy = llms.length ? "llms.txt" : "links";
+    }
     const links = llms.length ? llms : extractLinks(root.body, start);
     for (const link of links) {
       if (units.length >= MAX_PAGES || totalBytes >= MAX_TOTAL_BYTES) break;
@@ -508,8 +582,13 @@ export async function fetchUrlUnits(config: Record<string, unknown>): Promise<Co
       seen.add(key);
       const p = await fetchPagePreferMarkdown(lu);
       if (p) ingestPage(p);
+      else logCrawlPage(crawl, { url: key, outcome: "failed" });
     }
+  } else if (crawl) {
+    // A single non-HTML entry (a lone markdown/plain doc) — no link discovery.
+    crawl.strategy = "single";
   }
+  if (crawl) crawl.totalBytes = totalBytes;
   return units;
 }
 
@@ -978,7 +1057,7 @@ async function distillThread(
 async function setStatus(
   tenantId: string,
   id: string,
-  fields: { status: string; last_error?: string | null; doc_count?: number; touchSynced?: boolean; syncToken?: string | null },
+  fields: { status: string; last_error?: string | null; doc_count?: number; touchSynced?: boolean; syncToken?: string | null; crawlLog?: CrawlLog | null },
 ): Promise<void> {
   await withTenant(tenantId, async (c) => {
     await c.query(
@@ -987,9 +1066,11 @@ async function setStatus(
          last_error = COALESCE($3, last_error),
          doc_count = COALESCE($4, doc_count),
          last_synced_at = CASE WHEN $5 THEN now() ELSE last_synced_at END,
-         last_sync_token = COALESCE($6, last_sync_token)
+         last_sync_token = COALESCE($6, last_sync_token),
+         crawl_log = COALESCE($7::jsonb, crawl_log)
        WHERE id = $1`,
-      [id, fields.status, fields.last_error ?? null, fields.doc_count ?? null, fields.touchSynced ?? false, fields.syncToken ?? null],
+      [id, fields.status, fields.last_error ?? null, fields.doc_count ?? null, fields.touchSynced ?? false, fields.syncToken ?? null,
+       fields.crawlLog ? JSON.stringify(fields.crawlLog) : null],
     );
     // last_error must be clearable to NULL on success; COALESCE won't null it, so
     // handle the explicit-clear case separately.
@@ -1047,6 +1128,10 @@ export async function syncSource(
   if (!src) return null;
 
   await setStatus(tenantId, sourceId, { status: "syncing" });
+  // Telemetry sink: filled by the connector as it fetches, persisted after so the source detail
+  // can show what this sync actually did. Stays null on the short-circuit path (nothing crawled),
+  // so we never overwrite the last real crawl log with an empty one.
+  let crawl: CrawlLog | null = null;
   try {
     // Smart-resync short-circuit: probe the upstream revision cheaply (github head SHA). If it matches
     // the token from our last successful sync AND we already hold docs, skip the whole fetch+diff and
@@ -1082,14 +1167,18 @@ export async function syncSource(
       const r = await c.query("SELECT source_key FROM documents WHERE source_id = $1 AND source_key IS NOT NULL", [sourceId]);
       return new Set((r.rows as Array<{ source_key: string }>).map((x) => x.source_key));
     });
-    const units = await fn(src.config, { tenantId, existingKeys });
+    crawl = newCrawlLog();
+    const units = await fn(src.config, { tenantId, existingKeys, crawl });
 
     // Incremental resync: diff the fetched units against what's stored (by key + content hash) and
     // only re-embed/re-index what changed — unchanged docs (and their embeddings) are left alone,
     // and the source is never emptied up-front, so a mid-sync failure keeps the last-good docs.
     const diff = await syncDocuments(tenantId, sourceId, units);
 
-    await setStatus(tenantId, sourceId, { status: "ok", doc_count: diff.total, touchSynced: true, syncToken });
+    crawl.diff = { added: diff.added, updated: diff.updated, unchanged: diff.unchanged, removed: diff.removed, total: diff.total };
+    crawl.ok = true;
+    crawl.finishedAt = new Date().toISOString();
+    await setStatus(tenantId, sourceId, { status: "ok", doc_count: diff.total, touchSynced: true, syncToken, crawlLog: crawl });
     await emitSourceSynced(tenantId, sourceId, "ok", diff.total);
     // Also fire the domain event so tenant Studio flows can react to a completed sync. The diff is
     // surfaced in ctx so a flow can branch on whether anything actually changed. Fire-and-forget.
@@ -1102,7 +1191,12 @@ export async function syncSource(
     return { status: "ok", docCount: diff.total, diff };
   } catch (err) {
     const msg = (err as Error).message ?? "sync failed";
-    await setStatus(tenantId, sourceId, { status: "error", last_error: msg });
+    if (crawl) {
+      crawl.ok = false;
+      crawl.error = msg;
+      crawl.finishedAt = new Date().toISOString();
+    }
+    await setStatus(tenantId, sourceId, { status: "error", last_error: msg, crawlLog: crawl });
     await emitSourceSynced(tenantId, sourceId, "error", 0);
     return { status: "error", docCount: 0, error: msg };
   }

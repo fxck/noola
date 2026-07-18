@@ -43,6 +43,8 @@ import {
   type ChannelConnection, fetchChannelConnections, saveTelegramConnection, saveWhatsAppConnection, deleteChannelConnection,
   type SlackConnection, fetchSlackConnections, saveSlackConnection, deleteSlackConnection,
   fetchEmailRoute, saveEmailRoute,
+  type SendingDomain, type DnsRecord,
+  fetchSendingDomains, addSendingDomain, verifySendingDomain, deleteSendingDomain,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -602,6 +604,9 @@ export function SettingsIntegrationsPage() {
                     </FormDialog>
                   </section>
 
+                  {/* ── Branded sending domains (Model-B: send AS the customer's own domain) ── */}
+                  <SendingDomainsSection isAdmin={isAdmin} />
+
                   {/* ── Editor ── */}
                   <FormDialog
                     open={!!draft}
@@ -789,5 +794,245 @@ export function SettingsIntegrationsPage() {
         onCancel={() => setRemoveTarget(null)}
       />
     </>
+  );
+}
+
+// ── Branded sending domains (Model-B) ────────────────────────────────────────
+// The Intercom "custom email domain" feature: a tenant verifies their OWN domain so outbound
+// replies send AS support@theirdomain with real DKIM, not from the shared platform domain. The
+// provider (Resend) issues the DNS records; we display them + poll for verification. Self-contained
+// (own state + fetch) so it doesn't thread through the big page component. Governs OUTBOUND identity
+// only — the inbound support address (above) stays the routing key.
+
+const DOMAIN_STATUS: Record<string, { label: string; cls: string }> = {
+  verified: { label: "Verified", cls: "border-success/30 bg-success/10 text-success" },
+  pending: { label: "Pending DNS", cls: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400" },
+  verifying: { label: "Verifying…", cls: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400" },
+  failed: { label: "Failed", cls: "border-destructive/30 bg-destructive/10 text-destructive" },
+  not_started: { label: "Not started", cls: "border-border bg-muted text-muted-foreground" },
+};
+
+function DomainStatusBadge({ status }: { status: string }) {
+  const s = DOMAIN_STATUS[status] ?? DOMAIN_STATUS.pending;
+  return (
+    <span className={cn("inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-micro font-medium", s.cls)}>
+      {s.label}
+    </span>
+  );
+}
+
+/** The DNS records the tenant must publish for a domain — a compact, copyable table. */
+function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
+  if (!records.length) {
+    return (
+      <p className="px-3 py-2 text-xs text-muted-foreground">
+        No DNS records yet. Add your provider API key (or open the domain in your provider dashboard) to fetch them.
+      </p>
+    );
+  }
+  const copy = (v: string) => {
+    void navigator.clipboard?.writeText(v).then(() => toast.success("Copied.")).catch(() => {});
+  };
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-xs">
+        <thead className="text-micro uppercase tracking-wide text-muted-foreground">
+          <tr>
+            <th className="px-3 py-1.5 font-medium">Type</th>
+            <th className="px-3 py-1.5 font-medium">Name / Host</th>
+            <th className="px-3 py-1.5 font-medium">Value</th>
+          </tr>
+        </thead>
+        <tbody className="font-mono">
+          {records.map((r, i) => (
+            <tr key={i} className="border-t border-border/60 align-top">
+              <td className="whitespace-nowrap px-3 py-1.5 text-muted-foreground">
+                {r.type}
+                {typeof r.priority === "number" && <span className="text-muted-foreground/60"> · {r.priority}</span>}
+              </td>
+              <td className="max-w-[10rem] px-3 py-1.5">
+                <button type="button" className="block max-w-full truncate hover:text-primary" title={`${r.name} (click to copy)`} onClick={() => copy(r.name)}>
+                  {r.name}
+                </button>
+              </td>
+              <td className="max-w-[16rem] px-3 py-1.5">
+                <button type="button" className="block max-w-full truncate hover:text-primary" title={`${r.value} (click to copy)`} onClick={() => copy(r.value)}>
+                  {r.value}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SendingDomainsSection({ isAdmin }: { isAdmin: boolean }) {
+  const [domains, setDomains] = useState<SendingDomain[] | null>(null);
+  const [providerEnabled, setProviderEnabled] = useState(true);
+  const [input, setInput] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<SendingDomain | null>(null);
+  const [removing, setRemoving] = useState(false);
+
+  useEffect(() => {
+    void fetchSendingDomains()
+      .then((r) => { setDomains(r.domains); setProviderEnabled(r.providerEnabled); })
+      .catch(() => setDomains([]));
+  }, []);
+
+  async function onAdd() {
+    const domain = input.trim().toLowerCase();
+    if (!domain) return;
+    setAdding(true);
+    try {
+      const d = await addSendingDomain(domain);
+      setDomains((xs) => [...(xs ?? []), d]);
+      setExpanded(d.id); // reveal the DNS records to publish immediately
+      setInput("");
+      toast.success(providerEnabled ? "Domain added — publish the DNS records below, then verify." : "Domain tracked. Add it in your provider dashboard to fetch DNS records.");
+    } catch (e) {
+      const s = (e as { status?: number }).status;
+      toast.error(s === 409 ? "That domain is already added." : (e as { detail?: string }).detail || "Couldn't add that domain.");
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function onVerify(d: SendingDomain) {
+    setBusyId(d.id);
+    try {
+      const fresh = await verifySendingDomain(d.id);
+      setDomains((xs) => (xs ?? []).map((x) => (x.id === d.id ? fresh : x)));
+      toast.success(fresh.status === "verified" ? "Domain verified — you can now send from it." : "Re-checked — DNS not fully verified yet.");
+    } catch (e) {
+      toast.error((e as { detail?: string }).detail || "Couldn't check that domain.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function onConfirmRemove() {
+    if (!removeTarget) return;
+    setRemoving(true);
+    try {
+      await deleteSendingDomain(removeTarget.id);
+      setDomains((xs) => (xs ?? []).filter((x) => x.id !== removeTarget.id));
+      toast.success("Domain removed.");
+      setRemoveTarget(null);
+    } catch {
+      toast.error("Couldn't remove that domain.");
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  // Hidden entirely until loaded; empty + non-admin shows nothing (admins get the setup affordance).
+  if (domains === null) return null;
+  if (!isAdmin && domains.length === 0) return null;
+
+  return (
+    <section className="mt-8">
+      <div className="mb-1 flex items-center gap-2">
+        <Globe className="size-4 text-muted-foreground" />
+        <h2 className="text-sm font-semibold text-foreground">Branded sending domains</h2>
+      </div>
+      <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
+        Verify a domain you own to send replies from your own address (e.g. <span className="font-mono">support@yourdomain.com</span>)
+        with real DKIM/SPF — so email lands in the inbox and looks like it's from you. Publish the DNS records we show, then verify.
+      </p>
+
+      {!providerEnabled && (
+        <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          Self-serve provisioning is off (no provider API key on this server). You can still track a domain here and set it up
+          manually in your email provider's dashboard.
+        </p>
+      )}
+
+      <div className="space-y-2">
+        {domains.map((d) => {
+          const isOpen = expanded === d.id;
+          return (
+            <div key={d.id} className="rounded-lg border">
+              <div className="flex items-center gap-3 px-4 py-3">
+                <span className="min-w-0 flex-1 truncate font-mono text-sm text-foreground">{d.domain}</span>
+                <DomainStatusBadge status={d.status} />
+                <button
+                  type="button"
+                  className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => setExpanded(isOpen ? null : d.id)}
+                >
+                  {isOpen ? "Hide DNS" : "View DNS"}
+                </button>
+                {isAdmin && (
+                  <>
+                    <Button variant="outline" size="sm" className="h-7" disabled={busyId === d.id} onClick={() => void onVerify(d)}>
+                      {busyId === d.id ? <Loader2 className="size-3.5 animate-spin" /> : "Verify"}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      title="Remove domain"
+                      onClick={() => setRemoveTarget(d)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </>
+                )}
+              </div>
+              {isOpen && (
+                <div className="border-t bg-muted/20 py-1">
+                  <DnsRecordsTable records={d.records} />
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {domains.length === 0 && (
+          <p className="rounded-lg border border-dashed px-4 py-3 text-xs text-muted-foreground">
+            No sending domains yet — add one below to send from your own address.
+          </p>
+        )}
+      </div>
+
+      {isAdmin && (
+        <div className="mt-3 flex items-center gap-2">
+          <Input
+            className="max-w-xs"
+            placeholder="yourdomain.com"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void onAdd(); }}
+          />
+          <Button variant="outline" size="sm" className="h-9 gap-1.5" disabled={adding || !input.trim()} onClick={() => void onAdd()}>
+            {adding ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
+            Add domain
+          </Button>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!removeTarget}
+        title="Remove sending domain?"
+        message={
+          removeTarget ? (
+            <>
+              <span className="font-mono text-foreground">{removeTarget.domain}</span> will be removed. Replies will fall back
+              to your shared support address. This can't be undone.
+            </>
+          ) : undefined
+        }
+        confirmLabel="Remove"
+        destructive
+        busy={removing}
+        onConfirm={() => void onConfirmRemove()}
+        onCancel={() => setRemoveTarget(null)}
+      />
+    </section>
   );
 }
