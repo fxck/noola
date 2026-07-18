@@ -465,58 +465,64 @@ export async function bulkUpsertContacts(
 }
 
 /** The single-row upsert body, reused by bulkUpsertContacts so the whole batch shares one
- *  transaction. Returns true if the row was inserted, false if it updated an existing row. */
+ *  transaction. Returns true if the row was inserted, false if it updated an existing row.
+ *
+ * A contact has TWO unique identities — external_id and lower(email) — so a single ON CONFLICT
+ * (which targets only one constraint) 500s when a row carries a NEW external_id but an email that
+ * already belongs to someone (a re-used email across Intercom user_ids, or a contact the widget
+ * already created). We instead resolve the existing contact by external_id then email and update
+ * it in place; the two handles only move onto the row when the incoming value isn't already held
+ * by a DIFFERENT contact, so neither unique constraint can be violated. Net effect: duplicate-email
+ * rows collapse onto one contact (the schema's one-contact-per-email invariant), last write wins. */
 async function upsertOne(
   c: import("pg").PoolClient,
   input: ContactInputShape,
 ): Promise<boolean> {
+  const ext = input.external_id ?? null;
+  const email = input.email ?? null;
+  const attrs = jsonOrNull(input.attributes);
   const cid = input.company_id ?? null;
   const avatar = input.avatar_url ?? null;
   const unsub = input.unsubscribed_at ?? null;
   const seen = input.last_seen_at ?? null;
-  if (input.external_id) {
-    const r = await c.query(
-      `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
-       VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $6, COALESCE($5,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz)
-       ON CONFLICT (tenant_id, external_id) WHERE external_id IS NOT NULL
-       DO UPDATE SET
-         email = COALESCE(EXCLUDED.email, contacts.email),
-         name = CASE WHEN $3 IS NULL THEN contacts.name ELSE EXCLUDED.name END,
-         company = CASE WHEN $4 IS NULL THEN contacts.company ELSE EXCLUDED.company END,
-         company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
-         attributes = contacts.attributes || COALESCE($5,'{}'::jsonb),
-         avatar_url = COALESCE(EXCLUDED.avatar_url, contacts.avatar_url),
-         unsubscribed_at = COALESCE(EXCLUDED.unsubscribed_at, contacts.unsubscribed_at),
-         last_seen_at = COALESCE(EXCLUDED.last_seen_at, contacts.last_seen_at),
-         updated_at = now()
-       RETURNING (xmax = 0) AS created`,
-      [input.external_id, input.email ?? null, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes), cid, avatar, unsub, seen],
-    );
-    return r.rows[0].created as boolean;
+
+  let id: string | null = null;
+  if (ext) {
+    const r = await c.query(`SELECT id FROM contacts WHERE external_id = $1 LIMIT 1`, [ext]);
+    if (r.rowCount) id = r.rows[0].id as string;
   }
-  if (input.email) {
-    const r = await c.query(
-      `INSERT INTO contacts (tenant_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
-       VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), $5, COALESCE($4,'{}'::jsonb), $6, $7::timestamptz, $8::timestamptz)
-       ON CONFLICT (tenant_id, lower(email)) WHERE email IS NOT NULL AND email <> ''
-       DO UPDATE SET
-         name = CASE WHEN $2 IS NULL THEN contacts.name ELSE EXCLUDED.name END,
-         company = CASE WHEN $3 IS NULL THEN contacts.company ELSE EXCLUDED.company END,
-         company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
-         attributes = contacts.attributes || COALESCE($4,'{}'::jsonb),
-         avatar_url = COALESCE(EXCLUDED.avatar_url, contacts.avatar_url),
-         unsubscribed_at = COALESCE(EXCLUDED.unsubscribed_at, contacts.unsubscribed_at),
-         last_seen_at = COALESCE(EXCLUDED.last_seen_at, contacts.last_seen_at),
-         updated_at = now()
-       RETURNING (xmax = 0) AS created`,
-      [input.email, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes), cid, avatar, unsub, seen],
-    );
-    return r.rows[0].created as boolean;
+  if (!id && email) {
+    const r = await c.query(`SELECT id FROM contacts WHERE email <> '' AND lower(email) = lower($1) LIMIT 1`, [email]);
+    if (r.rowCount) id = r.rows[0].id as string;
   }
+
+  if (id) {
+    await c.query(
+      `UPDATE contacts SET
+         name = CASE WHEN $2::text IS NULL THEN name ELSE $2::text END,
+         company = CASE WHEN $3::text IS NULL THEN company ELSE $3::text END,
+         company_id = COALESCE($4::uuid, company_id),
+         attributes = attributes || COALESCE($5::jsonb,'{}'::jsonb),
+         avatar_url = COALESCE($6::text, avatar_url),
+         unsubscribed_at = COALESCE($7::timestamptz, unsubscribed_at),
+         last_seen_at = COALESCE($8::timestamptz, last_seen_at),
+         email = CASE WHEN $9::text IS NOT NULL AND NOT EXISTS
+                   (SELECT 1 FROM contacts x WHERE x.id <> $1 AND x.email <> '' AND lower(x.email) = lower($9::text))
+                 THEN $9::text ELSE email END,
+         external_id = CASE WHEN $10::text IS NOT NULL AND NOT EXISTS
+                   (SELECT 1 FROM contacts x WHERE x.id <> $1 AND x.external_id = $10::text)
+                 THEN $10::text ELSE external_id END,
+         updated_at = now()
+       WHERE id = $1`,
+      [id, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, email, ext],
+    );
+    return false;
+  }
+
   await c.query(
-    `INSERT INTO contacts (tenant_id, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
-     VALUES (current_tenant(), COALESCE($1,''), COALESCE($2,''), $4, COALESCE($3,'{}'::jsonb), $5, $6::timestamptz, $7::timestamptz)`,
-    [input.name ?? null, input.company ?? null, jsonOrNull(input.attributes), cid, avatar, unsub, seen],
+    `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
+     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz)`,
+    [ext, email, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen],
   );
   return true;
 }

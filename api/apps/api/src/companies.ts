@@ -122,7 +122,7 @@ export async function listCompanies(tenantId: string, q?: string): Promise<Compa
          LEFT JOIN csat_stats cs ON cs.company_id = co.id
          ${filter}
         ORDER BY co.name
-        LIMIT 500`,
+        LIMIT 5000`,
       params,
     );
     return (r.rows as Record<string, unknown>[])
