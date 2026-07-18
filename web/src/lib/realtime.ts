@@ -7,7 +7,7 @@ import { Socket } from "phoenix";
 function resolveEdgeUrl(): string {
   const explicit = import.meta.env.VITE_EDGE_URL as string | undefined;
   if (explicit) return explicit;
-  if (import.meta.env.DEV) return "ws://localhost:4000";
+  if (import.meta.env.DEV) return "wss://edgestage-561-4000.prg1.zerops.app";
   throw new Error(
     "VITE_EDGE_URL must be set for a production build — refusing to silently fall back to the stage edge.",
   );

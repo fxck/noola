@@ -173,6 +173,7 @@ const PUBLIC_ROUTES = new Set([
   // Ask-AI widget + public help center + messenger — widget-key-scoped, no session (./routes/widget.ts).
   "POST /synthetic/messages",
   "POST /public/ask",
+  "POST /public/ask/stream",
   "POST /public/conversation",
   "POST /public/conversations",
   "POST /public/assistant-mode",

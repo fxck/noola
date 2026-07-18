@@ -15,7 +15,7 @@ import { ingestInbound } from "../ingest.js";
 import { createAttachment, claimAttachments, attachmentsForTicket, type AttachmentRow } from "../attachments.js";
 import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
-import { suggestForQuery } from "../copilot.js";
+import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey } from "../widget.js";
 import { upsertContact, bumpContactSeen } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
@@ -208,6 +208,105 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       app.log.error({ err }, "public ask failed");
       // The question is already persisted (agent sees it); only the AI answer is unavailable.
       return reply.code(502).send({ error: "answer unavailable" });
+    }
+  });
+
+  // Streaming sibling of /public/ask (Server-Sent Events). Same trust model + ingest, but the AI
+  // answer arrives token-by-token so the widget renders it live (Intercom-style perceived speed)
+  // instead of blocking on the full generation. The customer message is persisted first; the answer
+  // is persisted (agent/automation) only once the stream completes, then fanned out over the widget
+  // WS + returned by the terminal `done` event (messageId seeds the widget's dedupe so poll/WS
+  // echoes of the same id never double-render). SSE frames:
+  //   event: delta  data: {"t":"…"}                          — an incremental text chunk
+  //   event: done   data: {"messageId","conversationId","confidence","citations"} — final, persisted
+  //   event: error  data: {"error":"…"}                       — generation failed after ingest
+  // The widget uses this lane only for AI-mode text turns; escalate / human-mode / attachment-only
+  // turns still use /public/ask (no streamed answer to produce).
+  app.post("/public/ask/stream", { bodyLimit: 40 * 1024 * 1024 }, async (req, reply) => {
+    const parsed = PublicAskInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const { key, question, conversationId, email, name } = parsed.data;
+    const text = question.trim();
+    if (!text) return reply.code(400).send({ error: "message is empty" });
+
+    const wk = await resolveWidgetKey(key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+
+    // Persist the visitor's message onto the widget ticket (creates/threads by identity), exactly
+    // like /public/ask, BEFORE opening the stream — so a mid-stream disconnect never loses the ask.
+    const inbound = await ingestInbound({
+      tenantId: wk.tenantId,
+      body: text,
+      authorType: "customer",
+      channelType: "widget",
+      externalChannelId: conversationId ?? null,
+      subject: text.slice(0, 80),
+      identity: { externalId: conversationId ?? null, email: email ?? null, name: name ?? null },
+    });
+    if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
+
+    // Not in AI mode → nothing to stream; tell the widget to fall back to its human-queue rendering.
+    if (!(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
+      return reply.code(200).send({ deferred: true, conversationId: inbound.ticketId, messageId: inbound.messageId });
+    }
+
+    // Hand the socket to us: write SSE frames on reply.raw. CORS headers are set explicitly because
+    // hijack bypasses the @fastify/cors reply-header staging; the origin is already allowlist-checked.
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no", // defeat proxy buffering so tokens flush immediately
+      "access-control-allow-origin": origin ?? "*",
+      vary: "Origin",
+    });
+    const send = (event: string, data: unknown): void => {
+      raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    // A heartbeat comment every 15s keeps intermediaries from idling the connection out on a slow model.
+    const hb = setInterval(() => raw.write(": ping\n\n"), 15_000);
+
+    try {
+      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public" });
+      // Manual iteration so we capture the generator's RETURN value (the final Suggestion).
+      let suggestion: Awaited<ReturnType<typeof suggestForQuery>>;
+      for (;;) {
+        const step = await stream.next();
+        if (step.done) {
+          suggestion = step.value;
+          break;
+        }
+        if (step.value?.delta) send("delta", { t: step.value.delta });
+      }
+
+      // Persist the finished answer as an agent message on the SAME ticket → threads + fans out over
+      // the widget WS. origin:'automation' stops the AI's own reply re-triggering the rules engine.
+      const answerMsg = await ingestInbound({
+        tenantId: wk.tenantId,
+        body: suggestion.draft,
+        authorType: "agent",
+        ticketId: inbound.ticketId,
+        channelType: "widget",
+        origin: "automation",
+      });
+      send("done", {
+        messageId: answerMsg.messageId,
+        conversationId: inbound.ticketId,
+        confidence: suggestion.confidence,
+        citations: suggestion.citations.map((c) => ({ title: c.title, snippet: c.snippet })),
+      });
+    } catch (err) {
+      app.log.error({ err }, "public ask stream failed");
+      send("error", { error: "answer unavailable" });
+    } finally {
+      clearInterval(hb);
+      raw.end();
     }
   });
 

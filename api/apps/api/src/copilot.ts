@@ -1,5 +1,5 @@
 import { withTenant } from "@repo/db";
-import { modelDriver, embeddingDriver, clip, type DraftResult } from "./model.js";
+import { modelDriver, embeddingDriver, clip, type DraftResult, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { personaFragment } from "./persona.js";
 import { searchArticles, hydrateArticles } from "./kb.js";
@@ -236,6 +236,96 @@ export async function suggestForQuery(
     };
   }
 
+  const prep = await prepareDraft(tenantId, query, opts, started);
+  const draftStarted = Date.now();
+  let result: DraftResult;
+  let model: string;
+  try {
+    result = await prep.driver.draftReply(prep.draftInput);
+    model = prep.driver.name;
+  } catch {
+    result = await modelDriver.draftReply(prep.draftInput);
+    model = `${modelDriver.name} (fallback)`;
+  }
+  return prep.finalize(result, model, Date.now() - draftStarted);
+}
+
+/** Streaming sibling of suggestForQuery. Runs the identical retrieval + grounding, then
+ *  streams the draft token-by-token (yielding `{ delta }`), and RETURNS the same fully-
+ *  formed Suggestion (trace + citations + gap detection) once generation completes — so
+ *  the SSE endpoint gets live tokens AND the canonical persisted answer from one call. */
+export async function* suggestForQueryStream(
+  tenantId: string,
+  query: string,
+  opts: SuggestOpts = {},
+): AsyncGenerator<{ delta: string }, Suggestion, void> {
+  const started = Date.now();
+  // No customer text → stream the safe acknowledgement whole (no retrieval), matching the
+  // non-streaming path's early return.
+  if (!query || !query.trim()) {
+    const suggestion = await suggestForQuery(tenantId, query, opts);
+    yield { delta: suggestion.draft };
+    return suggestion;
+  }
+
+  const prep = await prepareDraft(tenantId, query, opts, started);
+  const draftStarted = Date.now();
+  let text = "";
+  let dr: DraftResult | null = null;
+  let model = prep.driver.name;
+
+  if (prep.driver.draftReplyStream) {
+    try {
+      for await (const ev of prep.driver.draftReplyStream(prep.draftInput)) {
+        if (ev.delta) {
+          text += ev.delta;
+          yield { delta: ev.delta };
+        }
+        if (ev.done) dr = ev.done;
+      }
+    } catch {
+      // A stream that fails AFTER emitting text can't be un-sent — keep what the client
+      // already has. Only a stream that produced nothing falls through to a fresh draft.
+      if (text) dr = { text, confidence: 0.7 };
+    }
+  }
+  if (!dr && !text) {
+    // Streaming unsupported or produced nothing → non-stream draft, degrade to baseline.
+    try {
+      dr = await prep.driver.draftReply(prep.draftInput);
+    } catch {
+      dr = await modelDriver.draftReply(prep.draftInput);
+      model = `${modelDriver.name} (fallback)`;
+    }
+    text = dr.text;
+    yield { delta: dr.text };
+  } else if (!dr) {
+    dr = { text, confidence: 0.7 };
+  }
+
+  return prep.finalize(dr, model, Date.now() - draftStarted);
+}
+
+/** The shared retrieval + grounding + driver-resolution used by both the blocking and the
+ *  streaming entry points. Returns the ready-to-call draft input plus a `finalize` closure
+ *  that records the trace, runs content-gap detection, and assembles the Suggestion once a
+ *  DraftResult exists (however it was produced — one shot or streamed). */
+async function prepareDraft(
+  tenantId: string,
+  query: string,
+  opts: SuggestOpts,
+  started: number,
+): Promise<{
+  driver: ModelServingDriver;
+  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string };
+  citations: Citation[];
+  retrieval: RetrievalSummary;
+  finalize: (result: DraftResult, model: string, latencyMs: number) => Promise<Suggestion>;
+}> {
+  const source = opts.source ?? "live";
+  const ticketId = opts.ticketId ?? null;
+  const messageId = opts.messageId ?? null;
+
   // Embed the query once (all three surfaces share the vector), then retrieve each
   // IN-SCOPE surface with hybrid keyword+vector fusion. Tenant-scoped throughout. The
   // audience scope (item 18) drops whole surfaces: public answers default to KB only.
@@ -323,42 +413,35 @@ export async function suggestForQuery(
   // no-op. Best-effort — a persona lookup failure must never block a draft.
   const persona = await personaFragment(tenantId).catch(() => "");
   const draftInput = { customerMessage: query, sources: grounding, persona };
-  let result: DraftResult;
-  let model: string;
-  const draftStarted = Date.now();
-  try {
-    result = await driver.draftReply(draftInput);
-    model = driver.name;
-  } catch {
-    result = await modelDriver.draftReply(draftInput);
-    model = `${modelDriver.name} (fallback)`;
-  }
-  const latencyMs = Date.now() - draftStarted;
 
-  const traceSources = perCitation.map((p, i) => ({
-    kind: p.kind, id: p.id, title: citations[i]?.title ?? "", score: p.score, rank: i,
-  }));
-  const traceId = await recordDraftTrace({
-    tenantId, ticketId, messageId, query, sources: traceSources, retrieval,
-    draft: result.text, model, embedModel: embeddingDriver.name,
-    confidence: result.confidence ?? null, tokensIn: result.tokensIn ?? null,
-    tokensOut: result.tokensOut ?? null, latencyMs: Date.now() - started, source,
-  });
-
-  // Content-gap detection: a weak retrieval means the KB couldn't answer this question — record it
-  // (clustered, best-effort) so it surfaces in the Sources worklist and routes back into authoring.
-  if (isContentGap(retrieval.agreement, retrieval.topScore)) {
-    void recordKnowledgeGap(tenantId, {
-      query, confidence: result.confidence ?? null, topScore: retrieval.topScore,
-      agreement: retrieval.agreement, source, ticketId,
+  // Trace + content-gap + Suggestion assembly, invoked once a DraftResult exists (one-shot
+  // or streamed). `latencyMs` is the draft-generation time the caller measured.
+  const finalize = async (result: DraftResult, model: string, latencyMs: number): Promise<Suggestion> => {
+    const traceSources = perCitation.map((p, i) => ({
+      kind: p.kind, id: p.id, title: citations[i]?.title ?? "", score: p.score, rank: i,
+    }));
+    const traceId = await recordDraftTrace({
+      tenantId, ticketId, messageId, query, sources: traceSources, retrieval,
+      draft: result.text, model, embedModel: embeddingDriver.name,
+      confidence: result.confidence ?? null, tokensIn: result.tokensIn ?? null,
+      tokensOut: result.tokensOut ?? null, latencyMs: Date.now() - started, source,
     });
-  }
-
-  return {
-    draft: result.text, citations, model, basedOn: clip(query, 160),
-    retrieval, confidence: result.confidence ?? null, traceId,
-    tokensIn: result.tokensIn ?? null, tokensOut: result.tokensOut ?? null, latencyMs,
+    // Content-gap detection: weak retrieval means the KB couldn't answer this — record it
+    // (clustered, best-effort) so it surfaces in the Sources worklist and routes back to authoring.
+    if (isContentGap(retrieval.agreement, retrieval.topScore)) {
+      void recordKnowledgeGap(tenantId, {
+        query, confidence: result.confidence ?? null, topScore: retrieval.topScore,
+        agreement: retrieval.agreement, source, ticketId,
+      });
+    }
+    return {
+      draft: result.text, citations, model, basedOn: clip(query, 160),
+      retrieval, confidence: result.confidence ?? null, traceId,
+      tokensIn: result.tokensIn ?? null, tokensOut: result.tokensOut ?? null, latencyMs,
+    };
   };
+
+  return { driver, draftInput, citations, retrieval, finalize };
 }
 
 /** The ticket-scoped entry point for the /suggest endpoint: find the latest customer

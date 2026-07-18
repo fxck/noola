@@ -13,6 +13,7 @@ import {
   fetchDiscordChannelsConfig,
   saveDiscordChannelBindings,
   saveDiscordTeamRoles,
+  linkDiscordGuild,
 } from "@/lib/settings";
 import { type Company, fetchCompanies } from "@/lib/companies";
 import { Button } from "@/components/ui/button";
@@ -44,6 +45,81 @@ function Field({ label, hint, children }: { label: string; hint?: React.ReactNod
   );
 }
 
+/** First-run onboarding: bind a Discord server (guild) to this workspace. Invite the bot, then
+ *  paste the Server ID — this writes the discord_links row that routes the server's messages here.
+ *  Without it the bot sits in the server but its traffic maps to no tenant. The channel/mirror
+ *  pickers below only list servers linked here, so this is the step that unblocks everything else. */
+function ConnectServerSection({
+  connectedGuildIds,
+  onLinked,
+}: {
+  connectedGuildIds: string[];
+  onLinked: () => void;
+}) {
+  const [guildId, setGuildId] = useState("");
+  const [linking, setLinking] = useState(false);
+
+  async function link() {
+    const id = guildId.trim();
+    if (!/^\d{15,20}$/.test(id)) {
+      toast.error("Enter your Discord Server ID — the long number from right-click server → Copy Server ID.");
+      return;
+    }
+    setLinking(true);
+    try {
+      await linkDiscordGuild(id);
+      toast.success("Server connected — its channels and roles will populate below.");
+      setGuildId("");
+      onLinked();
+    } catch (e) {
+      toast.error((e as { detail?: string }).detail || "Couldn't connect that server. Check the ID and try again.");
+    } finally {
+      setLinking(false);
+    }
+  }
+
+  return (
+    <section className="space-y-3">
+      <div>
+        <h2 className="text-sm font-semibold tracking-tight">Connected servers</h2>
+        <p className="mt-0.5 text-small text-muted-foreground">
+          The Discord server(s) this workspace handles. Invite the bot to your server, then paste its
+          Server ID here — enable Developer Mode in Discord (User Settings → Advanced), right-click the server
+          icon → <strong>Copy Server ID</strong>.
+        </p>
+      </div>
+
+      {connectedGuildIds.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {connectedGuildIds.map((id) => (
+            <Badge key={id} variant="muted" className="font-mono">
+              {id}
+            </Badge>
+          ))}
+        </div>
+      ) : (
+        <p className="text-small text-muted-foreground">No servers connected yet.</p>
+      )}
+
+      <div className="flex items-center gap-2">
+        <Input
+          className="max-w-xs font-mono"
+          placeholder="Server ID (e.g. 1521941266038919299)"
+          value={guildId}
+          inputMode="numeric"
+          onChange={(e) => setGuildId(e.target.value.replace(/\D/g, ""))}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void link();
+          }}
+        />
+        <Button size="sm" className="h-9 gap-1.5" disabled={linking || !guildId.trim()} onClick={() => void link()}>
+          <Plus className="size-4" /> Connect server
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 type Draft = DiscordMirrorBindingInput & { _key: string };
 
 function toDraft(b: DiscordMirrorBinding): Draft {
@@ -65,6 +141,9 @@ export function SettingsDiscordMirrorPage() {
   const [botOnline, setBotOnline] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Bumped after a server is linked so every section (connected servers, customer channels, mirror)
+  // re-fetches and picks up the new guild without a full page reload.
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     fetchDiscordMirrorConfig()
@@ -74,7 +153,7 @@ export function SettingsDiscordMirrorPage() {
         setBotOnline(cfg.botOnline);
       })
       .catch(() => setLoadError(true));
-  }, []);
+  }, [reloadKey]);
 
   async function save(next: Draft[]) {
     setSaving(true);
@@ -122,7 +201,12 @@ export function SettingsDiscordMirrorPage() {
       description="Customer channels, team identity and the management-forum mirror — tickets in and out of Discord."
     >
       <div className="max-w-3xl space-y-8 px-6 pb-12 pt-4">
-        <CustomerChannelsSection />
+        <ConnectServerSection
+          connectedGuildIds={guilds.map((g) => g.id)}
+          onLinked={() => setReloadKey((k) => k + 1)}
+        />
+
+        <CustomerChannelsSection key={reloadKey} />
 
         {/* ── Ops mirror ── */}
         <section className="space-y-3">

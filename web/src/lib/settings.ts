@@ -285,6 +285,13 @@ export interface DiscordChannelsConfig {
 export async function saveDiscordTeamRoles(guildId: string, teamRoleIds: string[]): Promise<void> {
   await api("/discord/classification", { method: "POST", body: JSON.stringify({ guildId, teamRoleIds }) });
 }
+
+/** Link a Discord server (guild) to this workspace — writes the discord_links row that routes the
+ *  server's messages here. The first-run onboarding step: without it the bot is in the server but
+ *  its traffic maps to no tenant. Idempotent (re-links on conflict). */
+export async function linkDiscordGuild(guildId: string): Promise<void> {
+  await api("/discord/link", { method: "POST", body: JSON.stringify({ guildId }) });
+}
 export interface DiscordChannelBindingInput {
   guildId: string;
   channelId: string;

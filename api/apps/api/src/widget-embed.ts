@@ -54,6 +54,10 @@ export const WIDGET_JS = String.raw`(function () {
   var activeConvId = null;
   var pollTimer = null;
   var ws = null, wsHb = null, wsRef = 0;
+  // While an AI answer streams token-by-token (SSE), the poll/WS/hydrate reconcilers must NOT
+  // rebuild #log from the server — the answer isn't persisted until the stream's 'done', so a
+  // mid-stream hydrate would wipe the live bubble. Set to the conversation id during a stream.
+  var streamingConv = null;
 
   // ---- storage helpers ----
   function skey(sfx) { return 'noola_' + sfx + '_' + KEY; }
@@ -191,7 +195,19 @@ export const WIDGET_JS = String.raw`(function () {
     '.screen.leave-back{z-index:2;transition:transform .26s var(--ease-drawer)}' +
     '.screen.leave-back.go{transform:translateX(100%)}' +
     '.hd{background:var(--ba);color:var(--ba-fg);padding:15px 15px 14px;display:flex;align-items:flex-start;gap:10px;position:relative}' +
-    '.hd.grad{background:linear-gradient(150deg,color-mix(in srgb,var(--ba) 87%,#fff),var(--ba))}' +
+    // Premium multi-stop mesh gradient (Intercom-style) instead of a flat accent bar.
+    '.hd.grad{background:' +
+      'radial-gradient(120% 140% at 0% 0%,color-mix(in srgb,var(--ba) 62%,#fff) 0%,transparent 55%),' +
+      'radial-gradient(120% 130% at 100% 0%,color-mix(in srgb,var(--ba) 30%,#000) 0%,transparent 60%),' +
+      'linear-gradient(150deg,color-mix(in srgb,var(--ba) 86%,#fff),var(--ba))}' +
+    // Tall home header: oversized greeting + a decorative team-avatar cluster, top-right.
+    '.hd.home{flex-direction:column;align-items:stretch;gap:0;padding:20px 18px 20px}' +
+    '.hd.home .homeTop{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}' +
+    '.hd.home .faces{display:flex;flex-direction:row-reverse}' +
+    '.hd.home .faces .fc{width:34px;height:34px;border-radius:50%;margin-left:-10px;border:2px solid color-mix(in srgb,var(--ba) 70%,#000);background:rgba(255,255,255,.22);overflow:hidden;display:grid;place-items:center;color:var(--ba-fg)}' +
+    '.hd.home .faces .fc img{width:100%;height:100%;object-fit:cover}.hd.home .faces .fc svg{width:17px;height:17px}' +
+    '.hd.home h2{margin:18px 0 0;font-size:23px;line-height:1.18;font-weight:720;letter-spacing:-.02em}' +
+    '.hd.home h2 .dim{opacity:.62}' +
     '.hd .htxt{min-width:0;flex:1}' +
     '.hd h3{margin:0;font-size:16.5px;font-weight:680;letter-spacing:-.012em;line-height:1.25}' +
     '.hd p{margin:3px 0 0;font-size:12.5px;opacity:.9;line-height:1.4}' +
@@ -251,7 +267,18 @@ export const WIDGET_JS = String.raw`(function () {
     '.mrow.right .mstack{align-items:flex-end}' +
     '.mwho{font-size:11.5px;font-weight:600;color:var(--fg2);margin:0 0 1px 3px;display:flex;gap:6px;align-items:baseline}' +
     '.mwho .t{color:var(--fg3);font-weight:500;font-size:10.5px}' +
-    '.rowm{padding:9px 13px;border-radius:var(--rb);font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word;max-width:100%}' +
+    '.rowm{padding:9px 13px;border-radius:var(--rb);font-size:14px;line-height:1.5;white-space:normal;word-wrap:break-word;overflow-wrap:anywhere;max-width:100%}' +
+    '.rowm p{margin:0}.rowm p+p{margin-top:8px}' +
+    '.rowm ul,.rowm ol{margin:6px 0;padding-left:20px}.rowm li{margin:2px 0}.rowm li::marker{color:var(--fg3)}' +
+    '.rowm.me li::marker{color:rgba(255,255,255,.7)}' +
+    '.rowm .mdh{font-weight:680;letter-spacing:-.01em;margin:8px 0 3px;font-size:14.5px}.rowm .mdh:first-child{margin-top:0}' +
+    '.rowm em{font-style:italic}' +
+    // Streaming: the live caret that trails the AI answer while tokens arrive; a soft blur-in as the
+    // first token replaces the thinking dots so the two states blend rather than pop.
+    '.rowm.streaming{animation:streamin .18s var(--ease-out)}' +
+    '@keyframes streamin{from{filter:blur(2px);opacity:.5}to{filter:none;opacity:1}}' +
+    '.caret{display:inline-block;width:2px;height:1.05em;margin-left:1px;vertical-align:-2px;border-radius:1px;background:var(--ba);opacity:.9;animation:caret 1s steps(1) infinite}' +
+    '@keyframes caret{50%{opacity:0}}' +
     '.rowm.me{background:var(--ba);color:var(--me-fg)}' +
     '.rowm.agent{background:var(--elev);color:var(--fg);border:1px solid var(--bd)}' +
     '.rowm.ai{background:var(--ai-bg);color:var(--fg);border:1px solid var(--ai-bd)}' +
@@ -305,6 +332,36 @@ export const WIDGET_JS = String.raw`(function () {
     '.art h1{font-size:19px;margin:0 0 12px;letter-spacing:-.01em;color:var(--fg)}' +
     '.art .art-body{font-size:14px;line-height:1.6;color:var(--fg2);white-space:pre-wrap;word-wrap:break-word}' +
     '.brand{padding:8px 16px 14px;text-align:center;font-size:11px;color:var(--fg3);background:var(--bg-sub)}' +
+    // Thin, auto-hiding scrollbars in the shadow root — a native gray bar reads as "web page",
+    // a hairline reads as "app". Firefox uses scrollbar-width; WebKit uses ::-webkit-scrollbar.
+    '.body,.log,.art{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--fg3) 55%,transparent) transparent}' +
+    '.body::-webkit-scrollbar,.log::-webkit-scrollbar,.art::-webkit-scrollbar{width:7px;height:7px}' +
+    '.body::-webkit-scrollbar-thumb,.log::-webkit-scrollbar-thumb,.art::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--fg3) 45%,transparent);border-radius:99px;border:2px solid transparent;background-clip:padding-box}' +
+    '.body:hover::-webkit-scrollbar-thumb,.log:hover::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--fg3) 70%,transparent);background-clip:padding-box}' +
+    '.body::-webkit-scrollbar-track,.log::-webkit-scrollbar-track,.art::-webkit-scrollbar-track{background:transparent}' +
+    // Send button: idle (disabled) is muted; "ready" (there is content) lifts to accent with a soft ring.
+    '.foot button#send{background:var(--bd2);color:var(--fg3);transition:background .16s var(--ease-out),color .16s var(--ease-out),transform .12s var(--ease-out),box-shadow .16s var(--ease-out)}' +
+    '.foot button#send.ready{background:var(--ba);color:var(--ba-fg);box-shadow:0 2px 8px color-mix(in srgb,var(--ba) 40%,transparent)}' +
+    '.foot button#send.ready:hover{filter:brightness(1.07)}' +
+    '.foot button#send:disabled{opacity:1;cursor:default}' +
+    // Large image attachment tile in the composer (Intercom-style preview with a corner ✕).
+    '.attthumb{position:relative;width:76px;height:76px;border-radius:12px;overflow:hidden;border:1px solid var(--bd);background:var(--bg-sub)}' +
+    '.attthumb img{width:100%;height:100%;object-fit:cover;display:block}' +
+    '.attthumb .rm{position:absolute;top:4px;right:4px;width:20px;height:20px;min-width:0;padding:0;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;display:grid;place-items:center;cursor:pointer;border:none;backdrop-filter:blur(2px)}' +
+    '.attthumb .rm svg{width:11px;height:11px;color:#fff}' +
+    // Quick-reply chips (suggested next actions under an AI answer).
+    '.qrs{display:flex;flex-wrap:wrap;gap:7px;margin:9px 0 2px 34px}' +
+    '.qr{border:1px solid var(--ai-bd);background:var(--elev);color:var(--ba);font:inherit;font-size:13px;font-weight:560;padding:7px 13px;border-radius:999px;cursor:pointer;transition:background .15s var(--ease-out),transform .12s var(--ease-out)}' +
+    '.qr:hover{background:var(--ai-bg)}.qr:active{transform:scale(.97)}' +
+    // Conversation-ended divider.
+    '.ended{align-self:center;display:flex;align-items:center;gap:10px;width:calc(100% - 28px);margin:16px 0 6px;color:var(--fg3);font-size:12px}' +
+    '.ended::before,.ended::after{content:"";flex:1;height:1px;background:var(--bd)}' +
+    // Refined Home primary card: sparkle + label + trailing avatar cluster.
+    '.askcard{display:flex;align-items:center;gap:12px;margin:0 16px 12px;padding:14px 15px;border-radius:15px;background:var(--elev);border:1px solid var(--bd);box-shadow:var(--shadow-sm);cursor:pointer;width:calc(100% - 32px);text-align:left;font:inherit;transition:transform .12s var(--ease-out),border-color .15s var(--ease-out),box-shadow .16s var(--ease-out)}' +
+    '.askcard:hover{border-color:var(--bd2);box-shadow:0 4px 16px rgba(16,24,40,.08)}.askcard:active{transform:scale(.99)}' +
+    '.askcard .ic{width:38px;height:38px;flex:0 0 auto;border-radius:11px;display:grid;place-items:center;background:var(--ai-bg);color:var(--ba)}.askcard .ic svg{width:20px;height:20px}' +
+    '.askcard .at{flex:1;min-width:0}.askcard .att{font-weight:660;font-size:14.5px;color:var(--fg);letter-spacing:-.01em}.askcard .ats{font-size:12.5px;color:var(--fg2);margin-top:1px}' +
+    '.askcard .chev{color:var(--fg3);flex:0 0 auto}.askcard .chev svg{width:18px;height:18px;display:block}' +
     '@media (prefers-reduced-motion:reduce){' +
       '.bubble,.bubble .g,.panel,.panel.on,.screen,.screen.enter-tab,.screen.enter-tab.active,.screen.enter-fwd,.screen.enter-fwd.active,' +
       '.screen.enter-back,.screen.enter-back.active,.screen.leave-tab,.screen.leave-fwd,.screen.leave-back,.mrow.msg-enter,.talk,.foot button{' +
@@ -510,6 +567,22 @@ export const WIDGET_JS = String.raw`(function () {
     })(btns[i]);
   }
 
+  // The home header's stacked avatar cluster: the AI mark plus up to two real agent avatars the
+  // visitor has actually talked to (from past conversations) — genuine faces, never fake stock.
+  function homeFaces() {
+    var urls = [], seen = {};
+    for (var i = 0; i < convs.length; i++) {
+      var ms = convs[i].msgs || [];
+      for (var j = 0; j < ms.length; j++) {
+        var u = ms[j] && ms[j].authorAvatarUrl;
+        if (u && !seen[u]) { seen[u] = 1; urls.push(u); }
+      }
+    }
+    urls = urls.slice(0, 2);
+    var out = '<span class="fc">' + iconSparkle() + '</span>';
+    for (var k = 0; k < urls.length; k++) out += '<span class="fc"><img src="' + esc(avatarUrl(urls[k])) + '" alt=""></span>';
+    return out;
+  }
   function renderHome() {
     var recent = touchedConvs()[0];
     var recentCard = '';
@@ -522,11 +595,24 @@ export const WIDGET_JS = String.raw`(function () {
           '<span class="chev">' + iconChev() + '</span>' +
         '</div></div>';
     }
+    var hi = isIdentified() && identity.name ? esc(String(identity.name).split(/\s+/)[0]) : null;
+    var homeHead =
+      '<div class="hd grad home">' +
+        '<div class="homeTop">' +
+          '<div class="faces">' + homeFaces() + '</div>' +
+          '<button class="iconbtn" id="cl" aria-label="Close">' + iconClose() + '</button>' +
+        '</div>' +
+        '<h2>' + (hi ? ('Hi ' + hi + '. ') : 'Hi there. ') + '<span class="dim">How can we help?</span></h2>' +
+      '</div>';
     var html =
-      header(CFG.title, isIdentified() && identity.name ? ('Hi ' + identity.name + ' \u{1F44B}') : null) + tabbar() +
+      homeHead + tabbar() +
       '<div class="body">' +
         '<div class="greet">' + esc(CFG.greeting) + '</div>' +
-        '<button class="cta" id="startc"><span>Send us a message</span>' + iconSend() + '</button>' +
+        '<button class="askcard" id="startc">' +
+          '<span class="ic">' + iconSparkle() + '</span>' +
+          '<span class="at"><span class="att">Ask a question</span><span class="ats">AI Agent &amp; team · instant answers</span></span>' +
+          '<span class="chev">' + iconChev() + '</span>' +
+        '</button>' +
         recentCard +
         (CFG.tabs.help ? (
           '<div class="search" id="hsearch"><span>' + iconSearch() + '</span><input id="hq" placeholder="Search for help" autocomplete="off"></div>' +
@@ -651,6 +737,9 @@ export const WIDGET_JS = String.raw`(function () {
       out += mrowHtml(m, gs, m.at);
       prev = m;
     }
+    // A resolved/closed ticket shows an "ended" divider (Intercom-style) above the toggle; the
+    // visitor can still ask again, which reopens the thread server-side on the next turn.
+    if (c.status === 'resolved' || c.status === 'closed') out += '<div class="ended">This conversation has ended</div>';
     // One toggle, driven by the authoritative AI mode: mute the bot ("Talk to a human") or turn it
     // back on ("Ask the assistant"). Always present so the visitor is never stuck in one mode.
     var toggle = c.escalated
@@ -675,12 +764,16 @@ export const WIDGET_JS = String.raw`(function () {
   // widget shows EXACTLY what the agent console shows (single source of truth). Only rebuilds the DOM
   // when the message set actually changed (by id) or the AI mode flipped — most polls are no-ops.
   function hydrateThread(convId, cb) {
+    // Don't reconcile a conversation whose AI answer is mid-stream — the persisted answer doesn't
+    // exist yet, so rebuilding from the server would erase the live streaming bubble.
+    if (streamingConv === convId) { if (cb) cb(); return; }
     fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId }) })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         var c = getConv(convId); if (!c || !d) { if (cb) cb(); return; }
         var wasEsc = !!c.escalated;
         c.escalated = d.assistantEnabled === false;
+        c.status = d.status || null;
         var server = (d.messages || []).map(function (m) { return { role: m.role === 'agent' ? 'agent' : m.role === 'ai' ? 'ai' : 'me', id: m.id, body: m.body, attachments: m.attachments || [], at: m.at ? +new Date(m.at) : Date.now(), authorName: m.authorName || null, authorAvatarUrl: m.authorAvatarUrl || null }; });
         var localIds = c.msgs.map(function (m) { return m.id || ''; }).join('|');
         var serverIds = server.map(function (m) { return m.id; }).join('|');
@@ -755,12 +848,13 @@ export const WIDGET_JS = String.raw`(function () {
       var log = sel('#log'); if (log) log.scrollTop = log.scrollHeight;
       wireThreadLog(c);
       send.addEventListener('click', function () { sendMsg(c.id); });
-      q.addEventListener('input', function () { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 96) + 'px'; });
+      q.addEventListener('input', function () { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 96) + 'px'; syncSendState(); });
       q.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(c.id); } });
       var attach = sel('#attach'), fi = sel('#fileinput');
       if (attach && fi) attach.addEventListener('click', function () { fi.click(); });
       if (fi) fi.addEventListener('change', function () { addFiles(fi.files); fi.value = ''; });
       renderAttPrev();
+      syncSendState();
       q.focus();
       // Reconcile against the server on open, then keep the thread live (poll + WS) regardless of mode
       // so agent replies AND AI answers stream in and both interfaces stay in lockstep.
@@ -790,21 +884,48 @@ export const WIDGET_JS = String.raw`(function () {
   function renderAttPrev() {
     var box = sel('#attprev'); if (!box) return;
     box.innerHTML = pending.map(function (p, i) {
-      var thumb = p.isImage ? '<img src="' + p.dataUrl + '" alt="">' : iconFile();
-      return '<span class="attchip">' + thumb + '<span>' + esc(p.filename) + '</span>' +
+      // Images get a large tile preview (Intercom-style); other files a compact chip.
+      if (p.isImage) {
+        return '<span class="attthumb"><img src="' + p.dataUrl + '" alt="' + esc(p.filename) + '">' +
+          '<button class="rm" type="button" data-i="' + i + '" aria-label="Remove">' + iconX() + '</button></span>';
+      }
+      return '<span class="attchip">' + iconFile() + '<span>' + esc(p.filename) + '</span>' +
         '<button class="rm" type="button" data-i="' + i + '" aria-label="Remove">' + iconX() + '</button></span>';
     }).join('');
     var rms = box.querySelectorAll('.rm');
-    for (var k = 0; k < rms.length; k++) (function (b) { b.addEventListener('click', function () { pending.splice(+b.getAttribute('data-i'), 1); renderAttPrev(); }); })(rms[k]);
+    for (var k = 0; k < rms.length; k++) (function (b) { b.addEventListener('click', function () { pending.splice(+b.getAttribute('data-i'), 1); renderAttPrev(); syncSendState(); }); })(rms[k]);
   }
-  // Minimal, XSS-safe markdown for chat bubbles: escape FIRST, then render bold, code spans and
-  // links. (AI answers come back in markdown; without this the raw asterisks show literally.)
+  // XSS-safe markdown for chat bubbles: a small line parser (headings, bullet/ordered lists,
+  // paragraphs) with inline bold / italic / code / links. Everything is escaped BEFORE any markup
+  // is added, so no user/model text can inject HTML. AI answers come back in markdown; rendering it
+  // is what makes an answer read as a crafted reply instead of a wall of asterisks.
+  function mdInline(t) {
+    t = esc(t);
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    t = t.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return t;
+  }
   function md(s) {
-    var h = esc(s);
-    h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    h = h.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
-    h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    return h;
+    var text = String(s == null ? '' : s);
+    var lines = text.split('\n');
+    var html = '', listType = null, para = [];
+    function flushPara() { if (para.length) { html += '<p>' + para.join('<br>') + '</p>'; para = []; } }
+    function closeList() { if (listType) { html += '</' + listType + '>'; listType = null; } }
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      var h = /^(#{1,3})\s+(.*)$/.exec(ln);
+      var ul = /^\s*[-*]\s+(.*)$/.exec(ln);
+      var ol = /^\s*\d+\.\s+(.*)$/.exec(ln);
+      if (h) { flushPara(); closeList(); html += '<div class="mdh">' + mdInline(h[2]) + '</div>'; }
+      else if (ul) { flushPara(); if (listType !== 'ul') { closeList(); html += '<ul>'; listType = 'ul'; } html += '<li>' + mdInline(ul[1]) + '</li>'; }
+      else if (ol) { flushPara(); if (listType !== 'ol') { closeList(); html += '<ol>'; listType = 'ol'; } html += '<li>' + mdInline(ol[1]) + '</li>'; }
+      else if (!ln.trim()) { flushPara(); closeList(); }
+      else { closeList(); para.push(mdInline(ln)); }
+    }
+    flushPara(); closeList();
+    return html || esc(text);
   }
   // A message attachment, served from the scoped public lane (key + conversation handle). Images
   // render inline; everything else is a downloadable file chip.
@@ -865,21 +986,133 @@ export const WIDGET_JS = String.raw`(function () {
     if (files.length) body.attachments = files.map(function (f) { return { dataUrl: f.dataUrl, filename: f.filename }; });
     if (identity.email) body.email = identity.email;
     if (identity.name) body.name = identity.name;
-    var thinking = null;
-    if (!c.escalated && text) {   // AI only answers real text, not an attachment-only turn
-      var log = sel('#log');
-      if (log) { thinking = document.createElement('div'); thinking.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconSparkle() + '</span></div><div class="mstack"><div class="rowm ai think"><span></span><span></span><span></span></div></div></div>'; log.appendChild(thinking); log.scrollTop = log.scrollHeight; }
-    }
-    var clearThinking = function () { if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); thinking = null; };
+    var unbusy = function () { busy = false; var sb = sel('#send'); if (sb) sb.disabled = false; syncSendState(); var qq = sel('#q'); if (qq) qq.focus(); };
+    trackActivity('conversation_message', { conversationId: convId });
+
+    // AI-mode text turns stream the answer token-by-token over SSE (perceived-instant). Human mode,
+    // escalated threads, and attachment-only turns keep the plain /public/ask lane (nothing to stream).
+    if (!c.escalated && text) { streamAiAnswer(convId, body, unbusy); return; }
+
     fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       // Render nothing by hand — pull the persisted turn(s) from the server so the widget shows
       // exactly what the agent console shows (single source of truth, no duplicate/again bubbles).
-      .then(function () { hydrateThread(convId, clearThinking); })
-      .catch(function () { clearThinking(); appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); })
-      .finally(function () { busy = false; var sb = sel('#send'); if (sb) sb.disabled = false; var qq = sel('#q'); if (qq) qq.focus(); });
-    // record the interaction as activity for identified visitors
-    trackActivity('conversation_message', { conversationId: convId });
+      .then(function () { hydrateThread(convId); })
+      .catch(function () { appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); })
+      .finally(unbusy);
+  }
+
+  // ---- SSE streaming of the AI answer -------------------------------------
+  // Read a POST Server-Sent-Events response frame-by-frame. Handlers: onEvent(name,data) per SSE
+  // frame, onJson(obj) if the server answered non-stream JSON (deferred/not-AI), onError(err).
+  function streamSSE(url, body, h) {
+    fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        var ct = res.headers.get('content-type') || '';
+        if (ct.indexOf('text/event-stream') === -1) {
+          return res.json().then(function (j) { if (h.onJson) h.onJson(j); }).catch(function () { if (h.onError) h.onError(); });
+        }
+        if (!res.body || !res.body.getReader) {   // no streaming reader → read whole, then parse frames
+          return res.text().then(function (txt) { parseFrames(txt, h); });
+        }
+        var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
+        function pump() {
+          return reader.read().then(function (r) {
+            if (r.done) { if (buf.trim()) emitFrame(buf, h); return; }
+            buf += dec.decode(r.value, { stream: true });
+            var idx;
+            while ((idx = buf.indexOf('\n\n')) >= 0) { var f = buf.slice(0, idx); buf = buf.slice(idx + 2); emitFrame(f, h); }
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function (e) { if (h.onError) h.onError(e); });
+  }
+  function emitFrame(frame, h) {
+    var event = 'message', data = '';
+    var lines = frame.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      if (ln.indexOf('event:') === 0) event = ln.slice(6).trim();
+      else if (ln.indexOf('data:') === 0) data += ln.slice(5).trim();
+    }
+    if (!data) return;                         // ':' heartbeat comments carry no data
+    var parsed = null; try { parsed = JSON.parse(data); } catch (e) {}
+    if (h.onEvent) h.onEvent(event, parsed);
+  }
+  function parseFrames(txt, h) { var fs = txt.split('\n\n'); for (var i = 0; i < fs.length; i++) if (fs[i].trim()) emitFrame(fs[i], h); }
+
+  // Stream an AI answer into the log: thinking-dots → a live bubble that fills token-by-token with a
+  // caret, then on 'done' stamp the server message id (so poll/WS never double-render) and reconcile.
+  function streamAiAnswer(convId, body, done) {
+    var log = sel('#log');
+    var thinking = null, bubbleRow = null, bubble = null, acc = '', raf = 0, doneCalled = false, stick = true;
+    var msg = { role: 'ai', id: null, body: '', at: Date.now() };
+    streamingConv = convId;
+    if (log) {
+      thinking = document.createElement('div');
+      thinking.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconSparkle() + '</span></div><div class="mstack"><div class="rowm ai think"><span></span><span></span><span></span></div></div></div>';
+      log.appendChild(thinking); log.scrollTop = log.scrollHeight;
+    }
+    function atBottom() { return log ? (log.scrollHeight - log.scrollTop - log.clientHeight < 60) : true; }
+    function paint() {
+      raf = 0; if (!bubble) return;
+      bubble.innerHTML = md(acc) + '<span class="caret"></span>';
+      if (stick && log) log.scrollTop = log.scrollHeight;
+    }
+    function mount() {
+      if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); thinking = null;
+      var wrap = document.createElement('div');
+      wrap.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconSparkle() + '</span></div><div class="mstack"><div class="mwho">' + esc('AI Assistant') + '</div><div class="rowm ai streaming"></div></div></div>';
+      bubbleRow = wrap.firstChild;
+      if (!reducedMotion() && bubbleRow.classList) bubbleRow.classList.add('msg-enter');
+      if (log) { var talk = log.querySelector('.talk'); if (talk) log.insertBefore(bubbleRow, talk); else log.appendChild(bubbleRow); }
+      bubble = bubbleRow.querySelector('.rowm');
+      if (!reducedMotion() && bubbleRow.classList) requestAnimationFrame(function () { requestAnimationFrame(function () { bubbleRow.classList.add('in'); }); });
+    }
+    function onDelta(t) { if (!bubble) mount(); stick = atBottom(); acc += t; if (!raf) raf = requestAnimationFrame(paint); }
+    function commit(id) {
+      var c = getConv(convId);
+      msg.body = acc; msg.id = id || ('s' + Date.now());
+      if (c) { c.msgs.push(msg); c.updatedAt = Date.now(); saveConvs(); }
+    }
+    function finish(id) {
+      if (doneCalled) return; doneCalled = true; streamingConv = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (bubble) bubble.classList.remove('streaming');
+      if (bubble) bubble.innerHTML = md(acc);      // drop the caret
+      if (acc) commit(id);
+      hydrateThread(convId);                       // reconcile now that the answer is persisted
+      if (done) done();
+    }
+    function fail() {
+      if (doneCalled) return; doneCalled = true; streamingConv = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking);
+      if (acc) { if (bubble) { bubble.classList.remove('streaming'); bubble.innerHTML = md(acc); } commit(null); }
+      else { if (bubbleRow && bubbleRow.parentNode) bubbleRow.parentNode.removeChild(bubbleRow); appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); }
+      if (done) done();
+    }
+    streamSSE(API + '/public/ask/stream', body, {
+      onEvent: function (event, data) {
+        if (event === 'delta') { if (data && data.t) onDelta(data.t); }
+        else if (event === 'done') finish(data && data.messageId);
+        else if (event === 'error') fail();
+      },
+      onJson: function () { streamingConv = null; if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); hydrateThread(convId); if (done) done(); },
+      onError: fail
+    });
+  }
+
+  // Enable/lift the send button only when there's something to send (text or a pending attachment)
+  // and we're not mid-request — the Intercom "send lights up" affordance.
+  function syncSendState() {
+    var q = sel('#q'), send = sel('#send'); if (!send) return;
+    var has = !!((q && q.value.trim()) || pending.length);
+    send.disabled = busy || !has;
+    if (send.classList) send.classList.toggle('ready', has && !busy);
   }
 
   // Human handoff: mute the assistant on this conversation (server-authoritative, set before the
