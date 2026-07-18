@@ -9,7 +9,6 @@ import {
   type RowSelectionState,
   type SortingState,
   type Table as TanstackTable,
-  type VisibilityState,
 } from "@tanstack/react-table";
 import {
   Users,
@@ -67,6 +66,8 @@ import { RowsSkeleton } from "@/components/ui/skeleton";
 import { Checkbox } from "@/components/data-table/cells";
 import { DataTableRT } from "@/components/data-table/data-table-rt";
 import { attributeColumns, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
+import { PageSizeSelect, PAGE_SIZE_OPTIONS } from "@/components/data-table/page-size-select";
+import { usePersistentVisibility, usePersistentNumber } from "@/components/data-table/persist";
 import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
 import {
   type FilterCondition,
@@ -93,7 +94,7 @@ function parseSort(s: string | undefined): SortingState {
     const [id, dir] = s.split(".");
     if (id) return [{ id, desc: dir !== "asc" }];
   }
-  return [{ id: "updated_at", desc: true }];
+  return [{ id: "last_seen_at", desc: true }];
 }
 
 /** Anonymous rows read as intentional, not broken: channel + a short handle instead of "Unnamed". */
@@ -197,26 +198,14 @@ const COLUMNS: ColumnDef<Contact>[] = [
     },
   },
   {
-    accessorKey: "updated_at",
+    // "Last activity" = real presence (last_seen_at). We fall back to updated_at only when a
+    // contact has never been seen — otherwise a bulk import (which stamps updated_at for every
+    // row at once) would make this column identical everywhere. Sorts server-side on last_seen_at.
+    accessorKey: "last_seen_at",
     header: "Last activity",
     meta: { align: "right", label: "Last activity" },
-    cell: ({ getValue }) => {
-      const v = getValue() as string;
-      return (
-        <span className="whitespace-nowrap text-muted-foreground" title={new Date(v).toLocaleString()}>
-          {relativeTime(v)}
-        </span>
-      );
-    },
-  },
-  // Intercom's "Signed up" / "Last seen" — first-class timestamps, offered as optional columns
-  // (hidden by default) alongside the imported attribute columns.
-  {
-    accessorKey: "created_at",
-    header: "Signed up",
-    meta: { align: "right", label: "Signed up" },
-    cell: ({ getValue }) => {
-      const v = getValue() as string | null;
+    cell: ({ row }) => {
+      const v = row.original.last_seen_at || row.original.updated_at;
       return v ? (
         <span className="whitespace-nowrap text-muted-foreground" title={new Date(v).toLocaleString()}>
           {relativeTime(v)}
@@ -224,10 +213,12 @@ const COLUMNS: ColumnDef<Contact>[] = [
       ) : null;
     },
   },
+  // Intercom's "Signed up" — a first-class timestamp offered as an optional column (hidden by
+  // default) alongside the imported attribute columns.
   {
-    accessorKey: "last_seen_at",
-    header: "Last seen",
-    meta: { align: "right", label: "Last seen" },
+    accessorKey: "created_at",
+    header: "Signed up",
+    meta: { align: "right", label: "Signed up" },
     cell: ({ getValue }) => {
       const v = getValue() as string | null;
       return v ? (
@@ -302,14 +293,16 @@ export function ContactsPage() {
     return [[]];
   });
   const [q, setQ] = useState(search.q ?? "");
+  // Rows-per-page persists across reloads (localStorage), seeding pagination.
+  const [pageSize, setPageSize] = usePersistentNumber("noola.pagesize.contacts", PAGE_SIZE, PAGE_SIZE_OPTIONS);
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: search.page ?? 0,
-    pageSize: PAGE_SIZE,
+    pageSize,
   });
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
-  // Signed up / Last seen ship hidden by default (Last activity already covers the common case);
-  // imported attribute columns are hidden by useHideAttrsByDefault as they're discovered.
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({ created_at: false, last_seen_at: false });
+  // Column choices persist per table; Signed up ships hidden by default; imported attribute columns
+  // are hidden by useHideAttrsByDefault as they're discovered.
+  const [columnVisibility, setColumnVisibility] = usePersistentVisibility("noola.view.contacts", { created_at: false });
 
   const [editing, setEditing] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -341,6 +334,10 @@ export function ContactsPage() {
 
   // Any view-altering change (search / filters / sort) returns to the first page.
   const resetPage = () => setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }));
+  // A changed rows-per-page reflows the set — sync it into pagination and jump to page 1.
+  useEffect(() => {
+    setPagination((p) => (p.pageSize === pageSize ? p : { ...p, pageIndex: 0, pageSize }));
+  }, [pageSize]);
 
   // Only complete conditions filter; strip the client-only `id` for the API's grammar.
   // One group ships as the flat `filters`; two or more as `filterGroups` (OR-ed).
@@ -377,8 +374,8 @@ export function ContactsPage() {
             identity: identity || undefined,
             sortBy,
             sortDir,
-            limit: PAGE_SIZE,
-            offset: pagination.pageIndex * PAGE_SIZE,
+            limit: pagination.pageSize,
+            offset: pagination.pageIndex * pagination.pageSize,
           });
           if (!live) return;
           setContacts(res.contacts);
@@ -415,7 +412,7 @@ export function ContactsPage() {
       clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, serverFilters, serverFilterGroups, identity, sortBy, sortDir, pagination.pageIndex, reloadSignal]);
+  }, [q, serverFilters, serverFilterGroups, identity, sortBy, sortDir, pagination.pageIndex, pagination.pageSize, reloadSignal]);
   const reload = () => setReloadSignal((n) => n + 1);
 
   // STABLE data reference for react-table. (Memoised: an inline `contacts ?? []` is a fresh ref
@@ -464,7 +461,7 @@ export function ContactsPage() {
     [attrKeys],
   );
 
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageCount = Math.max(1, Math.ceil(total / pagination.pageSize));
 
   // Sorting changes reset to page 1 (a page-N view of a re-sorted set is meaningless).
   const handleSortingChange: OnChangeFn<SortingState> = (updater) => {
@@ -532,7 +529,7 @@ export function ContactsPage() {
         value: f.value,
       }));
     setGroups(joinFilterGroups(revive(def.filters ?? []), def.filterGroups?.map(revive)));
-    setSorting(def.sortBy ? [{ id: def.sortBy, desc: def.sortDir !== "asc" }] : [{ id: "updated_at", desc: true }]);
+    setSorting(def.sortBy ? [{ id: def.sortBy, desc: def.sortDir !== "asc" }] : [{ id: "last_seen_at", desc: true }]);
     resetPage();
   }
 
@@ -577,8 +574,8 @@ export function ContactsPage() {
     q.trim().length > 0 || serverFilters.length > 0 || (serverFilterGroups?.length ?? 0) > 0;
   const filterRowVisible = showFilters || condCount > 0;
   const pageRows = table.getRowModel().rows.length;
-  const from = total === 0 ? 0 : pagination.pageIndex * PAGE_SIZE + 1;
-  const to = pagination.pageIndex * PAGE_SIZE + pageRows;
+  const from = total === 0 ? 0 : pagination.pageIndex * pagination.pageSize + 1;
+  const to = pagination.pageIndex * pagination.pageSize + pageRows;
   const busyPaging = loading && contacts !== null;
 
   async function deleteSelected() {
@@ -833,9 +830,12 @@ export function ContactsPage() {
       {/* pagination */}
       {state === "ok" && total > 0 && (
         <div className="flex shrink-0 items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground lg:px-6">
-          <span className="tabular-nums">
-            {from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()}
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="tabular-nums">
+              {from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()}
+            </span>
+            <PageSizeSelect value={pageSize} onChange={setPageSize} />
+          </div>
           <div className="flex items-center gap-1">
             <Button
               variant="outline"

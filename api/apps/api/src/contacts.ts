@@ -87,6 +87,7 @@ const CORE_COL: Record<string, string> = {
   company: "company",
   created_at: "created_at",
   updated_at: "updated_at",
+  last_seen_at: "last_seen_at",
   unsubscribed_at: "unsubscribed_at",
 };
 const DATE_FIELDS = new Set(["created_at", "updated_at", "unsubscribed_at"]);

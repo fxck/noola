@@ -531,7 +531,7 @@ export const CONTACT_FILTER_OPS = [
 ] as const;
 export type ContactFilterOp = (typeof CONTACT_FILTER_OPS)[number];
 
-export const CONTACT_SORT_FIELDS = ["name", "email", "company", "created_at", "updated_at"] as const;
+export const CONTACT_SORT_FIELDS = ["name", "email", "company", "created_at", "updated_at", "last_seen_at"] as const;
 export type ContactSortField = (typeof CONTACT_SORT_FIELDS)[number];
 
 export const ContactFilterConditionSchema = z.object({

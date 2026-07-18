@@ -38,14 +38,14 @@ import {
   type PaginationState,
   type OnChangeFn,
   type RowSelectionState,
-  type VisibilityState,
   type Table as TanstackTable,
 } from "@tanstack/react-table";
 import { DataTableRT } from "@/components/data-table/data-table-rt";
 import { MultiSelect, type ComboOption } from "@/components/ui/combobox";
 import { EntityCell, StatePill, MetricDrillCell, Checkbox, type PillTone } from "@/components/data-table/cells";
 import { attributeColumns, useAttributeKeys, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
-import { PageSizeSelect, DEFAULT_PAGE_SIZE } from "@/components/data-table/page-size-select";
+import { PageSizeSelect, DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS } from "@/components/data-table/page-size-select";
+import { usePersistentVisibility, usePersistentNumber } from "@/components/data-table/persist";
 import { cn } from "@/lib/utils";
 
 // Companies — first-class account records with a rolled-up health score. The directory surfaces the
@@ -182,9 +182,10 @@ export function CompaniesPage() {
   const [q, setQ] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
   const [sorting, setSorting] = useState<SortingState>([{ id: "name", desc: false }]);
-  const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize: DEFAULT_PAGE_SIZE });
+  const [pageSize, setPageSize] = usePersistentNumber("noola.pagesize.companies", DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS);
+  const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize });
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  const [columnVisibility, setColumnVisibility] = usePersistentVisibility("noola.view.companies", {});
   const [reloadSignal, setReloadSignal] = useState(0);
   const [formOpen, setFormOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -209,6 +210,8 @@ export function CompaniesPage() {
   // A re-sorted or re-filtered set makes a page-N view meaningless — jump back to page 1.
   const handleSortingChange: OnChangeFn<SortingState> = (updater) => { setSorting(updater); resetPage(); };
   useEffect(() => { resetPage(); }, [debouncedQ]);
+  // Persisted rows-per-page reflows the set — sync into pagination + jump to page 1.
+  useEffect(() => { setPagination((p) => (p.pageSize === pageSize ? p : { pageIndex: 0, pageSize })); }, [pageSize]);
 
   // Fetch the current page whenever the query, sort, or page changes.
   useEffect(() => {
@@ -256,7 +259,6 @@ export function CompaniesPage() {
   const from = total === 0 ? 0 : pagination.pageIndex * pagination.pageSize + 1;
   const to = pagination.pageIndex * pagination.pageSize + companies.length;
   const noun = (n: number) => (n === 1 ? "company" : "companies");
-  const setPageSize = (n: number) => setPagination({ pageIndex: 0, pageSize: n });
 
   function exportSelected() {
     const rows = selectedRows.map((r) => r.original);
