@@ -333,12 +333,10 @@ function MessengerEditor({
             )}
           </Button>
         </div>
-        <p className="text-xs text-muted-foreground">
-          Add the <span className="font-mono">Noola(…)</span> SDK to identify users and track activity:{" "}
-          <span className="font-mono">Noola('boot', {"{ email, name, user_id }"})</span>,{" "}
-          <span className="font-mono">Noola('track', 'event_name')</span>.
-        </p>
       </div>
+
+      {/* Programmatic API reference — control/identify the widget from the host page. */}
+      <WidgetApiReference />
 
       {/* Actions */}
       <div className="flex items-center gap-2">
@@ -429,6 +427,57 @@ function WidgetPreview({ cfg }: { cfg: WidgetConfig }) {
       >
         <MessagesSquare className="size-5" />
       </div>
+    </div>
+  );
+}
+
+// ── Widget API reference ──────────────────────────────────────────────────────
+// Documents the embed's programmatic surface right where the install snippet lives, so a developer
+// never has to hunt for how to identify users, open the panel from a custom button, or react to
+// open/close. Static reference — mirrors widget-embed.ts.
+function ApiRow({ code, desc }: { code: string; desc: string }) {
+  return (
+    <div className="grid grid-cols-1 gap-0.5 py-1.5 sm:grid-cols-[minmax(0,22rem)_1fr] sm:gap-3">
+      <code className="min-w-0 break-words font-mono text-micro text-foreground/90">{code}</code>
+      <span className="text-xs leading-snug text-muted-foreground">{desc}</span>
+    </div>
+  );
+}
+
+function WidgetApiReference() {
+  return (
+    <div className="space-y-2">
+      <Label>Widget API</Label>
+      <p className="text-xs text-muted-foreground">
+        Control the widget from your site with the global <span className="font-mono">Noola(…)</span> queue — calls are
+        safe before the script finishes loading.
+      </p>
+      <div className="divide-y rounded-md border">
+        <div className="p-3">
+          <div className="mb-1 text-micro font-semibold uppercase tracking-wide text-muted-foreground">Embed attributes</div>
+          <ApiRow code="data-noola-hidden" desc="Start with no launcher bubble — show it yourself, or open on your own button (custom launcher)." />
+          <ApiRow code={'data-noola-accent="#4f46e5"'} desc="Brand accent color." />
+          <ApiRow code={'data-noola-title="Ask us anything"'} desc="Header title." />
+        </div>
+        <div className="p-3">
+          <div className="mb-1 text-micro font-semibold uppercase tracking-wide text-muted-foreground">Commands</div>
+          <ApiRow code="Noola('open')  ·  Noola('close')" desc="Open / close the chat panel." />
+          <ApiRow code="Noola('show')  ·  Noola('hide')" desc="Show / hide the launcher bubble." />
+          <ApiRow code="Noola('boot', { email, name, user_id })" desc="Identify the current visitor." />
+          <ApiRow code="Noola('update', { … })" desc="Update the identified visitor's attributes." />
+          <ApiRow code="Noola('track', 'event_name', { … })" desc="Log a custom activity event." />
+          <ApiRow code="Noola('shutdown')" desc="Clear identity + reset (e.g. on logout)." />
+        </div>
+        <div className="p-3">
+          <div className="mb-1 text-micro font-semibold uppercase tracking-wide text-muted-foreground">Events</div>
+          <ApiRow code="window.addEventListener('noola:open', fn)" desc="Fires when the panel opens." />
+          <ApiRow code="window.addEventListener('noola:close', fn)" desc="Fires when the panel closes." />
+        </div>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Custom launcher: add <span className="font-mono">data-noola-hidden</span>, then call{" "}
+        <span className="font-mono">Noola('open')</span> from your own button.
+      </p>
     </div>
   );
 }

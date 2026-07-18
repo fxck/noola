@@ -17,14 +17,18 @@ export interface SourceDocument {
   last_synced_at?: string | null;
   /** Most recent ingest error, if the last run failed — optional. */
   last_error?: string | null;
+  /** Provenance: null/absent = hand-uploaded; set = crawled by that connection (source). */
+  source_id?: string | null;
 }
 
-/** A retrieved passage — one chunk of a document, with its source id for citation. */
+/** A retrieved passage — one chunk of a document, with its source id + filename for citation. */
 export interface ChunkHit {
   id: string;
   document_id: string;
   chunk_index: number;
   text: string;
+  /** Parent document's filename — carried on the hit so citations resolve without the doc list. */
+  filename?: string;
 }
 
 // The server accepts text formats only (the extractor handles plain/markdown/html).
@@ -52,8 +56,22 @@ export interface DocumentContent {
   content: string;
 }
 
+/** Uploaded files only (hand-uploaded, source_id NULL) — crawled connection pages are excluded
+ *  (they live under their connection via fetchSourceDocuments). */
 export async function fetchDocuments(): Promise<SourceDocument[]> {
-  return (await api<{ documents: SourceDocument[] }>("/documents")).documents;
+  return (await api<{ documents: SourceDocument[]; total?: number }>("/documents")).documents;
+}
+
+/** The pages a specific connection (source) ingested, paginated. */
+export async function fetchSourceDocuments(
+  sourceId: string,
+  opts?: { limit?: number; offset?: number },
+): Promise<{ documents: SourceDocument[]; total: number }> {
+  const p = new URLSearchParams();
+  if (opts?.limit) p.set("limit", String(opts.limit));
+  if (opts?.offset) p.set("offset", String(opts.offset));
+  const qs = p.toString() ? `?${p}` : "";
+  return api<{ documents: SourceDocument[]; total: number }>(`/sources/${sourceId}/documents${qs}`);
 }
 
 /** A single document's metadata (backs the routed /documents/$id viewer). */

@@ -28,6 +28,9 @@ export interface ChunkHit {
   document_id: string;
   chunk_index: number;
   text: string;
+  /** The parent document's filename — carried on the hit so a citation resolves without a
+   *  separate document lookup (the "Test retrieval" panel no longer depends on the uploads list). */
+  filename?: string;
 }
 
 const DOC_COLS = "id, filename, content_type, char_count, chunk_count, status, source_id, created_at, updated_at";
@@ -110,18 +113,49 @@ export async function hydrateChunks(tenantId: string, ids: string[]): Promise<Ch
   if (ids.length === 0) return [];
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT id, document_id, chunk_index, text FROM document_chunks
-        WHERE id = ANY($1::uuid[]) ORDER BY array_position($1::uuid[], id)`,
+      `SELECT dc.id, dc.document_id, dc.chunk_index, dc.text, d.filename
+         FROM document_chunks dc JOIN documents d ON d.id = dc.document_id
+        WHERE dc.id = ANY($1::uuid[]) ORDER BY array_position($1::uuid[], dc.id)`,
       [ids],
     );
     return r.rows as ChunkHit[];
   });
 }
 
-export async function listDocuments(tenantId: string): Promise<DocumentRow[]> {
+/** Filters for listing documents by provenance. `manualOnly` = hand-uploaded files (source_id
+ *  NULL); `sourceId` = the pages a specific connection ingested. Omit both for everything. */
+export interface ListDocumentsOpts { manualOnly?: boolean; sourceId?: string | null; limit?: number; offset?: number }
+
+function docWhere(opts: ListDocumentsOpts, params: unknown[]): string {
+  const where: string[] = [];
+  if (opts.manualOnly) where.push("source_id IS NULL");
+  if (opts.sourceId) { params.push(opts.sourceId); where.push(`source_id = $${params.length}`); }
+  return where.length ? `WHERE ${where.join(" AND ")}` : "";
+}
+
+export async function listDocuments(tenantId: string, opts: ListDocumentsOpts = {}): Promise<DocumentRow[]> {
+  const params: unknown[] = [];
+  const whereSql = docWhere(opts, params);
+  const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
+  const offset = Math.max(opts.offset ?? 0, 0);
+  params.push(limit); const limIdx = params.length;
+  params.push(offset); const offIdx = params.length;
   return withTenant(tenantId, async (c) => {
-    const r = await c.query(`SELECT ${DOC_COLS} FROM documents ORDER BY created_at DESC LIMIT 200`);
+    const r = await c.query(
+      `SELECT ${DOC_COLS} FROM documents ${whereSql} ORDER BY created_at DESC LIMIT $${limIdx} OFFSET $${offIdx}`,
+      params,
+    );
     return r.rows as DocumentRow[];
+  });
+}
+
+/** Total document count matching the same provenance filter — for pagination + the tab badge. */
+export async function countDocuments(tenantId: string, opts: ListDocumentsOpts = {}): Promise<number> {
+  const params: unknown[] = [];
+  const whereSql = docWhere(opts, params);
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(`SELECT count(*)::int AS n FROM documents ${whereSql}`, params);
+    return (r.rows[0]?.n as number) ?? 0;
   });
 }
 

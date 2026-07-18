@@ -22,6 +22,7 @@ import {
   type SourceDocument,
   ACCEPT_ATTR,
   fetchDocuments,
+  fetchSourceDocuments,
   uploadDocument,
   deleteDocument,
 } from "@/lib/documents";
@@ -44,6 +45,7 @@ import { ErrorState } from "@/components/ui/error-state";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Checkbox } from "@/components/data-table/cells";
+import { fetchArticles } from "@/lib/kb";
 import { formatBytes } from "@/lib/tickets";
 import { useRealtime } from "@/lib/realtime-context";
 import { useNerdMode } from "@/lib/nerd-mode";
@@ -975,6 +977,10 @@ export function SourcesPage() {
           <RetrievalPanel docsById={docsById} shell="px-4" onClose={() => setRetrievalOpen(false)} />
         )}
 
+        {/* ── the AI's other knowledge surfaces (not files) — so "sources" reads as the whole
+              picture of what answers draw from, not just uploads/connections ─────────────── */}
+        <AiSourcesNote />
+
         {/* ── body: the active view's rows — nothing else ──────────────────── */}
         <div className="min-h-0 flex-1 overflow-y-auto">
           {view === "connections" ? connectionsBody : uploadsBody}
@@ -1212,32 +1218,9 @@ export function SourceDetail({
             {/* editable settings — the form is the write surface; facts live in the rail */}
             <SourceSettings source={s} onSaved={(u) => setSource(u)} />
 
-            {/* the source's ingested documents (summary — the crawl runs server-side) */}
-            <section className="mt-6">
-              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Documents
-              </h3>
-              <div className="flex items-start gap-2 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                <Sparkles className="mt-0.5 size-4 shrink-0 text-primary" />
-                <p>
-                  {s.doc_count > 0 ? (
-                    <>
-                      The {s.doc_count} ingested {docNoun(s)} are chunked and indexed. Use{" "}
-                      <span className="font-medium text-foreground">Test retrieval</span> on the sources
-                      page to retrieve the passages that answer a question — the same retrieval the AI will
-                      cite.
-                    </>
-                  ) : s.status === "syncing" ? (
-                    <>Crawling now — documents will appear here as they're ingested and indexed.</>
-                  ) : (
-                    <>
-                      Nothing ingested yet. Use <span className="font-medium text-foreground">Sync now</span>{" "}
-                      to crawl this source and index its content.
-                    </>
-                  )}
-                </p>
-              </div>
-            </section>
+            {/* the pages this connection ingested — listed HERE (under their source), not mixed into
+                the shared Uploads tab. Paginated so a big crawl is browsable. */}
+            <SourcePages source={s} />
 
             {/* crawl log — what the last sync actually did (strategy, per-page outcome, counts) */}
             <CrawlLogPanel s={s} />
@@ -1260,6 +1243,142 @@ export function SourceDetail({
         </aside>
       </div>
     </div>
+  );
+}
+
+// ── AI knowledge surfaces ────────────────────────────────────────────────────
+// "Sources" (this page) is only the file/connection surface. The AI actually fuses three: the KB
+// (used for public answers), resolved tickets (learned from past replies), and these documents.
+// Naming the other two here makes the whole retrieval picture legible instead of hidden.
+function AiSourcesNote() {
+  const [kbCount, setKbCount] = useState<number | null>(null);
+  useEffect(() => {
+    void fetchArticles()
+      .then((a) => setKbCount(a.length))
+      .catch(() => setKbCount(null));
+  }, []);
+  return (
+    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 border-b bg-muted/20 px-4 py-2.5 text-xs text-muted-foreground">
+      <Sparkles className="size-3.5 shrink-0 text-primary" />
+      <span className="text-foreground/80">The AI also answers from:</span>
+      <Link to="/kb" className="font-medium text-foreground underline-offset-2 hover:underline">
+        Knowledge Base{kbCount != null ? ` (${kbCount.toLocaleString()})` : ""}
+      </Link>
+      <span className="text-muted-foreground/70">— used for public answers</span>
+      <span className="text-muted-foreground/40">·</span>
+      <span className="text-foreground/80">resolved tickets</span>
+      <span className="text-muted-foreground/70">— learned from past replies</span>
+    </div>
+  );
+}
+
+// ── Source pages ─────────────────────────────────────────────────────────────
+// The documents a connection ingested, listed under the connection itself (paginated) — so
+// crawled pages live with their source instead of flooding the shared Uploads tab.
+const SOURCE_PAGES_PER = 50;
+
+function SourcePages({ source }: { source: SourceRow }) {
+  const [docs, setDocs] = useState<SourceDocument[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(
+    async (off: number) => {
+      setLoading(true);
+      try {
+        const r = await fetchSourceDocuments(source.id, { limit: SOURCE_PAGES_PER, offset: off });
+        setDocs(r.documents);
+        setTotal(r.total);
+        setOffset(off);
+      } catch {
+        setDocs([]);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [source.id],
+  );
+
+  // (Re)load when the source finishes a sync (doc_count / last_synced_at move).
+  useEffect(() => {
+    void load(0);
+  }, [load, source.doc_count, source.last_synced_at]);
+
+  const noun = docNoun(source);
+  const hasPages = total > 0 || (docs?.length ?? 0) > 0;
+  const from = offset + 1;
+  const to = Math.min(offset + SOURCE_PAGES_PER, total);
+
+  return (
+    <section className="mt-6">
+      <h3 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        {source.kind === "url" ? "Pages" : "Documents"}
+        {total > 0 && <span className="font-normal normal-case tracking-normal text-muted-foreground/70">· {total.toLocaleString()} indexed</span>}
+      </h3>
+
+      {!hasPages ? (
+        <div className="flex items-start gap-2 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+          <Sparkles className="mt-0.5 size-4 shrink-0 text-primary" />
+          <p>
+            {source.status === "syncing" ? (
+              <>Crawling now — {noun}s will appear here as they're ingested and indexed.</>
+            ) : (
+              <>
+                Nothing ingested yet. Use <span className="font-medium text-foreground">Sync now</span> to crawl this source
+                and index its content.
+              </>
+            )}
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-lg border">
+          <ul className="divide-y divide-border/60">
+            {(docs ?? []).map((d) => {
+              const isUrl = /^https?:\/\//i.test(d.filename);
+              return (
+                <li key={d.id} className="flex items-center gap-3 px-3 py-2 text-xs">
+                  <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+                  {isUrl ? (
+                    <a
+                      href={d.filename}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="min-w-0 flex-1 truncate font-mono text-muted-foreground hover:text-primary hover:underline"
+                      title={d.filename}
+                    >
+                      {d.filename.replace(/^https?:\/\//, "")}
+                    </a>
+                  ) : (
+                    <span className="min-w-0 flex-1 truncate" title={d.filename}>
+                      {d.filename}
+                    </span>
+                  )}
+                  <span className="shrink-0 font-mono tabular-nums text-muted-foreground/60">
+                    {d.chunk_count.toLocaleString()} chunks
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+          {total > SOURCE_PAGES_PER && (
+            <div className="flex items-center justify-between border-t px-3 py-2 text-xs text-muted-foreground">
+              <span className="tabular-nums">
+                {from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <Button variant="outline" size="sm" className="h-7" disabled={loading || offset === 0} onClick={() => void load(Math.max(0, offset - SOURCE_PAGES_PER))}>
+                  Prev
+                </Button>
+                <Button variant="outline" size="sm" className="h-7" disabled={loading || to >= total} onClick={() => void load(offset + SOURCE_PAGES_PER)}>
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

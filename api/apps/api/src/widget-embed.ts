@@ -38,7 +38,9 @@ export const WIDGET_JS = String.raw`(function () {
 
   var KEY = dataKey;              // resolved widget key (data attr OR Noola('boot',{key}))
   var mounted = false;
-  var launcherHidden = false;
+  // Start-hidden: the data-noola-hidden attribute on the embed = no launcher bubble until you call
+  // Noola('show') or Noola('open') from your own button (the Intercom custom-launcher pattern). No flash.
+  var launcherHidden = !!(script && script.hasAttribute('data-noola-hidden'));
   var panelOpen = false;
   var configLoaded = false;
 
@@ -413,6 +415,7 @@ export const WIDGET_JS = String.raw`(function () {
     bubbleEl.addEventListener('click', function () { panelOpen ? closePanel() : openPanel(); });
 
     applyConfig();
+    if (launcherHidden) bubbleEl.style.display = 'none'; // start-hidden embed — no launcher until shown
     renderBadge();
     resumeLive();
   }
@@ -443,10 +446,15 @@ export const WIDGET_JS = String.raw`(function () {
     prevBadge = n;
   }
 
+  // Fire a window event so a host page can react (Intercom onShow/onHide parity):
+  //   window.addEventListener('noola:open', fn) / 'noola:close'.
+  function emit(name) { try { window.dispatchEvent(new CustomEvent('noola:' + name)); } catch (e) {} }
+
   function openPanel() {
     mount();
     if (panelOpen) return;
     panelOpen = true;
+    emit('open');
     bubbleEl.classList.add('open');
     panelEl.style.display = 'flex';
     pendingDir = 'none';
@@ -464,6 +472,7 @@ export const WIDGET_JS = String.raw`(function () {
   function closePanel() {
     if (!panelOpen) return;
     panelOpen = false;
+    emit('close');
     if (bubbleEl) bubbleEl.classList.remove('open');
     if (panelEl) {
       panelEl.classList.remove('on');

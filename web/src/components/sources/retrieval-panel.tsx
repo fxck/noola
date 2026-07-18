@@ -111,7 +111,7 @@ export function RetrievalPanel({
                     <div className="mb-1.5 flex items-center gap-2 text-micro text-muted-foreground">
                       <FileText className="size-3.5 shrink-0" />
                       <span className="truncate font-medium text-foreground/80">
-                        {doc?.filename ?? "Unknown source"}
+                        {h.filename ?? doc?.filename ?? "Unknown source"}
                       </span>
                       <span aria-hidden>·</span>
                       <span className="shrink-0">passage {h.chunk_index + 1}</span>

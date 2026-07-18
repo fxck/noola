@@ -5,7 +5,7 @@ import {
   createArticle, listArticles, getArticle, updateArticle, deleteArticle, searchArticles,
   listCollections, createCollection, updateCollection, deleteCollection,
 } from "../kb.js";
-import { ingestDocument, listDocuments, getDocument, getDocumentContent, deleteDocument, searchDocuments } from "../documents.js";
+import { ingestDocument, listDocuments, countDocuments, getDocument, getDocumentContent, deleteDocument, searchDocuments } from "../documents.js";
 import { listSources, getSource, createSource, updateSource, deleteSource, syncSource, maskSource } from "../sources.js";
 import { presignUpload, storageSmoke } from "../storage.js";
 
@@ -88,7 +88,34 @@ export default async function knowledgeRoutes(app: FastifyInstance): Promise<voi
     }
   }));
 
-  app.get("/documents", tenanted(async (tenantId) => ({ documents: await listDocuments(tenantId) })));
+  // The Uploads tab defaults to MANUAL uploads only (source_id NULL) — crawled connection pages
+  // live under their connection (GET /sources/:id/documents), not mixed in here. `scope=all` keeps
+  // the legacy everything-view for any caller that wants it. Returns a total for the tab badge.
+  app.get("/documents", tenanted(async (tenantId, req) => {
+    const q = (req.query ?? {}) as { scope?: string; limit?: string; offset?: string };
+    const manualOnly = q.scope !== "all";
+    const limit = q.limit ? Number(q.limit) : 200;
+    const offset = q.offset ? Number(q.offset) : 0;
+    const [documents, total] = await Promise.all([
+      listDocuments(tenantId, { manualOnly, limit, offset }),
+      countDocuments(tenantId, { manualOnly }),
+    ]);
+    return { documents, total };
+  }));
+
+  // A connection's ingested pages, paginated — so a big crawl (hundreds of pages) is browsable
+  // under the source that produced it instead of flooding the shared Uploads list.
+  app.get("/sources/:id/documents", tenanted(async (tenantId, req) => {
+    const { id } = req.params as { id: string };
+    const q = (req.query ?? {}) as { limit?: string; offset?: string };
+    const limit = q.limit ? Number(q.limit) : 100;
+    const offset = q.offset ? Number(q.offset) : 0;
+    const [documents, total] = await Promise.all([
+      listDocuments(tenantId, { sourceId: id, limit, offset }),
+      countDocuments(tenantId, { sourceId: id }),
+    ]);
+    return { documents, total };
+  }));
 
   app.post("/documents", tenanted(async (tenantId, req, reply) => {
     const parsed = DocumentInput.safeParse(req.body);
