@@ -66,6 +66,12 @@ services:
     maxContainers: 2
     verticalAutoscaling:
       cpuMode: DEDICATED
+  - hostname: geo
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: geo
+    minContainers: 1
+    maxContainers: 2
   - hostname: runner
     type: docker@26.1.5
     buildFromGit: https://github.com/fxck/noola

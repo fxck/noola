@@ -252,6 +252,37 @@ zerops:
         # onnxruntime never tries to pin CPU affinity on a cgroup-restricted container.
         OMP_NUM_THREADS: "1"
 
+  # ═══ geo — IP→location sidecar · geo/ (bakes DB-IP City Lite mmdb) ══════
+  # Owns the heavy mmdb so the api artifact stays lean; the api calls it over
+  # the internal network (http://geo:3002/lookup?ip=). Single always-on service.
+  - setup: geo
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd geo && npm install
+        # Keyless DB-IP City Lite (CC-BY). Try current month then last month; non-fatal —
+        # a failed download leaves no mmdb and geo lookups just return empty.
+        - 'cd geo && (for M in $(date +%Y-%m) $(date -d "-1 month" +%Y-%m); do curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-$M.mmdb.gz" -o /tmp/geo.gz && break; done && gunzip -c /tmp/geo.gz > geoip.mmdb && ls -la geoip.mmdb) || echo "geo db download failed — lookups will be empty"'
+      deployFiles:
+        - geo                          # ship the built geo/ dir (deps + baked mmdb)
+      cache:
+        - geo/node_modules
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3002
+          httpSupport: true
+      start: node geo/server.mjs
+      healthCheck:
+        httpGet:
+          port: 3002
+          path: /health
+      envVariables:
+        PORT: "3002"
+        GEOIP_DB_PATH: /var/www/geo/geoip.mmdb
+
   # ═══ web — React 19 / Vite · web/ ══════════════════════════════════════
   - setup: webdev
     build:

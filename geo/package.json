@@ -1,0 +1,8 @@
+{
+  "name": "geo",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "maxmind": "^5.0.6"
+  }
+}

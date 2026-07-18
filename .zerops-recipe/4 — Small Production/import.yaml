@@ -62,6 +62,12 @@ services:
     zeropsSetup: embedder
     minContainers: 1
     maxContainers: 1
+  - hostname: geo
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: geo
+    minContainers: 1
+    maxContainers: 1
   - hostname: runner
     type: docker@26.1.5
     buildFromGit: https://github.com/fxck/noola
