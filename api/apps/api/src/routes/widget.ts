@@ -406,6 +406,24 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     return { config: wk.config };
   });
 
+  // The support team shown in the widget home header (the "staffed" signal): up to 4 real agents,
+  // avatars-first. Names/avatars of the support team are meant to be customer-facing (like Intercom).
+  app.get("/public/team", async (req, reply) => {
+    const key = (req.query as { key?: string }).key;
+    const wk = key ? await resolveWidgetKey(key) : null;
+    if (!wk) return reply.code(401).send({ error: "invalid or missing widget key" });
+    const rows = await withTenant(wk.tenantId, (c) =>
+      c.query(
+        `SELECT name, avatar_url FROM users
+         WHERE role <> 'viewer' AND coalesce(name,'') <> ''
+         ORDER BY (avatar_url IS NULL), name
+         LIMIT 4`,
+      ),
+    );
+    reply.header("cache-control", "public, max-age=120");
+    return { team: rows.rows.map((r: { name: string; avatar_url: string | null }) => ({ name: r.name, avatarUrl: r.avatar_url })) };
+  });
+
   // Identify a visitor (Noola('boot'|'update')). Upserts the contact by external user_id/email
   // (attributes shallow-merge) and stamps a last-seen + last-page marker so an agent sees "user
   // activity" on the contact. Anonymous visitors (no user_id/email) are a 200 no-op.
