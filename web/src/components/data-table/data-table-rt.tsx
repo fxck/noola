@@ -24,6 +24,20 @@ export function DataTableRT<T>({
   // Roving-tabindex keyboard nav: one row is tabbable; arrows/j/k move focus,
   // Enter/Space activates. The table is the console's core triage verb.
   const [focused, setFocused] = useState(0);
+  // Drag-to-reorder columns (Intercom-style). The selection column stays pinned first;
+  // everything else can be dragged. Persistence is the parent's job via onColumnOrderChange.
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
+  const reorder = (from: string, to: string) => {
+    if (from === to || from === "select" || to === "select") return;
+    const cur = table.getState().columnOrder;
+    const ids = cur.length ? [...cur] : table.getAllLeafColumns().map((c) => c.id);
+    const fromIdx = ids.indexOf(from);
+    const toIdx = ids.indexOf(to);
+    if (fromIdx < 0 || toIdx < 0) return;
+    ids.splice(toIdx, 0, ids.splice(fromIdx, 1)[0]);
+    table.setColumnOrder(ids);
+  };
   const bodyRef = useRef<HTMLTableSectionElement>(null);
   const activeIdx = rows.length ? Math.min(focused, rows.length - 1) : 0;
 
@@ -77,13 +91,47 @@ export function DataTableRT<T>({
               const right = meta?.align === "right";
               const canSort = header.column.getCanSort();
               const sorted = header.column.getIsSorted();
+              const draggable = header.column.id !== "select" && !header.isPlaceholder;
               return (
                 <th
                   key={header.id}
                   style={header.column.id === "select" ? { width: 40 } : undefined}
+                  draggable={draggable}
+                  onDragStart={draggable ? () => setDragId(header.column.id) : undefined}
+                  onDragOver={
+                    draggable
+                      ? (e) => {
+                          e.preventDefault();
+                          setOverId(header.column.id);
+                        }
+                      : undefined
+                  }
+                  onDragLeave={
+                    draggable ? () => setOverId((o) => (o === header.column.id ? null : o)) : undefined
+                  }
+                  onDrop={
+                    draggable
+                      ? (e) => {
+                          e.preventDefault();
+                          if (dragId) reorder(dragId, header.column.id);
+                          setDragId(null);
+                          setOverId(null);
+                        }
+                      : undefined
+                  }
+                  onDragEnd={() => {
+                    setDragId(null);
+                    setOverId(null);
+                  }}
                   className={cn(
                     "border-b px-3 py-2 text-xs font-medium text-muted-foreground",
                     right ? "text-right" : "text-left",
+                    draggable && "cursor-grab select-none",
+                    dragId === header.column.id && "opacity-40",
+                    overId === header.column.id &&
+                      dragId &&
+                      dragId !== header.column.id &&
+                      "shadow-[inset_2px_0_0_var(--primary)]",
                   )}
                 >
                   {header.isPlaceholder ? null : canSort ? (

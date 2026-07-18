@@ -25,6 +25,29 @@ export function usePersistentVisibility(storageKey: string, initial: VisibilityS
   return [state, setState] as const;
 }
 
+/** Persist the drag-reordered column layout (Intercom lets you drag headers and remembers the order).
+ *  Stored as the full ordered id list; an empty array means "use definition order". Columns the stored
+ *  order doesn't mention (e.g. attribute columns that loaded later) are appended by react-table. */
+export function usePersistentOrder(storageKey: string) {
+  const [state, setState] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) return JSON.parse(raw) as string[];
+    } catch {
+      /* corrupt/absent storage — fall back to definition order */
+    }
+    return [];
+  });
+  useEffect(() => {
+    try {
+      if (state.length) localStorage.setItem(storageKey, JSON.stringify(state));
+    } catch {
+      /* storage full / unavailable — order just won't persist */
+    }
+  }, [storageKey, state]);
+  return [state, setState] as const;
+}
+
 /** Persist a rows-per-page choice, validated against the allowed set (an out-of-range stored value
  *  falls back to `initial` rather than trusting arbitrary localStorage). */
 export function usePersistentNumber(storageKey: string, initial: number, allowed: readonly number[]) {

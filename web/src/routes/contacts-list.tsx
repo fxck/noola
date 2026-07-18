@@ -67,7 +67,7 @@ import { Checkbox } from "@/components/data-table/cells";
 import { DataTableRT } from "@/components/data-table/data-table-rt";
 import { attributeColumns, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
 import { PageSizeSelect, PAGE_SIZE_OPTIONS } from "@/components/data-table/page-size-select";
-import { usePersistentVisibility, usePersistentNumber } from "@/components/data-table/persist";
+import { usePersistentVisibility, usePersistentNumber, usePersistentOrder } from "@/components/data-table/persist";
 import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
 import {
   type FilterCondition,
@@ -303,6 +303,7 @@ export function ContactsPage() {
   // Column choices persist per table; Signed up ships hidden by default; imported attribute columns
   // are hidden by useHideAttrsByDefault as they're discovered.
   const [columnVisibility, setColumnVisibility] = usePersistentVisibility("noola.view.contacts", { created_at: false });
+  const [columnOrder, setColumnOrder] = usePersistentOrder("noola.order.contacts");
 
   const [editing, setEditing] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -472,7 +473,7 @@ export function ContactsPage() {
   const table = useReactTable({
     data,
     columns,
-    state: { sorting, pagination, rowSelection, columnVisibility },
+    state: { sorting, pagination, rowSelection, columnVisibility, columnOrder },
     getRowId: (c) => c.id,
     manualFiltering: true,
     manualSorting: true,
@@ -483,6 +484,7 @@ export function ContactsPage() {
     onPaginationChange: setPagination,
     onRowSelectionChange: setRowSelection,
     onColumnVisibilityChange: setColumnVisibility,
+    onColumnOrderChange: setColumnOrder,
     getCoreRowModel: getCoreRowModel(),
   });
 

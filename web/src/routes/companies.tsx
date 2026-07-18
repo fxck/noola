@@ -46,7 +46,7 @@ import { MultiSelect, type ComboOption } from "@/components/ui/combobox";
 import { EntityCell, StatePill, MetricDrillCell, Checkbox, type PillTone } from "@/components/data-table/cells";
 import { attributeColumns, useAttributeKeys, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
 import { PageSizeSelect, DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS } from "@/components/data-table/page-size-select";
-import { usePersistentVisibility, usePersistentNumber } from "@/components/data-table/persist";
+import { usePersistentVisibility, usePersistentNumber, usePersistentOrder } from "@/components/data-table/persist";
 import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
 import { type FilterCondition, splitFilterGroups } from "@/components/data-table/types";
 import { cn } from "@/lib/utils";
@@ -202,6 +202,7 @@ export function CompaniesPage() {
   const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize });
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [columnVisibility, setColumnVisibility] = usePersistentVisibility("noola.view.companies", {});
+  const [columnOrder, setColumnOrder] = usePersistentOrder("noola.order.companies");
   const [reloadSignal, setReloadSignal] = useState(0);
   const [band, setBand] = useState<HealthBand | "">("");
   const [groups, setGroups] = useState<FilterCondition[][]>([[]]);
@@ -288,7 +289,7 @@ export function CompaniesPage() {
     data: companies,
     columns,
     getRowId: (c) => c.id,
-    state: { sorting, pagination, rowSelection, columnVisibility },
+    state: { sorting, pagination, rowSelection, columnVisibility, columnOrder },
     manualSorting: true,
     manualPagination: true,
     manualFiltering: true,
@@ -298,6 +299,7 @@ export function CompaniesPage() {
     onPaginationChange: setPagination,
     onRowSelectionChange: setRowSelection,
     onColumnVisibilityChange: setColumnVisibility,
+    onColumnOrderChange: setColumnOrder,
     getCoreRowModel: getCoreRowModel(),
   });
 
