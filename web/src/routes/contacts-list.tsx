@@ -66,6 +66,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { RowsSkeleton } from "@/components/ui/skeleton";
 import { Checkbox } from "@/components/data-table/cells";
 import { DataTableRT } from "@/components/data-table/data-table-rt";
+import { attributeColumns, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
 import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
 import {
   type FilterCondition,
@@ -208,6 +209,34 @@ const COLUMNS: ColumnDef<Contact>[] = [
       );
     },
   },
+  // Intercom's "Signed up" / "Last seen" — first-class timestamps, offered as optional columns
+  // (hidden by default) alongside the imported attribute columns.
+  {
+    accessorKey: "created_at",
+    header: "Signed up",
+    meta: { align: "right", label: "Signed up" },
+    cell: ({ getValue }) => {
+      const v = getValue() as string | null;
+      return v ? (
+        <span className="whitespace-nowrap text-muted-foreground" title={new Date(v).toLocaleString()}>
+          {relativeTime(v)}
+        </span>
+      ) : null;
+    },
+  },
+  {
+    accessorKey: "last_seen_at",
+    header: "Last seen",
+    meta: { align: "right", label: "Last seen" },
+    cell: ({ getValue }) => {
+      const v = getValue() as string | null;
+      return v ? (
+        <span className="whitespace-nowrap text-muted-foreground" title={new Date(v).toLocaleString()}>
+          {relativeTime(v)}
+        </span>
+      ) : null;
+    },
+  },
 ];
 
 const byName = (a: Segment, b: Segment) => a.name.localeCompare(b.name);
@@ -226,7 +255,7 @@ function ColumnVisibility({ table }: { table: TanstackTable<Contact> }) {
       label="View"
       icon={SlidersHorizontal}
       align="end"
-      searchable={false}
+      searchable
       values={values}
       options={options}
       onChange={(vis) => cols.forEach((c) => c.toggleVisibility(vis.includes(c.id)))}
@@ -278,7 +307,9 @@ export function ContactsPage() {
     pageSize: PAGE_SIZE,
   });
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  // Signed up / Last seen ship hidden by default (Last activity already covers the common case);
+  // imported attribute columns are hidden by useHideAttrsByDefault as they're discovered.
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({ created_at: false, last_seen_at: false });
 
   const [editing, setEditing] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -392,6 +423,11 @@ export function ContactsPage() {
   // new page actually arrives.)
   const data = useMemo(() => contacts ?? [], [contacts]);
 
+  // Core columns + one optional column per imported attribute (Intercom's "add columns"). New
+  // attribute columns land hidden so the default view stays clean; the View menu surfaces them.
+  const columns = useMemo<ColumnDef<Contact>[]>(() => [...COLUMNS, ...attributeColumns<Contact>(attrKeys)], [attrKeys]);
+  useHideAttrsByDefault(attrKeys, setColumnVisibility);
+
   // The fields the builder targets: core columns + every attribute key seen + dates. No live
   // value counts/suggestions — with server-side data we don't hold the full set (and there's no
   // distinct-values endpoint); the free-text value input carries the UX.
@@ -438,7 +474,7 @@ export function ContactsPage() {
 
   const table = useReactTable({
     data,
-    columns: COLUMNS,
+    columns,
     state: { sorting, pagination, rowSelection, columnVisibility },
     getRowId: (c) => c.id,
     manualFiltering: true,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, getRouteApi, useNavigate } from "@tanstack/react-router";
-import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight } from "lucide-react";
+import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight, Search, Download, X, SlidersHorizontal } from "lucide-react";
 import {
   type Company,
   type CompanyDetail,
@@ -37,11 +37,15 @@ import {
   type SortingState,
   type PaginationState,
   type OnChangeFn,
+  type RowSelectionState,
+  type VisibilityState,
+  type Table as TanstackTable,
 } from "@tanstack/react-table";
 import { DataTableRT } from "@/components/data-table/data-table-rt";
-import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
-import { DataTableEmpty } from "@/components/data-table/states";
-import { EntityCell, StatePill, MetricDrillCell, type PillTone } from "@/components/data-table/cells";
+import { MultiSelect, type ComboOption } from "@/components/ui/combobox";
+import { EntityCell, StatePill, MetricDrillCell, Checkbox, type PillTone } from "@/components/data-table/cells";
+import { attributeColumns, useAttributeKeys, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
+import { PageSizeSelect, DEFAULT_PAGE_SIZE } from "@/components/data-table/page-size-select";
 import { cn } from "@/lib/utils";
 
 // Companies — first-class account records with a rolled-up health score. The directory surfaces the
@@ -70,8 +74,25 @@ const ccolHelp = createColumnHelper<Company>();
 
 function buildCompanyColumns(): ColumnDef<Company, any>[] {
   return [
+    ccolHelp.display({
+      id: "select",
+      enableSorting: false,
+      enableHiding: false,
+      header: ({ table }) => (
+        <Checkbox
+          checked={table.getIsAllPageRowsSelected()}
+          indeterminate={table.getIsSomePageRowsSelected()}
+          onChange={() => table.toggleAllPageRowsSelected()}
+          label="Select all rows on this page"
+        />
+      ),
+      cell: ({ row }) => (
+        <Checkbox checked={row.getIsSelected()} onChange={() => row.toggleSelected()} label="Select row" />
+      ),
+    }),
     ccolHelp.accessor("name", {
       header: "Company",
+      enableHiding: false,
       meta: { label: "Company" },
       cell: ({ row }) => <EntityCell name={row.original.name} sub={row.original.domain || undefined} />,
     }),
@@ -130,86 +151,25 @@ function buildCompanyColumns(): ColumnDef<Company, any>[] {
   ];
 }
 
-const PAGE_SIZE = 50;
-
-// Server-paginated companies table: `companies` is only the current page; `total` is the server's
-// match count. Sorting/search/pagination are controlled by the parent and drive a refetch.
-function CompaniesTable({
-  companies,
-  total,
-  loading,
-  onOpen,
-  sorting,
-  onSortingChange,
-  pagination,
-  onPaginationChange,
-  search,
-  onSearchChange,
-}: {
-  companies: Company[];
-  total: number;
-  loading: boolean;
-  onOpen: (c: Company) => void;
-  sorting: SortingState;
-  onSortingChange: OnChangeFn<SortingState>;
-  pagination: PaginationState;
-  onPaginationChange: OnChangeFn<PaginationState>;
-  search: string;
-  onSearchChange: (v: string) => void;
-}) {
-  const columns = useMemo(() => buildCompanyColumns(), []);
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const table = useReactTable({
-    data: companies,
-    columns,
-    getRowId: (c) => c.id,
-    state: { sorting, pagination },
-    manualSorting: true,
-    manualPagination: true,
-    manualFiltering: true,
-    pageCount,
-    autoResetPageIndex: false,
-    onSortingChange,
-    onPaginationChange,
-    getCoreRowModel: getCoreRowModel(),
-  });
-  const from = total === 0 ? 0 : pagination.pageIndex * PAGE_SIZE + 1;
-  const to = pagination.pageIndex * PAGE_SIZE + companies.length;
-
+// Column-visibility "View" control — the same pane-header control the contacts table uses, so both
+// customer tables carry one chrome. Attribute columns (imported bag) show up here as options.
+function ColumnVisibility({ table }: { table: TanstackTable<Company> }) {
+  const cols = table.getAllColumns().filter((c) => c.getCanHide());
+  const options: ComboOption[] = cols.map((c) => ({
+    value: c.id,
+    label: (c.columnDef.meta as { label?: string } | undefined)?.label ?? c.id,
+  }));
+  const values = cols.filter((c) => c.getIsVisible()).map((c) => c.id);
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="px-4 py-2">
-        <DataTableToolbar table={table} search={search} onSearchChange={onSearchChange} facets={[]} searchPlaceholder="Search companies…" />
-      </div>
-      {total === 0 && !loading ? (
-        <DataTableEmpty
-          isFiltered={search.trim().length > 0}
-          onClearFilters={() => onSearchChange("")}
-          icon={Building2}
-          title="No companies yet"
-          description="Roll accounts up from your contacts, or add one directly."
-        />
-      ) : (
-        <div className="min-h-0 flex-1 overflow-auto">
-          <DataTableRT table={table} onRowClick={onOpen} />
-        </div>
-      )}
-      {total > 0 && (
-        <div className="flex shrink-0 items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
-          <span className="tabular-nums">
-            {from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()}
-          </span>
-          <div className="flex items-center gap-1">
-            <Button variant="outline" size="icon" className="size-7" disabled={!table.getCanPreviousPage() || loading} onClick={() => table.previousPage()} aria-label="Previous page">
-              <ChevronLeft className="size-4" />
-            </Button>
-            <Button variant="outline" size="icon" className="size-7" disabled={!table.getCanNextPage() || loading} onClick={() => table.nextPage()} aria-label="Next page">
-              <ChevronRight className="size-4" />
-            </Button>
-          </div>
-        </div>
-      )}
-    </div>
+    <MultiSelect
+      label="View"
+      icon={SlidersHorizontal}
+      align="end"
+      searchable
+      values={values}
+      options={options}
+      onChange={(vis) => cols.forEach((c) => c.toggleVisibility(vis.includes(c.id)))}
+    />
   );
 }
 
@@ -222,7 +182,9 @@ export function CompaniesPage() {
   const [q, setQ] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
   const [sorting, setSorting] = useState<SortingState>([{ id: "name", desc: false }]);
-  const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize: PAGE_SIZE });
+  const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize: DEFAULT_PAGE_SIZE });
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
   const [reloadSignal, setReloadSignal] = useState(0);
   const [formOpen, setFormOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -233,6 +195,7 @@ export function CompaniesPage() {
   const [importCsv, setImportCsv] = useState("");
   const [importFile, setImportFile] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [bulkConfirm, setBulkConfirm] = useState(false);
   const navigate = useNavigate();
   const reload = () => setReloadSignal((n) => n + 1);
 
@@ -256,14 +219,84 @@ export function CompaniesPage() {
       q: debouncedQ || undefined,
       sort: sorting[0]?.id,
       dir: sorting[0]?.desc ? "desc" : "asc",
-      limit: PAGE_SIZE,
-      offset: pagination.pageIndex * PAGE_SIZE,
+      limit: pagination.pageSize,
+      offset: pagination.pageIndex * pagination.pageSize,
     })
       .then((r) => { if (!live) return; setCompanies(r.companies); setTotal(r.total); })
       .catch(() => { if (live) setError(true); })
       .finally(() => { if (live) { setLoading(false); setFirstLoad(false); } });
     return () => { live = false; };
-  }, [debouncedQ, sorting, pagination.pageIndex, reloadSignal]);
+  }, [debouncedQ, sorting, pagination.pageIndex, pagination.pageSize, reloadSignal]);
+
+  // Core columns + one optional column per imported attribute (Intercom's "add columns").
+  const attrKeys = useAttributeKeys(companies);
+  useHideAttrsByDefault(attrKeys, setColumnVisibility);
+  const columns = useMemo(() => [...buildCompanyColumns(), ...attributeColumns<Company>(attrKeys)], [attrKeys]);
+  const pageCount = Math.max(1, Math.ceil(total / pagination.pageSize));
+  const table = useReactTable({
+    data: companies,
+    columns,
+    getRowId: (c) => c.id,
+    state: { sorting, pagination, rowSelection, columnVisibility },
+    manualSorting: true,
+    manualPagination: true,
+    manualFiltering: true,
+    pageCount,
+    autoResetPageIndex: false,
+    onSortingChange: handleSortingChange,
+    onPaginationChange: setPagination,
+    onRowSelectionChange: setRowSelection,
+    onColumnVisibilityChange: setColumnVisibility,
+    getCoreRowModel: getCoreRowModel(),
+  });
+
+  const busyPaging = loading && !firstLoad;
+  const selectedRows = table.getSelectedRowModel().rows;
+  const selectedCount = selectedRows.length;
+  const from = total === 0 ? 0 : pagination.pageIndex * pagination.pageSize + 1;
+  const to = pagination.pageIndex * pagination.pageSize + companies.length;
+  const noun = (n: number) => (n === 1 ? "company" : "companies");
+  const setPageSize = (n: number) => setPagination({ pageIndex: 0, pageSize: n });
+
+  function exportSelected() {
+    const rows = selectedRows.map((r) => r.original);
+    if (!rows.length) return;
+    const esc = (v: unknown) => {
+      const s = v == null ? "" : String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const attrCols = [...new Set(rows.flatMap((r) => Object.keys(r.attributes ?? {})))].sort();
+    const base = ["name", "domain", "plan", "contactCount", "openTickets", "health"] as const;
+    const lines = [[...base, ...attrCols].join(",")];
+    for (const r of rows) {
+      const b = [r.name, r.domain, r.plan, r.contactCount, r.health.openTickets, r.health.band].map(esc);
+      const a = attrCols.map((k) => esc(r.attributes?.[k]));
+      lines.push([...b, ...a].join(","));
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `companies-${rows.length}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success(`Exported ${rows.length} ${noun(rows.length)} to CSV.`);
+  }
+
+  async function deleteSelected() {
+    const rows = selectedRows.map((r) => r.original);
+    if (!rows.length) return;
+    setBulkConfirm(false);
+    // Optimistic: drop from the current page + count; reload() re-syncs authoritative data.
+    setCompanies((prev) => prev.filter((c) => !rows.some((r) => r.id === c.id)));
+    setTotal((t) => Math.max(0, t - rows.length));
+    table.resetRowSelection();
+    const results = await Promise.allSettled(rows.map((r) => deleteCompany(r.id)));
+    const failed = results.filter((x) => x.status === "rejected").length;
+    if (failed) toast.error(`Couldn't delete ${failed} ${noun(failed)}. Please try again.`);
+    else toast.success(`Deleted ${rows.length} ${noun(rows.length)}.`);
+    reload();
+  }
 
   function openForm() {
     setNewName("");
@@ -329,37 +362,109 @@ export function CompaniesPage() {
   return (
     <>
       <div className="flex min-h-0 flex-1 flex-col">
-        {/* pane header (§3) — title · People|Companies switch · search · new */}
+        {/* pane header (§3) — swaps to a bulk cluster while rows are selected, mirroring People */}
         <header className="flex h-12 shrink-0 items-center gap-3 px-4">
-          <h1 className="text-sm font-semibold tracking-tight">Customers</h1>
-          <CustomersViewSwitch current="companies" />
-          <div className="ml-auto flex items-center gap-1.5">
-            <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" onClick={openImport}>
-              <Upload className="size-3.5" /> Import
-            </Button>
-            <Button size="sm" variant="brand" className="h-8 gap-1.5 text-xs" onClick={openForm}>
-              <Plus className="size-3.5" /> New company
-            </Button>
-          </div>
+          {selectedCount > 0 ? (
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="text-sm font-semibold tabular-nums tracking-tight">{selectedCount} selected</span>
+              <span className="mx-1 h-4 w-px bg-border" />
+              <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" onClick={exportSelected}>
+                <Download className="size-3.5" /> Export CSV
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1.5 text-xs text-destructive hover:text-destructive"
+                onClick={() => setBulkConfirm(true)}
+              >
+                <Trash2 className="size-3.5" /> Delete
+              </Button>
+              <Button variant="ghost" size="sm" className="ml-auto h-8 gap-1 text-xs" onClick={() => table.resetRowSelection()}>
+                <X className="size-3.5" /> Clear
+              </Button>
+            </div>
+          ) : (
+            <>
+              <h1 className="text-sm font-semibold tracking-tight">Customers</h1>
+              <CustomersViewSwitch current="companies" />
+              <span className="text-xs tabular-nums text-muted-foreground">
+                {loading && firstLoad ? "loading…" : `${total.toLocaleString()} ${noun(total)}`}
+              </span>
+              {busyPaging && <Spinner className="size-3.5" />}
+              <div className="ml-auto flex items-center gap-1.5">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={q}
+                    onChange={(e) => setQ(e.target.value)}
+                    placeholder="Search companies…"
+                    aria-label="Search companies"
+                    className="h-8 w-44 pl-8 text-sm lg:w-56"
+                  />
+                </div>
+                <ColumnVisibility table={table} />
+                <Button size="sm" variant="outline" className="h-8 gap-1.5" onClick={openImport}>
+                  <Upload className="size-4" /> Import
+                </Button>
+                <Button size="sm" variant="brand" className="h-8 gap-1.5" onClick={openForm}>
+                  <Plus className="size-4" /> New company
+                </Button>
+              </div>
+            </>
+          )}
         </header>
 
-        {error && firstLoad ? (
-          <ErrorState title="Couldn't load companies" onRetry={reload} />
-        ) : firstLoad ? (
-          <RowsSkeleton rows={8} />
-        ) : (
-          <CompaniesTable
-            companies={companies}
-            total={total}
-            loading={loading}
-            onOpen={(c) => void navigate({ to: "/companies/$companyId", params: { companyId: c.id } })}
-            sorting={sorting}
-            onSortingChange={handleSortingChange}
-            pagination={pagination}
-            onPaginationChange={setPagination}
-            search={q}
-            onSearchChange={setQ}
-          />
+        {/* table — dimmed + locked while a page fetch is in flight (mirrors People) */}
+        <div
+          className={cn(
+            "min-h-0 flex-1 overflow-auto transition-opacity duration-150 motion-reduce:transition-none",
+            busyPaging ? "pointer-events-none opacity-60" : "opacity-100",
+          )}
+        >
+          {error && firstLoad ? (
+            <ErrorState title="Couldn't load companies" onRetry={reload} />
+          ) : firstLoad ? (
+            <RowsSkeleton rows={8} />
+          ) : total === 0 ? (
+            <EmptyState
+              icon={Building2}
+              title={debouncedQ ? "No companies match your search." : "No companies yet"}
+              description={debouncedQ ? undefined : "Roll accounts up from your contacts, or add one directly."}
+              action={
+                !debouncedQ ? (
+                  <div className="flex items-center gap-1.5">
+                    <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-xs" onClick={openImport}>
+                      <Upload className="size-3.5" /> Import
+                    </Button>
+                    <Button size="sm" variant="brand" className="h-7 gap-1 px-2 text-xs" onClick={openForm}>
+                      <Plus className="size-3.5" /> New company
+                    </Button>
+                  </div>
+                ) : undefined
+              }
+            />
+          ) : (
+            <DataTableRT table={table} onRowClick={(c) => void navigate({ to: "/companies/$companyId", params: { companyId: c.id } })} />
+          )}
+        </div>
+
+        {!firstLoad && total > 0 && (
+          <div className="flex shrink-0 items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground lg:px-6">
+            <div className="flex items-center gap-3">
+              <span className="tabular-nums">
+                {from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()}
+              </span>
+              <PageSizeSelect value={pagination.pageSize} onChange={setPageSize} />
+            </div>
+            <div className="flex items-center gap-1">
+              <Button variant="outline" size="icon" className="size-7" disabled={!table.getCanPreviousPage() || busyPaging} onClick={() => table.previousPage()} aria-label="Previous page">
+                <ChevronLeft className="size-4" />
+              </Button>
+              <Button variant="outline" size="icon" className="size-7" disabled={!table.getCanNextPage() || busyPaging} onClick={() => table.nextPage()} aria-label="Next page">
+                <ChevronRight className="size-4" />
+              </Button>
+            </div>
+          </div>
         )}
       </div>
 
@@ -421,6 +526,16 @@ export function CompaniesPage() {
           </p>
         </div>
       </FormDialog>
+
+      <ConfirmDialog
+        open={bulkConfirm}
+        title={`Delete ${selectedCount} ${noun(selectedCount)}?`}
+        message="Their contacts stay, but lose their company link. This can't be undone."
+        confirmLabel="Delete"
+        destructive
+        onConfirm={() => void deleteSelected()}
+        onCancel={() => setBulkConfirm(false)}
+      />
     </>
   );
 }
