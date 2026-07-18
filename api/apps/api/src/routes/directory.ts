@@ -248,13 +248,41 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
 
   // ---- Companies (account records) -----------------------------------------
   // First-class accounts with a rolled-up health score (open tickets + negative sentiment + CSAT).
-  app.get("/companies", tenanted(async (tenantId, req) => {
+  app.get("/companies", tenanted(async (tenantId, req, reply) => {
     const query = (req.query as Record<string, string | undefined>) ?? {};
     const num = (v: string | undefined): number | undefined => (v === undefined || v === "" ? undefined : Number(v));
     const band = ["healthy", "at_risk", "critical"].includes(query.band ?? "") ? (query.band as HealthBand) : undefined;
+    // Filter-builder conditions ride the same JSON `filters` / `filterGroups` params as the contacts
+    // directory (a condition is the same {field, op, value} shape, so the schemas are reused).
+    let conditions;
+    if (query.filters) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(query.filters);
+      } catch {
+        return reply.code(400).send({ error: "invalid filters json" });
+      }
+      const parsed = ContactFilterConditions.safeParse(raw);
+      if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+      conditions = parsed.data;
+    }
+    let conditionGroups;
+    if (query.filterGroups) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(query.filterGroups);
+      } catch {
+        return reply.code(400).send({ error: "invalid filterGroups json" });
+      }
+      const parsed = ContactFilterConditionGroups.safeParse(raw);
+      if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+      conditionGroups = parsed.data;
+    }
     const opts = {
       q: query.q,
       band,
+      conditions,
+      conditionGroups,
       limit: num(query.limit),
       offset: num(query.offset),
       sortBy: query.sort,

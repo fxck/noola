@@ -106,9 +106,19 @@ const mapCompany = (r: Record<string, unknown>): Company => ({
   updated_at: r.updated_at instanceof Date ? (r.updated_at as Date).toISOString() : String(r.updated_at),
 });
 
+/** A filter-builder condition — the same {field, op, value} shape the contacts directory uses.
+ *  Fields: name / domain / plan (columns) or attr:<key> (the attributes bag). */
+export interface CompanyFilterCondition {
+  field: string;
+  op: string;
+  value?: string;
+}
+
 export interface CompanyListOpts {
   q?: string;
   band?: HealthBand;
+  conditions?: CompanyFilterCondition[];
+  conditionGroups?: CompanyFilterCondition[][];
   limit?: number;
   offset?: number;
   sortBy?: string;
@@ -131,11 +141,78 @@ const COMPANY_SORT_SQL: Record<string, string> = {
   lastActivity: "last_activity",
 };
 
-function bandPredicate(band?: HealthBand): string {
-  if (band === "healthy") return "WHERE health_score >= 70";
-  if (band === "at_risk") return "WHERE health_score >= 40 AND health_score < 70";
-  if (band === "critical") return "WHERE health_score < 40";
-  return "";
+function bandClause(band?: HealthBand): string | null {
+  if (band === "healthy") return "health_score >= 70";
+  if (band === "at_risk") return "health_score >= 40 AND health_score < 70";
+  if (band === "critical") return "health_score < 40";
+  return null;
+}
+
+// Compile ONE filter-builder condition into SQL against the base CTE. name/domain/plan are columns;
+// attr:<key> targets the attributes bag. Same op vocabulary + LIKE-escaping as the contacts grammar.
+function compileCompanyCondition(cond: CompanyFilterCondition, clauses: string[], params: unknown[]): void {
+  const { field, op } = cond;
+  const value = cond.value;
+  const needsValue = ["is", "is_not", "contains", "not_contains", "starts_with", "ends_with"].includes(op);
+  if (needsValue && (value === undefined || value === "")) return;
+  const likeLiteral = (v: string): string => v.replace(/[\\%_]/g, "\\$&");
+
+  const isAttr = field.startsWith("attr:");
+  let colExpr: string;
+  if (field === "name") colExpr = "name";
+  else if (field === "domain") colExpr = "domain";
+  else if (field === "plan") colExpr = "plan";
+  else if (isAttr) {
+    const key = field.slice(5).trim();
+    if (!key) return;
+    params.push(key);
+    colExpr = `attributes ->> $${params.length}`;
+  } else return; // unknown field — ignore rather than error
+
+  if (op === "exists") {
+    clauses.push(isAttr ? `attributes ? $${params.length}` : `(${colExpr} IS NOT NULL AND ${colExpr} <> '')`);
+    return;
+  }
+  if (op === "not_exists") {
+    clauses.push(isAttr ? `NOT (attributes ? $${params.length})` : `(${colExpr} IS NULL OR ${colExpr} = '')`);
+    return;
+  }
+  if (op === "is") {
+    params.push(value);
+    clauses.push(`${colExpr} = $${params.length}`);
+  } else if (op === "is_not") {
+    params.push(value);
+    clauses.push(`${colExpr} IS DISTINCT FROM $${params.length}`);
+  } else if (op === "contains") {
+    params.push(`%${likeLiteral(String(value))}%`);
+    clauses.push(`${colExpr} ILIKE $${params.length}`);
+  } else if (op === "not_contains") {
+    params.push(`%${likeLiteral(String(value))}%`);
+    clauses.push(`(${colExpr} IS NULL OR ${colExpr} NOT ILIKE $${params.length})`);
+  } else if (op === "starts_with") {
+    params.push(`${likeLiteral(String(value))}%`);
+    clauses.push(`${colExpr} ILIKE $${params.length}`);
+  } else if (op === "ends_with") {
+    params.push(`%${likeLiteral(String(value))}`);
+    clauses.push(`${colExpr} ILIKE $${params.length}`);
+  }
+}
+
+// The combined outer WHERE: health band + filter-builder conditions (AND) + OR groups. Appends its
+// params to the shared array (which already carries the base CTE's q param, if any).
+function companyWhere(opts: CompanyListOpts, params: unknown[]): string {
+  const clauses: string[] = [];
+  const band = bandClause(opts.band);
+  if (band) clauses.push(band);
+  for (const cond of opts.conditions ?? []) compileCompanyCondition(cond, clauses, params);
+  const groupSqls: string[] = [];
+  for (const group of opts.conditionGroups ?? []) {
+    const gc: string[] = [];
+    for (const cond of group) compileCompanyCondition(cond, gc, params);
+    if (gc.length) groupSqls.push(`(${gc.join(" AND ")})`);
+  }
+  if (groupSqls.length) clauses.push(`(${groupSqls.join(" OR ")})`);
+  return clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
 }
 
 // Shared base: rollups + health_score + optional name/domain search. When q is present it binds $1.
@@ -164,6 +241,7 @@ function companyBaseCte(q?: string): { cte: string; params: unknown[] } {
 export async function listCompanies(tenantId: string, opts: CompanyListOpts = {}): Promise<CompanyRow[]> {
   return withTenant(tenantId, async (c) => {
     const { cte, params } = companyBaseCte(opts.q);
+    const where = companyWhere(opts, params); // appends filter params after q
     const sortCol = COMPANY_SORT_SQL[opts.sortBy ?? ""] ?? "name";
     const dir = opts.sortDir === "desc" ? "DESC" : "ASC";
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
@@ -172,7 +250,7 @@ export async function listCompanies(tenantId: string, opts: CompanyListOpts = {}
     const r = await c.query(
       `${cte}
        SELECT * FROM base
-       ${bandPredicate(opts.band)}
+       ${where}
        ORDER BY ${sortCol} ${dir} NULLS LAST, name ASC
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
@@ -189,7 +267,8 @@ export async function listCompanies(tenantId: string, opts: CompanyListOpts = {}
 export async function countCompanies(tenantId: string, opts: CompanyListOpts = {}): Promise<number> {
   return withTenant(tenantId, async (c) => {
     const { cte, params } = companyBaseCte(opts.q);
-    const r = await c.query(`${cte} SELECT count(*)::int AS n FROM base ${bandPredicate(opts.band)}`, params);
+    const where = companyWhere(opts, params);
+    const r = await c.query(`${cte} SELECT count(*)::int AS n FROM base ${where}`, params);
     return Number(r.rows[0]?.n ?? 0);
   });
 }

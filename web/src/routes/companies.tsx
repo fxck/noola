@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, getRouteApi, useNavigate } from "@tanstack/react-router";
-import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight, Search, Download, X, SlidersHorizontal } from "lucide-react";
+import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight, Search, Download, X, SlidersHorizontal, ListFilter, Globe, Tag } from "lucide-react";
 import {
   type Company,
   type CompanyDetail,
+  type CompanyFilter,
   type HealthBand,
   HEALTH_META,
   fetchCompanies,
@@ -46,6 +47,8 @@ import { EntityCell, StatePill, MetricDrillCell, Checkbox, type PillTone } from 
 import { attributeColumns, useAttributeKeys, useHideAttrsByDefault } from "@/components/data-table/attribute-columns";
 import { PageSizeSelect, DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS } from "@/components/data-table/page-size-select";
 import { usePersistentVisibility, usePersistentNumber } from "@/components/data-table/persist";
+import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
+import { type FilterCondition, splitFilterGroups } from "@/components/data-table/types";
 import { cn } from "@/lib/utils";
 
 // Companies — first-class account records with a rolled-up health score. The directory surfaces the
@@ -173,6 +176,19 @@ function ColumnVisibility({ table }: { table: TanstackTable<Company> }) {
   );
 }
 
+// A condition with a value-requiring op but no value yet doesn't filter (still being built).
+function isComplete(cond: FilterCondition): boolean {
+  if (cond.op === "exists" || cond.op === "not_exists") return true;
+  return (cond.value ?? "").trim() !== "";
+}
+
+const HEALTH_CUTS: { value: HealthBand | ""; label: string }[] = [
+  { value: "", label: "All" },
+  { value: "healthy", label: "Healthy" },
+  { value: "at_risk", label: "At risk" },
+  { value: "critical", label: "Critical" },
+];
+
 export function CompaniesPage() {
   const [companies, setCompanies] = useState<Company[]>([]);
   const [total, setTotal] = useState(0);
@@ -187,6 +203,9 @@ export function CompaniesPage() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [columnVisibility, setColumnVisibility] = usePersistentVisibility("noola.view.companies", {});
   const [reloadSignal, setReloadSignal] = useState(0);
+  const [band, setBand] = useState<HealthBand | "">("");
+  const [groups, setGroups] = useState<FilterCondition[][]>([[]]);
+  const [showFilters, setShowFilters] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [newDomain, setNewDomain] = useState("");
@@ -213,13 +232,29 @@ export function CompaniesPage() {
   // Persisted rows-per-page reflows the set — sync into pagination + jump to page 1.
   useEffect(() => { setPagination((p) => (p.pageSize === pageSize ? p : { pageIndex: 0, pageSize })); }, [pageSize]);
 
-  // Fetch the current page whenever the query, sort, or page changes.
+  // Only complete conditions filter; one group ships flat as `filters`, 2+ as OR-ed `filterGroups`.
+  const { flat: serverFilters, groups: serverFilterGroups } = useMemo(
+    () =>
+      splitFilterGroups<CompanyFilter>(
+        groups.map((g) =>
+          g.filter(isComplete).map((c) => ({ field: c.field, op: c.op, ...(c.value !== undefined ? { value: c.value } : {}) })),
+        ),
+      ),
+    [groups],
+  );
+  // A changed band / filter set makes a page-N view meaningless — back to page 1.
+  useEffect(() => { resetPage(); }, [band, serverFilters, serverFilterGroups]);
+
+  // Fetch the current page whenever the query, sort, filters, band, or page changes.
   useEffect(() => {
     let live = true;
     setLoading(true);
     setError(false);
     fetchCompanies({
       q: debouncedQ || undefined,
+      band: band || undefined,
+      filters: serverFilters.length ? serverFilters : undefined,
+      filterGroups: serverFilterGroups,
       sort: sorting[0]?.id,
       dir: sorting[0]?.desc ? "desc" : "asc",
       limit: pagination.pageSize,
@@ -229,12 +264,25 @@ export function CompaniesPage() {
       .catch(() => { if (live) setError(true); })
       .finally(() => { if (live) { setLoading(false); setFirstLoad(false); } });
     return () => { live = false; };
-  }, [debouncedQ, sorting, pagination.pageIndex, pagination.pageSize, reloadSignal]);
+  }, [debouncedQ, band, serverFilters, serverFilterGroups, sorting, pagination.pageIndex, pagination.pageSize, reloadSignal]);
 
   // Core columns + one optional column per imported attribute (Intercom's "add columns").
   const attrKeys = useAttributeKeys(companies);
   useHideAttrsByDefault(attrKeys, setColumnVisibility);
   const columns = useMemo(() => [...buildCompanyColumns(), ...attributeColumns<Company>(attrKeys)], [attrKeys]);
+  // Filter-builder fields: company columns + one per imported attribute (attr:<key>).
+  const filterFields = useMemo<BuilderFieldDef[]>(
+    () => [
+      { key: "name", label: "Name", type: "text", icon: Building2 },
+      { key: "domain", label: "Domain", type: "text", icon: Globe },
+      { key: "plan", label: "Plan", type: "text", icon: Tag },
+      ...attrKeys.map((k): BuilderFieldDef => ({ key: `attr:${k}`, label: k, type: "text", icon: Tag })),
+    ],
+    [attrKeys],
+  );
+  const condCount = groups.reduce((n, g) => n + g.length, 0);
+  const filterRowVisible = showFilters || condCount > 0;
+  const hasFilters = debouncedQ.trim().length > 0 || band !== "" || serverFilters.length > 0 || (serverFilterGroups?.length ?? 0) > 0;
   const pageCount = Math.max(1, Math.ceil(total / pagination.pageSize));
   const table = useReactTable({
     data: companies,
@@ -394,6 +442,37 @@ export function CompaniesPage() {
               </span>
               {busyPaging && <Spinner className="size-3.5" />}
               <div className="ml-auto flex items-center gap-1.5">
+                {/* health cut — quick band filter (server-side), mirrors People's identity toggle */}
+                <div className="inline-flex h-8 items-center rounded-md bg-muted/60 p-0.5 text-xs">
+                  {HEALTH_CUTS.map((c) => (
+                    <button
+                      key={c.value || "all"}
+                      type="button"
+                      aria-pressed={band === c.value}
+                      onClick={() => setBand(c.value)}
+                      className={cn(
+                        "rounded px-2 py-1 transition-colors",
+                        band === c.value ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
+                {/* filter toggle — the builder row is on-demand, pinned open while conditions exist */}
+                <button
+                  type="button"
+                  onClick={() => setShowFilters((v) => !v)}
+                  aria-expanded={filterRowVisible}
+                  className={cn(
+                    "inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs transition-colors hover:bg-muted/60",
+                    condCount ? "font-medium text-foreground" : "text-muted-foreground hover:text-foreground",
+                    filterRowVisible && "bg-muted/60 text-foreground",
+                  )}
+                >
+                  <ListFilter className="size-3.5" />
+                  {condCount ? `Filter · ${condCount}` : "Filter"}
+                </button>
                 <div className="relative">
                   <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                   <Input
@@ -416,6 +495,13 @@ export function CompaniesPage() {
           )}
         </header>
 
+        {/* filter builder — a quiet row, only while in use. "+ Or" adds an OR-ed row. */}
+        {filterRowVisible && selectedCount === 0 && (
+          <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
+            <FilterBuilder fields={filterFields} groups={groups} onChange={setGroups} />
+          </div>
+        )}
+
         {/* table — dimmed + locked while a page fetch is in flight (mirrors People) */}
         <div
           className={cn(
@@ -430,10 +516,10 @@ export function CompaniesPage() {
           ) : total === 0 ? (
             <EmptyState
               icon={Building2}
-              title={debouncedQ ? "No companies match your search." : "No companies yet"}
-              description={debouncedQ ? undefined : "Roll accounts up from your contacts, or add one directly."}
+              title={hasFilters ? "No companies match these filters." : "No companies yet"}
+              description={hasFilters ? undefined : "Roll accounts up from your contacts, or add one directly."}
               action={
-                !debouncedQ ? (
+                !hasFilters ? (
                   <div className="flex items-center gap-1.5">
                     <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-xs" onClick={openImport}>
                       <Upload className="size-3.5" /> Import

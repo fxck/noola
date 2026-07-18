@@ -38,9 +38,19 @@ export interface CompanyInput {
   attributes?: Record<string, unknown>;
 }
 
+export interface CompanyFilter {
+  field: string;
+  op: string;
+  value?: string;
+}
+
 export interface CompanyQuery {
   q?: string;
   band?: HealthBand;
+  /** Filter-builder conditions (AND-combined); attribute fields use the `attr:<key>` prefix. */
+  filters?: CompanyFilter[];
+  /** OR-ed groups (conditions AND within a group, groups OR across). */
+  filterGroups?: CompanyFilter[][];
   limit?: number;
   offset?: number;
   sort?: string;
@@ -52,6 +62,10 @@ export async function fetchCompanies(opts: CompanyQuery = {}): Promise<{ compani
   const p = new URLSearchParams();
   if (opts.q) p.set("q", opts.q);
   if (opts.band) p.set("band", opts.band);
+  const packFilter = (f: CompanyFilter) => ({ field: f.field, op: f.op, ...(f.value !== undefined ? { value: f.value } : {}) });
+  if (opts.filters && opts.filters.length) p.set("filters", JSON.stringify(opts.filters.map(packFilter)));
+  const groups = (opts.filterGroups ?? []).filter((g) => g.length > 0);
+  if (groups.length) p.set("filterGroups", JSON.stringify(groups.map((g) => g.map(packFilter))));
   if (opts.limit != null) p.set("limit", String(opts.limit));
   if (opts.offset != null) p.set("offset", String(opts.offset));
   if (opts.sort) p.set("sort", opts.sort);
