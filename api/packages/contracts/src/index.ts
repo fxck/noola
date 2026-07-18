@@ -790,6 +790,12 @@ export const PublicAskInput = z.object({
   // contact (email is the cross-channel unifier), so a later email from the same person threads together.
   email: z.string().email().max(320).optional(),
   name: z.string().max(200).optional(),
+  userId: z.string().trim().min(1).max(200).optional(),
+  // Intercom-parity identity proof — either the CURRENT signed JWT (intercom_user_jwt; identity is
+  // in the claims) or the LEGACY user_hash HMAC. Verified server-side before an identified message
+  // is linked to the real contact (when verifyIdentity is on).
+  userHash: z.string().trim().min(1).max(128).optional(),
+  userJwt: z.string().trim().min(1).max(8192).optional(),
 });
 export type PublicAskInput = z.infer<typeof PublicAskInput>;
 
@@ -823,6 +829,11 @@ export const WidgetConfig = z.object({
   greeting: z.string().min(1).max(280),
   position: z.enum(["right", "left"]),
   tabs: WidgetTabs,
+  /** Identity verification (Intercom-parity, migration 0095). When true, the api requires a
+   *  valid user_hash before it trusts an identified visitor or returns their conversation
+   *  history — unverified identified-claims are downgraded to anonymous. This flag is safe to
+   *  ship to the browser (it's a "you should pass user_hash" hint); the SECRET never is. */
+  verifyIdentity: z.boolean(),
 });
 export type WidgetConfig = z.infer<typeof WidgetConfig>;
 
@@ -833,6 +844,7 @@ export const WIDGET_CONFIG_DEFAULTS: WidgetConfig = {
   greeting: "Hi there 👋  Ask a question for an instant answer, or browse our help center.",
   position: "right",
   tabs: { home: true, messages: true, help: true },
+  verifyIdentity: false,
 };
 
 /** Partial personalization patch (PATCH /widget-keys/:key). Every field optional; only the
@@ -843,6 +855,7 @@ export const WidgetConfigInput = z.object({
   greeting: z.string().min(1).max(280).optional(),
   position: z.enum(["right", "left"]).optional(),
   tabs: WidgetTabs.partial().optional(),
+  verifyIdentity: z.boolean().optional(),
 });
 export type WidgetConfigInput = z.infer<typeof WidgetConfigInput>;
 
@@ -863,6 +876,7 @@ export function mergeWidgetConfig(base: WidgetConfig, patch: WidgetConfigInput |
     greeting: patch.greeting ?? base.greeting,
     position: patch.position ?? base.position,
     tabs: { ...base.tabs, ...(patch.tabs ?? {}) },
+    verifyIdentity: patch.verifyIdentity ?? base.verifyIdentity,
   };
 }
 
@@ -888,6 +902,9 @@ export const PublicIdentifyInput = z.object({
   company: z.string().trim().max(200).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
   page: z.object({ url: z.string().max(2048).optional(), title: z.string().max(500).optional() }).optional(),
+  // Intercom-parity identity proof: signed JWT (intercom_user_jwt) or legacy user_hash HMAC.
+  userHash: z.string().trim().min(1).max(128).optional(),
+  userJwt: z.string().trim().min(1).max(8192).optional(),
 });
 export type PublicIdentifyInput = z.infer<typeof PublicIdentifyInput>;
 
@@ -899,6 +916,9 @@ export const PublicTrackInput = z.object({
   userId: z.string().trim().min(1).max(200).optional(),
   name: z.string().trim().min(1).max(120),
   metadata: z.record(z.string(), z.unknown()).optional(),
+  // Intercom-parity identity proof: signed JWT (intercom_user_jwt) or legacy user_hash HMAC.
+  userHash: z.string().trim().min(1).max(128).optional(),
+  userJwt: z.string().trim().min(1).max(8192).optional(),
 });
 export type PublicTrackInput = z.infer<typeof PublicTrackInput>;
 

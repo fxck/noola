@@ -222,7 +222,7 @@ export function BulkImportDialog({
   onError,
 }: {
   onClose: () => void;
-  onDone: (res: { created: number; updated: number; skipped?: number }) => void;
+  onDone: (res: { created: number; updated: number; skipped?: number; linked?: number }) => void;
   onError: (msg: string) => void;
 }) {
   // Two source formats (0092): a CSV file/paste (the everyday path — export from a spreadsheet)

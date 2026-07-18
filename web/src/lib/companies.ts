@@ -55,6 +55,17 @@ export async function deleteCompany(id: string): Promise<void> {
   await api(`/companies/${id}`, { method: "DELETE" });
 }
 
+/** CSV import (Intercom migration): the api maps name/domain/plan + free-form attribute columns
+ *  onto the idempotent upsert, keyed on lower(name). Returns per-outcome counts. */
+export async function importCompaniesCsv(
+  csv: string,
+): Promise<{ created: number; updated: number; skipped: number }> {
+  return api<{ created: number; updated: number; skipped: number }>("/companies/import", {
+    method: "POST",
+    body: JSON.stringify({ csv }),
+  });
+}
+
 export const HEALTH_META: Record<HealthBand, { label: string; badge: "default" | "warning" | "muted"; dot: string }> = {
   healthy: { label: "Healthy", badge: "default", dot: "var(--success)" },
   at_risk: { label: "At risk", badge: "warning", dot: "var(--warning)" },

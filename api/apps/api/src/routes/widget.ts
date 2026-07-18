@@ -16,7 +16,7 @@ import { createAttachment, claimAttachments, attachmentsForTicket, type Attachme
 import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
 import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
-import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey } from "../widget.js";
+import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
 import { listPublicArticles, listPublicCollections, getPublicArticleBySlug, searchPublicArticles } from "../kb.js";
@@ -132,7 +132,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
   app.post("/public/ask", { bodyLimit: 40 * 1024 * 1024 }, async (req, reply) => {
     const parsed = PublicAskInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-    const { key, question, conversationId, escalate, resumeAi, email, name } = parsed.data;
+    const { key, question, conversationId, escalate, resumeAi, name, userId, userHash, userJwt } = parsed.data;
     const files = parsed.data.attachments ?? [];
     const text = question.trim();
     if (!text && files.length === 0) return reply.code(400).send({ error: "message is empty" });
@@ -143,6 +143,18 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+
+    // Identity verification (Intercom-parity): the identity is either proven by a signed JWT
+    // (identity from its claims) or a user_hash HMAC. When verification is ENABLED, an unproven
+    // identified claim is DOWNGRADED to anonymous — dropped so the message can't be threaded into
+    // someone else's contact/conversation.
+    const rid = resolveVerifiedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    let email = rid.email ?? undefined;
+    let identName = name ?? null;
+    if (wk.config.verifyIdentity && !rid.verified) {
+      email = undefined;
+      identName = null;
     }
 
     // AI mode is authoritative on the ticket. Escalation MUTES the assistant (set BEFORE ingest so the
@@ -163,7 +175,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       channelType: "widget",
       externalChannelId: conversationId ?? null,
       subject: body.slice(0, 80),
-      identity: { externalId: conversationId ?? null, email: email ?? null, name: name ?? null },
+      identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
     });
 
     // Store + claim any inline files onto the persisted message (first-class attachments the agent
@@ -225,7 +237,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
   app.post("/public/ask/stream", { bodyLimit: 40 * 1024 * 1024 }, async (req, reply) => {
     const parsed = PublicAskInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-    const { key, question, conversationId, email, name } = parsed.data;
+    const { key, question, conversationId, name, userId, userHash, userJwt } = parsed.data;
     const text = question.trim();
     if (!text) return reply.code(400).send({ error: "message is empty" });
 
@@ -234,6 +246,14 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    // Same identity-verification gate as /public/ask — drop an unverified identity claim.
+    const rid = resolveVerifiedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    let email = rid.email ?? undefined;
+    let identName = name ?? null;
+    if (wk.config.verifyIdentity && !rid.verified) {
+      email = undefined;
+      identName = null;
     }
 
     // Persist the visitor's message onto the widget ticket (creates/threads by identity), exactly
@@ -245,7 +265,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       channelType: "widget",
       externalChannelId: conversationId ?? null,
       subject: text.slice(0, 80),
-      identity: { externalId: conversationId ?? null, email: email ?? null, name: name ?? null },
+      identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
     });
     if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
 
@@ -397,16 +417,23 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
-    const { email, name, userId, company, attributes, page } = parsed.data;
-    if (!email && !userId) return { ok: true, identified: false };
+    const { name, company, attributes, page, userHash, userJwt } = parsed.data;
+    // Identity is either proven by a signed JWT (identity from its claims) or a user_hash HMAC.
+    const rid = resolveVerifiedIdentity(wk, { userId: parsed.data.userId, email: parsed.data.email, userHash, userJwt });
+    if (!rid.email && !rid.userId) return { ok: true, identified: false };
+    // When verification is enabled, refuse to attach an identity that isn't proven — the visitor
+    // stays anonymous rather than claiming someone else's profile. Off by default (opt-in, like Intercom).
+    if (wk.config.verifyIdentity && !rid.verified) {
+      return { ok: true, identified: false, verification: "failed" as const };
+    }
     // Fold last-seen + last-page into the custom-attributes bag (jsonb shallow-merge on upsert),
     // so the agent-side contact profile shows recency without a dedicated column.
     const merged: Record<string, unknown> = { ...(attributes ?? {}), last_seen_at: new Date().toISOString() };
     if (page?.url) merged.last_page_url = page.url;
     if (page?.title) merged.last_page_title = page.title;
     const { contact } = await upsertContact(wk.tenantId, {
-      external_id: userId,
-      email,
+      external_id: rid.userId ?? undefined,
+      email: rid.email ?? undefined,
       name,
       company,
       attributes: merged,
@@ -426,9 +453,16 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
+    const rid = resolveVerifiedIdentity(wk, {
+      userId: parsed.data.userId, email: parsed.data.email, userHash: parsed.data.userHash, userJwt: parsed.data.userJwt,
+    });
+    // Don't attribute an event to an unverified identity claim when verification is enabled.
+    if (wk.config.verifyIdentity && (rid.email || rid.userId) && !rid.verified) {
+      return { ok: true, recorded: false, verification: "failed" as const };
+    }
     const event = await trackEvent(wk.tenantId, {
-      externalId: parsed.data.userId,
-      email: parsed.data.email,
+      externalId: rid.userId ?? undefined,
+      email: rid.email ?? undefined,
       name: parsed.data.name,
       metadata: parsed.data.metadata,
     });
@@ -506,7 +540,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
   // conversations live only in their browser. Each entry is enough to render the list + reopen (the
   // conversationId is the widget handle); opening one hydrates the full transcript via /public/conversation.
   app.post("/public/conversations", async (req, reply) => {
-    const body = (req.body ?? {}) as { key?: string; email?: string };
+    const body = (req.body ?? {}) as { key?: string; email?: string; userId?: string; userHash?: string; userJwt?: string };
     if (!body.key) return reply.code(400).send({ error: "key is required" });
     const wk = await resolveWidgetKey(body.key);
     if (!wk) return reply.code(401).send({ error: "invalid widget key" });
@@ -514,10 +548,29 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
-    const email = (body.email ?? "").trim();
-    if (!email) return { conversations: [] }; // anonymous — nothing server-side to list
+    const rid = resolveVerifiedIdentity(wk, {
+      userId: (body.userId ?? "").trim() || undefined,
+      email: (body.email ?? "").trim() || undefined,
+      userHash: body.userHash,
+      userJwt: body.userJwt,
+    });
+    if (!rid.email && !rid.userId) return { conversations: [] }; // anonymous — nothing server-side to list
+    // The history read is the sensitive one — it exposes another person's transcripts if the
+    // identity is spoofed (the IDOR this whole feature closes). When verification is enabled,
+    // require a valid proof (JWT or user_hash); when it's off, fall back to legacy identity trust
+    // (Intercom-parity: history is only guarded once you opt into identity verification).
+    if (wk.config.verifyIdentity && !rid.verified) {
+      return { conversations: [] };
+    }
+    const email = rid.email ?? "";
+    const userId = rid.userId ?? "";
     const rows = await withTenant(wk.tenantId, async (c) => {
-      const contact = await c.query(`SELECT id FROM contacts WHERE lower(email) = lower($1) LIMIT 1`, [email]);
+      const contact = await c.query(
+        `SELECT id FROM contacts
+          WHERE (email <> '' AND lower(email) = lower($1)) OR (external_id IS NOT NULL AND external_id = $2)
+          LIMIT 1`,
+        [email, userId],
+      );
       if (!contact.rowCount) return [];
       const r = await c.query(
         `SELECT t.external_channel_id AS cid, t.assistant_enabled, t.updated_at,
@@ -648,5 +701,19 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const gone = await deleteWidgetKey(tenantId, (req.params as { key: string }).key);
     if (!gone) return reply.code(404).send({ error: "not found" });
     return { ok: true };
+  }));
+
+  // Set (bring-your-own) or rotate a key's identity-verification secret. Pass { secret } to paste
+  // an existing secret — e.g. your Intercom Identity Verification secret, so the user_hash your
+  // backend already generates validates here with no code change (same HMAC-SHA256, same message).
+  // Omit it to rotate to a fresh random secret. Every previously-issued hash then needs recomputing.
+  app.post("/widget-keys/:key/identity-secret", tenanted(async (tenantId, req, reply) => {
+    const body = (req.body ?? {}) as { secret?: string };
+    if (body.secret !== undefined && (typeof body.secret !== "string" || body.secret.trim().length < 8)) {
+      return reply.code(400).send({ error: "secret must be at least 8 characters" });
+    }
+    const updated = await setIdentitySecret(tenantId, (req.params as { key: string }).key, body.secret);
+    if (!updated) return reply.code(404).send({ error: "not found" });
+    return { key: updated };
   }));
 }

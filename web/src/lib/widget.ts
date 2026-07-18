@@ -17,6 +17,8 @@ export interface WidgetConfig {
   greeting: string;
   position: "right" | "left";
   tabs: WidgetTabs;
+  /** Require a valid Intercom-style user_hash before trusting an identified visitor (opt-in). */
+  verifyIdentity: boolean;
 }
 
 export interface WidgetKey {
@@ -26,6 +28,8 @@ export interface WidgetKey {
   enabled: boolean;
   createdAt: string;
   config: WidgetConfig;
+  /** The identity-verification HMAC secret (shown only in-app; never shipped to the widget). */
+  identitySecret: string | null;
 }
 
 export const WIDGET_CONFIG_DEFAULTS: WidgetConfig = {
@@ -34,6 +38,7 @@ export const WIDGET_CONFIG_DEFAULTS: WidgetConfig = {
   greeting: "Hi there 👋  Ask a question for an instant answer, or browse our help center.",
   position: "right",
   tabs: { home: true, messages: true, help: true },
+  verifyIdentity: false,
 };
 
 export async function fetchWidgetKeys(): Promise<WidgetKey[]> {
@@ -61,4 +66,16 @@ export async function updateWidgetKey(
 
 export async function deleteWidgetKey(publicKey: string): Promise<void> {
   await api<{ ok: true }>(`/widget-keys/${encodeURIComponent(publicKey)}`, { method: "DELETE" });
+}
+
+/** Set (bring-your-own) or rotate a key's identity-verification secret. Pass `secret` to paste an
+ *  existing one — e.g. your Intercom Identity Verification secret, so the user_hash your backend
+ *  already emits validates unchanged. Omit it to rotate to a fresh random secret. */
+export async function setWidgetIdentitySecret(publicKey: string, secret?: string): Promise<WidgetKey> {
+  return (
+    await api<{ key: WidgetKey }>(`/widget-keys/${encodeURIComponent(publicKey)}/identity-secret`, {
+      method: "POST",
+      body: JSON.stringify(secret !== undefined ? { secret } : {}),
+    })
+  ).key;
 }

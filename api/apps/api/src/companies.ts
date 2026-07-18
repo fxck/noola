@@ -197,3 +197,71 @@ export async function deleteCompany(tenantId: string, id: string): Promise<boole
     return (r.rowCount ?? 0) > 0;
   });
 }
+
+export interface CompanyImportRow {
+  name: string;
+  domain?: string;
+  plan?: string;
+  attributes?: Record<string, unknown>;
+}
+
+/**
+ * Bulk import companies (CSV). Idempotent per row, keyed on lower(name) via the companies_name_uq
+ * index (migration 0055) — a re-import updates in place, never duplicates. Provided scalar fields
+ * overwrite (unless blank, which keeps the stored value) and attributes shallow-merge. One
+ * tenant-scoped transaction. Returns how many rows were inserted vs updated.
+ */
+export async function bulkUpsertCompanies(
+  tenantId: string,
+  rows: CompanyImportRow[],
+): Promise<{ created: number; updated: number }> {
+  return withTenant(tenantId, async (c) => {
+    let created = 0;
+    let updated = 0;
+    for (const r of rows) {
+      const name = (r.name ?? "").trim();
+      if (!name) continue;
+      const res = await c.query(
+        `INSERT INTO companies (tenant_id, name, domain, plan, attributes)
+         VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb))
+         ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET
+           domain = CASE WHEN COALESCE($2,'') = '' THEN companies.domain ELSE EXCLUDED.domain END,
+           plan = CASE WHEN COALESCE($3,'') = '' THEN companies.plan ELSE EXCLUDED.plan END,
+           attributes = companies.attributes || COALESCE($4::jsonb,'{}'::jsonb),
+           updated_at = now()
+         RETURNING (xmax = 0) AS created`,
+        [name, r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null],
+      );
+      if (res.rows[0].created) created++;
+      else updated++;
+    }
+    return { created, updated };
+  });
+}
+
+/**
+ * Resolve a set of company names → their ids, creating any that don't exist yet (keyed on
+ * lower(name)). The linking primitive behind the contacts importer: a person's free-text company
+ * becomes a real company_id FK. Returns a lower(name) → id map.
+ */
+export async function ensureCompaniesByName(
+  tenantId: string,
+  names: string[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const uniq = [...new Set(names.map((n) => (n ?? "").trim()).filter(Boolean))];
+  if (!uniq.length) return map;
+  return withTenant(tenantId, async (c) => {
+    for (const name of uniq) {
+      // DO UPDATE (no-op) instead of DO NOTHING so RETURNING yields the row on conflict too.
+      const r = await c.query(
+        `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
+         ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET name = companies.name
+         RETURNING id`,
+        [name],
+      );
+      map.set(name.toLowerCase(), r.rows[0].id as string);
+    }
+    return map;
+  });
+}

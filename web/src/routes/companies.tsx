@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, getRouteApi, useNavigate } from "@tanstack/react-router";
-import { Building2, Plus, ArrowLeft, Trash2, Activity, Users, Pencil } from "lucide-react";
+import { Building2, Plus, ArrowLeft, Trash2, Activity, Users, Pencil, Upload } from "lucide-react";
 import {
   type Company,
   type CompanyDetail,
@@ -11,6 +11,7 @@ import {
   createCompany,
   updateCompany,
   deleteCompany,
+  importCompaniesCsv,
 } from "@/lib/companies";
 import { relativeTime, initials, avatarHue } from "@/lib/tickets";
 import { api } from "@/lib/api";
@@ -219,6 +220,10 @@ export function CompaniesPage() {
   const [newDomain, setNewDomain] = useState("");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importCsv, setImportCsv] = useState("");
+  const [importFile, setImportFile] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const navigate = useNavigate();
 
   const load = () => {
@@ -233,6 +238,39 @@ export function CompaniesPage() {
     setNewDomain("");
     setFormError(null);
     setFormOpen(true);
+  }
+
+  function openImport() {
+    setImportCsv("");
+    setImportFile(null);
+    setImportOpen(true);
+  }
+
+  function onPickCsv(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportFile(file.name);
+    const reader = new FileReader();
+    reader.onload = () => setImportCsv(typeof reader.result === "string" ? reader.result : "");
+    reader.readAsText(file);
+  }
+
+  async function runImport() {
+    if (!importCsv.trim()) return;
+    setImporting(true);
+    try {
+      const r = await importCompaniesCsv(importCsv);
+      setImportOpen(false);
+      const parts = [`${r.created} created`, `${r.updated} updated`];
+      if (r.skipped) parts.push(`${r.skipped} skipped`);
+      toast.success(`Companies imported — ${parts.join(", ")}.`);
+      load();
+    } catch (e) {
+      const detail = (e as { detail?: string }).detail;
+      toast.error(detail || "Couldn't import that CSV. Check it has a 'name' column.");
+    } finally {
+      setImporting(false);
+    }
   }
 
   async function create() {
@@ -264,6 +302,9 @@ export function CompaniesPage() {
           <h1 className="text-sm font-semibold tracking-tight">Customers</h1>
           <CustomersViewSwitch current="companies" />
           <div className="ml-auto flex items-center gap-1.5">
+            <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" onClick={openImport}>
+              <Upload className="size-3.5" /> Import
+            </Button>
             <Button size="sm" variant="brand" className="h-8 gap-1.5 text-xs" onClick={openForm}>
               <Plus className="size-3.5" /> New company
             </Button>
@@ -318,6 +359,27 @@ export function CompaniesPage() {
           />
         </div>
         {formError && <p className="text-sm text-destructive">{formError}</p>}
+      </FormDialog>
+
+      <FormDialog
+        open={importOpen}
+        title="Import companies from CSV"
+        description="Map name, domain & plan automatically — every other column is kept as a custom attribute. Re-importing updates existing companies (matched by name)."
+        onClose={() => setImportOpen(false)}
+        onSubmit={() => void runImport()}
+        submitLabel={importing ? "Importing…" : "Import companies"}
+        submitDisabled={!importCsv.trim()}
+        busy={importing}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="co-csv">CSV file</Label>
+          <Input id="co-csv" type="file" accept=".csv,text/csv" onChange={onPickCsv} />
+          <p className="text-micro text-muted-foreground">
+            {importFile
+              ? `${importFile} — ${importCsv.split("\n").filter((l) => l.trim()).length - 1} row(s) ready`
+              : "Exported from Intercom or any tool with a header row. A 'name' column is required."}
+          </p>
+        </div>
       </FormDialog>
     </>
   );

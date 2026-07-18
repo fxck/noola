@@ -41,6 +41,11 @@ export interface ContactInputShape {
   company?: string;
   company_id?: string | null;
   attributes?: Record<string, unknown>;
+  /** Semantic fields the CSV importer maps onto real columns (Intercom parity). All optional;
+   *  written by upsertOne only, and only when provided (COALESCE keeps the stored value otherwise). */
+  avatar_url?: string | null;
+  unsubscribed_at?: string | null;
+  last_seen_at?: string | null;
 }
 
 export interface ListFilters {
@@ -465,41 +470,53 @@ async function upsertOne(
   c: import("pg").PoolClient,
   input: ContactInputShape,
 ): Promise<boolean> {
+  const cid = input.company_id ?? null;
+  const avatar = input.avatar_url ?? null;
+  const unsub = input.unsubscribed_at ?? null;
+  const seen = input.last_seen_at ?? null;
   if (input.external_id) {
     const r = await c.query(
-      `INSERT INTO contacts (tenant_id, external_id, email, name, company, attributes)
-       VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), COALESCE($5,'{}'::jsonb))
+      `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
+       VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $6, COALESCE($5,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz)
        ON CONFLICT (tenant_id, external_id) WHERE external_id IS NOT NULL
        DO UPDATE SET
          email = COALESCE(EXCLUDED.email, contacts.email),
          name = CASE WHEN $3 IS NULL THEN contacts.name ELSE EXCLUDED.name END,
          company = CASE WHEN $4 IS NULL THEN contacts.company ELSE EXCLUDED.company END,
+         company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
          attributes = contacts.attributes || COALESCE($5,'{}'::jsonb),
+         avatar_url = COALESCE(EXCLUDED.avatar_url, contacts.avatar_url),
+         unsubscribed_at = COALESCE(EXCLUDED.unsubscribed_at, contacts.unsubscribed_at),
+         last_seen_at = COALESCE(EXCLUDED.last_seen_at, contacts.last_seen_at),
          updated_at = now()
        RETURNING (xmax = 0) AS created`,
-      [input.external_id, input.email ?? null, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes)],
+      [input.external_id, input.email ?? null, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes), cid, avatar, unsub, seen],
     );
     return r.rows[0].created as boolean;
   }
   if (input.email) {
     const r = await c.query(
-      `INSERT INTO contacts (tenant_id, email, name, company, attributes)
-       VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), COALESCE($4,'{}'::jsonb))
+      `INSERT INTO contacts (tenant_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
+       VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), $5, COALESCE($4,'{}'::jsonb), $6, $7::timestamptz, $8::timestamptz)
        ON CONFLICT (tenant_id, lower(email)) WHERE email IS NOT NULL AND email <> ''
        DO UPDATE SET
          name = CASE WHEN $2 IS NULL THEN contacts.name ELSE EXCLUDED.name END,
          company = CASE WHEN $3 IS NULL THEN contacts.company ELSE EXCLUDED.company END,
+         company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
          attributes = contacts.attributes || COALESCE($4,'{}'::jsonb),
+         avatar_url = COALESCE(EXCLUDED.avatar_url, contacts.avatar_url),
+         unsubscribed_at = COALESCE(EXCLUDED.unsubscribed_at, contacts.unsubscribed_at),
+         last_seen_at = COALESCE(EXCLUDED.last_seen_at, contacts.last_seen_at),
          updated_at = now()
        RETURNING (xmax = 0) AS created`,
-      [input.email, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes)],
+      [input.email, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes), cid, avatar, unsub, seen],
     );
     return r.rows[0].created as boolean;
   }
   await c.query(
-    `INSERT INTO contacts (tenant_id, name, company, attributes)
-     VALUES (current_tenant(), COALESCE($1,''), COALESCE($2,''), COALESCE($3,'{}'::jsonb))`,
-    [input.name ?? null, input.company ?? null, jsonOrNull(input.attributes)],
+    `INSERT INTO contacts (tenant_id, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
+     VALUES (current_tenant(), COALESCE($1,''), COALESCE($2,''), $4, COALESCE($3,'{}'::jsonb), $5, $6::timestamptz, $7::timestamptz)`,
+    [input.name ?? null, input.company ?? null, jsonOrNull(input.attributes), cid, avatar, unsub, seen],
   );
   return true;
 }

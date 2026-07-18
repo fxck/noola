@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { MessagesSquare, Plus, Copy, Check, Trash2, Loader2, Home, MessageCircle, LifeBuoy } from "lucide-react";
+import {
+  MessagesSquare, Plus, Copy, Check, Trash2, Loader2, Home, MessageCircle, LifeBuoy,
+  ShieldCheck, KeyRound, RefreshCw, Eye, EyeOff,
+} from "lucide-react";
 import { toast } from "@/components/ui/toaster";
 import { SettingsPage } from "@/components/settings-page";
 import { Button } from "@/components/ui/button";
@@ -19,6 +22,7 @@ import {
   createWidgetKey,
   updateWidgetKey,
   deleteWidgetKey,
+  setWidgetIdentitySecret,
 } from "@/lib/widget";
 
 type Status = "loading" | "ready" | "error";
@@ -335,6 +339,14 @@ function MessengerEditor({
         </div>
       </div>
 
+      {/* Identity verification — Intercom-parity HMAC user_hash. */}
+      <IdentityVerificationCard
+        widgetKey={widgetKey}
+        verifyOn={cfg.verifyIdentity}
+        onToggle={(v) => set("verifyIdentity", v)}
+        onSecretChanged={onSaved}
+      />
+
       {/* Programmatic API reference — control/identify the widget from the host page. */}
       <WidgetApiReference />
 
@@ -358,6 +370,156 @@ function MessengerEditor({
             <Trash2 /> Delete key
           </Button>
         )}
+      </div>
+    </div>
+  );
+}
+
+function IdentityVerificationCard({
+  widgetKey,
+  verifyOn,
+  onToggle,
+  onSecretChanged,
+}: {
+  widgetKey: WidgetKey;
+  verifyOn: boolean;
+  onToggle: (v: boolean) => void;
+  onSecretChanged: (k: WidgetKey) => void;
+}) {
+  const secret = widgetKey.identitySecret ?? "";
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [byo, setByo] = useState("");
+  const [busy, setBusy] = useState<"save" | "rotate" | null>(null);
+
+  const masked = secret ? secret.slice(0, 6) + "•".repeat(Math.max(0, secret.length - 6)) : "—";
+
+  async function copySecret() {
+    try {
+      await navigator.clipboard.writeText(secret);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("Couldn't copy — reveal and copy it manually.");
+    }
+  }
+
+  async function applySecret(custom?: string) {
+    setBusy(custom !== undefined ? "save" : "rotate");
+    try {
+      const updated = await setWidgetIdentitySecret(widgetKey.publicKey, custom);
+      onSecretChanged(updated);
+      setByo("");
+      setRevealed(false);
+      toast.success(custom !== undefined ? "Secret saved." : "Secret rotated — update your server with the new value.");
+    } catch {
+      toast.error("Couldn't update the secret. Please try again.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Server-side snippet — signs the same JWT Intercom's current Messenger uses (HS256 with your
+  // Messenger API Secret). The secret is loaded from env, never inlined into client code.
+  const codeSnippet = [
+    'const jwt = require("jsonwebtoken");',
+    "// Server-side only — sign with your Messenger API Secret (the value shown above).",
+    "const token = jwt.sign(",
+    "  { user_id: currentUser.id, email: currentUser.email },",
+    "  process.env.NOOLA_IDENTITY_SECRET,   // === your Intercom Messenger API Secret",
+    '  { algorithm: "HS256" },',
+    ");",
+    "",
+    "// then on the page (drop-in for Intercom's intercom_user_jwt):",
+    '//   Noola("boot", { intercom_user_jwt: token })',
+  ].join("\n");
+
+  return (
+    <div className="space-y-3 rounded-xl border p-4">
+      <div className="flex items-start gap-3">
+        <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
+          <ShieldCheck className="size-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold">Identity verification</h3>
+          </div>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Prove a visitor is who they claim before showing their conversation history. Your server signs a
+            token with a shared secret and passes it to the widget as{" "}
+            <code className="font-mono text-micro">intercom_user_jwt</code> — a spoofed{" "}
+            <code className="font-mono text-micro">user_id</code> can't read someone else's chats.
+          </p>
+        </div>
+        <Switch checked={verifyOn} onCheckedChange={onToggle} aria-label="Require identity verification" />
+      </div>
+
+      {/* Secret */}
+      <div className="space-y-1.5 rounded-lg border bg-muted/30 p-3">
+        <Label className="flex items-center gap-1.5 text-micro uppercase tracking-wide text-muted-foreground">
+          <KeyRound className="size-3.5" /> Identity verification secret
+        </Label>
+        <div className="flex items-center gap-2">
+          <code className="min-w-0 flex-1 truncate rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs">
+            {revealed ? secret || "—" : masked}
+          </code>
+          <Button type="button" variant="ghost" size="icon" className="shrink-0" aria-label={revealed ? "Hide secret" : "Reveal secret"} onClick={() => setRevealed((v) => !v)}>
+            {revealed ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+          </Button>
+          <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => void copySecret()}>
+            {copied ? <><Check className="text-success" /> Copied</> : <><Copy /> Copy</>}
+          </Button>
+        </div>
+        <p className="text-micro text-muted-foreground">
+          Keep this on your server only. Rotating it invalidates every previously-issued <code className="font-mono">user_hash</code>.
+        </p>
+      </div>
+
+      {/* Already on Intercom? Bring your own secret. */}
+      <div className="space-y-1.5">
+        <Label htmlFor="byo-secret" className="text-xs">Already using Intercom?</Label>
+        <div className="flex items-start gap-2">
+          <Input
+            id="byo-secret"
+            value={byo}
+            onChange={(e) => setByo(e.target.value)}
+            placeholder="Paste your Intercom Messenger API Secret"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-mono text-xs"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={byo.trim().length < 8 || busy !== null}
+            onClick={() => void applySecret(byo.trim())}
+          >
+            {busy === "save" ? <Loader2 className="animate-spin motion-reduce:animate-none" /> : "Use this secret"}
+          </Button>
+        </div>
+        <p className="text-micro text-muted-foreground">
+          Noola verifies the <strong>same signed JWT</strong> Intercom's Messenger uses (
+          <code className="font-mono">intercom_user_jwt</code>, HS256). Paste your{" "}
+          <strong>Messenger API Secret</strong> and pass the token your backend already generates —{" "}
+          <strong>no server changes</strong>. (The legacy <code className="font-mono">user_hash</code> HMAC is
+          accepted too.)
+        </p>
+      </div>
+
+      {/* Server snippet */}
+      <div className="space-y-1.5">
+        <Label className="text-xs">Compute the hash on your server</Label>
+        <pre className="overflow-x-auto rounded-md border border-input bg-background p-3 text-micro leading-relaxed">
+          {codeSnippet}
+        </pre>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <Button type="button" variant="ghost" size="sm" className="text-muted-foreground" disabled={busy !== null} onClick={() => void applySecret()}>
+          {busy === "rotate" ? <Loader2 className="animate-spin motion-reduce:animate-none" /> : <RefreshCw />} Rotate secret
+        </Button>
       </div>
     </div>
   );

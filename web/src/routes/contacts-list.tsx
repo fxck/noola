@@ -866,7 +866,8 @@ export function ContactsPage() {
           onDone={(res) => {
             setImportOpen(false);
             const skipped = res.skipped ? `, ${res.skipped} skipped` : "";
-            toast.success(`Imported — ${res.created} created, ${res.updated} updated${skipped}.`);
+            const linked = res.linked ? `, ${res.linked} linked to companies` : "";
+            toast.success(`Imported — ${res.created} created, ${res.updated} updated${linked}${skipped}.`);
             resetPage();
             reload();
           }}

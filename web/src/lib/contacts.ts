@@ -229,8 +229,8 @@ export async function bulkImportContacts(
  *  free-form attribute columns onto the same idempotent upsert. Returns per-outcome counts. */
 export async function importContactsCsv(
   csv: string,
-): Promise<{ created: number; updated: number; skipped: number }> {
-  return api<{ created: number; updated: number; skipped: number }>("/contacts/import", {
+): Promise<{ created: number; updated: number; skipped: number; linked?: number }> {
+  return api<{ created: number; updated: number; skipped: number; linked?: number }>("/contacts/import", {
     method: "POST",
     body: JSON.stringify({ csv }),
   });

@@ -10,7 +10,7 @@ import {
   upsertContact, bulkUpsertContacts, contactHistory, mergeContacts, listContactIdentities,
 } from "../contacts.js";
 import { recordContactEvent, listContactEvents } from "../contact-events.js";
-import { listCompanies, getCompany, createCompany, updateCompany, deleteCompany } from "../companies.js";
+import { listCompanies, getCompany, createCompany, updateCompany, deleteCompany, bulkUpsertCompanies, ensureCompaniesByName } from "../companies.js";
 import { listCompanyCustomValues, putCompanyCustomValues } from "../customfields.js";
 import {
   listFeatureRequests, getFeatureRequest, createFeatureRequest, updateFeatureRequest,
@@ -20,7 +20,7 @@ import { listSegments, getSegment, createSegment, updateSegment, deleteSegment }
 import { recordAudit } from "../audit.js";
 import { exportContactData, eraseContact } from "../governance.js";
 import { roleAtLeast } from "../rbac.js";
-import { parseCsvContacts } from "../csv-import.js";
+import { parseCsvContacts, parseCsvCompanies } from "../csv-import.js";
 
 // The customer-directory surfaces: contacts (people), companies (accounts + health), feature
 // requests (voice-of-customer with ticket evidence), and saved segments (reusable filters).
@@ -181,12 +181,20 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
     const parsed = parseCsvContacts(b.csv);
     if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
     if (!parsed.rows.length) return reply.code(400).send({ error: "no importable rows found" });
+    // Connect people to accounts: resolve each row's free-text company name → a real company_id
+    // (creating the company if it's new), so imported contacts land linked, not just labeled.
+    const companyMap = await ensureCompaniesByName(tenantId, parsed.rows.map((r) => r.company ?? ""));
+    let linked = 0;
+    for (const r of parsed.rows) {
+      const id = r.company ? companyMap.get(r.company.trim().toLowerCase()) : undefined;
+      if (id) { r.company_id = id; linked++; }
+    }
     const result = await bulkUpsertContacts(tenantId, parsed.rows);
     await recordAudit(tenantId, {
       actorId: req.session?.userId ?? null, action: "contacts.imported", entityType: "contact",
-      meta: { created: result.created, updated: result.updated, skipped: parsed.skipped },
+      meta: { created: result.created, updated: result.updated, skipped: parsed.skipped, linked },
     }).catch(() => {});
-    return { ...result, skipped: parsed.skipped };
+    return { ...result, skipped: parsed.skipped, linked };
   }));
 
   app.get("/contacts/:id/history", tenanted(async (tenantId, req, reply) => {
@@ -260,6 +268,25 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
       if ((e as { code?: string }).code === "23505") return reply.code(409).send({ error: "a company with that name already exists" });
       throw e;
     }
+  }));
+
+  // CSV import (Intercom migration): header-mapped company rows, keyed idempotently on lower(name).
+  // Body is the raw CSV text (the SPA reads the file client-side); returns per-outcome counts. Run
+  // this BEFORE the contacts import so people link to already-provisioned accounts (though the
+  // contacts import also create-if-missing links, so order is convenience, not a hard requirement).
+  app.post("/companies/import", tenanted(async (tenantId, req, reply) => {
+    const b = (req.body ?? {}) as Partial<{ csv: string }>;
+    if (!b.csv || typeof b.csv !== "string") return reply.code(400).send({ error: "csv text is required" });
+    if (b.csv.length > 5_000_000) return reply.code(413).send({ error: "csv too large (5MB max)" });
+    const parsed = parseCsvCompanies(b.csv);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    if (!parsed.rows.length) return reply.code(400).send({ error: "no importable rows found" });
+    const result = await bulkUpsertCompanies(tenantId, parsed.rows);
+    await recordAudit(tenantId, {
+      actorId: req.session?.userId ?? null, action: "companies.imported", entityType: "company",
+      meta: { created: result.created, updated: result.updated, skipped: parsed.skipped },
+    }).catch(() => {});
+    return { ...result, skipped: parsed.skipped };
   }));
 
   app.patch("/companies/:id", tenanted(async (tenantId, req, reply) => {

@@ -45,7 +45,7 @@ export const WIDGET_JS = String.raw`(function () {
   var configLoaded = false;
 
   // ---- identity + conversations (persisted per key) ----
-  var identity = { email: null, name: null, user_id: null, company: null, attributes: {} };
+  var identity = { email: null, name: null, user_id: null, user_hash: null, user_jwt: null, company: null, attributes: {} };
   var convs = [];                 // [{ id, escalated, updatedAt, unread, msgs:[{role,body,id,at}] }]
   var view = 'home';              // home | messages | help | thread | article
   var threadId = null;            // conversation id when view === 'thread'
@@ -68,10 +68,10 @@ export const WIDGET_JS = String.raw`(function () {
 
   function loadIdentity() {
     var s = loadJSON(skey('ident'), null);
-    if (s && typeof s === 'object') identity = { email: s.email || null, name: s.name || null, user_id: s.user_id || null, company: s.company || null, attributes: s.attributes || {} };
+    if (s && typeof s === 'object') identity = { email: s.email || null, name: s.name || null, user_id: s.user_id || null, user_hash: s.user_hash || null, user_jwt: s.user_jwt || null, company: s.company || null, attributes: s.attributes || {} };
   }
   function saveIdentity() { saveJSON(skey('ident'), identity); }
-  function isIdentified() { return !!(identity.email || identity.user_id); }
+  function isIdentified() { return !!(identity.email || identity.user_id || identity.user_jwt); }
 
   function loadConvs() {
     convs = loadJSON(skey('convs'), null) || [];
@@ -98,8 +98,8 @@ export const WIDGET_JS = String.raw`(function () {
   // server conversation becomes a stub with a one-line preview; opening it hydrates the full transcript.
   var serverConvsSynced = false;
   function syncServerConvs(cb) {
-    if (!identity.email) { if (cb) cb(false); return; }
-    fetch(API + '/public/conversations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, email: identity.email }) })
+    if (!identity.email && !identity.user_id && !identity.user_jwt) { if (cb) cb(false); return; }
+    fetch(API + '/public/conversations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, email: identity.email || undefined, userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined }) })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         if (!d || !d.conversations) { if (cb) cb(false); return; }
@@ -995,6 +995,9 @@ export const WIDGET_JS = String.raw`(function () {
     if (files.length) body.attachments = files.map(function (f) { return { dataUrl: f.dataUrl, filename: f.filename }; });
     if (identity.email) body.email = identity.email;
     if (identity.name) body.name = identity.name;
+    if (identity.user_id) body.userId = identity.user_id;
+    if (identity.user_hash) body.userHash = identity.user_hash;
+    if (identity.user_jwt) body.userJwt = identity.user_jwt;
     var unbusy = function () { busy = false; var sb = sel('#send'); if (sb) sb.disabled = false; syncSendState(); var qq = sel('#q'); if (qq) qq.focus(); };
     trackActivity('conversation_message', { conversationId: convId });
 
@@ -1133,6 +1136,9 @@ export const WIDGET_JS = String.raw`(function () {
     var b = { key: KEY, question: 'I’d like to talk to a human, please.', conversationId: convId, escalate: true };
     if (identity.email) b.email = identity.email;
     if (identity.name) b.name = identity.name;
+    if (identity.user_id) b.userId = identity.user_id;
+    if (identity.user_hash) b.userHash = identity.user_hash;
+    if (identity.user_jwt) b.userJwt = identity.user_jwt;
     trackActivity('requested_human', { conversationId: convId });
     fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) })
       .then(function () {
@@ -1275,13 +1281,19 @@ export const WIDGET_JS = String.raw`(function () {
   }
 
   // ---- identity / activity SDK plumbing ----
-  var KNOWN = { key: 1, api: 1, api_base: 1, email: 1, name: 1, user_id: 1, userId: 1, company: 1 };
+  var KNOWN = { key: 1, api: 1, api_base: 1, email: 1, name: 1, user_id: 1, userId: 1, user_hash: 1, userHash: 1, user_jwt: 1, userJwt: 1, intercom_user_jwt: 1, company: 1 };
   function ingestIdentity(opts) {
     if (!opts || typeof opts !== 'object') return;
     if (typeof opts.email === 'string') identity.email = opts.email;
     if (typeof opts.name === 'string') identity.name = opts.name;
     var uid = opts.user_id != null ? opts.user_id : opts.userId;
     if (uid != null) identity.user_id = String(uid);
+    // Intercom-parity identity proof — the CURRENT signed JWT (intercom_user_jwt / user_jwt) OR the
+    // LEGACY HMAC user_hash. Either is passed straight through to the api, which verifies it.
+    var uh = opts.user_hash != null ? opts.user_hash : opts.userHash;
+    if (uh != null) identity.user_hash = String(uh);
+    var jwt = opts.intercom_user_jwt != null ? opts.intercom_user_jwt : (opts.user_jwt != null ? opts.user_jwt : opts.userJwt);
+    if (jwt != null) identity.user_jwt = String(jwt);
     if (typeof opts.company === 'string') identity.company = opts.company;
     for (var k in opts) { if (opts.hasOwnProperty(k) && !KNOWN[k]) identity.attributes[k] = opts[k]; }
     saveIdentity();
@@ -1292,14 +1304,15 @@ export const WIDGET_JS = String.raw`(function () {
     var attrs = {}; for (var k in identity.attributes) if (identity.attributes.hasOwnProperty(k)) attrs[k] = identity.attributes[k];
     if (extra) for (var k2 in extra) if (extra.hasOwnProperty(k2)) attrs[k2] = extra[k2];
     fetch(API + '/public/identify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      key: KEY, email: identity.email || undefined, name: identity.name || undefined, user_id: identity.user_id || undefined,
+      key: KEY, email: identity.email || undefined, name: identity.name || undefined,
+      userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined,
       company: identity.company || undefined, attributes: attrs, page: currentPage()
     }) }).catch(function () {});
   }
   function trackActivity(name, metadata) {
     if (!isIdentified() || !KEY) return;
     fetch(API + '/public/track', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      key: KEY, email: identity.email || undefined, user_id: identity.user_id || undefined, name: name, metadata: metadata || {}
+      key: KEY, email: identity.email || undefined, userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined, name: name, metadata: metadata || {}
     }) }).catch(function () {});
   }
 
@@ -1343,7 +1356,7 @@ export const WIDGET_JS = String.raw`(function () {
       case 'close': { closePanel(); break; }
       case 'shutdown': {
         try { localStorage.removeItem(skey('ident')); localStorage.removeItem(skey('convs')); } catch (e) {}
-        identity = { email: null, name: null, user_id: null, company: null, attributes: {} };
+        identity = { email: null, name: null, user_id: null, user_hash: null, user_jwt: null, company: null, attributes: {} };
         convs = []; threadId = null; activeConvId = null; stopPoll(); closeWS();
         closePanel(); renderBadge();
         break;
