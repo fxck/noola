@@ -19,6 +19,7 @@ import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
+import { deriveContactContext } from "../enrich.js";
 import { listPublicArticles, listPublicCollections, getPublicArticleBySlug, searchPublicArticles } from "../kb.js";
 import { WIDGET_JS } from "../widget-embed.js";
 import { ANSWERS_JS } from "../answers-embed.js";
@@ -431,6 +432,14 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const merged: Record<string, unknown> = { ...(attributes ?? {}), last_seen_at: new Date().toISOString() };
     if (page?.url) merged.last_page_url = page.url;
     if (page?.title) merged.last_page_title = page.title;
+    // Live enrichment (Intercom-parity): browser/OS from UA, language from header, timezone +
+    // referrer from the widget, geo from IP — written under Intercom's display-name keys so they
+    // overwrite the imported snapshot in place. Best-effort: never fails the identify.
+    Object.assign(merged, await deriveContactContext(req, {
+      timezone: parsed.data.timezone,
+      referrer: parsed.data.referrer,
+      language: parsed.data.language,
+    }));
     const { contact } = await upsertContact(wk.tenantId, {
       external_id: rid.userId ?? undefined,
       email: rid.email ?? undefined,

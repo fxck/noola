@@ -902,6 +902,11 @@ export const PublicIdentifyInput = z.object({
   company: z.string().trim().max(200).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
   page: z.object({ url: z.string().max(2048).optional(), title: z.string().max(500).optional() }).optional(),
+  // Live-enrichment signals the widget reports (the browser knows them exactly); the server derives
+  // browser/OS/geo from headers + IP. Optional — an old embed simply omits them.
+  timezone: z.string().trim().max(64).optional(),
+  referrer: z.string().trim().max(2048).optional(),
+  language: z.string().trim().max(64).optional(),
   // Intercom-parity identity proof: signed JWT (intercom_user_jwt) or legacy user_hash HMAC.
   userHash: z.string().trim().min(1).max(128).optional(),
   userJwt: z.string().trim().min(1).max(8192).optional(),

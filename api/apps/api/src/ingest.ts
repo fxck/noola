@@ -288,6 +288,19 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
       [ticketId, whoseTurn, retarget, msgChannelType, msgExternal],
     );
 
+    // "Last contacted" (Intercom-parity): an outbound (non-customer) message stamps the ticket's
+    // contact — the last time WE reached out. Written under Intercom's display key; no-op when the
+    // ticket has no contact (e.g. a channel-post with no resolved person).
+    if (input.authorType !== "customer") {
+      await c.query(
+        `UPDATE contacts
+            SET attributes = COALESCE(attributes, '{}'::jsonb) || jsonb_build_object('Last contacted', now()::text)
+           FROM tickets t
+          WHERE t.id = $1 AND contacts.id = t.contact_id`,
+        [ticketId],
+      );
+    }
+
     // transactional outbox — same txn as the write; the relay publishes later.
     const envelope = {
       id: messageId,

@@ -71,6 +71,14 @@ export async function trackOpen(tenantId: string, recipientId: string): Promise<
     await c.query("UPDATE broadcast_recipients SET opened_at = COALESCE(opened_at, now()) WHERE id = $1", [
       recipientId,
     ]);
+    // Intercom-parity "Last opened email" on the recipient's contact (RLS scopes the join).
+    await c.query(
+      `UPDATE contacts
+          SET attributes = COALESCE(attributes, '{}'::jsonb) || jsonb_build_object('Last opened email', now()::text)
+         FROM broadcast_recipients br
+        WHERE br.id = $1 AND contacts.id = br.contact_id`,
+      [recipientId],
+    );
   });
 }
 
@@ -79,6 +87,15 @@ export async function trackClick(tenantId: string, recipientId: string): Promise
   await withTenant(tenantId, async (c) => {
     await c.query(
       "UPDATE broadcast_recipients SET clicked_at = COALESCE(clicked_at, now()), opened_at = COALESCE(opened_at, now()) WHERE id = $1",
+      [recipientId],
+    );
+    // Intercom-parity "Last clicked on link in email" (+ implied open) on the contact.
+    await c.query(
+      `UPDATE contacts
+          SET attributes = COALESCE(attributes, '{}'::jsonb)
+                           || jsonb_build_object('Last clicked on link in email', now()::text, 'Last opened email', now()::text)
+         FROM broadcast_recipients br
+        WHERE br.id = $1 AND contacts.id = br.contact_id`,
       [recipientId],
     );
   });

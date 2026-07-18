@@ -1299,14 +1299,22 @@ export const WIDGET_JS = String.raw`(function () {
     saveIdentity();
   }
   function currentPage() { return { url: location.href, title: document.title }; }
+  // Live-enrichment signals the browser knows exactly (Intercom-parity): timezone, arrival
+  // referrer, UI language. The server derives browser/OS/geo from the request itself.
+  function clientCtx() {
+    var tz; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+    return { timezone: tz || undefined, referrer: document.referrer || undefined, language: (navigator && navigator.language) || undefined };
+  }
   function sendIdentify(extra) {
     if (!isIdentified() || !KEY) return;
     var attrs = {}; for (var k in identity.attributes) if (identity.attributes.hasOwnProperty(k)) attrs[k] = identity.attributes[k];
     if (extra) for (var k2 in extra) if (extra.hasOwnProperty(k2)) attrs[k2] = extra[k2];
+    var cc = clientCtx();
     fetch(API + '/public/identify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
       key: KEY, email: identity.email || undefined, name: identity.name || undefined,
       userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined,
-      company: identity.company || undefined, attributes: attrs, page: currentPage()
+      company: identity.company || undefined, attributes: attrs, page: currentPage(),
+      timezone: cc.timezone, referrer: cc.referrer, language: cc.language
     }) }).catch(function () {});
   }
   function trackActivity(name, metadata) {

@@ -313,8 +313,21 @@ export async function getContact(tenantId: string, id: string): Promise<ContactR
  *  from this at read time, so no disconnect hook is needed. Fire-and-forget at call sites. */
 export async function bumpContactSeen(tenantId: string, contactId: string): Promise<void> {
   await withTenant(tenantId, async (c) => {
+    // Presence + session counting in one write (Intercom-parity "Web sessions"): a touch after a
+    // 30-min inactivity gap (or the first touch) starts a new session and increments the counter,
+    // stored under Intercom's "Web sessions" key so it overwrites the imported snapshot in place.
+    // The regexp guard tolerates a non-numeric imported value without aborting the update.
     await c.query(
-      `UPDATE contacts SET last_seen_at = now()
+      `UPDATE contacts
+          SET last_seen_at = now(),
+              attributes = jsonb_set(
+                COALESCE(attributes, '{}'::jsonb),
+                '{Web sessions}',
+                to_jsonb(
+                  COALESCE(NULLIF(regexp_replace(COALESCE(attributes->>'Web sessions', ''), '\\D', '', 'g'), '')::int, 0)
+                  + CASE WHEN last_seen_at IS NULL OR last_seen_at < now() - interval '30 minutes' THEN 1 ELSE 0 END
+                )
+              )
         WHERE id = $1 AND (last_seen_at IS NULL OR last_seen_at < now() - interval '60 seconds')`,
       [contactId],
     );
