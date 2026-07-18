@@ -152,10 +152,10 @@ export function ContactDetail({
     setCompanyId(null);
     if (!companyName) return;
     let live = true;
-    fetchCompanies(companyName)
-      .then((list) => {
+    fetchCompanies({ q: companyName, limit: 50 })
+      .then(({ companies }) => {
         if (!live) return;
-        const hit = list.find((co) => co.name.toLowerCase() === companyName.toLowerCase());
+        const hit = companies.find((co) => co.name.toLowerCase() === companyName.toLowerCase());
         if (hit) setCompanyId(hit.id);
       })
       .catch(() => {});

@@ -46,6 +46,8 @@ export interface ContactInputShape {
   avatar_url?: string | null;
   unsubscribed_at?: string | null;
   last_seen_at?: string | null;
+  /** "Customer since" — from Intercom's Signed up / First Seen. Backfills the real created_at. */
+  created_at?: string | null;
 }
 
 export interface ListFilters {
@@ -485,6 +487,7 @@ async function upsertOne(
   const avatar = input.avatar_url ?? null;
   const unsub = input.unsubscribed_at ?? null;
   const seen = input.last_seen_at ?? null;
+  const created = input.created_at ?? null;
 
   let id: string | null = null;
   if (ext) {
@@ -512,17 +515,18 @@ async function upsertOne(
          external_id = CASE WHEN $10::text IS NOT NULL AND NOT EXISTS
                    (SELECT 1 FROM contacts x WHERE x.id <> $1 AND x.external_id = $10::text)
                  THEN $10::text ELSE external_id END,
+         created_at = COALESCE($11::timestamptz, created_at),
          updated_at = now()
        WHERE id = $1`,
-      [id, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, email, ext],
+      [id, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, email, ext, created],
     );
     return false;
   }
 
   await c.query(
-    `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at)
-     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz)`,
-    [ext, email, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen],
+    `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at, created_at)
+     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz, COALESCE($10::timestamptz, now()))`,
+    [ext, email, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, created],
   );
   return true;
 }

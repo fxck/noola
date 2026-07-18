@@ -445,7 +445,7 @@ function CustomerChannelsSection() {
   const [loadError, setLoadError] = useState(false);
 
   useEffect(() => {
-    Promise.all([fetchDiscordChannelsConfig(), fetchCompanies().catch(() => [])])
+    Promise.all([fetchDiscordChannelsConfig(), fetchCompanies({ limit: 200 }).then((r) => r.companies).catch(() => [])])
       .then(([c, cos]) => {
         setCfg(c);
         setCompanies(cos);

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, getRouteApi, useNavigate } from "@tanstack/react-router";
-import { Building2, Plus, ArrowLeft, Trash2, Activity, Users, Pencil, Upload } from "lucide-react";
+import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight } from "lucide-react";
 import {
   type Company,
   type CompanyDetail,
@@ -32,21 +32,16 @@ import { CustomersViewSwitch } from "@/components/customers/view-switch";
 import {
   useReactTable,
   getCoreRowModel,
-  getFilteredRowModel,
-  getSortedRowModel,
-  getFacetedRowModel,
-  getFacetedUniqueValues,
   createColumnHelper,
   type ColumnDef,
   type SortingState,
-  type ColumnFiltersState,
+  type PaginationState,
+  type OnChangeFn,
 } from "@tanstack/react-table";
 import { DataTableRT } from "@/components/data-table/data-table-rt";
-import { DataTableToolbar, ResultCount, type FacetConfig } from "@/components/data-table/data-table-toolbar";
+import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
 import { DataTableEmpty } from "@/components/data-table/states";
 import { EntityCell, StatePill, MetricDrillCell, type PillTone } from "@/components/data-table/cells";
-import { SegmentBar } from "@/components/data-table/segment-bar";
-import { type SegmentDefinition } from "@/lib/segments";
 import { cn } from "@/lib/utils";
 
 // Companies — first-class account records with a rolled-up health score. The directory surfaces the
@@ -135,70 +130,61 @@ function buildCompanyColumns(): ColumnDef<Company, any>[] {
   ];
 }
 
-const COMPANY_HEALTH_FACET: FacetConfig = {
-  columnId: "health",
-  label: "Health",
-  icon: Activity,
-  staticOptions: [
-    { value: "critical", label: "Critical" },
-    { value: "at_risk", label: "At risk" },
-    { value: "healthy", label: "Healthy" },
-  ],
-};
+const PAGE_SIZE = 50;
 
-function CompaniesTable({ companies, onOpen }: { companies: Company[]; onOpen: (c: Company) => void }) {
-  const [sorting, setSorting] = useState<SortingState>([{ id: "health", desc: false }]); // worst-first
-  const [globalFilter, setGlobalFilter] = useState("");
-  const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-  const [columnVisibility, setColumnVisibility] = useState({});
+// Server-paginated companies table: `companies` is only the current page; `total` is the server's
+// match count. Sorting/search/pagination are controlled by the parent and drive a refetch.
+function CompaniesTable({
+  companies,
+  total,
+  loading,
+  onOpen,
+  sorting,
+  onSortingChange,
+  pagination,
+  onPaginationChange,
+  search,
+  onSearchChange,
+}: {
+  companies: Company[];
+  total: number;
+  loading: boolean;
+  onOpen: (c: Company) => void;
+  sorting: SortingState;
+  onSortingChange: OnChangeFn<SortingState>;
+  pagination: PaginationState;
+  onPaginationChange: OnChangeFn<PaginationState>;
+  search: string;
+  onSearchChange: (v: string) => void;
+}) {
   const columns = useMemo(() => buildCompanyColumns(), []);
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const table = useReactTable({
     data: companies,
     columns,
-    getCoreRowModel: getCoreRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFacetedRowModel: getFacetedRowModel(),
-    getFacetedUniqueValues: getFacetedUniqueValues(),
     getRowId: (c) => c.id,
-    state: { sorting, globalFilter, columnFilters, columnVisibility },
-    onSortingChange: setSorting,
-    onGlobalFilterChange: setGlobalFilter,
-    onColumnFiltersChange: setColumnFilters,
-    onColumnVisibilityChange: setColumnVisibility,
-    globalFilterFn: (row, _id, value: string) => {
-      const c = row.original;
-      const v = String(value).toLowerCase();
-      return c.name.toLowerCase().includes(v) || (c.domain || "").toLowerCase().includes(v);
-    },
+    state: { sorting, pagination },
+    manualSorting: true,
+    manualPagination: true,
+    manualFiltering: true,
+    pageCount,
+    autoResetPageIndex: false,
+    onSortingChange,
+    onPaginationChange,
+    getCoreRowModel: getCoreRowModel(),
   });
-  const rows = table.getRowModel().rows;
-  const isFiltered = globalFilter.trim().length > 0 || columnFilters.length > 0;
-  const definition: SegmentDefinition = useMemo(
-    () => ({ q: globalFilter || undefined, sortBy: sorting[0]?.id, sortDir: sorting[0]?.desc ? "desc" : "asc" }),
-    [globalFilter, sorting],
-  );
-  const applyDefinition = (def: SegmentDefinition) => {
-    setGlobalFilter(def.q ?? "");
-    if (def.sortBy) setSorting([{ id: def.sortBy, desc: def.sortDir !== "asc" }]);
-  };
+  const from = total === 0 ? 0 : pagination.pageIndex * PAGE_SIZE + 1;
+  const to = pagination.pageIndex * PAGE_SIZE + companies.length;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
-        <ResultCount count={rows.length} noun="companies" />
-        <SegmentBar resource="companies" definition={definition} onApply={applyDefinition} />
+      <div className="px-4 py-2">
+        <DataTableToolbar table={table} search={search} onSearchChange={onSearchChange} facets={[]} searchPlaceholder="Search companies…" />
       </div>
-      <div className="px-4 pb-2">
-        <DataTableToolbar table={table} search={globalFilter} onSearchChange={setGlobalFilter} facets={[COMPANY_HEALTH_FACET]} searchPlaceholder="Search companies…" />
-      </div>
-      {rows.length === 0 ? (
+      {total === 0 && !loading ? (
         <DataTableEmpty
-          isFiltered={isFiltered}
-          onClearFilters={() => {
-            setGlobalFilter("");
-            table.resetColumnFilters();
-          }}
+          isFiltered={search.trim().length > 0}
+          onClearFilters={() => onSearchChange("")}
           icon={Building2}
           title="No companies yet"
           description="Roll accounts up from your contacts, or add one directly."
@@ -208,13 +194,36 @@ function CompaniesTable({ companies, onOpen }: { companies: Company[]; onOpen: (
           <DataTableRT table={table} onRowClick={onOpen} />
         </div>
       )}
+      {total > 0 && (
+        <div className="flex shrink-0 items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
+          <span className="tabular-nums">
+            {from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()}
+          </span>
+          <div className="flex items-center gap-1">
+            <Button variant="outline" size="icon" className="size-7" disabled={!table.getCanPreviousPage() || loading} onClick={() => table.previousPage()} aria-label="Previous page">
+              <ChevronLeft className="size-4" />
+            </Button>
+            <Button variant="outline" size="icon" className="size-7" disabled={!table.getCanNextPage() || loading} onClick={() => table.nextPage()} aria-label="Next page">
+              <ChevronRight className="size-4" />
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 export function CompaniesPage() {
-  const [companies, setCompanies] = useState<Company[] | null>(null);
+  const [companies, setCompanies] = useState<Company[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [firstLoad, setFirstLoad] = useState(true);
   const [error, setError] = useState(false);
+  const [q, setQ] = useState("");
+  const [debouncedQ, setDebouncedQ] = useState("");
+  const [sorting, setSorting] = useState<SortingState>([{ id: "name", desc: false }]);
+  const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize: PAGE_SIZE });
+  const [reloadSignal, setReloadSignal] = useState(0);
   const [formOpen, setFormOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [newDomain, setNewDomain] = useState("");
@@ -225,13 +234,36 @@ export function CompaniesPage() {
   const [importFile, setImportFile] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const navigate = useNavigate();
+  const reload = () => setReloadSignal((n) => n + 1);
 
-  const load = () => {
-    setCompanies(null);
+  // Debounce the search box.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQ(q.trim()), 300);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  const resetPage = () => setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }));
+  // A re-sorted or re-filtered set makes a page-N view meaningless — jump back to page 1.
+  const handleSortingChange: OnChangeFn<SortingState> = (updater) => { setSorting(updater); resetPage(); };
+  useEffect(() => { resetPage(); }, [debouncedQ]);
+
+  // Fetch the current page whenever the query, sort, or page changes.
+  useEffect(() => {
+    let live = true;
+    setLoading(true);
     setError(false);
-    fetchCompanies().then(setCompanies).catch(() => setError(true));
-  };
-  useEffect(() => load(), []);
+    fetchCompanies({
+      q: debouncedQ || undefined,
+      sort: sorting[0]?.id,
+      dir: sorting[0]?.desc ? "desc" : "asc",
+      limit: PAGE_SIZE,
+      offset: pagination.pageIndex * PAGE_SIZE,
+    })
+      .then((r) => { if (!live) return; setCompanies(r.companies); setTotal(r.total); })
+      .catch(() => { if (live) setError(true); })
+      .finally(() => { if (live) { setLoading(false); setFirstLoad(false); } });
+    return () => { live = false; };
+  }, [debouncedQ, sorting, pagination.pageIndex, reloadSignal]);
 
   function openForm() {
     setNewName("");
@@ -264,7 +296,7 @@ export function CompaniesPage() {
       const parts = [`${r.created} created`, `${r.updated} updated`];
       if (r.skipped) parts.push(`${r.skipped} skipped`);
       toast.success(`Companies imported — ${parts.join(", ")}.`);
-      load();
+      reload();
     } catch (e) {
       const detail = (e as { detail?: string }).detail;
       toast.error(detail || "Couldn't import that CSV. Check it has a 'name' column.");
@@ -282,10 +314,10 @@ export function CompaniesPage() {
     setSaving(true);
     setFormError(null);
     try {
-      const c = await createCompany({ name, domain: newDomain.trim() || undefined });
+      await createCompany({ name, domain: newDomain.trim() || undefined });
       setFormOpen(false);
       toast.success("Company created.");
-      setCompanies((prev) => (prev ? [c, ...prev] : [c]));
+      reload();
     } catch (e) {
       const conflict = (e as { status?: number }).status === 409;
       setFormError(conflict ? "A company with that name already exists." : "Couldn't create the company. Please try again.");
@@ -311,14 +343,22 @@ export function CompaniesPage() {
           </div>
         </header>
 
-        {error ? (
-          <ErrorState title="Couldn't load companies" onRetry={() => load()} />
-        ) : !companies ? (
+        {error && firstLoad ? (
+          <ErrorState title="Couldn't load companies" onRetry={reload} />
+        ) : firstLoad ? (
           <RowsSkeleton rows={8} />
         ) : (
           <CompaniesTable
             companies={companies}
+            total={total}
+            loading={loading}
             onOpen={(c) => void navigate({ to: "/companies/$companyId", params: { companyId: c.id } })}
+            sorting={sorting}
+            onSortingChange={handleSortingChange}
+            pagination={pagination}
+            onPaginationChange={setPagination}
+            search={q}
+            onSearchChange={setQ}
           />
         )}
       </div>

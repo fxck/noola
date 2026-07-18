@@ -106,28 +106,91 @@ const mapCompany = (r: Record<string, unknown>): Company => ({
   updated_at: r.updated_at instanceof Date ? (r.updated_at as Date).toISOString() : String(r.updated_at),
 });
 
-/** All companies with contact counts + computed health, worst-health first (surface risk). */
-export async function listCompanies(tenantId: string, q?: string): Promise<CompanyRow[]> {
+export interface CompanyListOpts {
+  q?: string;
+  band?: HealthBand;
+  limit?: number;
+  offset?: number;
+  sortBy?: string;
+  sortDir?: "asc" | "desc";
+}
+
+// A SQL health score that mirrors computeHealth() exactly, so server sort + band filter agree with
+// the badge the client renders from the same rollups. Kept in one place next to computeHealth.
+const HEALTH_SCORE_SQL = `GREATEST(0, LEAST(100, round((100
+  - coalesce(ts.neg_open,0)*15
+  - LEAST(coalesce(ts.open_tickets,0)*3, 30)
+  - CASE WHEN cs.avg_csat IS NOT NULL THEN (5 - cs.avg_csat)*8 ELSE 0 END)::numeric)))::int`;
+
+// Whitelist of sortable columns → safe SQL identifiers (field names can't be parameterized).
+const COMPANY_SORT_SQL: Record<string, string> = {
+  name: "name",
+  health: "health_score",
+  contacts: "contact_count",
+  created: "created_at",
+  lastActivity: "last_activity",
+};
+
+function bandPredicate(band?: HealthBand): string {
+  if (band === "healthy") return "WHERE health_score >= 70";
+  if (band === "at_risk") return "WHERE health_score >= 40 AND health_score < 70";
+  if (band === "critical") return "WHERE health_score < 40";
+  return "";
+}
+
+// Shared base: rollups + health_score + optional name/domain search. When q is present it binds $1.
+function companyBaseCte(q?: string): { cte: string; params: unknown[] } {
+  const params: unknown[] = [];
+  let qFilter = "";
+  if (q && q.trim()) {
+    params.push(`%${q.trim()}%`);
+    qFilter = "WHERE co.name ILIKE $1 OR co.domain ILIKE $1";
+  }
+  const cte = `${ROLLUP_CTE}
+    , base AS (
+      SELECT co.${COLS.split(", ").join(", co.")},
+             (SELECT count(*)::int FROM contacts x WHERE x.company_id = co.id) AS contact_count,
+             ts.open_tickets, ts.neg_open, ts.total_tickets, ts.last_activity, cs.avg_csat,
+             ${HEALTH_SCORE_SQL} AS health_score
+        FROM companies co
+        LEFT JOIN ticket_stats ts ON ts.company_id = co.id
+        LEFT JOIN csat_stats cs ON cs.company_id = co.id
+        ${qFilter}
+    )`;
+  return { cte, params };
+}
+
+/** One page of companies (contact counts + computed health), server-sorted + filtered + paginated. */
+export async function listCompanies(tenantId: string, opts: CompanyListOpts = {}): Promise<CompanyRow[]> {
   return withTenant(tenantId, async (c) => {
-    const params: unknown[] = [];
-    let filter = "";
-    if (q && q.trim()) { params.push(`%${q.trim()}%`); filter = `WHERE co.name ILIKE $${params.length} OR co.domain ILIKE $${params.length}`; }
+    const { cte, params } = companyBaseCte(opts.q);
+    const sortCol = COMPANY_SORT_SQL[opts.sortBy ?? ""] ?? "name";
+    const dir = opts.sortDir === "desc" ? "DESC" : "ASC";
+    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const offset = Math.max(opts.offset ?? 0, 0);
+    params.push(limit, offset);
     const r = await c.query(
-      `${ROLLUP_CTE}
-       SELECT co.${COLS.split(", ").join(", co.")},
-              (SELECT count(*)::int FROM contacts x WHERE x.company_id = co.id) AS contact_count,
-              ts.open_tickets, ts.neg_open, ts.total_tickets, ts.last_activity, cs.avg_csat
-         FROM companies co
-         LEFT JOIN ticket_stats ts ON ts.company_id = co.id
-         LEFT JOIN csat_stats cs ON cs.company_id = co.id
-         ${filter}
-        ORDER BY co.name
-        LIMIT 5000`,
+      `${cte}
+       SELECT * FROM base
+       ${bandPredicate(opts.band)}
+       ORDER BY ${sortCol} ${dir} NULLS LAST, name ASC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
-    return (r.rows as Record<string, unknown>[])
-      .map((row) => ({ ...mapCompany(row), contactCount: Number(row.contact_count ?? 0), health: rowToHealth(row) }))
-      .sort((a, b) => a.health.score - b.health.score);
+    return (r.rows as Record<string, unknown>[]).map((row) => ({
+      ...mapCompany(row),
+      contactCount: Number(row.contact_count ?? 0),
+      health: rowToHealth(row),
+    }));
+  });
+}
+
+/** Total companies matching the same q/band filters — the pagination denominator. */
+export async function countCompanies(tenantId: string, opts: CompanyListOpts = {}): Promise<number> {
+  return withTenant(tenantId, async (c) => {
+    const { cte, params } = companyBaseCte(opts.q);
+    const r = await c.query(`${cte} SELECT count(*)::int AS n FROM base ${bandPredicate(opts.band)}`, params);
+    return Number(r.rows[0]?.n ?? 0);
   });
 }
 
@@ -203,6 +266,8 @@ export interface CompanyImportRow {
   domain?: string;
   plan?: string;
   attributes?: Record<string, unknown>;
+  /** Intercom "Company created at" — backfills the real created_at. */
+  created_at?: string;
 }
 
 /**
@@ -222,15 +287,16 @@ export async function bulkUpsertCompanies(
       const name = (r.name ?? "").trim();
       if (!name) continue;
       const res = await c.query(
-        `INSERT INTO companies (tenant_id, name, domain, plan, attributes)
-         VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb))
+        `INSERT INTO companies (tenant_id, name, domain, plan, attributes, created_at)
+         VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb), COALESCE($5::timestamptz, now()))
          ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET
            domain = CASE WHEN COALESCE($2,'') = '' THEN companies.domain ELSE EXCLUDED.domain END,
            plan = CASE WHEN COALESCE($3,'') = '' THEN companies.plan ELSE EXCLUDED.plan END,
            attributes = companies.attributes || COALESCE($4::jsonb,'{}'::jsonb),
+           created_at = COALESCE($5::timestamptz, companies.created_at),
            updated_at = now()
          RETURNING (xmax = 0) AS created`,
-        [name, r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null],
+        [name, r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null, r.created_at ?? null],
       );
       if (res.rows[0].created) created++;
       else updated++;

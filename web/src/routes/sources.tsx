@@ -1264,10 +1264,10 @@ function AiSourcesNote() {
       <Link to="/kb" className="font-medium text-foreground underline-offset-2 hover:underline">
         Knowledge Base{kbCount != null ? ` (${kbCount.toLocaleString()})` : ""}
       </Link>
-      <span className="text-muted-foreground/70">— used for public answers</span>
+      <span className="text-muted-foreground/70">— the only source for public/widget answers</span>
       <span className="text-muted-foreground/40">·</span>
       <span className="text-foreground/80">resolved tickets</span>
-      <span className="text-muted-foreground/70">— learned from past replies</span>
+      <span className="text-muted-foreground/70">— agent answers only, never public</span>
     </div>
   );
 }

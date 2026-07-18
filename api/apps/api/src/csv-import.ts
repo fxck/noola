@@ -37,7 +37,9 @@ export function parseCsv(text: string): string[][] {
 }
 
 function normalizeHeader(h: string): string {
-  return h.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  // Strip a trailing parenthetical (e.g. Intercom's "Last seen (CEST)" timezone tag) BEFORE
+  // collapsing separators, so "Last seen (CEST)" → "lastseen" matches the semantic column.
+  return h.trim().toLowerCase().replace(/\([^)]*\)/g, "").replace(/[\s_-]+/g, "");
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -97,6 +99,11 @@ export function parseCsvContacts(
       } else if (h === "lastseen" || h === "lastseenat" || h === "lastrequestat" || h === "lastheardfrom") {
         const at = parseMaybeDate(value);
         if (at) contact.last_seen_at = at;
+      } else if (h === "signedup" || h === "signedupat" || h === "createdat" || h === "firstseen" || h === "firstseenat") {
+        // "customer since": Intercom Signed up / First Seen becomes the real created_at (Signed up wins).
+        const at = parseMaybeDate(value);
+        const isSignup = h === "signedup" || h === "signedupat" || h === "createdat";
+        if (at && (isSignup || !contact.created_at)) contact.created_at = at;
       } else {
         // Unknown columns become free-form attributes under the original-ish key.
         attributes[grid[0][c].trim().slice(0, 60) || h] = value.slice(0, 500);
@@ -125,6 +132,7 @@ export function parseCsvCompanies(
     let name = "";
     let domain: string | undefined;
     let plan: string | undefined;
+    let createdAt: string | undefined;
     const attributes: Record<string, unknown> = {};
     for (let c = 0; c < headers.length; c++) {
       const value = (cells[c] ?? "").trim();
@@ -136,8 +144,11 @@ export function parseCsvCompanies(
         if (!domain) domain = value.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").slice(0, 300);
       } else if (h === "plan" || h === "companyplan" || h === "planname") {
         plan = value.slice(0, 120);
+      } else if (h === "companycreatedat" || h === "createdat") {
+        const at = parseMaybeDate(value);
+        if (at) createdAt = at;
       } else {
-        // company id, size, seats, MRR, industry, created at, … → attributes (nothing dropped).
+        // company id, size, seats, MRR, industry, last seen, … → attributes (nothing dropped).
         attributes[grid[0][c].trim().slice(0, 60) || h] = value.slice(0, 500);
       }
     }
@@ -145,6 +156,7 @@ export function parseCsvCompanies(
     const row: CompanyImportRow = { name };
     if (domain) row.domain = domain;
     if (plan) row.plan = plan;
+    if (createdAt) row.created_at = createdAt;
     if (Object.keys(attributes).length) row.attributes = attributes;
     rows.push(row);
     if (rows.length >= 10_000) break;

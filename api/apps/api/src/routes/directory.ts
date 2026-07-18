@@ -10,7 +10,7 @@ import {
   upsertContact, bulkUpsertContacts, contactHistory, mergeContacts, listContactIdentities,
 } from "../contacts.js";
 import { recordContactEvent, listContactEvents } from "../contact-events.js";
-import { listCompanies, getCompany, createCompany, updateCompany, deleteCompany, bulkUpsertCompanies, ensureCompaniesByName } from "../companies.js";
+import { listCompanies, countCompanies, getCompany, createCompany, updateCompany, deleteCompany, bulkUpsertCompanies, ensureCompaniesByName, type HealthBand } from "../companies.js";
 import { listCompanyCustomValues, putCompanyCustomValues } from "../customfields.js";
 import {
   listFeatureRequests, getFeatureRequest, createFeatureRequest, updateFeatureRequest,
@@ -174,10 +174,10 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
 
   // CSV import (0092): header-mapped rows ride the same idempotent upsert as /contacts/bulk.
   // Body is the raw CSV text (the SPA reads the file client-side); returns per-outcome counts.
-  app.post("/contacts/import", tenanted(async (tenantId, req, reply) => {
+  app.post("/contacts/import", { bodyLimit: 24 * 1024 * 1024 }, tenanted(async (tenantId, req, reply) => {
     const b = (req.body ?? {}) as Partial<{ csv: string }>;
     if (!b.csv || typeof b.csv !== "string") return reply.code(400).send({ error: "csv text is required" });
-    if (b.csv.length > 5_000_000) return reply.code(413).send({ error: "csv too large (5MB max)" });
+    if (b.csv.length > 20_000_000) return reply.code(413).send({ error: "csv too large (20MB max)" });
     const parsed = parseCsvContacts(b.csv);
     if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
     if (!parsed.rows.length) return reply.code(400).send({ error: "no importable rows found" });
@@ -249,8 +249,19 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
   // ---- Companies (account records) -----------------------------------------
   // First-class accounts with a rolled-up health score (open tickets + negative sentiment + CSAT).
   app.get("/companies", tenanted(async (tenantId, req) => {
-    const q = (req.query as { q?: string }).q;
-    return { companies: await listCompanies(tenantId, q) };
+    const query = (req.query as Record<string, string | undefined>) ?? {};
+    const num = (v: string | undefined): number | undefined => (v === undefined || v === "" ? undefined : Number(v));
+    const band = ["healthy", "at_risk", "critical"].includes(query.band ?? "") ? (query.band as HealthBand) : undefined;
+    const opts = {
+      q: query.q,
+      band,
+      limit: num(query.limit),
+      offset: num(query.offset),
+      sortBy: query.sort,
+      sortDir: query.dir === "desc" ? ("desc" as const) : query.dir === "asc" ? ("asc" as const) : undefined,
+    };
+    const [companies, total] = await Promise.all([listCompanies(tenantId, opts), countCompanies(tenantId, opts)]);
+    return { companies, total };
   }));
 
   app.get("/companies/:id", tenanted(async (tenantId, req, reply) => {
@@ -274,10 +285,10 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
   // Body is the raw CSV text (the SPA reads the file client-side); returns per-outcome counts. Run
   // this BEFORE the contacts import so people link to already-provisioned accounts (though the
   // contacts import also create-if-missing links, so order is convenience, not a hard requirement).
-  app.post("/companies/import", tenanted(async (tenantId, req, reply) => {
+  app.post("/companies/import", { bodyLimit: 24 * 1024 * 1024 }, tenanted(async (tenantId, req, reply) => {
     const b = (req.body ?? {}) as Partial<{ csv: string }>;
     if (!b.csv || typeof b.csv !== "string") return reply.code(400).send({ error: "csv text is required" });
-    if (b.csv.length > 5_000_000) return reply.code(413).send({ error: "csv too large (5MB max)" });
+    if (b.csv.length > 20_000_000) return reply.code(413).send({ error: "csv too large (20MB max)" });
     const parsed = parseCsvCompanies(b.csv);
     if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
     if (!parsed.rows.length) return reply.code(400).send({ error: "no importable rows found" });

@@ -38,9 +38,26 @@ export interface CompanyInput {
   attributes?: Record<string, unknown>;
 }
 
-export async function fetchCompanies(q?: string): Promise<Company[]> {
-  const qs = q ? `?q=${encodeURIComponent(q)}` : "";
-  return (await api<{ companies: Company[] }>(`/companies${qs}`)).companies;
+export interface CompanyQuery {
+  q?: string;
+  band?: HealthBand;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+  dir?: "asc" | "desc";
+}
+
+/** One page of companies + the total match count (server-side pagination/sort/filter). */
+export async function fetchCompanies(opts: CompanyQuery = {}): Promise<{ companies: Company[]; total: number }> {
+  const p = new URLSearchParams();
+  if (opts.q) p.set("q", opts.q);
+  if (opts.band) p.set("band", opts.band);
+  if (opts.limit != null) p.set("limit", String(opts.limit));
+  if (opts.offset != null) p.set("offset", String(opts.offset));
+  if (opts.sort) p.set("sort", opts.sort);
+  if (opts.dir) p.set("dir", opts.dir);
+  const qs = p.toString() ? `?${p}` : "";
+  return api<{ companies: Company[]; total: number }>(`/companies${qs}`);
 }
 export async function fetchCompany(id: string): Promise<CompanyDetail> {
   return (await api<{ company: CompanyDetail }>(`/companies/${id}`)).company;
