@@ -35,6 +35,7 @@ import {
   Activity,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useLiveRefresh } from "@/lib/realtime-context";
 import {
   type Contact,
   type ContactFilter,
@@ -415,6 +416,8 @@ export function ContactsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q, serverFilters, serverFilterGroups, identity, sortBy, sortDir, pagination.pageIndex, pagination.pageSize, reloadSignal]);
   const reload = () => setReloadSignal((n) => n + 1);
+  // Live: refetch when a contact or company changes anywhere (create/delete/edit).
+  useLiveRefresh(["contact.", "company."], reload);
 
   // STABLE data reference for react-table. (Memoised: an inline `contacts ?? []` is a fresh ref
   // every render → autoReset fires → infinite render/navigation loop. This only changes when a

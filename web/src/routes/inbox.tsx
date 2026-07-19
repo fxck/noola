@@ -193,9 +193,12 @@ export function InboxPage() {
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const unsubscribe = subscribe((e) => {
+      // Only ticket-bearing events touch the inbox (message/ticket/autoreply all carry a ticketId).
+      // Entity events (contact/company/… — ticketId '') are for their own surfaces; ignore them here.
+      if (!e.ticketId) return;
       if (timer) clearTimeout(timer); // coalesce bursts into one reload
       timer = setTimeout(() => void loadRef.current(), 250);
-      if (e.ticketId && e.ticketId === selectedRef.current) setRtSignal((n) => n + 1);
+      if (e.ticketId === selectedRef.current) setRtSignal((n) => n + 1);
       // Flash a live pulse dot on the touched row, then let it fade after 2.5s.
       if (e.ticketId) {
         const id = e.ticketId;

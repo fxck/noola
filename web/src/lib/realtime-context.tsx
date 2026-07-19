@@ -54,6 +54,31 @@ export function useRealtime(): RealtimeApi {
   return ctx ?? NULL_API;
 }
 
+/**
+ * Refetch a surface live when a relevant event arrives. Subscribes to the tenant bus, keeps only
+ * events whose `type` starts with one of `prefixes` (e.g. "contact.", "company."), and calls
+ * `refetch` — coalescing bursts into one call (250ms) so a bulk change is a single reload. The
+ * `prefixes`/`refetch` are read through a ref, so callers can pass inline values without
+ * re-subscribing every render. One line to make any list/detail surface live.
+ */
+export function useLiveRefresh(prefixes: string[], refetch: () => void) {
+  const { subscribe } = useRealtime();
+  const ref = useRef({ prefixes, refetch });
+  ref.current = { prefixes, refetch };
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsub = subscribe((e) => {
+      if (!ref.current.prefixes.some((p) => e.type.startsWith(p))) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => ref.current.refetch(), 250);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsub();
+    };
+  }, [subscribe]);
+}
+
 // When no provider is mounted (e.g. the login screen), consumers still render.
 const NULL_API: RealtimeApi = {
   status: "connecting",

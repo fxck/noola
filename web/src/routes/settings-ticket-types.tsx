@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SettingsPage } from "@/components/settings-page";
 import { cn } from "@/lib/utils";
+import { useLiveRefresh } from "@/lib/realtime-context";
 
 type Status = "loading" | "ready" | "error";
 type Editing = { id: string; name: string; color: TypeColor };
@@ -40,6 +41,7 @@ export function SettingsTicketTypesPage() {
       .catch(() => setStatus("error"));
   }
   useEffect(load, []);
+  useLiveRefresh(["ticket_type."], load);
 
   async function create() {
     const trimmed = name.trim();

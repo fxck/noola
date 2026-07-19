@@ -14,6 +14,7 @@ import { RowsSkeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/toaster";
 import type { ApiError } from "@/lib/api";
 import { type AgentUser, fetchUsers, relativeTime } from "@/lib/tickets";
+import { useLiveRefresh } from "@/lib/realtime-context";
 import { type Team, fetchTeams, createTeam, updateTeam, deleteTeam } from "@/lib/teams";
 
 // Settings → Teams — named agent groups: shared inbox lanes, routing/assignment
@@ -42,6 +43,7 @@ export function SettingsTeamsPage() {
     setError(false);
     fetchTeams().then(setTeams).catch(() => setError(true));
   }
+  useLiveRefresh(["team."], load);
   useEffect(() => {
     load();
     fetchUsers().then(setUsers).catch(() => setUsers([]));

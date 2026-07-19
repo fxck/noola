@@ -3,6 +3,7 @@ import { MessageSquareText, Loader2, Trash2, Plus, Pencil, X } from "lucide-reac
 import { toast } from "@/components/ui/toaster";
 import { type Macro, fetchMacros, createMacro, updateMacro, deleteMacro } from "@/lib/macros";
 import type { ApiError } from "@/lib/api";
+import { useLiveRefresh } from "@/lib/realtime-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -40,6 +41,7 @@ export function SettingsMacrosPage() {
   useEffect(() => {
     void load();
   }, [load]);
+  useLiveRefresh(["macro."], () => void load());
 
   function openNew() {
     setName("");

@@ -15,6 +15,7 @@ import {
   importCompaniesCsv,
 } from "@/lib/companies";
 import { relativeTime, initials, avatarHue } from "@/lib/tickets";
+import { useLiveRefresh } from "@/lib/realtime-context";
 import { api } from "@/lib/api";
 import { fetchFieldDefs, type CustomFieldDef } from "@/lib/custom-fields";
 import { Button } from "@/components/ui/button";
@@ -219,6 +220,8 @@ export function CompaniesPage() {
   const [bulkConfirm, setBulkConfirm] = useState(false);
   const navigate = useNavigate();
   const reload = () => setReloadSignal((n) => n + 1);
+  // Live: refetch when a company or contact changes (companies show member/contact rollups).
+  useLiveRefresh(["company.", "contact."], reload);
 
   // Debounce the search box.
   useEffect(() => {

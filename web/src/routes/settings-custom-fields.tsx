@@ -10,6 +10,7 @@ import {
   updateFieldDef,
   deleteFieldDef,
 } from "@/lib/custom-fields";
+import { useLiveRefresh } from "@/lib/realtime-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PopoverSelect } from "@/components/ui/menu";
@@ -57,6 +58,7 @@ export function SettingsCustomFieldsPage() {
       .catch(() => setStatus("error"));
   }
   useEffect(load, []);
+  useLiveRefresh(["custom_field."], load);
 
   function addOption() {
     const v = optionDraft.trim();
