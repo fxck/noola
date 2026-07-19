@@ -50,6 +50,10 @@ export interface IngestInput {
   authorKind?: "customer" | "agent" | "ai" | "community" | null;
   authorExternalName?: string | null;
   authorExternalAvatarUrl?: string | null;
+  /** The raw per-channel author id (e.g. Discord user id) for non-customer responders — so a repeat
+   *  community/team-role author can be correlated across tickets and back-linked to a seat/contact
+   *  when later identified (column added in 0098). */
+  authorExternalId?: string | null;
   /** §5.3 — suppress the post-commit ambient autoreply dispatch (used by /ask + thread pre-seat so
    *  ingesting a question doesn't also fire ambient autoreply on the same turn). */
   skipAutoreply?: boolean;
@@ -233,14 +237,15 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
     try {
       const m = await c.query(
         `INSERT INTO messages (tenant_id, ticket_id, author_type, body, idempotency_key, channel_type,
-             external_channel_id, author_id, author_kind, author_contact_id, author_external_name, author_external_avatar_url)
-         VALUES (current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+             external_channel_id, author_id, author_kind, author_contact_id, author_external_name, author_external_avatar_url, author_external_id)
+         VALUES (current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
         [ticketId, input.authorType, input.body, input.idempotencyKey ?? null, msgChannelType, msgExternal,
          input.authorId ?? null,
          input.authorKind ?? (isCustomer ? "customer" : "agent"),
          isCustomer ? contactId : null,
          input.authorExternalName ?? null,
-         input.authorExternalAvatarUrl ?? null],
+         input.authorExternalAvatarUrl ?? null,
+         input.authorExternalId ?? null],
       );
       messageId = m.rows[0].id;
     } catch (e) {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearch, Link } from "@tanstack/react-router";
+import { useNavigate, useSearch, useRouterState, Link } from "@tanstack/react-router";
 import {
   getCoreRowModel,
   useReactTable,
@@ -44,6 +44,7 @@ import {
   deleteContact,
   isContactsUnavailable,
 } from "@/lib/contacts";
+import { contactDisplayName } from "@/lib/contact-display";
 import {
   type Segment,
   type SegmentDefinition,
@@ -98,20 +99,6 @@ function parseSort(s: string | undefined): SortingState {
   return [{ id: "last_seen_at", desc: true }];
 }
 
-/** Anonymous rows read as intentional, not broken: channel + a short handle instead of "Unnamed". */
-const CHANNEL_VISITOR: Record<string, string> = {
-  widget: "Widget visitor",
-  email: "Email contact",
-  discord: "Discord user",
-  slack: "Slack user",
-  telegram: "Telegram user",
-  whatsapp: "WhatsApp user",
-};
-function anonymousLabel(c: Contact): string {
-  const base = CHANNEL_VISITOR[c.primary_channel ?? ""] ?? "Anonymous";
-  return `${base} · ${c.id.slice(0, 4)}`;
-}
-
 const COLUMNS: ColumnDef<Contact>[] = [
   {
     id: "select",
@@ -135,9 +122,9 @@ const COLUMNS: ColumnDef<Contact>[] = [
     enableHiding: false,
     meta: { label: "Name" },
     cell: ({ row }) => (
-      <div className="flex items-center gap-2.5">
+      <div className="flex min-w-0 items-center gap-2.5">
         <span className="relative shrink-0">
-          <Avatar name={row.original.name || row.original.email || "?"} className="size-7 text-micro" />
+          <Avatar name={contactDisplayName(row.original)} className="size-7 text-micro" />
           {row.original.online && (
             <span
               title="Active now"
@@ -150,12 +137,13 @@ const COLUMNS: ColumnDef<Contact>[] = [
           params={{ contactId: row.original.id }}
           tabIndex={-1}
           onClick={(e) => e.stopPropagation()}
+          title={row.original.name || row.original.email || undefined}
           className={cn(
-            "truncate hover:underline",
+            "block max-w-[20rem] truncate hover:underline",
             row.original.name || row.original.email ? "font-medium text-foreground" : "text-muted-foreground",
           )}
         >
-          {row.original.name || row.original.email || anonymousLabel(row.original)}
+          {contactDisplayName(row.original)}
         </Link>
         {/* marketing opt-out — a quiet icon, not a chip (§4); broadcasts skip them */}
         {row.original.unsubscribed_at && (
@@ -184,7 +172,7 @@ const COLUMNS: ColumnDef<Contact>[] = [
     meta: { label: "Company" },
     cell: ({ getValue }) => {
       const v = getValue() as string;
-      return v ? <span className="truncate">{v}</span> : null;
+      return v ? <span className="block max-w-[14rem] truncate" title={v}>{v}</span> : null;
     },
   },
   {
@@ -258,6 +246,9 @@ function ColumnVisibility({ table }: { table: TanstackTable<Contact> }) {
 export function ContactsPage() {
   const navigate = useNavigate();
   const search = useSearch({ from: "/contacts" });
+  // Live pathname — the URL-sync effect below must never navigate while this page isn't the
+  // active route, or a post-navigation settle would replace-yank the user back to /contacts.
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
 
   // Server-side: `contacts` is only the CURRENT page; `total` is the server's match count.
   const [contacts, setContacts] = useState<Contact[] | null>(null);
@@ -495,6 +486,9 @@ export function ContactsPage() {
   // Guarded so an unchanged view never re-navigates — belt-and-suspenders against any loop.
   const lastSearchRef = useRef("");
   useEffect(() => {
+    // Only mirror state into the URL while /contacts is the active route — never replace-navigate
+    // back here after the user has moved to another route (that was the "bounce to Customers" bug).
+    if (pathname !== "/contacts") return;
     const sort = sorting[0] ? `${sorting[0].id}.${sorting[0].desc ? "desc" : "asc"}` : undefined;
     // Single row → legacy ?filters=; 2+ rows → ?filterGroups= (never both).
     const nonEmpty = groups.filter((g) => g.length > 0);
@@ -510,7 +504,7 @@ export function ContactsPage() {
     lastSearchRef.current = key;
     void navigate({ to: "/contacts", replace: true, search: next });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sorting, groups, q, pagination.pageIndex]);
+  }, [sorting, groups, q, pagination.pageIndex, pathname]);
 
   // The live view (persisted when saving a segment), and applying a saved segment's
   // definition back onto the page.

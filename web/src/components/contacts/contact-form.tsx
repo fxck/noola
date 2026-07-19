@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { type AttrRow, attrRowsOf, rowsToAttributes, IMPORT_PLACEHOLDER } from "@/components/contacts/contact-lib";
+import { isSystemAttribute } from "@/lib/contact-display";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Add / edit form.
@@ -36,7 +37,13 @@ export function ContactForm({
   const [email, setEmail] = useState(initial?.email ?? "");
   const [companyName, setCompanyName] = useState(initial?.company ?? "");
   const [externalId, setExternalId] = useState(initial?.external_id ?? "");
-  const [rows, setRows] = useState<AttrRow[]>(() => attrRowsOf(initial));
+  // Only genuine CUSTOM attributes are editable here — system-derived signals (Browser/OS/City/…) are
+  // Noola-managed (shown read-only on the profile) and must not be editable, or an edit would be
+  // silently reverted on the next visit and this replace-update would corrupt them.
+  const [rows, setRows] = useState<AttrRow[]>(() => {
+    const custom = attrRowsOf(initial).filter((r) => !r.key || !isSystemAttribute(r.key));
+    return custom.length ? custom : [{ key: "", value: "" }];
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,12 +66,18 @@ export function ContactForm({
       setError("Give the contact a name or an email.");
       return;
     }
+    // Preserve the Noola-managed system attributes (not shown as editable rows) so this replace-update
+    // doesn't wipe them — merge them back with the edited custom rows.
+    const systemAttrs: Record<string, string> = {};
+    for (const [k, v] of Object.entries(initial?.attributes ?? {})) {
+      if (isSystemAttribute(k)) systemAttrs[k] = v;
+    }
     const input: ContactInput = {
       name: n,
       email: em || null,
       company: companyName.trim(),
       external_id: externalId.trim() || null,
-      attributes: rowsToAttributes(rows),
+      attributes: { ...systemAttrs, ...rowsToAttributes(rows) },
     };
     setBusy(true);
     try {

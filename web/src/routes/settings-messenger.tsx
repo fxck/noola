@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   MessagesSquare, Plus, Copy, Check, Trash2, Loader2, Home, MessageCircle, LifeBuoy,
-  ShieldCheck, KeyRound, RefreshCw, Eye, EyeOff,
+  ShieldCheck, KeyRound, RefreshCw, Eye, EyeOff, Sparkles,
 } from "lucide-react";
 import { toast } from "@/components/ui/toaster";
 import { SettingsPage } from "@/components/settings-page";
@@ -246,7 +246,7 @@ function MessengerEditor({
               onChange={(e) => set("greeting", e.target.value)}
               maxLength={280}
               rows={2}
-              placeholder="Hi there 👋 How can we help?"
+              placeholder="Get an instant answer from our AI, or browse the help center."
             />
           </div>
 
@@ -552,33 +552,65 @@ function TabToggle({
 
 function WidgetPreview({ cfg }: { cfg: WidgetConfig }) {
   const enabled = (["home", "messages", "help"] as const).filter((t) => cfg.tabs[t]);
+  const tabIcon = { home: Home, messages: MessageCircle, help: LifeBuoy } as const;
+  // Mirrors widget-embed.ts: a dark hero header (faint accent glow only) with a face cluster, the
+  // Panel title + greeting exactly as an admin sets them, and a bottom nav. Accent stays budgeted.
+  const heroBg = `radial-gradient(135% 120% at 16% -10%, color-mix(in srgb, ${cfg.accent} 40%, #13241d) 0%, #13241d 46%, #0b1611 100%)`;
   return (
-    <div className="relative h-[320px] overflow-hidden rounded-xl border bg-muted/40">
+    <div className="relative h-[340px] overflow-hidden rounded-xl border bg-muted/40">
       {/* Panel mock */}
       <div
         className={cn(
-          "absolute bottom-3 flex w-[220px] flex-col overflow-hidden rounded-xl bg-white shadow-lg dark:bg-neutral-900",
+          "absolute bottom-3 flex w-[232px] flex-col overflow-hidden rounded-2xl bg-neutral-50 shadow-xl ring-1 ring-black/5 dark:bg-neutral-900 dark:ring-white/10",
           cfg.position === "left" ? "left-3" : "right-3",
         )}
-        style={{ height: 268 }}
+        style={{ height: 300 }}
       >
-        <div className="px-3 py-3 text-white" style={{ backgroundColor: cfg.accent }}>
-          <div className="text-small font-semibold leading-tight">{cfg.title || "Ask us anything"}</div>
-        </div>
-        <div className="flex-1 space-y-2 overflow-hidden bg-neutral-50 p-3 dark:bg-neutral-800/50">
-          <p className="text-micro leading-snug text-neutral-600 dark:text-neutral-300">{cfg.greeting}</p>
-          <div className="flex items-center justify-between rounded-lg px-3 py-2 text-micro font-semibold text-white" style={{ backgroundColor: cfg.accent }}>
-            Send us a message
+        {/* Dark hero header */}
+        <div className="relative px-3.5 pb-4 pt-3 text-white" style={{ background: heroBg }}>
+          <div className="flex items-center justify-end">
+            <span className="grid size-6 place-items-center rounded-full text-white ring-2 ring-[#13241d]" style={{ backgroundColor: cfg.accent }}>
+              <Sparkles className="size-3" />
+            </span>
+            <span className="-ml-2.5 grid size-6 place-items-center rounded-full bg-white/[.16] text-[8px] font-semibold text-white ring-2 ring-[#13241d]">JS</span>
           </div>
-          <div className="rounded-lg border bg-white p-2 text-micro text-neutral-500 dark:bg-neutral-900">Search for help…</div>
+          <div className="mt-3">
+            <div className="text-[10px] font-medium text-white/60">Hi there.</div>
+            <div className="text-small font-semibold leading-tight text-balance">{cfg.title || "Ask us anything"}</div>
+            {cfg.greeting && <div className="mt-1 line-clamp-2 text-[10px] leading-snug text-white/60">{cfg.greeting}</div>}
+          </div>
         </div>
+        {/* Body */}
+        <div className="flex-1 space-y-2 overflow-hidden bg-neutral-50 p-2.5 dark:bg-neutral-800/40">
+          <div className="flex items-center gap-2 rounded-xl border bg-white p-2 shadow-sm dark:border-white/10 dark:bg-neutral-900">
+            <span className="grid size-6 place-items-center rounded-full bg-neutral-100 dark:bg-neutral-800" style={{ color: cfg.accent }}>
+              <Sparkles className="size-3" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[10px] font-semibold text-foreground">Ask a question</div>
+              <div className="truncate text-[9px] text-muted-foreground">AI Agent &amp; team · instant answers</div>
+            </div>
+          </div>
+          {cfg.tabs.help && (
+            <div className="rounded-xl border bg-white p-2 text-[9px] text-neutral-500 dark:border-white/10 dark:bg-neutral-900">Search for help…</div>
+          )}
+        </div>
+        {/* Bottom nav */}
         {enabled.length > 1 && (
-          <div className="flex border-t bg-white dark:bg-neutral-900">
-            {enabled.map((t) => (
-              <div key={t} className="flex-1 py-1.5 text-center text-[9px] font-medium capitalize" style={{ color: cfg.accent }}>
-                {t}
-              </div>
-            ))}
+          <div className="flex border-t bg-white dark:border-white/10 dark:bg-neutral-900">
+            {enabled.map((t, i) => {
+              const Icon = tabIcon[t];
+              return (
+                <div
+                  key={t}
+                  className="flex flex-1 flex-col items-center gap-0.5 py-1.5 text-[8px] font-medium capitalize text-neutral-400"
+                  style={i === 0 ? { color: cfg.accent } : undefined}
+                >
+                  <Icon className="size-3.5" />
+                  {t}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

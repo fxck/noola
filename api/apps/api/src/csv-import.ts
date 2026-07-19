@@ -109,6 +109,16 @@ export function parseCsvContacts(
         attributes[grid[0][c].trim().slice(0, 60) || h] = value.slice(0, 500);
       }
     }
+    // Compose the display name from First/Last name columns when no explicit name/fullname column was
+    // present — otherwise the real name stays stranded in attributes and the contact reads as anonymous.
+    if (!contact.name) {
+      const findAttr = (want: string): string => {
+        const hit = Object.keys(attributes).find((k) => k.toLowerCase() === want);
+        return hit ? String(attributes[hit] ?? "").trim() : "";
+      };
+      const composed = [findAttr("first name"), findAttr("last name")].filter(Boolean).join(" ");
+      if (composed) contact.name = composed.slice(0, 200);
+    }
     if (Object.keys(attributes).length) contact.attributes = attributes;
     if (!contact.email && !contact.external_id) { skipped++; continue; }
     rows.push(contact);

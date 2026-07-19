@@ -89,8 +89,11 @@ export function EntityCell({
     <Avatar name={name} image={avatarSrc(image)} className={cn(size === "sm" ? "size-5 text-[9px]" : "size-6 text-micro")} />
   );
   const body = (
-    <span className="flex min-w-0 flex-col leading-tight">
-      <span className={cn("truncate", empty ? "text-muted-foreground" : "font-medium text-foreground")}>
+    <span className="flex min-w-0 max-w-[18rem] flex-col leading-tight">
+      <span
+        className={cn("truncate", empty ? "text-muted-foreground" : "font-medium text-foreground")}
+        title={empty ? undefined : name ?? undefined}
+      >
         {empty ? "Unassigned" : name}
       </span>
       {sub != null && sub !== "" && <span className="truncate text-xs text-muted-foreground">{sub}</span>}

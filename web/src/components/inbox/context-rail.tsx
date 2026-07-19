@@ -301,6 +301,20 @@ export function ContextRail({
             <FactRow label={distinctChannels.length > 1 ? "Channels" : "Channel"}>
               {channelLabel}
             </FactRow>
+            {/* Discord-origin ticket → deep-link back to the source thread (the forum post it came
+                from). Only when we hold both the guild + thread id (mig 0076). */}
+            {t.channel_type === "discord" && t.external_guild_id && t.external_thread_id && (
+              <FactRow label="Source">
+                <a
+                  href={`https://discord.com/channels/${t.external_guild_id}/${t.external_thread_id}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  View in Discord <ArrowUpRight className="size-3.5" />
+                </a>
+              </FactRow>
+            )}
             <FactRow label="Messages">
               <span className="tabular-nums">{messageCount ?? "—"}</span>
             </FactRow>

@@ -409,54 +409,17 @@ export interface UpsertResult {
  * insert from an update via the xmax=0 trick (xmax is 0 only on a fresh row).
  */
 export async function upsertContact(tenantId: string, input: ContactInputShape): Promise<UpsertResult> {
+  // Delegate to the resolve-then-update primitive (upsertOne) so a single upsert survives the
+  // two-unique-key case a bare ON CONFLICT can't express: a NEW external_id/userId arriving with an
+  // email ALREADY held by a DIFFERENT contact previously threw an uncaught pg 23505 → 500, breaking
+  // the live-enrichment / identify path. Delegating also links company_id + the semantic columns.
   const result = await withTenant(tenantId, async (c) => {
-    if (input.external_id) {
-      const r = await c.query(
-        `INSERT INTO contacts (tenant_id, external_id, email, name, company, attributes)
-         VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), COALESCE($5,'{}'::jsonb))
-         ON CONFLICT (tenant_id, external_id) WHERE external_id IS NOT NULL
-         DO UPDATE SET
-           email = COALESCE(EXCLUDED.email, contacts.email),
-           name = CASE WHEN $3 IS NULL THEN contacts.name ELSE EXCLUDED.name END,
-           company = CASE WHEN $4 IS NULL THEN contacts.company ELSE EXCLUDED.company END,
-           attributes = contacts.attributes || COALESCE($5,'{}'::jsonb),
-           updated_at = now()
-         RETURNING ${COLS}, (xmax = 0) AS created`,
-        [input.external_id, input.email ?? null, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes)],
-      );
-      return splitUpsert(r.rows[0]);
-    }
-    if (input.email) {
-      const r = await c.query(
-        `INSERT INTO contacts (tenant_id, email, name, company, attributes)
-         VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), COALESCE($4,'{}'::jsonb))
-         ON CONFLICT (tenant_id, lower(email)) WHERE email IS NOT NULL AND email <> ''
-         DO UPDATE SET
-           name = CASE WHEN $2 IS NULL THEN contacts.name ELSE EXCLUDED.name END,
-           company = CASE WHEN $3 IS NULL THEN contacts.company ELSE EXCLUDED.company END,
-           attributes = contacts.attributes || COALESCE($4,'{}'::jsonb),
-           updated_at = now()
-         RETURNING ${COLS}, (xmax = 0) AS created`,
-        [input.email, input.name ?? null, input.company ?? null, jsonOrNull(input.attributes)],
-      );
-      return splitUpsert(r.rows[0]);
-    }
-    // No idempotency key — a plain insert (always created).
-    const r = await c.query(
-      `INSERT INTO contacts (tenant_id, name, company, attributes)
-       VALUES (current_tenant(), COALESCE($1,''), COALESCE($2,''), COALESCE($3,'{}'::jsonb))
-       RETURNING ${COLS}`,
-      [input.name ?? null, input.company ?? null, jsonOrNull(input.attributes)],
-    );
-    return { contact: r.rows[0] as ContactRow, created: true };
+    const { id, created } = await upsertOne(c, input);
+    const r = await c.query(`SELECT ${COLS} FROM contacts WHERE id = $1`, [id]);
+    return { contact: r.rows[0] as ContactRow, created };
   });
   fireWebhook(tenantId, result.created ? "contact.created" : "contact.updated", result.contact);
   return result;
-}
-
-function splitUpsert(row: ContactRow & { created: boolean }): UpsertResult {
-  const { created, ...contact } = row;
-  return { contact: contact as ContactRow, created };
 }
 
 /**
@@ -473,7 +436,7 @@ export async function bulkUpsertContacts(
     let updated = 0;
     for (const input of rows) {
       const res = await upsertOne(c, input);
-      if (res) created++;
+      if (res.created) created++;
       else updated++;
     }
     return { created, updated };
@@ -493,7 +456,7 @@ export async function bulkUpsertContacts(
 async function upsertOne(
   c: import("pg").PoolClient,
   input: ContactInputShape,
-): Promise<boolean> {
+): Promise<{ id: string; created: boolean }> {
   const ext = input.external_id ?? null;
   const email = input.email ?? null;
   const attrs = jsonOrNull(input.attributes);
@@ -526,7 +489,7 @@ async function upsertOne(
          email = CASE WHEN $9::text IS NOT NULL AND NOT EXISTS
                    (SELECT 1 FROM contacts x WHERE x.id <> $1 AND x.email <> '' AND lower(x.email) = lower($9::text))
                  THEN $9::text ELSE email END,
-         external_id = CASE WHEN $10::text IS NOT NULL AND NOT EXISTS
+         external_id = CASE WHEN external_id IS NULL AND $10::text IS NOT NULL AND NOT EXISTS
                    (SELECT 1 FROM contacts x WHERE x.id <> $1 AND x.external_id = $10::text)
                  THEN $10::text ELSE external_id END,
          created_at = COALESCE($11::timestamptz, created_at),
@@ -534,15 +497,16 @@ async function upsertOne(
        WHERE id = $1`,
       [id, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, email, ext, created],
     );
-    return false;
+    return { id, created: false };
   }
 
-  await c.query(
+  const ins = await c.query(
     `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at, created_at)
-     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz, COALESCE($10::timestamptz, now()))`,
+     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz, COALESCE($10::timestamptz, now()))
+     RETURNING id`,
     [ext, email, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, created],
   );
-  return true;
+  return { id: ins.rows[0].id as string, created: true };
 }
 
 // ── Cross-channel identity resolution (omnichannel) ──────────────────────────
@@ -608,6 +572,30 @@ export async function resolveContactForInbound(c: PoolClient, identity: Identity
       [email, name],
     );
     const contactId = r.rows[0].id as string;
+    // Unify identify vs ask: if this channel handle already mapped to a DIFFERENT (anonymous) contact
+    // — the visitor asked before they identified — fold that contact's conversations/events onto the
+    // now-email-identified one and re-point the handle, instead of leaving two split contacts.
+    if (handle) {
+      const prior = await c.query(
+        `SELECT contact_id FROM contact_identities
+          WHERE channel_type = $1 AND lower(external_id) = lower($2) AND contact_id <> $3 LIMIT 1`,
+        [identity.channelType, handle, contactId],
+      );
+      if (prior.rowCount) {
+        const oldId = prior.rows[0].contact_id as string;
+        await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [contactId, oldId]);
+        await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [contactId, oldId]);
+        await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [contactId, oldId]);
+        // Drop the now-empty anonymous shell if it holds no OTHER identity (its only handle re-points below).
+        await c.query(
+          `DELETE FROM contacts WHERE id = $1 AND coalesce(email,'') = '' AND external_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM contact_identities x WHERE x.contact_id = $1
+                 AND NOT (x.channel_type = $2 AND lower(x.external_id) = lower($3)))`,
+          [oldId, identity.channelType, handle],
+        );
+      }
+    }
     await linkIdentity(c, contactId, identity.channelType, handle);
     return contactId;
   }
@@ -713,6 +701,42 @@ export async function contactHistory(
  * events, and channel identities onto the kept contact — a true identity merge, not just a directory
  * reconcile. Returns the merged contact, or null if either id is missing.
  */
+/** A real human name composed from Intercom-style First/Last name attributes, or "" if absent. */
+function composedName(c: ContactRow): string {
+  const a = c.attributes ?? {};
+  const first = String((a["First name"] ?? a["first name"] ?? "") as string).trim();
+  const last = String((a["Last name"] ?? a["last name"] ?? "") as string).trim();
+  return [first, last].filter(Boolean).join(" ");
+}
+
+/** Merge name precedence is QUALITY-aware, not positional — a channel handle (Discord "PaBi3") must
+ *  never beat a real name just because it sits on the kept side. A composed First/Last name is the
+ *  most trustworthy signal; else prefer the name attached to an email-identified contact; else fall
+ *  back to whichever side has one. */
+function pickMergedName(keep: ContactRow, drop: ContactRow): string {
+  return (
+    composedName(keep) ||
+    composedName(drop) ||
+    (keep.email ? keep.name : "") ||
+    (drop.email ? drop.name : "") ||
+    keep.name ||
+    drop.name
+  );
+}
+
+/** Earliest non-null timestamp — a marketing opt-out is sticky (most-restrictive wins on merge). */
+function earliestTs(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return a <= b ? a : b;
+}
+/** Latest non-null timestamp — presence keeps the most recent. */
+function latestTs(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return a >= b ? a : b;
+}
+
 export async function mergeContacts(
   tenantId: string,
   keepId: string,
@@ -722,17 +746,20 @@ export async function mergeContacts(
   const keep = await getContact(tenantId, keepId);
   const drop = await getContact(tenantId, dropId);
   if (!keep || !drop) return null;
-  const merged: ContactInputShape = {
-    name: keep.name || drop.name,
-    company: keep.company || drop.company,
-    email: keep.email || drop.email || undefined,
-    external_id: keep.external_id || drop.external_id || undefined,
-    attributes: { ...drop.attributes, ...keep.attributes },
-  };
+  const mergedName = pickMergedName(keep, drop);
+  const mergedCompany = keep.company || drop.company;
+  const mergedCompanyId = keep.company_id ?? drop.company_id; // don't drop account linkage
+  const mergedEmail = keep.email || drop.email || null;
+  const mergedExternal = keep.external_id || drop.external_id || null;
+  const mergedAttrs = { ...drop.attributes, ...keep.attributes };
+  const mergedUnsub = earliestTs(keep.unsubscribed_at, drop.unsubscribed_at); // opt-out sticky
+  const mergedAvatar = keep.avatar_url ?? drop.avatar_url;
+  const mergedSeen = latestTs(keep.last_seen_at, drop.last_seen_at);
   return withTenant(tenantId, async (c) => {
-    // Re-home only NON-thread conversations; a Discord thread-ticket stays keyed to its
-    // external_thread_id and must not be collapsed across the merge (§5.7).
-    await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2 AND external_thread_id IS NULL", [keepId, dropId]);
+    // Re-home ALL of the dropped contact's conversations, INCLUDING Discord thread-tickets — those
+    // were being orphaned (contact_id → NULL) and vanishing from the survivor. tickets_thread_uq keys
+    // on external_thread_id, not contact_id, so re-homing them is safe.
+    await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
     // Preserve authored-message attribution across the merge for thread-tickets and everything else.
     await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [keepId, dropId]);
     await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
@@ -753,12 +780,13 @@ export async function mergeContacts(
     await c.query("DELETE FROM contacts WHERE id = $1", [dropId]);
     const r = await c.query(
       `UPDATE contacts
-          SET name = $2, company = $3, email = $4, external_id = $5,
-              attributes = $6::jsonb, updated_at = now()
+          SET name = $2, company = $3, company_id = $4, email = $5, external_id = $6,
+              attributes = $7::jsonb, unsubscribed_at = $8::timestamptz, avatar_url = $9,
+              last_seen_at = $10::timestamptz, updated_at = now()
         WHERE id = $1
         RETURNING ${COLS}`,
-      [keepId, merged.name, merged.company, merged.email ?? null, merged.external_id ?? null,
-       JSON.stringify(merged.attributes ?? {})],
+      [keepId, mergedName, mergedCompany, mergedCompanyId, mergedEmail, mergedExternal,
+       JSON.stringify(mergedAttrs), mergedUnsub, mergedAvatar, mergedSeen],
     );
     return r.rowCount ? (r.rows[0] as ContactRow) : null;
   });

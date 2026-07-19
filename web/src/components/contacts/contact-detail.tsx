@@ -18,6 +18,8 @@ import {
   MailX,
   MessagesSquare,
   SlidersHorizontal,
+  MapPin,
+  Monitor,
 } from "lucide-react";
 import {
   type Contact,
@@ -48,6 +50,8 @@ import { FactRow, RailSection } from "@/components/ui/rail";
 import { avatarSrc, uploadAvatar } from "@/lib/avatar-upload";
 import { type LoadState } from "@/components/contacts/contact-lib";
 import { cn } from "@/lib/utils";
+import { contactDisplayName, systemAttributeGroup, SYSTEM_GROUP_ORDER, channelLabel } from "@/lib/contact-display";
+import { ErrorState } from "@/components/ui/error-state";
 
 const abs = (s: string) => {
   const d = new Date(s);
@@ -101,6 +105,8 @@ export function ContactDetail({
   const [historyState, setHistoryState] = useState<LoadState>("ok");
   const [identities, setIdentities] = useState<ContactIdentity[]>([]);
   const [notFound, setNotFound] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [reloadNonce, setReloadNonce] = useState(0);
   const [merging, setMerging] = useState(false);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
@@ -108,13 +114,18 @@ export function ContactDetail({
   useEffect(() => {
     let live = true;
     setNotFound(false);
+    setLoadError(false);
     // Fresh contact (attributes may have changed since the list loaded).
     void (async () => {
       try {
         const fresh = await fetchContact(contactId);
         if (live) setContact(fresh);
       } catch (e) {
-        if (live && (e as { status?: number }).status === 404) setNotFound(true);
+        if (!live) return;
+        // 404 = genuinely gone (distinct dead-end); anything else = a transient failure that must
+        // offer a retry, not spin forever (the old behaviour left initial=null loading indefinitely).
+        if ((e as { status?: number }).status === 404) setNotFound(true);
+        else setLoadError(true);
       }
     })();
     // History is best-effort — degrade gracefully if the endpoint is absent.
@@ -142,7 +153,7 @@ export function ContactDetail({
     return () => {
       live = false;
     };
-  }, [contactId]);
+  }, [contactId, reloadNonce]);
 
   // Resolve the contact's company NAME to an account id so the Company fact can
   // link to the company page. Best-effort — renders as plain text until matched.
@@ -225,6 +236,20 @@ export function ContactDetail({
     );
   }
 
+  if (loadError && !contact) {
+    return (
+      <div className="grid min-h-0 flex-1 place-items-center p-8">
+        <ErrorState
+          title="Couldn't load this contact"
+          onRetry={() => {
+            setLoadError(false);
+            setReloadNonce((n) => n + 1);
+          }}
+        />
+      </div>
+    );
+  }
+
   const c = contact;
   if (!c) {
     return (
@@ -246,7 +271,7 @@ export function ContactDetail({
           <ArrowLeft className="size-4" />
         </Link>
         <span className="relative shrink-0">
-          <Avatar name={c.name || c.email} image={avatarSrc(c.avatar_url)} className="size-6 text-micro" />
+          <Avatar name={contactDisplayName(c)} image={avatarSrc(c.avatar_url)} className="size-6 text-micro" />
           {c.online && (
             <span
               title="Active now"
@@ -255,7 +280,7 @@ export function ContactDetail({
           )}
         </span>
         <h1 className="min-w-0 truncate text-sm font-semibold tracking-tight">
-          {c.name || c.email || "Anonymous visitor"}
+          {contactDisplayName(c)}
         </h1>
         {c.online ? (
           <span className="hidden shrink-0 text-xs font-medium text-success sm:block">Active now</span>
@@ -333,8 +358,22 @@ export function ContactDetail({
               </div>
             )}
 
-            {/* custom-data events timeline */}
-            <EventTimeline contactId={contactId} />
+            {/* Conversations are the reason to open a contact in a support tool — lead with them,
+                not the usually-empty custom-events log that used to own the main stage. */}
+            <section>
+              <h3 className="mb-2 flex items-center gap-1.5 text-micro font-semibold uppercase tracking-wide text-muted-foreground">
+                <MessagesSquare className="size-3.5" /> Conversations
+                {history && history.tickets.length > 0 && (
+                  <span className="tabular-nums text-muted-foreground/70">{history.tickets.length}</span>
+                )}
+              </h3>
+              <ConversationList history={history} state={historyState} />
+            </section>
+
+            {/* custom-data events timeline — demoted below the conversations */}
+            <div className="mt-8">
+              <EventTimeline contactId={contactId} />
+            </div>
 
             {/* below xl the rail is hidden — the same facts stack here instead */}
             <div className="mt-8 xl:hidden">
@@ -342,7 +381,6 @@ export function ContactDetail({
                 contact={c}
                 companyId={companyId}
                 history={history}
-                historyState={historyState}
                 identities={identities}
               />
             </div>
@@ -355,7 +393,6 @@ export function ContactDetail({
             contact={c}
             companyId={companyId}
             history={history}
-            historyState={historyState}
             identities={identities}
           />
         </aside>
@@ -378,19 +415,30 @@ function ContactFacts({
   contact: c,
   companyId,
   history,
-  historyState,
   identities,
 }: {
   contact: Contact;
   companyId: string | null;
   history: ContactHistory | null;
-  historyState: LoadState;
   identities: ContactIdentity[];
 }) {
   const attrEntries = Object.entries(c.attributes ?? {});
   const planEntry = attrEntries.find(([k]) => k.toLowerCase() === "plan");
-  // Plan is pinned above — it leaves the Attributes section (a fact renders once).
-  const attrs = attrEntries.filter(([k]) => k.toLowerCase() !== "plan");
+  // Partition attributes: system-derived signals render READ-ONLY in their own grouped sections
+  // (Location / Device / Activity); only genuine tenant fields are "Custom attributes". Plan is
+  // pinned above and First/Last name compose the display name, so neither doubles as an attribute row.
+  const NAME_PARTS = new Set(["first name", "last name"]);
+  const systemGroups: Record<string, [string, string][]> = {};
+  const customAttrs: [string, string][] = [];
+  for (const [k, v] of attrEntries) {
+    const kl = k.toLowerCase();
+    if (kl === "plan" || NAME_PARTS.has(kl)) continue;
+    const g = systemAttributeGroup(k);
+    if (g) (systemGroups[g] ??= []).push([k, String(v)]);
+    else customAttrs.push([k, String(v)]);
+  }
+  const groupIcon: Record<string, typeof MapPin> = { Location: MapPin, "Device & browser": Monitor, Activity };
+  const sentiment = history?.sentiment;
   const latest = history?.tickets[0];
   const lastActivity = latest ? latest.updated_at || latest.created_at : null;
 
@@ -444,16 +492,43 @@ function ContactFacts({
           <FactRow label="Last activity">
             {lastActivity ? <span title={abs(lastActivity)}>{relativeTime(lastActivity)}</span> : "—"}
           </FactRow>
+          {sentiment && sentiment.total > 0 && (sentiment.positive > 0 || sentiment.negative > 0) && (
+            <FactRow label="Sentiment">
+              <span className="flex flex-wrap items-center gap-x-2 text-xs">
+                {sentiment.positive > 0 && <span className="text-success">{sentiment.positive} positive</span>}
+                {sentiment.negative > 0 && <span className="text-warning">{sentiment.negative} unhappy</span>}
+              </span>
+            </FactRow>
+          )}
         </dl>
       </div>
 
-      {attrs.length > 0 && (
-        <RailSection id="contact.attrs" icon={SlidersHorizontal} title="Attributes" count={attrs.length} defaultOpen>
+      {SYSTEM_GROUP_ORDER.map((g) => {
+        const entries = systemGroups[g];
+        if (!entries?.length) return null;
+        const Icon = groupIcon[g] ?? Activity;
+        return (
+          <RailSection key={g} id={`contact.sys.${g}`} icon={Icon} title={g} count={entries.length}>
+            <dl className="flex flex-col">
+              {entries.map(([k, v]) => (
+                <FactRow key={k} label={k}>
+                  <span className="min-w-0 truncate" title={v}>
+                    {v}
+                  </span>
+                </FactRow>
+              ))}
+            </dl>
+          </RailSection>
+        );
+      })}
+
+      {customAttrs.length > 0 && (
+        <RailSection id="contact.attrs" icon={SlidersHorizontal} title="Custom attributes" count={customAttrs.length} defaultOpen>
           <dl className="flex flex-col">
-            {attrs.map(([k, v]) => (
+            {customAttrs.map(([k, v]) => (
               <FactRow key={k} label={k}>
-                <span className="min-w-0 truncate" title={String(v)}>
-                  {String(v)}
+                <span className="min-w-0 truncate" title={v}>
+                  {v}
                 </span>
               </FactRow>
             ))}
@@ -467,27 +542,18 @@ function ContactFacts({
             {identities.map((i) => (
               <li key={i.id} className="flex items-center gap-2 py-1.5 text-small">
                 <ChannelIcon channel={i.channel_type} className="size-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate">{channelLabel(i.channel_type)}</span>
                 <span
-                  className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground"
+                  className="shrink-0 truncate font-mono text-micro text-muted-foreground/70"
                   title={i.external_id}
                 >
-                  {i.external_id}
+                  {i.external_id.length > 14 ? `${i.external_id.slice(0, 14)}…` : i.external_id}
                 </span>
               </li>
             ))}
           </ul>
         </RailSection>
       )}
-
-      <RailSection
-        id="contact.recent"
-        icon={MessagesSquare}
-        title="Recent conversations"
-        count={history?.tickets.length}
-        defaultOpen
-      >
-        <ConversationList history={history} state={historyState} />
-      </RailSection>
     </>
   );
 }

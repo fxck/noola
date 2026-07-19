@@ -206,7 +206,7 @@ async function apply() {
         `INSERT INTO messages (tenant_id, ticket_id, author_type, body, idempotency_key, channel_type, created_at)
          VALUES (current_tenant(), $1, 'customer', $2, $3, 'email', now() - interval '32 minute')`,
         [dt.rows[0].id,
-         "For the last ~20 minutes our requests to you keep failing, but your status page at https://status.acme-corp.example shows everything green. Before we wake our on-call, can you independently verify the service is actually reachable right now — not just what the status page claims?",
+         "For the last ~20 minutes our requests to you keep failing, but your status page at https://webstage-561.prg1.zerops.app shows everything green. Before we wake our on-call, can you independently verify the service is actually reachable right now — not just what the status page claims?",
          `seed-demo-ticket-${dt.rows[0].id}`],
       );
       console.log(`seeded demo ticket → ${dt.rows[0].id}`);

@@ -31,7 +31,7 @@ export const WIDGET_JS = String.raw`(function () {
   var CFG = {
     accent: (script && script.getAttribute('data-noola-accent')) || '#4f46e5',
     title: (script && script.getAttribute('data-noola-title')) || 'Ask us anything',
-    greeting: 'Hi there \u{1F44B}  Ask a question for an instant answer, or browse our help center.',
+    greeting: 'Get an instant answer from our AI, or browse the help center.',
     position: 'right',
     tabs: { home: true, messages: true, help: true }
   };
@@ -206,36 +206,56 @@ export const WIDGET_JS = String.raw`(function () {
     // glow — never a full brand-color wash. hd-a/b/c are theme-specific near-blacks.
     '.hd{background:var(--hd-a);color:#fff;padding:14px 14px 15px;display:flex;align-items:flex-start;gap:10px;position:relative}' +
     '.hd.grad{background-color:var(--hd-a);background-image:radial-gradient(135% 120% at 16% -10%,color-mix(in srgb,var(--ba) 40%,var(--hd-b)) 0%,var(--hd-b) 46%,var(--hd-c) 100%)}' +
-    '.hd.home{flex-direction:column;align-items:stretch;gap:0;padding:16px 18px 20px}' +
-    '.hd.home .homeTop{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:32px}' +
+    // Light header for non-home screens (Intercom reserves the dark hero for Home only). Dark text,
+    // hairline base, ghost icon buttons — the body reads as one calm light surface top-to-bottom.
+    '.hd.plain{background:var(--s1);color:var(--fg);border-bottom:1px solid var(--bd);padding:15px 14px;align-items:center}' +
+    '.hd.home{flex-direction:column;align-items:stretch;gap:0;padding:18px 20px 24px}' +
+    '.hd.home .homeTop{display:flex;align-items:center;justify-content:flex-end;gap:12px;min-height:34px}' +
     '.hd.home .faces{display:flex;align-items:center}' +
-    '.hd.home .faces .fc{width:30px;height:30px;border-radius:50%;border:2px solid var(--hd-b);background:var(--s1);overflow:hidden;display:grid;place-items:center;color:var(--fg);font-size:11px;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.35)}' +
-    '.hd.home .faces .fc+.fc{margin-left:-9px}' +
+    // Overlapping avatar cluster. Initials fall back to a translucent-white disc (never a stark white
+    // circle on the dark hero); photos fill; the AI mark is the one accent disc.
+    '.hd.home .faces .fc{width:32px;height:32px;border-radius:50%;border:2px solid var(--hd-b);background:rgba(255,255,255,.16);overflow:hidden;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.35)}' +
+    '.hd.home .faces .fc+.fc{margin-left:-10px}' +
     '.hd.home .faces .fc.ai{background:var(--ba);color:#fff}' +
     '.hd.home .faces .fc img{width:100%;height:100%;object-fit:cover}.hd.home .faces .fc svg{width:16px;height:16px}' +
-    '.hd.home h2{margin:16px 0 0;font-size:26px;line-height:1.18;font-weight:600;letter-spacing:-.02em;color:#fff}' +
-    '.hd.home h2 .dim{color:rgba(255,255,255,.72)}' +
+    // Home greeting: a dim personalized eyebrow + the admin\'s Panel title (bold headline) + the
+    // admin\'s greeting (dim subtitle). Everything an admin sets in Settings renders here.
+    '.hd.home .hgreet{margin-top:20px}' +
+    '.hd.home .eyebrow{font-size:15px;font-weight:500;letter-spacing:-.01em;color:rgba(255,255,255,.62)}' +
+    '.hd.home h2{margin:1px 0 0;font-size:26px;line-height:1.16;font-weight:600;letter-spacing:-.02em;color:#fff;text-wrap:balance}' +
+    '.hd.home .hsub{margin:9px 0 0;font-size:14px;line-height:1.45;color:rgba(255,255,255,.62);max-width:94%}' +
     '.hd .htxt{min-width:0;flex:1}' +
     '.hd h3{margin:0;font-size:16px;font-weight:600;letter-spacing:-.01em;line-height:1.25;color:#fff}' +
+    '.hd.plain h3{color:var(--fg)}' +
     '.hd p{margin:3px 0 0;font-size:13px;color:rgba(255,255,255,.72);line-height:1.4}' +
+    '.hd.plain p{color:var(--fg2)}' +
     '.hd .iconbtn{background:rgba(255,255,255,.14);border:none;color:#fff;width:32px;height:32px;border-radius:50%;cursor:pointer;display:grid;place-items:center;flex:0 0 auto;transition:background .15s var(--ease),transform .12s var(--spring)}' +
-    '@media (hover:hover) and (pointer:fine){.hd .iconbtn:hover{background:rgba(255,255,255,.24)}}' +
+    '.hd.plain .iconbtn{background:var(--s2);color:var(--fg2)}' +
+    '@media (hover:hover) and (pointer:fine){.hd .iconbtn:hover{background:rgba(255,255,255,.24)}.hd.plain .iconbtn:hover{background:var(--bd);color:var(--fg)}}' +
     '.hd .iconbtn:active{transform:scale(.92)}' +
     '.hd .iconbtn svg{width:18px;height:18px}' +
     '.hd-id{display:flex;align-items:center;gap:10px;min-width:0;flex:1}' +
     '.hd-id .idava{position:relative;flex:0 0 auto}' +
     '.hd-id .idava .av{width:40px;height:40px;border-radius:50%;overflow:hidden;background:rgba(255,255,255,.16);display:grid;place-items:center;color:#fff;font-weight:600;font-size:15px}' +
+    '.hd.plain .hd-id .idava .av{background:var(--s2);color:var(--fg)}' +
     '.hd-id .idava .av img{width:100%;height:100%;object-fit:cover;display:block}' +
+    // The AI mark is the green sparkle disc on every surface (home cluster, log, header) — one identity.
+    '.hd-id .idava .av.ai,.hd.plain .hd-id .idava .av.ai{background:var(--ba);color:#fff}' +
     '.hd-id .idava .av svg{width:20px;height:20px}' +
     '.hd-id .pres{position:absolute;right:-1px;bottom:-1px;width:11px;height:11px;border-radius:50%;background:#34d27b;box-shadow:0 0 0 2px var(--hd-a)}' +
+    '.hd.plain .hd-id .pres{box-shadow:0 0 0 2px var(--s1)}' +
     '.hd-id .idtxt{min-width:0}' +
     '.hd-id .idname{font-size:15px;font-weight:600;letter-spacing:-.01em;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.hd.plain .hd-id .idname{color:var(--fg)}' +
     '.hd-id .idsub{font-size:12.5px;color:rgba(255,255,255,.72);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.hd.plain .hd-id .idsub{color:var(--fg2)}' +
     '.body{flex:1;overflow-y:auto;background:var(--bg)}' +
-    '.tabbar{display:flex;background:var(--s1);border-bottom:1px solid var(--bd)}' +
-    '.tabbar button{flex:1;border:none;background:none;cursor:pointer;min-height:52px;padding:8px 4px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;color:var(--fg3);font-size:11px;font-weight:600;transition:color .15s var(--ease)}' +
-    '.tabbar button svg{width:20px;height:20px}' +
+    // Bottom nav (Intercom-style): fixed to the panel base, hairline top, active tab in accent.
+    '.tabbar{display:flex;background:var(--s1);border-top:1px solid var(--bd);padding-bottom:env(safe-area-inset-bottom,0);flex:0 0 auto}' +
+    '.tabbar button{flex:1;border:none;background:none;cursor:pointer;min-height:56px;padding:9px 4px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;color:var(--fg3);font-size:11px;font-weight:600;transition:color .15s var(--ease)}' +
+    '.tabbar button svg{width:22px;height:22px;transition:transform .18s var(--spring)}' +
     '.tabbar button.act{color:var(--ba)}' +
+    '.tabbar button.act svg{transform:translateY(-1px)}' +
     '@media (hover:hover) and (pointer:fine){.tabbar button:not(.act):hover{color:var(--fg2)}}' +
     '.card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rc);box-shadow:var(--shadow-card);margin:0 16px 16px;overflow:hidden}' +
     '.card-h{padding:14px 16px 6px;font-size:13px;font-weight:600;color:var(--fg)}' +
@@ -367,6 +387,13 @@ export const WIDGET_JS = String.raw`(function () {
     '.askcard .ic{width:40px;height:40px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;background:var(--s2);color:var(--ba)}.askcard .ic svg{width:20px;height:20px}' +
     '.askcard .at{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}.askcard .att{font-weight:600;font-size:15px;color:var(--fg);letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.askcard .ats{font-size:13px;color:var(--fg2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
     '.askcard .chev{color:var(--fg3);flex:0 0 auto}.askcard .chev svg{width:18px;height:18px;display:block}' +
+    // Mini overlapping face cluster on the ask card (the AI mark + up to two real agents) — the
+    // "AI Agent & team" signal Intercom puts on its primary card.
+    '.askcard .fcs{display:flex;align-items:center;flex:0 0 auto}' +
+    '.askcard .fcs .fc{width:26px;height:26px;border-radius:50%;border:2px solid var(--s1);background:var(--s2);overflow:hidden;display:grid;place-items:center;color:var(--fg2);font-size:10px;font-weight:600}' +
+    '.askcard .fcs .fc+.fc{margin-left:-9px}' +
+    '.askcard .fcs .fc.ai{background:var(--ba);color:#fff}' +
+    '.askcard .fcs .fc img{width:100%;height:100%;object-fit:cover}.askcard .fcs .fc svg{width:14px;height:14px}' +
     '@media (prefers-reduced-motion:reduce){' +
       '*{transition-duration:.01ms!important;animation-duration:.01ms!important;animation-iteration-count:1!important}' +
       '.mrow.msg-enter,.screen.enter-tab,.screen.enter-back,.screen.enter-fwd,.panel.on{opacity:1!important;transform:none!important}' +
@@ -548,7 +575,7 @@ export const WIDGET_JS = String.raw`(function () {
     opts = opts || {};
     var left = opts.back ? '<button class="iconbtn" id="bk" aria-label="Back">' + iconBack() + '</button>' : '';
     var h =
-      '<div class="hd grad">' + left +
+      '<div class="hd plain">' + left +
         '<div class="htxt"><h3>' + esc(title) + '</h3>' + (sub ? '<p>' + esc(sub) + '</p>' : '') + '</div>' +
         '<button class="iconbtn" id="cl" aria-label="Close">' + iconClose() + '</button>' +
       '</div>';
@@ -592,15 +619,16 @@ export const WIDGET_JS = String.raw`(function () {
   // The home header's stacked avatar cluster: the AI mark (a solid accent disc) leading up to three
   // real agent faces — a photo if the agent has one, else initials on a clean disc. Falls back to
   // any agent the visitor has already talked to, then to just the AI mark. Never fake stock faces.
-  function homeFaces() {
+  function homeFaces(max) {
+    max = max || 3;
     var faces = [];
     if (team && team.length) {
-      for (var i = 0; i < team.length && faces.length < 3; i++) faces.push(team[i]);
+      for (var i = 0; i < team.length && faces.length < max; i++) faces.push(team[i]);
     } else {
       var seen = {};
-      for (var c = 0; c < convs.length && faces.length < 3; c++) {
+      for (var c = 0; c < convs.length && faces.length < max; c++) {
         var ms = convs[c].msgs || [];
-        for (var j = 0; j < ms.length && faces.length < 3; j++) {
+        for (var j = 0; j < ms.length && faces.length < max; j++) {
           var m = ms[j];
           if (m.authorAvatarUrl && !seen[m.authorAvatarUrl]) { seen[m.authorAvatarUrl] = 1; faces.push({ name: m.authorName || '', avatarUrl: m.authorAvatarUrl }); }
         }
@@ -626,22 +654,28 @@ export const WIDGET_JS = String.raw`(function () {
           '<span class="chev">' + iconChev() + '</span>' +
         '</div></div>';
     }
+    // Home header renders exactly what the admin set in Settings → Messenger: a personalized eyebrow,
+    // the Panel title (headline), and the greeting (subtitle). No hardcoded copy.
     var hi = isIdentified() && identity.name ? esc(String(identity.name).split(/\s+/)[0]) : null;
     var homeHead =
       '<div class="hd grad home">' +
         '<div class="homeTop">' +
-          '<div class="faces">' + homeFaces() + '</div>' +
+          '<div class="faces">' + homeFaces(3) + '</div>' +
           '<button class="iconbtn" id="cl" aria-label="Close">' + iconClose() + '</button>' +
         '</div>' +
-        '<h2>' + (hi ? ('Hi ' + hi + '. ') : 'Hi there. ') + '<span class="dim">How can we help?</span></h2>' +
+        '<div class="hgreet">' +
+          (hi ? '<div class="eyebrow">Hi ' + hi + '.</div>' : '') +
+          '<h2>' + esc(CFG.title) + '</h2>' +
+          (CFG.greeting ? '<p class="hsub">' + esc(CFG.greeting) + '</p>' : '') +
+        '</div>' +
       '</div>';
     var html =
-      homeHead + tabbar() +
+      homeHead +
       '<div class="body">' +
         '<button class="askcard" id="startc" style="margin-top:16px">' +
           '<span class="ic">' + iconSparkle() + '</span>' +
           '<span class="at"><span class="att">Ask a question</span><span class="ats">AI Agent &amp; team · instant answers</span></span>' +
-          '<span class="chev">' + iconChev() + '</span>' +
+          '<span class="fcs">' + homeFaces(2) + '</span>' +
         '</button>' +
         recentCard +
         (CFG.tabs.help ? (
@@ -649,7 +683,8 @@ export const WIDGET_JS = String.raw`(function () {
           '<div class="sect">Top articles</div><div id="tophelp"><div class="empty">Loading…</div></div>'
         ) : '') +
         '<div class="brand">Powered by Noola</div>' +
-      '</div>';
+      '</div>' +
+      tabbar();
     return { html: html, wire: function () {
       wireHeader(); wireTabs();
       var sc = sel('#startc'); if (sc) sc.addEventListener('click', openOrStartConversation);
@@ -688,11 +723,12 @@ export const WIDGET_JS = String.raw`(function () {
         '<span class="chev">' + iconChev() + '</span></div>';
     }).join('') : '';
     var html =
-      header('Messages') + tabbar() +
+      header('Messages') +
       '<div class="body">' +
         '<button class="cta" id="startc" style="margin-top:16px"><span>Start a new conversation</span>' + iconSend() + '</button>' +
         (rows ? '<div class="card">' + rows + '</div>' : '<div class="empty">No conversations yet.<br>Start one above.</div>') +
-      '</div>';
+      '</div>' +
+      tabbar();
     return { html: html, wire: function () {
       wireHeader(); wireTabs();
       var sc = sel('#startc'); if (sc) sc.addEventListener('click', startConversation);
@@ -851,7 +887,7 @@ export const WIDGET_JS = String.raw`(function () {
       avInner = agent ? avatarInner(agent) : '<span class="av ai">' + iconSparkle() + '</span>';
       sub = 'Replies instantly · talk to a human anytime';
     }
-    return '<div class="hd grad">' +
+    return '<div class="hd plain">' +
       (back ? '<button class="iconbtn" id="bk" aria-label="Back">' + iconBack() + '</button>' : '') +
       '<div class="hd-id"><div class="idava">' + avInner + '<span class="pres"></span></div>' +
         '<div class="idtxt"><div class="idname">' + esc(name) + '</div><div class="idsub">' + esc(sub) + '</div></div></div>' +
@@ -1228,11 +1264,12 @@ export const WIDGET_JS = String.raw`(function () {
   var helpTimer = null;
   function renderHelp() {
     var html =
-      header('Help center', 'Search our knowledge base') + tabbar() +
+      header('Help center', 'Search our knowledge base') +
       '<div class="body">' +
         '<div class="search" style="margin-top:16px"><span>' + iconSearch() + '</span><input id="hq" placeholder="Search for articles" autocomplete="off"></div>' +
         '<div id="hres"><div class="sect">Browse</div><div id="hbrowse"><div class="empty">Loading…</div></div></div>' +
-      '</div>';
+      '</div>' +
+      tabbar();
     return { html: html, wire: function () {
       wireHeader(); wireTabs();
       var hq = sel('#hq');

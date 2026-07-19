@@ -841,7 +841,7 @@ export type WidgetConfig = z.infer<typeof WidgetConfig>;
 export const WIDGET_CONFIG_DEFAULTS: WidgetConfig = {
   accent: "#4f46e5",
   title: "Ask us anything",
-  greeting: "Hi there 👋  Ask a question for an instant answer, or browse our help center.",
+  greeting: "Get an instant answer from our AI, or browse the help center.",
   position: "right",
   tabs: { home: true, messages: true, help: true },
   verifyIdentity: false,
@@ -1397,3 +1397,30 @@ export const PublicEventInput = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 export type PublicEventInput = z.infer<typeof PublicEventInput>;
+
+// ── Contact attribute classification ─────────────────────────────────────────
+// System-derived signals Noola computes per visit (enrich.ts + widget identify). These are NEVER
+// tenant custom attributes: the profile UI groups + read-onlies them, and the public widget may not
+// spoof them on an unverified identity. Matched case-insensitively.
+export const SYSTEM_ATTRIBUTE_KEYS: readonly string[] = [
+  "Browser", "Browser Version", "OS", "Browser Language", "Timezone", "Referral URL",
+  "City", "Region", "Country", "Continent code",
+  "Web sessions", "Last contacted", "last_page_url", "last_page_title", "last_seen_at",
+];
+const SYSTEM_ATTR_LOWER = new Set(SYSTEM_ATTRIBUTE_KEYS.map((k) => k.toLowerCase()));
+/** Is this attribute key a Noola-derived system signal (case-insensitive)? */
+export function isSystemAttributeKey(key: string): boolean {
+  return SYSTEM_ATTR_LOWER.has(key.toLowerCase());
+}
+/** Trusted facts the agent UI relies on that a widget visitor must never set on an UNVERIFIED
+ *  identity (all system signals + the `plan` the profile pins as a fact). */
+export const RESERVED_ATTRIBUTE_KEYS: readonly string[] = [...SYSTEM_ATTRIBUTE_KEYS, "plan"];
+const RESERVED_ATTR_LOWER = new Set(RESERVED_ATTRIBUTE_KEYS.map((k) => k.toLowerCase()));
+/** Drop reserved/trusted keys from an untrusted (unverified) attributes bag before it is stored. */
+export function stripReservedAttributes(attrs: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    if (!RESERVED_ATTR_LOWER.has(k.toLowerCase())) out[k] = v;
+  }
+  return out;
+}

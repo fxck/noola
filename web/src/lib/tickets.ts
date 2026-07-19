@@ -50,6 +50,9 @@ export interface Ticket {
   support_mode?: "staffed" | "community" | null;
   /** The Discord thread id when this is a thread-ticket (community banner / group-chat view). */
   external_thread_id?: string | null;
+  /** Discord guild (server) id for a Discord-origin ticket — with external_thread_id it builds the
+   *  deep-link back to the source thread ("View in Discord"). */
+  external_guild_id?: string | null;
 }
 
 /** Merge this ticket (the duplicate) into `into` (the canonical). Moves messages + closes/flags. */

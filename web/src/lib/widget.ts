@@ -35,7 +35,7 @@ export interface WidgetKey {
 export const WIDGET_CONFIG_DEFAULTS: WidgetConfig = {
   accent: "#4f46e5",
   title: "Ask us anything",
-  greeting: "Hi there 👋  Ask a question for an instant answer, or browse our help center.",
+  greeting: "Get an instant answer from our AI, or browse the help center.",
   position: "right",
   tabs: { home: true, messages: true, help: true },
   verifyIdentity: false,

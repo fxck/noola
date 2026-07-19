@@ -187,16 +187,20 @@ export async function exportContactData(tenantId: string, contactId: string): Pr
     if (!contact.rowCount) return null;
     const [identities, events, tickets] = await Promise.all([
       c.query("SELECT channel_type, external_id, created_at FROM contact_identities WHERE contact_id = $1", [contactId]),
-      c.query("SELECT name, payload, created_at FROM contact_events WHERE contact_id = $1 ORDER BY created_at", [contactId]).catch(() => ({ rows: [] })),
+      // The real column is `metadata` — this was querying a non-existent `payload`, so the whole
+      // events timeline silently exported empty. No blanket catch: an export must fail loudly, not omit.
+      c.query("SELECT name, metadata, created_at FROM contact_events WHERE contact_id = $1 ORDER BY created_at", [contactId]),
       c.query("SELECT id, subject, status, channel_type, created_at, updated_at FROM tickets WHERE contact_id = $1 ORDER BY created_at", [contactId]),
     ]);
     const ticketIds = tickets.rows.map((t: { id: string }) => t.id);
-    const messages = ticketIds.length
-      ? await c.query(
-          "SELECT ticket_id, author_type, body, channel_type, created_at FROM messages WHERE ticket_id = ANY($1::uuid[]) AND deleted_at IS NULL ORDER BY created_at",
-          [ticketIds],
-        )
-      : { rows: [] };
+    // Messages in the contact's OWN tickets AND every message they authored anywhere (e.g. Discord
+    // community replies in other people's tickets) — a complete export, not just ticket-scoped.
+    const messages = await c.query(
+      `SELECT ticket_id, author_type, body, channel_type, created_at FROM messages
+         WHERE deleted_at IS NULL AND (author_contact_id = $1 OR ticket_id = ANY($2::uuid[]))
+         ORDER BY created_at`,
+      [contactId, ticketIds],
+    );
     return {
       exportedAt: new Date().toISOString(),
       contact: contact.rows[0],
@@ -226,6 +230,14 @@ export async function eraseContact(tenantId: string, contactId: string, actorId:
       }
       await c.query("DELETE FROM tickets WHERE id = ANY($1::uuid[])", [ids]);
     }
+    // The person's content authored in OTHER people's tickets (Discord community replies) isn't
+    // covered by deleting their own tickets — anonymize it so nothing of theirs survives the erase,
+    // while the other ticket's thread stays coherent.
+    await c.query(
+      `UPDATE messages SET body = '[erased]', author_external_name = NULL, author_contact_id = NULL
+         WHERE author_contact_id = $1`,
+      [contactId],
+    );
     await c.query("DELETE FROM contacts WHERE id = $1", [contactId]);
     return true;
   });

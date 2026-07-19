@@ -62,7 +62,7 @@ const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_chann
               (SELECT tt.color FROM ticket_types tt
                  WHERE tt.tenant_id = t.tenant_id AND tt.id = t.type_id) AS type_color,
               t.merged_into, t.snoozed_until, t.sentiment,
-              t.support_mode, t.external_thread_id,
+              t.support_mode, t.external_thread_id, t.external_guild_id,
               t.team_id,
               (SELECT tem.name FROM teams tem
                  WHERE tem.tenant_id = t.tenant_id AND tem.id = t.team_id) AS team_name,

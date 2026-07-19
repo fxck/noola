@@ -8,6 +8,7 @@ import {
   WidgetKeyUpdateInput,
   PublicIdentifyInput,
   PublicTrackInput,
+  stripReservedAttributes,
 } from "@repo/contracts";
 import { randomUUID } from "node:crypto";
 import { tenanted } from "../http/tenant.js";
@@ -445,9 +446,13 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (wk.config.verifyIdentity && !rid.verified) {
       return { ok: true, identified: false, verification: "failed" as const };
     }
-    // Fold last-seen + last-page into the custom-attributes bag (jsonb shallow-merge on upsert),
-    // so the agent-side contact profile shows recency without a dedicated column.
-    const merged: Record<string, unknown> = { ...(attributes ?? {}), last_seen_at: new Date().toISOString() };
+    // Customer-supplied attributes are UNTRUSTED unless the identity is cryptographically verified —
+    // strip reserved/trusted keys (system telemetry + `plan`) so a widget visitor can't spoof a fact
+    // the agent UI trusts (claim plan='enterprise', fake their City, …). A verified identity (JWT /
+    // user_hash) is the customer's own backend and is authoritative. `last_seen_at` lives on its own
+    // COLUMN (bumpContactSeen below) — never mirror it into the bag (that was a double source of truth).
+    const customAttrs = rid.verified ? (attributes ?? {}) : stripReservedAttributes(attributes ?? {});
+    const merged: Record<string, unknown> = { ...customAttrs };
     if (page?.url) merged.last_page_url = page.url;
     if (page?.title) merged.last_page_title = page.title;
     // Live enrichment (Intercom-parity): browser/OS from UA, language from header, timezone +

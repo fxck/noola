@@ -56,6 +56,15 @@ function transport(): MirrorTransport | null {
   return getMirrorTransport();
 }
 
+/** The Noola display name for a resolved teammate seat — so a mirrored note/reply is attributed to
+ *  the real Noola user, not just the Discord display handle. */
+async function teammateName(tenantId: string, userId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [userId]);
+    return r.rowCount ? (r.rows[0].name as string) : null;
+  });
+}
+
 function asFilter(v: unknown): MirrorFilter {
   if (v && typeof v === "object") return v as MirrorFilter;
   if (typeof v === "string") {
@@ -436,25 +445,31 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
   if (!body) return { handled: true };
 
   const binding = mirror.binding_id ? await loadBinding(mirror.binding_id) : null;
-  // NULL responder role = the whole server is the team (single-tenant pilot default). An explicitly
-  // marked teammate (agent_channel_identities) always counts, independent of Discord roles.
-  const isResponder =
-    !binding?.responder_role_id ||
-    m.roleIds.includes(binding.responder_role_id) ||
-    Boolean(await resolveTeammate(mirror.tenant_id, m.authorId));
+  // Resolve the Discord author to a Noola seat ONCE — reused to attribute the note AND gate promotion.
+  const agentId = await resolveTeammate(mirror.tenant_id, m.authorId);
+  // SECURITY: an UNSET responder role must NOT mean "the whole server is staff" — otherwise any
+  // server member's message could later be promoted to the customer or triage the ticket. Require the
+  // configured responder role OR an explicit teammate mark (agent_channel_identities).
+  const isResponder = binding?.responder_role_id
+    ? m.roleIds.includes(binding.responder_role_id) || Boolean(agentId)
+    : Boolean(agentId);
 
-  const name = m.authorDisplayName || "Discord teammate";
+  // Attribute the note to the resolved Noola user: author_id links it to their seat, and the name is
+  // their real Noola name — not just the Discord display handle (fixes "it's not aware it's me").
+  const seatName = agentId ? await teammateName(mirror.tenant_id, agentId) : null;
+  const name = seatName || m.authorDisplayName || "Discord teammate";
   const note = await addNote(mirror.tenant_id, mirror.ticket_id, {
+    authorId: agentId ?? null,
     authorName: `${name} (Discord)`,
     body,
   }).catch(() => null);
 
   await relayPool.query(
     `INSERT INTO ticket_mirror_messages
-       (discord_message_id, tenant_id, ticket_id, post_thread_id, author_discord_id, author_display_name, is_responder, body, note_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (discord_message_id, tenant_id, ticket_id, post_thread_id, author_discord_id, author_display_name, is_responder, body, note_id, author_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (discord_message_id) DO NOTHING`,
-    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, body, note?.id ?? null],
+    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, body, note?.id ?? null, agentId ?? null],
   );
   return { handled: true, noteId: note?.id };
 }
@@ -504,23 +519,35 @@ export async function handleMirrorReaction(
   const claim = await relayPool.query(
     `UPDATE ticket_mirror_messages SET promoted_at = now()
       WHERE discord_message_id = $1 AND is_responder AND promoted_at IS NULL
-      RETURNING tenant_id, ticket_id, body, author_display_name`,
+      RETURNING tenant_id, ticket_id, body, author_display_name, author_discord_id, author_user_id`,
     [r.discordMessageId],
   );
   if (!claim.rowCount) return { promoted: false, reason: "not_promotable" };
-  const row = claim.rows[0] as { tenant_id: string; ticket_id: string; body: string; author_display_name: string | null };
+  const row = claim.rows[0] as {
+    tenant_id: string; ticket_id: string; body: string;
+    author_display_name: string | null; author_discord_id: string | null; author_user_id: string | null;
+  };
 
+  // Attribute by the AUTHOR of the promoted message (not the reactor): a marked teammate → their Noola
+  // seat + real name + authorKind 'agent'; a genuinely seat-less responder stays 'community'. Falls
+  // back to the stored author_user_id, then a fresh resolve, then the reactor's seat.
+  const seatId =
+    row.author_user_id ??
+    (row.author_discord_id ? await resolveTeammate(row.tenant_id, row.author_discord_id) : null) ??
+    agentId;
+  const seatName = seatId ? await teammateName(row.tenant_id, seatId) : null;
   const attribution =
     binding?.attribution_mode === "collaborator"
-      ? row.author_display_name
-      : binding?.attribution_name ?? null;
+      ? seatName ?? row.author_display_name
+      : binding?.attribution_name ?? seatName ?? null;
 
   const result = await ingestInbound({
     tenantId: row.tenant_id,
     ticketId: row.ticket_id,
     body: row.body,
     authorType: "agent",
-    authorKind: "community",
+    authorKind: seatId ? "agent" : "community",
+    authorId: seatId ?? null,
     authorExternalName: attribution ?? row.author_display_name ?? "Support",
     origin: "discord_mirror",
     idempotencyKey: `discord-mirror-promote:${r.discordMessageId}`,

@@ -329,7 +329,16 @@ export async function updateCompany(tenantId: string, id: string, patch: { name?
         WHERE id = $1 RETURNING ${COLS}`,
       [id, patch.name ?? null, patch.domain ?? null, patch.plan ?? null, patch.attributes ? JSON.stringify(patch.attributes) : null],
     );
-    return r.rowCount ? mapCompany(r.rows[0] as Record<string, unknown>) : null;
+    if (!r.rowCount) return null;
+    // Keep contacts' denormalized `company` text in sync on rename, so name-based segments /
+    // broadcasts / directory filters don't drift off the account (the id-vs-name split).
+    if (patch.name && patch.name.trim()) {
+      await c.query(
+        "UPDATE contacts SET company = $2, updated_at = now() WHERE company_id = $1 AND company IS DISTINCT FROM $2",
+        [id, patch.name.trim()],
+      );
+    }
+    return mapCompany(r.rows[0] as Record<string, unknown>);
   });
 }
 

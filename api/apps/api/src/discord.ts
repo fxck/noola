@@ -207,6 +207,7 @@ export async function handleInboundMessage(
     authorId: cls.authorId,
     authorExternalName: m.authorDisplayName ?? null,
     authorExternalAvatarUrl: m.authorAvatarUrl ?? null,
+    authorExternalId: m.authorId,
     // Only a seeker resolves/creates a contact; teammates + community responders never mint one
     // (refuted-claim #2). Passing identity is harmless — ingest ignores it for non-customer authors.
     identity: isSeeker ? { externalId: m.authorId, name: m.authorDisplayName ?? null } : undefined,
@@ -374,6 +375,9 @@ export interface ThreadCreateInput {
   kind: "text_thread" | "forum_post";
   ownerDisplayName?: string | null;
   ownerAvatarUrl?: string | null;
+  /** The owner's Discord role ids, when the gateway can supply them — feeds classifyDiscordAuthor so a
+   *  teammate/responder who opens a thread isn't mis-seated as a customer. */
+  ownerRoleIds?: string[];
 }
 
 /**
@@ -388,6 +392,11 @@ export async function handleThreadCreate(t: ThreadCreateInput): Promise<IngestRe
   if (!tenantId) return null;
   const binding = await resolveBinding(t.guildId, t.threadId, t.parentId);
   if (!binding) return null;  // unbound / off — community threads ARE seated (Phase 3)
+  // Classify the owner instead of assuming 'customer': a marked teammate / team-role member opening a
+  // thread is not a seeker, so we must NOT pre-seat a customer ticket or mint a phantom contact for
+  // them. Only a genuine seeker gets seated (their first message rides the normal thread path).
+  const cls = await classifyDiscordAuthor({ tenantId, guildId: t.guildId, authorId: t.ownerId, roleIds: t.ownerRoleIds ?? [] });
+  if (cls.action === "drop" || cls.authorType !== "customer") return null;
   return ingestInbound({
     tenantId,
     body: t.name ?? "[thread]",
@@ -404,6 +413,7 @@ export async function handleThreadCreate(t: ThreadCreateInput): Promise<IngestRe
     authorKind: "customer",
     authorExternalName: t.ownerDisplayName ?? null,
     authorExternalAvatarUrl: t.ownerAvatarUrl ?? null,
+    authorExternalId: t.ownerId,
     identity: { externalId: t.ownerId, name: t.ownerDisplayName ?? null },
     skipAutoreply: true, // a thread-create seat is not a customer question turn
   });
