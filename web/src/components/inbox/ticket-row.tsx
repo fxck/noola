@@ -1,6 +1,7 @@
 import { ChevronUp, ChevronsUp, CornerUpLeft, UserRound } from "lucide-react";
 import { type Ticket, type TicketPriority, relativeTime } from "@/lib/tickets";
 import { Avatar } from "@/components/ui/avatar";
+import { avatarSrc } from "@/lib/avatar-upload";
 import { SlaBadge } from "@/components/sla-badge";
 import { cn } from "@/lib/utils";
 
@@ -70,7 +71,7 @@ export function TicketRow({
       />
 
       {ticket.contact_name ? (
-        <Avatar name={ticket.contact_name} className="mt-0.5 size-6 shrink-0 text-micro" />
+        <Avatar name={ticket.contact_name} image={avatarSrc(ticket.contact_avatar_url)} className="mt-0.5 size-6 shrink-0 text-micro" />
       ) : (
         // No contact identity — a neutral disc, never a loud hashed hue.
         <span
@@ -151,6 +152,7 @@ export function TicketRow({
             {ticket.assignee_id && (
               <Avatar
                 name={ticket.assignee_name}
+                image={avatarSrc(ticket.assignee_avatar_url)}
                 className="size-4 text-[8px]"
               />
             )}

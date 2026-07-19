@@ -393,6 +393,48 @@ function decodeEntities(s: string): string {
     .replace(/&#39;/gi, "'");
 }
 
+/** Resolve one link target to absolute against the page URL, or null to leave it untouched
+ *  (already absolute, an in-page anchor, or a non-navigational scheme like mailto:/data:). */
+function toAbsoluteLink(ref: string, base: string): string | null {
+  const r = ref.trim();
+  if (!r || r.startsWith("#")) return null;
+  if (r.startsWith("//") || /^[a-z][a-z0-9+.-]*:/i.test(r)) return null; // protocol-relative or scheme-qualified
+  try {
+    const abs = new URL(r, base).toString();
+    return abs === r ? null : abs;
+  } catch {
+    return null;
+  }
+}
+
+/** Rewrite relative links in crawled content to absolute URLs, based on the page's own URL. A doc's
+ *  `.md` twin (and its HTML) stores links like `/references/networking/l7` — quoted verbatim into an
+ *  AI answer those resolve against the wrong host and 404. Rewriting them at ingest keeps every cited
+ *  link live. Markdown inline/image links + reference definitions; HTML href/src. Plain text is left
+ *  alone (no link syntax to resolve). */
+export function absolutizeLinks(content: string, contentType: string, pageUrl: string): string {
+  if (contentType === "text/markdown") {
+    return content
+      // inline [text](target) and ![alt](target …"title")
+      .replace(/(!?\[[^\]]*\]\()\s*([^)\s]+)(\s*(?:"[^"]*"|'[^']*')?\s*\))/g, (whole, pre, target, post) => {
+        const abs = toAbsoluteLink(target, pageUrl);
+        return abs ? `${pre}${abs}${post}` : whole;
+      })
+      // reference-style definitions: [id]: target
+      .replace(/^(\s*\[[^\]]+\]:\s*)(\S+)/gm, (whole, pre, target) => {
+        const abs = toAbsoluteLink(target, pageUrl);
+        return abs ? `${pre}${abs}` : whole;
+      });
+  }
+  if (contentType === "text/html") {
+    return content.replace(/\b(href|src)\s*=\s*("([^"]*)"|'([^']*)')/gi, (whole, attr, _q, dq, sq) => {
+      const abs = toAbsoluteLink(dq ?? sq ?? "", pageUrl);
+      return abs ? `${attr}="${abs}"` : whole;
+    });
+  }
+  return content; // text/plain — nothing to resolve
+}
+
 // ---- llms.txt + Markdown content-negotiation (modern docs conventions) -----
 // Docs sites increasingly publish two LLM-friendly affordances we prefer over blind HTML scraping:
 //   • /llms.txt — a curated Markdown index of the canonical doc URLs (https://llmstxt.org). When a
@@ -521,7 +563,7 @@ export async function fetchUrlUnits(config: Record<string, unknown>, ctx?: Conne
       key: p.url,
       title: p.contentType === "text/html" ? titleOf(p.body, p.url) : p.url,
       contentType: p.contentType,
-      content: p.body,
+      content: absolutizeLinks(p.body, p.contentType, p.url),
     });
   };
 

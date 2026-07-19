@@ -12,6 +12,7 @@ export interface Ticket {
   whose_turn: "us" | "customer" | null;
   assignee_id: string | null;
   assignee_name: string | null;
+  assignee_avatar_url?: string | null;
   priority: TicketPriority;
   tags: string[];
   created_at: string;
@@ -35,6 +36,7 @@ export interface Ticket {
   /** The contact this conversation belongs to (omnichannel unification), or null. */
   contact_id?: string | null;
   contact_name?: string | null;
+  contact_avatar_url?: string | null;
   /** The contact's company (account) — row/rail context. Optional (older api). */
   company_id?: string | null;
   company_name?: string | null;

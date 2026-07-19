@@ -12,6 +12,7 @@ export interface TicketRow {
   whose_turn: string | null;
   assignee_id: string | null;
   assignee_name: string | null;
+  assignee_avatar_url: string | null;
   priority: string;
   tags: string[];
   created_at: string;
@@ -37,6 +38,7 @@ export interface TicketRow {
   /** The contact this conversation belongs to (omnichannel), or null. Name hydrated from contacts. */
   contact_id: string | null;
   contact_name: string | null;
+  contact_avatar_url: string | null;
   /** The contact's company (account), hydrated via contacts.company_id — row/rail context. */
   company_id: string | null;
   company_name: string | null;
@@ -49,7 +51,7 @@ export interface TicketRow {
 // search hydrate, and the rich table query never drift). `first_response_at` is a correlated
 // subquery (min agent-message time) so SLA state can be computed without a second round-trip.
 const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_channel_id,
-              t.whose_turn, t.assignee_id, u.name AS assignee_name, t.priority, t.tags,
+              t.whose_turn, t.assignee_id, u.name AS assignee_name, u.avatar_url AS assignee_avatar_url, t.priority, t.tags,
               t.created_at, t.updated_at, t.closed_at,
               (SELECT min(m.created_at) FROM messages m
                  WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id
@@ -64,7 +66,7 @@ const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_chann
               t.team_id,
               (SELECT tem.name FROM teams tem
                  WHERE tem.tenant_id = t.tenant_id AND tem.id = t.team_id) AS team_name,
-              t.contact_id, co.name AS contact_name,
+              t.contact_id, co.name AS contact_name, co.avatar_url AS contact_avatar_url,
               co.company_id,
               (SELECT cp.name FROM companies cp
                  WHERE cp.tenant_id = t.tenant_id AND cp.id = co.company_id) AS company_name,
