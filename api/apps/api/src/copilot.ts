@@ -165,12 +165,13 @@ async function latestCustomerMessage(tenantId: string, ticketId: string): Promis
 
 /** Who the answer is FOR. 'public' = anonymous surfaces (widget, docs embed, deflection,
  *  public answer API); 'agent' = the copilot + autoreply gate. Retrieval scoping (item 18)
- *  keys on this: public answers default to published-KB-only so resolved customer threads
- *  and internal documents can never leak into an anonymous answer. */
+ *  keys on this: public answers ground on the KB + your indexed documents (the docs you
+ *  crawled/uploaded to answer customers), but NEVER on resolved customer threads — so a prior
+ *  customer's conversation can't leak into an anonymous answer. Only agents see the thread surface. */
 export type Audience = "public" | "agent";
 
 const DEFAULT_SCOPES: Record<Audience, string[]> = {
-  public: ["kb"],
+  public: ["kb", "document"],
   agent: ["kb", "thread", "document"],
 };
 
