@@ -1,16 +1,16 @@
 import { Hero } from "./components/hero";
-import { Problem, Answers, Studio, Channels, Developers, Pricing, FinalCta } from "./components/sections";
+import { Problem, Studio, Answers, Channels, Developers, Pricing, FinalCta } from "./components/sections";
 
-// The marketing home. Order is the argument: show the product, name the problem, prove the AI,
-// reveal the differentiator (Studio), enumerate the channels, satisfy the engineer, be honest about
-// price, then close the loop. Each section earns its scroll.
+// The marketing home. Order is the argument: show the product, name the pain (dark interlude),
+// reveal the differentiator (Studio does real work), prove the AI reads context, enumerate the
+// channels, satisfy the engineer, be honest about price, then close the loop.
 export function Home() {
   return (
     <>
       <Hero />
       <Problem />
-      <Answers />
       <Studio />
+      <Answers />
       <Channels />
       <Developers />
       <Pricing />

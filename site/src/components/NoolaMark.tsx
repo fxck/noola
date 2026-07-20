@@ -23,8 +23,8 @@ export function NoolaMark({ size = 24, className }: { size?: number; className?:
 export function Wordmark({ className }: { className?: string }) {
   return (
     <span className={"inline-flex items-center gap-2 " + (className ?? "")}>
-      <NoolaMark size={22} className="text-muted-foreground" />
-      <span className="text-[1.05rem] font-semibold tracking-tight text-foreground">noola</span>
+      <NoolaMark size={22} className="text-foreground" />
+      <span className="text-[1.15rem] font-semibold tracking-[-0.02em] text-foreground">noola</span>
     </span>
   );
 }
