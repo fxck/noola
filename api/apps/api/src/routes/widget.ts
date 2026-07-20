@@ -202,7 +202,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     }
 
     try {
-      const s = await suggestForQuery(wk.tenantId, question, { audience: "public" });
+      const s = await suggestForQuery(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId });
       // Persist the AI answer as an agent message on the SAME ticket → threads + fans out over the
       // widget WS. origin:'automation' suppresses re-triggering the rules engine off the AI's reply.
       const answerMsg = await ingestInbound({
@@ -306,7 +306,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const hb = setInterval(() => raw.write(": ping\n\n"), 15_000);
 
     try {
-      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public" });
+      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId });
       // Manual iteration so we capture the generator's RETURN value (the final Suggestion).
       let suggestion: Awaited<ReturnType<typeof suggestForQuery>>;
       for (;;) {

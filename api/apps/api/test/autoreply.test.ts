@@ -33,6 +33,10 @@ async function agentMsgCount(ticketId: string): Promise<number> {
   const r = await superPool.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1 AND author_type = 'agent'", [ticketId]);
   return r.rows[0].n as number;
 }
+async function assistantEnabled(ticketId: string): Promise<boolean> {
+  const r = await superPool.query("SELECT assistant_enabled FROM tickets WHERE id = $1", [ticketId]);
+  return r.rowCount ? r.rows[0].assistant_enabled !== false : true;
+}
 async function decisionCount(ticketId: string): Promise<number> {
   const r = await superPool.query("SELECT count(*)::int AS n FROM autoreply_decisions WHERE ticket_id = $1", [ticketId]);
   return r.rows[0].n as number;
@@ -95,6 +99,7 @@ async function main() {
   const tSug = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY suggest", body: strongBody });
   const tOff = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY off", body: strongBody });
   const tGuard = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY guard", body: `I want a refund for my ${MARK} order and to speak to a manager right now.` });
+  const tHuman = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY human", body: `My ${MARK} question — actually, I'd like to talk to a human, please.` });
   const tWeak = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY weak", body: "zqxwv blorptth vrmpht gnarlfth?" });
   const tKill = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY kill", body: strongBody });
   const tCap = await ingestInbound({ tenantId: A, authorType: "customer", subject: "AUTOREPLY cap", body: strongBody });
@@ -186,6 +191,23 @@ async function main() {
   check("guardrail → outcome suppressed", guard?.outcome === "suppressed");
   check("guardrail → reason names the tripped guardrail", (guard?.reason ?? "").startsWith("guardrail:"));
   check("guardrail → nothing sent", (await agentMsgCount(tGuard.ticketId)) === 0);
+
+  // 3b. HUMAN HANDOFF: a typed "talk to a human" suppresses under the AMBIENT engine on ANY channel
+  // (not just the widget /ask lane) AND mutes the assistant, so the bot stays silent afterwards. Runs
+  // under mode='auto' to prove it beats a corroborated auto-send. Regression for the live case where
+  // the bot kept answering after "I'd like to talk to a human, please". (tHuman is ingested up-front
+  // under mode='off' so the ingest-time fire doesn't pre-record the decision — this explicit eval owns it.)
+  await arm(tHuman.ticketId);
+  const human = await evaluateAutoreply(A, tHuman.ticketId, tHuman.messageId);
+  check("handoff → outcome suppressed", human?.outcome === "suppressed");
+  check("handoff → reason handoff_requested", human?.reason === "handoff_requested");
+  check("handoff → nothing sent", (await agentMsgCount(tHuman.ticketId)) === 0);
+  check("handoff → assistant muted on the ticket", (await assistantEnabled(tHuman.ticketId)) === false);
+  const humanFollow = await ingestInbound({ tenantId: A, authorType: "customer", ticketId: tHuman.ticketId, body: `are you still there about my ${MARK}?` });
+  await arm(tHuman.ticketId);
+  const follow = await evaluateAutoreply(A, tHuman.ticketId, humanFollow.messageId);
+  check("handoff → muted assistant skips the follow-up (null)", follow === null);
+  check("handoff → still nothing sent after follow-up", (await agentMsgCount(tHuman.ticketId)) === 0);
 
   // 4. weak retrieval → suppressed weak_retrieval, no send
   await arm(tWeak.ticketId);

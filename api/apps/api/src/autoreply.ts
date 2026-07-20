@@ -1,6 +1,6 @@
 import { withTenant, relayPool } from "@repo/db";
 import { EVENT_TYPES } from "@repo/contracts";
-import { classifyRisk } from "./model.js";
+import { classifyRisk, wantsHuman } from "./model.js";
 import { getRiskKeywords } from "./classification.js";
 import { suggestForQuery, type Suggestion } from "./copilot.js";
 import { ingestInbound } from "./ingest.js";
@@ -269,6 +269,19 @@ async function loadContext(tenantId: string, ticketId: string, messageId: string
   });
 }
 
+/** A customer asked for a human — mute the assistant on THIS ticket (any channel) so ambient
+ *  autoreply stands down, and keep the ball on us so it surfaces in the "Needs reply" human queue.
+ *  Distinct from the widget's setWidgetAssistantMode (external-channel-scoped, widget-only): keys on
+ *  the ticket id, so a Discord / email / synthetic conversation is muted too. Idempotent. */
+async function muteAssistantForHandoff(tenantId: string, ticketId: string): Promise<void> {
+  await withTenant(tenantId, async (c) => {
+    await c.query(
+      "UPDATE tickets SET assistant_enabled = false, whose_turn = 'us' WHERE id = $1",
+      [ticketId],
+    );
+  });
+}
+
 export interface HardGateResult {
   riskTags: string[];
   /** The kill switch tripped (global AUTOREPLY_KILL or the per-tenant kill_switch). */
@@ -415,6 +428,20 @@ async function evaluateForMessage(
   // The AI is muted on this conversation (visitor asked for a human, or the assistant was
   // switched off). The bot must not answer past a handoff — the human owns it now.
   if (ctx.assistantEnabled === false) return null;
+
+  // Explicit human handoff — a typed "talk to a human, please". The AMBIENT engine must honor this
+  // on EVERY channel (email, Discord, synthetic, widget-ingest), not just the widget /ask lanes: mute
+  // the assistant on THIS ticket and stand down so a person owns it. Channel-agnostic (keys on ticket
+  // id, unlike the widget-only external-channel mute). Broader than the 'escalation' risk rule, which
+  // keys on "speak to"/"real person" and misses the common "talk to a human".
+  if (wantsHuman(ctx.body)) {
+    await muteAssistantForHandoff(tenantId, ticketId);
+    const id = await recordDecision(tenantId, {
+      messageId, ticketId, outcome: "suppressed", reason: "handoff_requested",
+      agreement: null, topScore: null, confidence: null, riskTags: [], sentMessageId: null, traceId: null,
+    });
+    return id ? { outcome: "suppressed", reason: "handoff_requested", decisionId: id } : null;
+  }
 
   const gate = checkHardGates(policy, ctx.body, await getRiskKeywords(tenantId));
   const riskTags = gate.riskTags;

@@ -23,9 +23,19 @@ export interface DraftSource {
   title: string;
   text: string;
 }
+/** One prior turn of the conversation (oldest→newest), so the hosted model has context —
+ *  who said what — and can CONTINUE its own previous reply instead of denying it exists. */
+export interface DraftTurn {
+  role: "customer" | "agent";
+  text: string;
+}
 export interface DraftReplyInput {
   customerMessage: string;
   sources: DraftSource[];
+  /** Prior conversation turns (oldest→newest), EXCLUDING the current customerMessage. Rendered as a
+   *  transcript ahead of the latest message so a follow-up ("you didn't finish your reply") is answered
+   *  WITH context, not blind. The extractive rule baseline ignores it (it only quotes sources). */
+  history?: DraftTurn[];
   // Optional per-tenant voice fragment (persona.ts). Prepended to the draft system prompt so the
   // hosted model answers in the team's configured tone/signature. The extractive rule baseline
   // ignores it — it can't paraphrase, so it stays honest regardless of persona.
@@ -252,7 +262,13 @@ export interface ChatModelOptions {
 const DRAFT_SYSTEM =
   "You are a customer-support agent. Write a concise, friendly reply to the customer's message, " +
   "grounded ONLY in the provided sources. Do not invent facts, prices, or policies. If the sources " +
-  "do not answer the question, say you are looking into it and will follow up. Sign off politely.";
+  "do not answer the question, say you are looking into it and will follow up. Reply in the same " +
+  "language the customer is writing in. Sign off politely.";
+
+// Output ceiling for a drafted reply. 600 was too tight: non-English replies (Czech, German, …)
+// tokenize ~2-3x heavier than English, so a normal-length answer hit the cap and was sent truncated
+// mid-word. 1500 gives a full support reply headroom while still bounding a runaway generation.
+const DRAFT_MAX_TOKENS = 1500;
 
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const sources = input.sources.map((s, i) => `[${i + 1}] ${s.title}\n${s.text}`).join("\n\n");
@@ -261,7 +277,16 @@ function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const persona = input.persona?.trim();
   const base = persona ? `${persona}\n\n${DRAFT_SYSTEM}` : DRAFT_SYSTEM;
   const system = sources ? `${base}\n\nSources:\n${sources}` : base;
-  const user = input.customerMessage || "(the customer has not written anything yet)";
+  const latest = input.customerMessage || "(the customer has not written anything yet)";
+  // Render prior turns as a labeled transcript so the model can see the conversation — without it a
+  // follow-up like "you didn't finish, continue?" is answered blind (the model denies its own reply).
+  // The latest customer message is presented last, as the turn to answer.
+  const history = (input.history ?? []).filter((t) => t.text && t.text.trim());
+  if (history.length === 0) return { system, user: latest };
+  const transcript = history
+    .map((t) => `${t.role === "agent" ? "You (support agent)" : "Customer"}: ${t.text.trim()}`)
+    .join("\n\n");
+  const user = `Conversation so far:\n${transcript}\n\nThe customer's latest message (reply to this):\n${latest}`;
   return { system, user };
 }
 
@@ -360,7 +385,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: 600,
+        max_tokens: DRAFT_MAX_TOKENS,
         temperature: 0.3,
         messages: [
           { role: "system", content: system },
@@ -395,7 +420,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: 600,
+        max_tokens: DRAFT_MAX_TOKENS,
         system,
         messages: [{ role: "user", content: user }],
       }),
@@ -447,7 +472,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: 600,
+        max_tokens: DRAFT_MAX_TOKENS,
         system,
         stream: true,
         messages: [{ role: "user", content: user }],
@@ -487,7 +512,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: 600,
+        max_tokens: DRAFT_MAX_TOKENS,
         temperature: 0.3,
         stream: true,
         stream_options: { include_usage: true },

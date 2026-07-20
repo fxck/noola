@@ -1,5 +1,5 @@
 import { withTenant } from "@repo/db";
-import { modelDriver, embeddingDriver, clip, type DraftResult, type ModelServingDriver } from "./model.js";
+import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { personaFragment } from "./persona.js";
 import { searchArticles, hydrateArticles } from "./kb.js";
@@ -307,6 +307,33 @@ export async function* suggestForQueryStream(
   return prep.finalize(dr, model, Date.now() - draftStarted);
 }
 
+/** Recent conversation turns for a ticket (oldest→newest) to give the hosted draft context — so a
+ *  follow-up sees the prior messages instead of answering blind. Excludes the triggering message
+ *  (that's the `query`) and empty bodies, keeps only customer/agent turns, and caps at the last N so
+ *  the prompt stays bounded. Best-effort: history is an enhancement, a load failure never blocks a draft. */
+async function loadHistory(
+  tenantId: string,
+  ticketId: string,
+  excludeMessageId: string | null,
+  limit = 10,
+): Promise<DraftTurn[]> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT author_type, body FROM messages
+         WHERE ticket_id = $1
+           AND ($2::text IS NULL OR id::text <> $2::text)
+           AND author_type IN ('customer','agent')
+           AND coalesce(btrim(body), '') <> ''
+         ORDER BY created_at DESC
+         LIMIT $3`,
+      [ticketId, excludeMessageId, limit],
+    );
+    return (r.rows as Array<{ author_type: string; body: string }>)
+      .reverse()
+      .map((m) => ({ role: m.author_type === "agent" ? "agent" : "customer", text: m.body }) as DraftTurn);
+  });
+}
+
 /** The shared retrieval + grounding + driver-resolution used by both the blocking and the
  *  streaming entry points. Returns the ready-to-call draft input plus a `finalize` closure
  *  that records the trace, runs content-gap detection, and assembles the Suggestion once a
@@ -318,7 +345,7 @@ async function prepareDraft(
   started: number,
 ): Promise<{
   driver: ModelServingDriver;
-  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string };
+  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[] };
   citations: Citation[];
   retrieval: RetrievalSummary;
   finalize: (result: DraftResult, model: string, latencyMs: number) => Promise<Suggestion>;
@@ -413,7 +440,10 @@ async function prepareDraft(
   // The tenant's configured voice (persona.ts) steers the hosted draft; empty/unconfigured is a
   // no-op. Best-effort — a persona lookup failure must never block a draft.
   const persona = await personaFragment(tenantId).catch(() => "");
-  const draftInput = { customerMessage: query, sources: grounding, persona };
+  // Conversation history (best-effort) so the draft is context-aware — a follow-up must see the
+  // prior turns, not answer blind. Ticket-scoped; a bare query (raw /suggest, eval) → no history.
+  const history = ticketId ? await loadHistory(tenantId, ticketId, messageId).catch(() => []) : [];
+  const draftInput = { customerMessage: query, sources: grounding, persona, history };
 
   // Trace + content-gap + Suggestion assembly, invoked once a DraftResult exists (one-shot
   // or streamed). `latencyMs` is the draft-generation time the caller measured.
