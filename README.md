@@ -71,6 +71,9 @@ cd web && npm install && npm run dev
 # embedder (Node) — the embedding sidecar
 cd embedder && npm install && node server.mjs
 
+# geo (Node) — the IP→location enrichment sidecar
+cd geo && npm install && node server.mjs
+
 # edge (Elixir · Phoenix) — realtime + canvas
 cd edge && mix deps.get && mix phx.server
 ```
