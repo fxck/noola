@@ -3,8 +3,9 @@
 export const DEMO_URL = "https://webstage-561.prg1.zerops.app";
 
 export const NAV_LINKS = [
-  { label: "How it works", href: "#problem" },
+  { label: "Inbox", href: "#inbox" },
   { label: "Studio", href: "#studio" },
   { label: "Channels", href: "#channels" },
   { label: "Developers", href: "#developers" },
+  { label: "Pricing", href: "#pricing" },
 ] as const;

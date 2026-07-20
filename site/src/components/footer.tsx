@@ -6,6 +6,7 @@ const COLS: { title: string; links: { label: string; href: string; external?: bo
   {
     title: "Product",
     links: [
+      { label: "Omnichannel inbox", href: "#inbox" },
       { label: "Agent Studio", href: "#studio" },
       { label: "AI answers", href: "#answers" },
       { label: "Channels", href: "#channels" },
@@ -30,7 +31,8 @@ export function Footer() {
         <div className="max-w-xs">
           <Wordmark />
           <p className="mt-4 text-[0.9rem] leading-relaxed text-muted-foreground">
-            The support platform for software teams whose users live in Discord. One conversation across every channel.
+            The omnichannel support platform for software teams. One conversation across every channel — with automation
+            that does the work.
           </p>
           <div className="mono mt-5 inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-[0.68rem] text-muted-foreground">
             <span className="size-1.5 rounded-full bg-success" />

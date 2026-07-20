@@ -1,5 +1,8 @@
 import type { ReactNode } from "react";
-import { ArrowUpRight, ArrowDown, Check, Container, Users2, GitBranch, BookOpen, ShieldCheck, Quote } from "lucide-react";
+import {
+  ArrowUpRight, ArrowDown, Check, Container, GitBranch, Blocks, Fingerprint, Layers, Reply,
+  BookOpen, ShieldCheck, Quote,
+} from "lucide-react";
 import { ProductShot, ChannelGlyph, CHANNEL, type ChannelKey } from "./mocks";
 import { buttonVariants } from "./ui/button";
 import { Reveal } from "./reveal";
@@ -30,6 +33,11 @@ function Capability({ icon, title, children }: { icon: ReactNode; title: string;
   );
 }
 
+/** A small caption under a product shot. */
+function Caption({ children }: { children: ReactNode }) {
+  return <p className="mono mt-3 text-center text-[0.68rem] text-faint">{children}</p>;
+}
+
 // ── 1 · The problem — a dark statement interlude (the product's world, as a beat) ──
 export function Problem() {
   return (
@@ -46,8 +54,8 @@ export function Problem() {
         </Reveal>
         <Reveal delay={130}>
           <p className="lead mt-6 max-w-2xl !text-[#a8a69b]">
-            Your users are in Discord. Billing questions are in email. Power users are in Slack. Every answer means five
-            tabs, three logins, and a guess at who's actually asking.
+            A question lands on Discord. The billing detail is buried in email. The power user pinged you on Slack.
+            Every answer means five tabs, three logins, and a guess at who's actually asking.
           </p>
         </Reveal>
       </div>
@@ -55,41 +63,50 @@ export function Problem() {
   );
 }
 
-// ── 2 · Agent Studio — the wedge, with the real node canvas ───────────────────
-export function Studio() {
+// ── 2 · Flagship one: the omnichannel synced inbox ────────────────────────────
+export function Inbox() {
   return (
-    <Section id="studio">
+    <Section id="inbox">
       <div className="max-w-2xl">
-        <Reveal><Eyebrow>Agent Studio</Eyebrow></Reveal>
+        <Reveal><Eyebrow>Omnichannel inbox</Eyebrow></Reveal>
         <Reveal delay={70}>
-          <h2 className="display-xl mt-4">It doesn't deflect. It does the work.</h2>
+          <h2 className="display-xl mt-4">Every channel becomes one conversation.</h2>
         </Reveal>
         <Reveal delay={130}>
           <p className="lead mt-5">
-            Most "AI support" stops at a canned reply. A Noola flow opens a real container, probes your status page,
-            classifies the risk, then routes or resolves — on a visual canvas your whole team edits together, live.
+            Noola keys every message to the person, not the channel — so a Discord thread, an email, and a widget chat
+            from the same user are one conversation, not three tickets. You reply from one place; it goes back out on
+            whatever channel they reached you on.
           </p>
         </Reveal>
       </div>
 
+      {/* the same flagship, now in light — makes the light/dark theming explicit (hero was dark) */}
       <Reveal delay={120} className="mt-12">
-        <ProductShot src="/shots/canvas.png" alt="Agent Studio — a flow that triggers on a new ticket, runs an AI agent, then fans out to set priority, save to the knowledge base and add tags" ratio="16/9" position="65% 46%" />
+        <ProductShot
+          src="/shots/inbox-light.png"
+          alt="The Noola inbox in light theme — the queue, an open conversation with an AI-suggested reply awaiting approval, and the customer context rail"
+        />
+        <Caption>The same inbox — in light or dark, whichever your team runs.</Caption>
       </Reveal>
 
       <div className="mt-12 grid gap-8 sm:grid-cols-3">
         <Reveal delay={60}>
-          <Capability icon={<Container className="size-4" />} title="Real containers">
-            Agent nodes run one ephemeral container per job — probe a URL, run a check, call a tool. Not a prompt; a process.
+          <Capability icon={<Fingerprint className="size-4" />} title="Identity, not inbox">
+            One thread per person, merged on contact identity across every channel — never the same customer split into
+            three siloed tickets.
           </Capability>
         </Reveal>
         <Reveal delay={120}>
-          <Capability icon={<Users2 className="size-4" />} title="Multiplayer canvas">
-            Build the flow together and watch a live run light up node by node — the same graph, edited by two people at once.
+          <Capability icon={<Layers className="size-4" />} title="No channel is second-class">
+            Every channel gets the same inbox, the same AI answers, and the same automations. Parity is the design, not a
+            roadmap promise.
           </Capability>
         </Reveal>
         <Reveal delay={180}>
-          <Capability icon={<GitBranch className="size-4" />} title="Branch on judgment">
-            Fork on an AI classification — risk, topic, sentiment — so the easy half resolves and the hard half reaches a human.
+          <Capability icon={<Reply className="size-4" />} title="Reply from one place">
+            Answer once and Noola sends it on the channel they used — Discord, email, Slack, or the widget — with the
+            full thread intact.
           </Capability>
         </Reveal>
       </div>
@@ -97,55 +114,108 @@ export function Studio() {
   );
 }
 
-// ── 3 · AI answers + customer context — the contact intelligence shot ─────────
-export function Answers() {
+// ── 3 · Flagship two: Agent Studio — n8n, but the nodes run your support desk ──
+export function Studio() {
   return (
     <div className="border-y border-border bg-well">
-      <Section id="answers" className="py-24 lg:py-28">
-        <div className="grid items-center gap-12 lg:grid-cols-2 lg:gap-16">
-          <div className="order-2 lg:order-1">
-            <Reveal>
-              <ProductShot src="/shots/contact.png" alt="A contact profile — Noola reads the account: a power user on the free plan, 41 services, $0 MRR, flagged as an expansion opportunity" ratio="4/3" position="left top" />
-            </Reveal>
-          </div>
-          <div className="order-1 lg:order-2">
-            <Reveal><Eyebrow>AI answers · Copilot</Eyebrow></Reveal>
-            <Reveal delay={70}>
-              <h2 className="display-xl mt-4">Every answer knows who's asking.</h2>
-            </Reveal>
-            <Reveal delay={130}>
-              <p className="lead mt-5">
-                Noola drafts from your own docs, code, and resolved threads — with citations and a confidence score —
-                and reads the account before it replies. A power user on the free plan and a churning enterprise get
-                different treatment, automatically.
-              </p>
-            </Reveal>
-            <div className="mt-8 flex flex-col gap-4">
-              <Reveal delay={80}>
-                <Capability icon={<BookOpen className="size-4" />} title="Shows its sources">
-                  Every draft cites the docs, changelog entries, and past threads it drew from — no black-box answers.
-                </Capability>
-              </Reveal>
-              <Reveal delay={140}>
-                <Capability icon={<ShieldCheck className="size-4" />} title="Confidence-gated">
-                  Above the bar it answers in-thread; below it, a human gets the draft. It never posts a guess.
-                </Capability>
-              </Reveal>
-            </div>
-          </div>
+      <Section id="studio">
+        <div className="max-w-2xl">
+          <Reveal><Eyebrow>Agent Studio</Eyebrow></Reveal>
+          <Reveal delay={70}>
+            <h2 className="display-xl mt-4">Like n8n — but the nodes run your support desk.</h2>
+          </Reveal>
+          <Reveal delay={130}>
+            <p className="lead mt-5">
+              Drag nodes onto a canvas and wire up real work. A node opens a ticket, searches your knowledge base, tags
+              and routes, messages a contact, or spins up an AI agent in a throwaway container to check something live.
+              The automation acts on the platform itself — not a webhook bolted onto the side of it.
+            </p>
+          </Reveal>
+        </div>
+
+        <Reveal delay={120} className="mt-12">
+          <ProductShot
+            src="/shots/canvas-dark.png"
+            alt="Agent Studio canvas — a live flow: a ticket-created trigger runs an AI agent, which fans out to set priority, save an incident log to the knowledge base, and add tags"
+          />
+          <Caption>A live flow — trigger → AI agent → set priority · save to KB · tag.</Caption>
+        </Reveal>
+
+        <div className="mt-12 grid gap-8 sm:grid-cols-3">
+          <Reveal delay={60}>
+            <Capability icon={<Blocks className="size-4" />} title="Nodes that act on the platform">
+              Set priority, add tags, upsert a KB article, message a contact, open a ticket — first-class actions on your
+              own data, not generic HTTP calls.
+            </Capability>
+          </Reveal>
+          <Reveal delay={120}>
+            <Capability icon={<Container className="size-4" />} title="Real containers, not just prompts">
+              An agent node runs one ephemeral container per job — probe a URL, run a check, execute a command. A
+              process, not a prompt.
+            </Capability>
+          </Reveal>
+          <Reveal delay={180}>
+            <Capability icon={<GitBranch className="size-4" />} title="Branch on judgment">
+              Fork on an AI classification — risk, topic, sentiment — so the easy half resolves itself and the hard half
+              reaches a human.
+            </Capability>
+          </Reveal>
         </div>
       </Section>
     </div>
   );
 }
 
-// ── 4 · Channels ──────────────────────────────────────────────────────────────
-type ChannelCard = { ch: ChannelKey; body: string; featured?: boolean };
+// ── 4 · AI answers + customer context — the contact-intelligence shot ─────────
+export function Answers() {
+  return (
+    <Section id="answers">
+      <div className="grid items-center gap-12 lg:grid-cols-2 lg:gap-16">
+        <div className="order-2 lg:order-1">
+          <Reveal>
+            <ProductShot
+              src="/shots/contact-light.png"
+              alt="A contact profile — Noola reads the account and says it out loud: a power user on the free plan, 41 services, $0 MRR, flagged as an expansion opportunity"
+            />
+          </Reveal>
+        </div>
+        <div className="order-1 lg:order-2">
+          <Reveal><Eyebrow>AI answers · Copilot</Eyebrow></Reveal>
+          <Reveal delay={70}>
+            <h2 className="display-xl mt-4">Every answer knows who's asking.</h2>
+          </Reveal>
+          <Reveal delay={130}>
+            <p className="lead mt-5">
+              Noola drafts from your own docs, code, and resolved threads — with citations and a confidence score — and
+              reads the account before it replies. A power user on the free plan and a churning enterprise get different
+              treatment, automatically.
+            </p>
+          </Reveal>
+          <div className="mt-8 flex flex-col gap-4">
+            <Reveal delay={80}>
+              <Capability icon={<BookOpen className="size-4" />} title="Shows its sources">
+                Every draft cites the docs, changelog entries, and past threads it drew from — no black-box answers.
+              </Capability>
+            </Reveal>
+            <Reveal delay={140}>
+              <Capability icon={<ShieldCheck className="size-4" />} title="Confidence-gated">
+                Above the bar it answers in-thread; below it, a human gets the draft. It never posts a guess.
+              </Capability>
+            </Reveal>
+          </div>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+// ── 5 · Channels — every channel at parity ────────────────────────────────────
+type ChannelCard = { ch: ChannelKey; body: string };
 const CHANNEL_CARDS: ChannelCard[] = [
-  { ch: "discord", body: "Thread = ticket. Reactions triage, roles map to identity, answers post back to the channel. Your whole community is the queue.", featured: true },
+  { ch: "discord", body: "Thread = ticket. Reactions triage, roles map to identity, answers post back to the channel." },
   { ch: "email", body: "Full threading, attachments, CC — a real ESP behind a driver seam." },
-  { ch: "widget", body: "Streaming AI answers, markdown, attachments both directions." },
   { ch: "slack", body: "An answer-bot in-channel; escalate to a human thread on demand." },
+  { ch: "widget", body: "Streaming AI answers, markdown, attachments both directions." },
   { ch: "telegram", body: "Self-serve connect. Same person, same inbox." },
   { ch: "whatsapp", body: "Self-serve connect. Same person, same inbox." },
   { ch: "api", body: "REST v1 + OpenAPI, and an MCP server your own agents can call." },
@@ -157,16 +227,17 @@ export function Channels() {
       <div className="max-w-2xl">
         <Reveal><Eyebrow>Every channel</Eyebrow></Reveal>
         <Reveal delay={70}><h2 className="display-xl mt-4">Seven doors. One conversation.</h2></Reveal>
+        <Reveal delay={130}>
+          <p className="lead mt-5">
+            No channel is a second-class citizen. Same inbox, same AI, same automations — wherever the message starts.
+            New channels plug into the same seam.
+          </p>
+        </Reveal>
       </div>
       <div className="mt-12 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {CHANNEL_CARDS.map((c, i) => (
-          <Reveal key={c.ch} delay={i * 40} className={cn(c.featured && "sm:col-span-2 lg:col-span-1 lg:row-span-2")}>
-            <div
-              className={cn(
-                "flex h-full flex-col gap-3 rounded-xl border border-border bg-surface p-5 transition-colors hover:border-border-strong",
-                c.featured && "lg:justify-between",
-              )}
-            >
+          <Reveal key={c.ch} delay={i * 40}>
+            <div className="flex h-full flex-col gap-3 rounded-xl border border-border bg-surface p-5 transition-colors hover:border-border-strong">
               <div className="flex items-center gap-2.5">
                 <span
                   className="grid size-9 place-items-center rounded-lg"
@@ -175,11 +246,8 @@ export function Channels() {
                   <ChannelGlyph channel={c.ch} className="size-4" />
                 </span>
                 <span className="display-m">{CHANNEL[c.ch].label}</span>
-                {c.featured && (
-                  <span className="mono ml-auto rounded-full bg-primary-tint px-2 py-0.5 text-[0.6rem] font-medium text-primary">flagship</span>
-                )}
               </div>
-              <p className={cn("text-[0.9rem] leading-relaxed text-muted-foreground", c.featured && "lg:text-[0.98rem]")}>{c.body}</p>
+              <p className="text-[0.9rem] leading-relaxed text-muted-foreground">{c.body}</p>
             </div>
           </Reveal>
         ))}
@@ -188,7 +256,7 @@ export function Channels() {
   );
 }
 
-// ── 5 · Developers / Enterprise ───────────────────────────────────────────────
+// ── 6 · Developers / Enterprise ───────────────────────────────────────────────
 const ENTERPRISE = [
   "SSO — SAML & OIDC",
   "SCIM user + group provisioning",
@@ -269,7 +337,7 @@ export function Developers() {
   );
 }
 
-// ── 6 · Pricing — honest early access ─────────────────────────────────────────
+// ── 7 · Pricing — honest early access ─────────────────────────────────────────
 const INCLUDED = [
   "Every channel — Discord, email, Slack, widget, Telegram, WhatsApp",
   "Agent Studio + the container runner",
@@ -286,7 +354,7 @@ export function Pricing() {
         <Reveal delay={70}><h2 className="display-xl mt-4">Free while we're in beta.</h2></Reveal>
         <Reveal delay={130}>
           <p className="lead mt-5">
-            Noola is early and built in the open. Self-serve, Discord-native, bring your own model key. Pricing lands at
+            Noola is early and built in the open. Self-serve, omnichannel, bring your own model key. Pricing lands at
             GA — until then, running the whole thing costs nothing.
           </p>
         </Reveal>
@@ -336,14 +404,14 @@ export function Pricing() {
   );
 }
 
-// ── 7 · Final CTA ─────────────────────────────────────────────────────────────
+// ── 8 · Final CTA ─────────────────────────────────────────────────────────────
 export function FinalCta() {
   return (
     <Section className="text-center">
       <Reveal className="mx-auto flex max-w-2xl flex-col items-center">
         <span className="ping mb-8 inline-grid size-2.5 place-items-center rounded-full bg-primary" />
-        <h2 className="display-xl">Point Noola at your Discord.</h2>
-        <p className="lead mt-5">Wire a channel, watch the repeatable half resolve itself, keep the receipts.</p>
+        <h2 className="display-xl">Bring every channel into one conversation.</h2>
+        <p className="lead mt-5">Wire up a channel — or all of them — watch the repeatable half resolve itself, and keep the receipts.</p>
         <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
           <a href={DEMO_URL} target="_blank" rel="noreferrer" className={cn(buttonVariants({ variant: "solid", size: "lg" }))}>
             See the live demo
