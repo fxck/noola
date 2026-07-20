@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Noola — support that reads the signal</title>
+    <meta
+      name="description"
+      content="One inbox for Discord, email, Slack, and your app. An AI that resolves the repeatable half and routes the rest — with the receipts to prove it. Discord-native, self-serve, built in the open."
+    />
+    <meta name="theme-color" content="#0d0d0c" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#fcfcfb" media="(prefers-color-scheme: light)" />
+    <meta property="og:title" content="Noola — support that reads the signal" />
+    <meta
+      property="og:description"
+      content="One inbox for Discord, email, Slack, and your app. An AI that resolves the repeatable half and routes the rest."
+    />
+    <meta property="og:type" content="website" />
+    <!-- The noola "oo" mark: a graphite ring (the conversation loop) beside the lit amber signal dot. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Ccircle%20cx='7'%20cy='12'%20r='4.1'%20fill='none'%20stroke='%238b897f'%20stroke-width='2.1'/%3E%3Ccircle%20cx='16.4'%20cy='12'%20r='4.35'%20fill='%23efa43c'/%3E%3C/svg%3E"
+    />
+    <script>
+      // Resolve theme before first paint — no flash. Dark is the hero; the toggle mirrors the
+      // product's `noola.theme` localStorage key, applied as the `.dark` class (matches the app).
+      (function () {
+        try {
+          var stored = localStorage.getItem("noola.theme");
+          var dark = stored ? stored === "dark" : true;
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

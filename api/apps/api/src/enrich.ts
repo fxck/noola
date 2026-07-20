@@ -86,11 +86,14 @@ export async function deriveContactContext(req: FastifyRequest, ctx: WidgetConte
     if (ctx.timezone) out["Timezone"] = ctx.timezone.slice(0, 64);
     if (ctx.referrer) out["Referral URL"] = ctx.referrer.slice(0, 2048);
 
+    // Approximate location from the request IP. We keep only country + city, and only as best-effort
+    // hints. We deliberately do NOT record "Region" (IP subdivision) or continent: subdivision geo is
+    // unreliable (VPN / mobile CGNAT / corporate egress), and behind Zerops' L7 balancer a mis-threaded
+    // XFF resolves to our own datacenter — so "region" would report our hosting region, not the user's.
+    // The honest "where/when" signal is the self-reported Timezone above (their local time), not this.
     const geo = await geoLookup(clientIp(req));
-    if (geo?.city) out["City"] = geo.city;
-    if (geo?.region) out["Region"] = geo.region;
     if (geo?.country) out["Country"] = geo.country;
-    if (geo?.continentCode) out["Continent code"] = geo.continentCode;
+    if (geo?.city) out["City"] = geo.city;
   } catch {
     /* enrichment is best-effort */
   }

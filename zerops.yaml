@@ -383,3 +383,33 @@ zerops:
       initCommands:
         - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker build -t noola-flow-runner:v1 runner/flow-runner"
       start: runner/runnerd
+
+  # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══
+  - setup: sitedev
+    build:
+      base: nodejs@22
+      os: ubuntu
+      buildCommands:
+        - cd site && npm install
+      deployFiles:
+        - .
+      cache:
+        - site/node_modules
+    run:
+      base: nodejs@22
+      os: ubuntu
+      ports:
+        - port: 5173
+          httpSupport: true
+      start: zsc noop --silent
+
+  - setup: siteprod
+    build:
+      base: nodejs@22
+      buildCommands:
+        - cd site && npm install
+        - cd site && npm run build
+      deployFiles:
+        - site/dist/~
+    run:
+      base: static

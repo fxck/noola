@@ -20,6 +20,9 @@ import {
   SlidersHorizontal,
   MapPin,
   Monitor,
+  Sparkles,
+  Clock,
+  Wrench,
 } from "lucide-react";
 import {
   type Contact,
@@ -50,7 +53,8 @@ import { FactRow, RailSection } from "@/components/ui/rail";
 import { avatarSrc, uploadAvatar } from "@/lib/avatar-upload";
 import { type LoadState } from "@/components/contacts/contact-lib";
 import { cn } from "@/lib/utils";
-import { contactDisplayName, systemAttributeGroup, SYSTEM_GROUP_ORDER, channelLabel } from "@/lib/contact-display";
+import { contactDisplayName, systemAttributeGroup, isTechnicalAttribute, SYSTEM_GROUP_ORDER, channelLabel } from "@/lib/contact-display";
+import { contactIntel, type ContactIntel, type Tone } from "@/lib/contact-intel";
 import { ErrorState } from "@/components/ui/error-state";
 
 const abs = (s: string) => {
@@ -259,6 +263,10 @@ export function ContactDetail({
     );
   }
 
+  // Synthesize the story the raw attributes are telling (verdict + the few stat tiles that matter),
+  // so the page leads with "who / valuable / happy / needs" instead of an empty canvas + a flat dump.
+  const intel = contactIntel(c);
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {/* ── pane header (§3): back · avatar · name · quiet email · actions ── */}
@@ -358,8 +366,11 @@ export function ContactDetail({
               </div>
             )}
 
-            {/* Conversations are the reason to open a contact in a support tool — lead with them,
-                not the usually-empty custom-events log that used to own the main stage. */}
+            {/* The page does the thinking: a synthesized verdict + the few stat tiles that matter,
+                so who/valuable/happy is answered in two seconds instead of buried in the attribute dump. */}
+            <IntelHeader intel={intel} />
+
+            {/* Conversations are the reason to open a contact in a support tool. */}
             <section>
               <h3 className="mb-2 flex items-center gap-1.5 text-micro font-semibold uppercase tracking-wide text-muted-foreground">
                 <MessagesSquare className="size-3.5" /> Conversations
@@ -382,6 +393,7 @@ export function ContactDetail({
                 companyId={companyId}
                 history={history}
                 identities={identities}
+                intel={intel}
               />
             </div>
           </div>
@@ -394,6 +406,7 @@ export function ContactDetail({
             companyId={companyId}
             history={history}
             identities={identities}
+            intel={intel}
           />
         </aside>
       </div>
@@ -408,6 +421,56 @@ export function ContactDetail({
   );
 }
 
+// ── Contact intelligence header — the verdict + the stat tiles that earn the hero. This is the
+// page doing the synthesis: a $0-spend power user reads as an OPPORTUNITY, not a neutral gray row. ──
+const TONE_TEXT: Record<Tone, string> = {
+  opportunity: "text-primary",
+  risk: "text-destructive",
+  success: "text-success",
+  info: "text-info",
+  default: "text-foreground",
+};
+const TONE_BANNER: Record<Tone, string> = {
+  opportunity: "border-primary/40 bg-primary/[0.06]",
+  risk: "border-destructive/40 bg-destructive/[0.06]",
+  success: "border-success/40 bg-success/[0.06]",
+  info: "border-info/40 bg-info/[0.06]",
+  default: "border-border bg-muted/40",
+};
+
+function IntelHeader({ intel }: { intel: ContactIntel }) {
+  const v = intel.verdict;
+  if (!v && intel.tiles.length === 0) return null;
+  return (
+    <section className="mb-6">
+      {v && (
+        <div className={cn("mb-3 flex items-start gap-2.5 rounded-lg border px-3.5 py-3", TONE_BANNER[v.tone])}>
+          <Sparkles className={cn("mt-0.5 size-4 shrink-0", TONE_TEXT[v.tone])} />
+          <p className="text-sm font-medium leading-snug text-foreground">{v.text}</p>
+        </div>
+      )}
+      {intel.tiles.length > 0 && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+          {intel.tiles.map((t) => (
+            <div key={t.label} className="rounded-lg border bg-card px-3 py-2.5">
+              <div className="text-micro font-medium uppercase tracking-wide text-muted-foreground">{t.label}</div>
+              <div className={cn("mt-1 flex items-baseline gap-1 text-xl font-semibold tabular-nums tracking-tight", TONE_TEXT[t.tone ?? "default"])}>
+                <span className="truncate">{t.value}</span>
+                {t.unit && <span className="shrink-0 text-xs font-normal text-muted-foreground">{t.unit}</span>}
+              </div>
+              {t.sub && (
+                <div className="mt-0.5 truncate text-micro text-muted-foreground" title={t.sub}>
+                  {t.sub}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 // The rail content — pinned facts, then collapsible sections. Rendered twice
 // (rail at xl+, stacked at the end of the main column below), so all fetching
 // stays in the parent.
@@ -416,25 +479,32 @@ function ContactFacts({
   companyId,
   history,
   identities,
+  intel,
 }: {
   contact: Contact;
   companyId: string | null;
   history: ContactHistory | null;
   identities: ContactIdentity[];
+  intel: ContactIntel;
 }) {
   const attrEntries = Object.entries(c.attributes ?? {});
   const planEntry = attrEntries.find(([k]) => k.toLowerCase() === "plan");
-  // Partition attributes: system-derived signals render READ-ONLY in their own grouped sections
-  // (Location / Device / Activity); only genuine tenant fields are "Custom attributes". Plan is
-  // pinned above and First/Last name compose the display name, so neither doubles as an attribute row.
+  // Partition attributes into a HIERARCHY instead of one flat gray list:
+  //  · system-derived signals → their own read-only grouped sections (Location / Device / Activity)
+  //  · anything the hero already surfaced as a tile → dropped (no "Monthly Spend: $0" twice)
+  //  · machine plumbing (appId, updateOnRouterChange, *_id) → a collapsed "Technical" group
+  //  · genuine tenant business fields → "Custom attributes"
+  // Plan is pinned above and First/Last name compose the display name, so neither doubles as a row.
   const NAME_PARTS = new Set(["first name", "last name"]);
   const systemGroups: Record<string, [string, string][]> = {};
   const customAttrs: [string, string][] = [];
+  const technicalAttrs: [string, string][] = [];
   for (const [k, v] of attrEntries) {
     const kl = k.toLowerCase();
-    if (kl === "plan" || NAME_PARTS.has(kl)) continue;
+    if (kl === "plan" || NAME_PARTS.has(kl) || intel.consumed.has(kl)) continue;
     const g = systemAttributeGroup(k);
     if (g) (systemGroups[g] ??= []).push([k, String(v)]);
+    else if (isTechnicalAttribute(k)) technicalAttrs.push([k, String(v)]);
     else customAttrs.push([k, String(v)]);
   }
   const groupIcon: Record<string, typeof MapPin> = { Location: MapPin, "Device & browser": Monitor, Activity };
@@ -477,6 +547,20 @@ function ContactFacts({
               <span className="min-w-0 truncate">{planEntry[1]}</span>
             </FactRow>
           )}
+          {/* The one honest "where/when": their local clock, from the self-reported timezone. */}
+          {intel.localTime && (
+            <FactRow label="Local time">
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                <Clock className="size-3 shrink-0 text-muted-foreground" />
+                <span className="tabular-nums">{intel.localTime}</span>
+                {intel.timezone && (
+                  <span className="min-w-0 truncate text-muted-foreground" title={intel.timezone}>
+                    {intel.timezone.split("/").pop()?.replace(/_/g, " ")}
+                  </span>
+                )}
+              </span>
+            </FactRow>
+          )}
           {/* subscribed is the default state — it stays quiet; only the opt-out
               carries weight (agents check this before broadcasting) */}
           <FactRow label="Marketing">
@@ -489,7 +573,18 @@ function ContactFacts({
           <FactRow label="Created">
             <span title={abs(c.created_at)}>{relativeTime(c.created_at)}</span>
           </FactRow>
-          <FactRow label="Last activity">
+          {/* Two DISTINCT facts, no longer contradicting: presence (matches the header) vs the last
+              conversation. Previously "Last seen 5m" (header) and "Last activity —" (rail) disagreed. */}
+          {c.last_seen_at && (
+            <FactRow label="Last seen">
+              {c.online ? (
+                <span className="text-success">Active now</span>
+              ) : (
+                <span title={abs(c.last_seen_at)}>{relativeTime(c.last_seen_at)}</span>
+              )}
+            </FactRow>
+          )}
+          <FactRow label="Last conversation">
             {lastActivity ? <span title={abs(lastActivity)}>{relativeTime(lastActivity)}</span> : "—"}
           </FactRow>
           {sentiment && sentiment.total > 0 && (sentiment.positive > 0 || sentiment.negative > 0) && (
@@ -528,6 +623,22 @@ function ContactFacts({
             {customAttrs.map(([k, v]) => (
               <FactRow key={k} label={k}>
                 <span className="min-w-0 truncate" title={v}>
+                  {v}
+                </span>
+              </FactRow>
+            ))}
+          </dl>
+        </RailSection>
+      )}
+
+      {/* Machine plumbing, tucked away and collapsed by default — present for the curious, out of the
+          way of the signals that matter. */}
+      {technicalAttrs.length > 0 && (
+        <RailSection id="contact.tech" icon={Wrench} title="Technical" count={technicalAttrs.length}>
+          <dl className="flex flex-col">
+            {technicalAttrs.map(([k, v]) => (
+              <FactRow key={k} label={k}>
+                <span className="min-w-0 truncate font-mono text-micro text-muted-foreground/80" title={v}>
                   {v}
                 </span>
               </FactRow>

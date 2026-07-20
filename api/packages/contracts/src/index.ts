@@ -1399,12 +1399,16 @@ export const PublicEventInput = z.object({
 export type PublicEventInput = z.infer<typeof PublicEventInput>;
 
 // ── Contact attribute classification ─────────────────────────────────────────
-// System-derived signals Noola computes per visit (enrich.ts + widget identify). These are NEVER
-// tenant custom attributes: the profile UI groups + read-onlies them, and the public widget may not
-// spoof them on an unverified identity. Matched case-insensitively.
+// Signals Noola can HONESTLY derive from a request (enrich.ts + widget identify). The test for
+// membership is "can you actually know this from the browser?" — self-reported UA/language/timezone/
+// page, server-observed sessions/last-seen, and (approximate) IP country+city. Deliberately NOT
+// here: "Region" and "Continent code" — IP→subdivision is an unreliable guess, and behind the L7
+// balancer it can resolve to our own datacenter region, so it is never a maintained fact. Dropping
+// "Region" also means any imported `region` attribute is now unambiguously a tenant custom value.
+// These are NEVER tenant custom attributes; the widget may not spoof them on an unverified identity.
 export const SYSTEM_ATTRIBUTE_KEYS: readonly string[] = [
   "Browser", "Browser Version", "OS", "Browser Language", "Timezone", "Referral URL",
-  "City", "Region", "Country", "Continent code",
+  "City", "Country",
   "Web sessions", "Last contacted", "last_page_url", "last_page_title", "last_seen_at",
 ];
 const SYSTEM_ATTR_LOWER = new Set(SYSTEM_ATTRIBUTE_KEYS.map((k) => k.toLowerCase()));
