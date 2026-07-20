@@ -290,11 +290,17 @@ export interface ChannelBindingRow {
   thread_per_message: boolean;
   kind: string;
   autoreply_mode: string | null;
+  // Per-forum close action (forum bindings): the tag NAME applied on a Noola-side close
+  // (null = auto-detect a Solved/Resolved/Closed-style tag), plus archive / lock the post.
+  close_tag: string | null;
+  close_archive: boolean;
+  close_lock: boolean;
 }
 
 export async function listDiscordChannelBindings(tenantId: string): Promise<ChannelBindingRow[]> {
   const r = await relayPool.query(
-    `SELECT guild_id, channel_id, mode, require_thread, thread_per_message, kind, autoreply_mode
+    `SELECT guild_id, channel_id, mode, require_thread, thread_per_message, kind, autoreply_mode,
+            close_tag, close_archive, close_lock
        FROM discord_channel_bindings WHERE tenant_id = $1 ORDER BY created_at ASC`,
     [tenantId],
   );
@@ -305,17 +311,23 @@ export async function listDiscordChannelBindings(tenantId: string): Promise<Chan
  *  untouched; removing a binding returns that channel to unmonitored. */
 export async function replaceDiscordChannelBindings(
   tenantId: string,
-  entries: { guildId: string; channelId: string; kind?: string; mode: string; requireThread: boolean; threadPerMessage: boolean; autoreplyMode?: string | null }[],
+  entries: {
+    guildId: string; channelId: string; kind?: string; mode: string; requireThread: boolean;
+    threadPerMessage: boolean; autoreplyMode?: string | null;
+    closeTag?: string | null; closeArchive?: boolean; closeLock?: boolean;
+  }[],
 ): Promise<ChannelBindingRow[]> {
   for (const e of entries) {
     await relayPool.query(
-      `INSERT INTO discord_channel_bindings (guild_id, channel_id, tenant_id, kind, mode, require_thread, thread_per_message, autoreply_mode)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO discord_channel_bindings (guild_id, channel_id, tenant_id, kind, mode, require_thread, thread_per_message, autoreply_mode, close_tag, close_archive, close_lock)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (guild_id, channel_id) DO UPDATE SET
          kind = EXCLUDED.kind, mode = EXCLUDED.mode, require_thread = EXCLUDED.require_thread,
-         thread_per_message = EXCLUDED.thread_per_message, autoreply_mode = EXCLUDED.autoreply_mode
+         thread_per_message = EXCLUDED.thread_per_message, autoreply_mode = EXCLUDED.autoreply_mode,
+         close_tag = EXCLUDED.close_tag, close_archive = EXCLUDED.close_archive, close_lock = EXCLUDED.close_lock
        WHERE discord_channel_bindings.tenant_id = $3`,
-      [e.guildId, e.channelId, tenantId, e.kind ?? "text", e.mode, e.requireThread, e.threadPerMessage, e.autoreplyMode ?? null],
+      [e.guildId, e.channelId, tenantId, e.kind ?? "text", e.mode, e.requireThread, e.threadPerMessage,
+       e.autoreplyMode ?? null, e.closeTag ?? null, e.closeArchive ?? true, e.closeLock ?? false],
     );
   }
   const keep = entries.map((e) => `${e.guildId}:${e.channelId}`);

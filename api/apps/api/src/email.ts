@@ -340,12 +340,26 @@ export async function sendAuthEmail(
  * with no HTML (a render hiccup never blocks the send). No-ops (with a reason)
  * when the channel is disabled or there's no recipient.
  */
+/** Absolute URL of the read-receipt pixel for one agent message. Mirrors unsubscribeUrl's public
+ *  base derivation (zeropsSubdomain → this api's own origin) so dev links land on apidev and stage
+ *  links on apistage. Email "Seen" is best-effort: it only fires in clients that load remote images
+ *  (Gmail/Outlook block by default), so a missing open never means "unread". */
+function seenPixelUrl(messageId: string): string {
+  const sub = process.env.zeropsSubdomain;
+  const base = sub
+    ? /^https?:\/\//.test(sub)
+      ? sub
+      : `https://${sub}`
+    : `http://localhost:${process.env.PORT ?? 3000}`;
+  return `${base.replace(/\/+$/, "")}/public/seen/${messageId}`;
+}
+
 export async function routeEmailOutbound(
   routing: { tenantId: string; externalChannelId?: string | null; ticketId?: string | null },
   subject: string,
   body: string,
   attachments?: MailAttachment[],
-  opts?: { agentName?: string | null; cc?: string[] },
+  opts?: { agentName?: string | null; cc?: string[]; seenMessageId?: string | null },
 ): Promise<{ delivered: boolean; reason?: string }> {
   const subj = /^re:/i.test(subject) ? subject : `Re: ${subject}`;
   // The tenant's flagged reply template (0072) restyles the frame; failures fall back to the
@@ -353,7 +367,9 @@ export async function routeEmailOutbound(
   const tokens = await import("./email-templates.js")
     .then((m) => m.getReplyTemplateTokens(routing.tenantId))
     .catch(() => null);
-  const rendered = await renderReplyEmail(body, { ...opts, tokens }).catch(() => null);
+  // Read-receipt pixel (best-effort — image-blocking clients simply never fire it).
+  const pixelUrl = opts?.seenMessageId ? seenPixelUrl(opts.seenMessageId) : null;
+  const rendered = await renderReplyEmail(body, { ...opts, tokens, pixelUrl }).catch(() => null);
   // P4 threading: reference the customer's last inbound email so their client threads the reply
   // (In-Reply-To/References), and reply-to the signed per-ticket address so THEIR reply routes to
   // exactly this conversation. Both best-effort — a lookup hiccup never blocks the send.
@@ -387,7 +403,7 @@ export async function routeEmailOutbound(
  */
 export async function notifyContactByEmailIfAway(
   tenantId: string,
-  args: { ticketId: string; subject: string | null; body: string; agentName?: string | null },
+  args: { ticketId: string; subject: string | null; body: string; agentName?: string | null; messageId?: string | null },
 ): Promise<void> {
   const info = await withTenant(tenantId, async (c) => {
     const r = await c.query(
@@ -405,7 +421,8 @@ export async function notifyContactByEmailIfAway(
     args.subject || "Support",
     args.body,
     undefined,
-    { agentName: args.agentName ?? null },
+    // best-effort read receipt on the away-fallback email too
+    { agentName: args.agentName ?? null, ...(args.messageId ? { seenMessageId: args.messageId } : {}) },
   ).catch(() => {});
 }
 

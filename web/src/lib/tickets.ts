@@ -191,6 +191,9 @@ export interface Message {
   attachments?: Attachment[];
   /** The channel this message arrived/left on (omnichannel unification), or null/absent. */
   channel_type?: string | null;
+  /** Read receipt: when the customer last saw this (agent) message — set by the widget foreground
+   *  poll or an email tracking-pixel open. Null/absent = not yet seen. Drives the "Seen" line. */
+  seen_at?: string | null;
   /** The agent who authored this message (real name, from users) — null/absent for
    *  customer messages, auto-replies, and rows older than the author stamp. */
   author_name?: string | null;

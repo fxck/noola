@@ -271,7 +271,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       withTenant(tenantId, async (c) => {
         const r = await c.query(
           `SELECT m.id, m.ticket_id, m.author_type, m.author_kind, m.body, COALESCE(m.auto, false) AS auto,
-                  m.meta, m.channel_type, m.created_at,
+                  m.meta, m.channel_type, m.created_at, m.seen_at,
                   COALESCE((SELECT u.name FROM users u WHERE u.tenant_id = m.tenant_id AND u.id = m.author_id),
                            m.author_external_name) AS author_name,
                   COALESCE((SELECT u.avatar_url FROM users u WHERE u.tenant_id = m.tenant_id AND u.id = m.author_id),
@@ -351,6 +351,8 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
             ...(mailAttachments?.length ? { attachments: mailAttachments } : {}),
             ...(parsed.data.cc?.length && result.channelType === "email" ? { cc: parsed.data.cc } : {}),
             agentName: req.session?.name ?? null,
+            // Read receipt: embed a tracking pixel keyed to THIS agent message so an email open stamps seen_at.
+            seenMessageId: result.messageId,
           },
         )
       : { delivered: false as boolean, reason: "no-driver" };
@@ -367,6 +369,8 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
         subject: result.subject,
         body: dispatchBody,
         agentName: req.session?.name ?? null,
+        // Read receipt: stamp seen_at on this reply if the away customer opens the fallback email.
+        messageId: result.messageId,
       }).catch((err) => app.log.warn({ err, ticketId: id }, "email fallback failed"));
     }
 

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { LogOut, Menu, Moon, Sun } from "lucide-react";
 import { useAuth } from "@/auth/auth";
 import { CommandPalette } from "@/components/command-palette";
@@ -43,6 +43,19 @@ function ThemeToggle({ className }: { className?: string }) {
 // surface; split surfaces divide themselves with vertical hairlines only.
 export type { NavKey };
 
+// Per-section browser-tab titles so the tab reflects where you are, not a static "noola".
+const NAV_TITLES: Partial<Record<NavKey, string>> = {
+  inbox: "Inbox",
+  studio: "Studio",
+  kb: "Knowledge Base",
+  sources: "Sources",
+  customers: "Customers",
+  broadcasts: "Broadcasts",
+  features: "Feature requests",
+  analytics: "Analytics",
+  settings: "Settings",
+};
+
 export function AppShell({
   active,
   scroll = "page",
@@ -81,6 +94,12 @@ export function AppShell({
   const { user, logout } = useAuth();
   const { activeCount: jobsActive } = useJobs();
   const [mobileNav, setMobileNav] = useState(false);
+
+  // Per-route document title so the browser tab reflects the current section, not a static "noola".
+  useEffect(() => {
+    const label = NAV_TITLES[active];
+    document.title = label ? `${label} · noola` : "noola";
+  }, [active]);
 
   // Rail footer — the global cluster the old top bar used to hold.
   const railFooter = (collapsed: boolean) =>

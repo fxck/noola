@@ -70,6 +70,18 @@ export function TicketRow({
         )}
       />
 
+      {/* unread marker — a leading dot down the left edge, the primary read/unread signal so a
+          glance down the list shows what's new. Read rows keep an empty slot so nothing shifts. */}
+      <span className="mt-2 flex w-2 shrink-0 justify-center" aria-hidden={!unread}>
+        {unread && (
+          <span
+            className="size-2 rounded-full bg-primary"
+            title="Unread — new customer message"
+            aria-label="Unread"
+          />
+        )}
+      </span>
+
       {ticket.contact_name ? (
         <Avatar name={ticket.contact_name} image={avatarSrc(ticket.contact_avatar_url)} className="mt-0.5 size-6 shrink-0 text-micro" />
       ) : (
@@ -85,7 +97,7 @@ export function TicketRow({
       <span className="min-w-0 flex-1">
         {/* line 1 — WHO (contact · company) + urgency + time */}
         <span className="flex items-center gap-1.5">
-          <span className="min-w-0 truncate text-small font-medium leading-5">
+          <span className={cn("min-w-0 truncate text-small leading-5", unread ? "font-semibold text-foreground" : "font-medium")}>
             {ticket.contact_name ||
               ticket.channel_type.charAt(0).toUpperCase() + ticket.channel_type.slice(1)}
           </span>
@@ -118,13 +130,6 @@ export function TicketRow({
           >
             {ticket.subject}
           </span>
-          {unread && (
-            <span
-              className="size-1.5 shrink-0 rounded-full bg-primary"
-              title="Unread — new customer message"
-              aria-label="unread"
-            />
-          )}
         </span>
 
         {/* line 3 — latest-message snippet + the quiet triage cluster. Short threads

@@ -100,6 +100,25 @@ const RISK_RULES: Array<[RiskTag, RegExp]> = [
  *  UI so a tenant sees which guardrails already fire before adding their own patterns. */
 export const BUILTIN_RISK_TAGS: RiskTag[] = RISK_RULES.map(([tag]) => tag);
 
+// A typed request to reach a human — broader than the "escalation" RISK rule above (which keys on
+// "speak to" and misses the common "talk to a human"). Drives the widget handoff: a match mutes the
+// assistant for that conversation and drops it into the human queue, so the bot stops auto-answering.
+const HUMAN_REQUEST_RE = new RegExp(
+  [
+    "\\b(?:talk|speak|chat|connect|transfer|get)\\s+(?:me\\s+)?(?:to|with)?\\s*(?:a|an|the|real|live|some\\s?one)?\\s*(?:human|person|agent|representative|rep|someone)\\b",
+    "\\b(?:human|live|real)\\s+(?:agent|person|rep|representative|support)\\b",
+    "\\breal\\s+person\\b",
+    "\\b(?:human|agent|person)\\s+please\\b",
+  ].join("|"),
+  "i",
+);
+
+/** True when the visitor is asking to reach a human ("talk to a human", "live agent", "human please").
+ *  Deliberately recall-favoring — a false handoff just routes to a person a beat early. */
+export function wantsHuman(text: string): boolean {
+  return HUMAN_REQUEST_RE.test(text);
+}
+
 /**
  * Business-risk tags for a message. The built-in RISK_RULES are the always-on floor; `extra` is the
  * tenant's ADDITIVE keyword patterns (risk_keywords config, 0087) — a substring match appends that

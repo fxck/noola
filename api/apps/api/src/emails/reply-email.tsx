@@ -34,7 +34,7 @@ const DEFAULTS = {
 
 type ReplyTokens = typeof DEFAULTS;
 
-function ReplyEmail({ body, agentName, t }: { body: string; agentName?: string | null; t: ReplyTokens }) {
+function ReplyEmail({ body, agentName, pixelUrl, t }: { body: string; agentName?: string | null; pixelUrl?: string | null; t: ReplyTokens }) {
   const main: React.CSSProperties = {
     backgroundColor: t.bodyBackground,
     fontFamily: t.fontFamily,
@@ -85,6 +85,10 @@ function ReplyEmail({ body, agentName, t }: { body: string; agentName?: string |
           <Text style={{ fontSize: `${t.smallSize}px`, color: t.mutedColor, lineHeight: 1.6, margin: "16px 0 0" }}>
             {t.footerText || "Sent with Noola · Reply to this email to continue the conversation."}
           </Text>
+          {/* Read-receipt pixel — its first load stamps the message seen. Best-effort: many clients
+              block remote images, so a missing open never implies "unread", only a fired one is a
+              positive signal. Rendered last so it never affects layout. */}
+          {pixelUrl ? <Img src={pixelUrl} width={1} height={1} alt="" style={{ display: "block", border: 0 }} /> : null}
         </Container>
       </Body>
     </Html>
@@ -100,7 +104,7 @@ function ReplyEmail({ body, agentName, t }: { body: string; agentName?: string |
  */
 export async function renderReplyEmail(
   body: string,
-  opts?: { agentName?: string | null; tokens?: Required<EmailTemplateTokens> | null },
+  opts?: { agentName?: string | null; tokens?: Required<EmailTemplateTokens> | null; pixelUrl?: string | null },
 ): Promise<{ html: string; text: string }> {
   const tk = opts?.tokens;
   const t: ReplyTokens = tk
@@ -121,7 +125,7 @@ export async function renderReplyEmail(
         footerText: tk.footerText,
       }
     : DEFAULTS;
-  const el = <ReplyEmail body={body} agentName={opts?.agentName} t={t} />;
+  const el = <ReplyEmail body={body} agentName={opts?.agentName} pixelUrl={opts?.pixelUrl ?? null} t={t} />;
   const [html, text] = await Promise.all([render(el), render(el, { plainText: true })]);
   return { html, text };
 }

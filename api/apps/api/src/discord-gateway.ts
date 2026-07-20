@@ -54,6 +54,12 @@ export interface MirrorTransport {
   postToThread(threadId: string, content: string): Promise<boolean>;
   setArchived(threadId: string, archived: boolean): Promise<boolean>;
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
+  /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
+  forumTagNames?(threadId: string): Promise<string[]>;
+  /** Available tag names on a FORUM channel (Settings picker for the per-binding close tag). */
+  listForumTags?(channelId: string): Promise<string[]>;
+  /** Lock a thread (per-binding close action). Optional, like forumTagNames. */
+  setLocked?(threadId: string, locked: boolean): Promise<boolean>;
   react(threadId: string, messageId: string, emoji: string): Promise<boolean>;
   memberRoleIds(guildId: string, userId: string): Promise<string[]>;
 }
@@ -174,6 +180,22 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       if (wasArchived) await t.setArchived(false).catch(() => {});
       await t.setAppliedTags(ids).catch(() => {});
       if (wasArchived) await t.setArchived(true).catch(() => {});
+      return true;
+    },
+    async forumTagNames(threadId) {
+      const t = await thread(threadId);
+      if (!t || t.parent?.type !== ChannelType.GuildForum) return [];
+      return (t.parent as ForumChannel).availableTags.map((tg) => tg.name);
+    },
+    async listForumTags(channelId) {
+      const f = await forum(channelId);
+      return f ? f.availableTags.map((tg) => tg.name) : [];
+    },
+    async setLocked(threadId, locked) {
+      const t = await thread(threadId);
+      if (!t) return false;
+      if (t.locked === locked) return true;
+      await t.setLocked(locked);
       return true;
     },
     async react(threadId, messageId, emoji) {

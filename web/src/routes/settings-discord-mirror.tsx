@@ -13,6 +13,7 @@ import {
   saveDiscordMirrorBindings,
   fetchDiscordChannelsConfig,
   saveDiscordChannelBindings,
+  fetchDiscordForumTags,
   saveDiscordTeamRoles,
   linkDiscordGuild,
 } from "@/lib/settings";
@@ -559,6 +560,89 @@ export function SettingsDiscordMirrorPage() {
 
 type ChannelDraft = DiscordChannelBindingInput & { _key: string };
 
+/** Per-forum "On close" config: which forum tag marks a post resolved (auto-detect by default),
+ *  plus whether closing the ticket in Noola archives / locks the Discord post. Tag names are
+ *  fetched live from the forum (falls back to any tag already stored when the bot is offline). */
+function ForumCloseSection({
+  guildId,
+  channelId,
+  closeTag,
+  closeArchive,
+  closeLock,
+  onChange,
+}: {
+  guildId: string;
+  channelId: string;
+  closeTag: string | null | undefined;
+  closeArchive: boolean | undefined;
+  closeLock: boolean | undefined;
+  onChange: (p: Partial<ChannelDraft>) => void;
+}) {
+  const [tags, setTags] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    if (!guildId || !channelId) {
+      setTags([]);
+      return;
+    }
+    let live = true;
+    fetchDiscordForumTags(guildId, channelId)
+      .then((t) => live && setTags(t))
+      .catch(() => live && setTags([]));
+    return () => {
+      live = false;
+    };
+  }, [guildId, channelId]);
+
+  // Always offer the currently-saved tag even if it's not in the fetched list (bot offline / renamed).
+  const options = [
+    { value: "", label: "Auto-detect a Solved / Resolved tag" },
+    ...(tags ?? []).map((t) => ({ value: t, label: `# ${t}` })),
+    ...(closeTag && !(tags ?? []).includes(closeTag) ? [{ value: closeTag, label: `# ${closeTag}` }] : []),
+  ];
+
+  return (
+    <div className="mt-3 space-y-3 rounded-lg border bg-muted/20 p-3">
+      <div>
+        <Label className="text-foreground">On close</Label>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          What happens to the Discord post when you close the ticket in Noola.
+        </p>
+      </div>
+      <Field label="Resolved tag" hint="Applied to the post on close. Auto-detect finds the forum's own Solved-style tag.">
+        <Combobox
+          value={closeTag ?? ""}
+          onChange={(v) => onChange({ closeTag: v || null })}
+          options={options}
+          placeholder="Auto-detect"
+        />
+      </Field>
+      <label className="flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-card p-3">
+        <span>
+          <span className="text-sm font-medium">Archive post</span>
+          <span className="block text-xs text-muted-foreground">Close the forum post so it drops out of the active list.</span>
+        </span>
+        <Switch
+          checked={closeArchive ?? true}
+          onCheckedChange={(v) => onChange({ closeArchive: v })}
+          aria-label="Archive post on close"
+        />
+      </label>
+      <label className="flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-card p-3">
+        <span>
+          <span className="text-sm font-medium">Lock post</span>
+          <span className="block text-xs text-muted-foreground">Stop new replies — a customer message can't reopen it.</span>
+        </span>
+        <Switch
+          checked={closeLock ?? false}
+          onCheckedChange={(v) => onChange({ closeLock: v })}
+          aria-label="Lock post on close"
+        />
+      </label>
+    </div>
+  );
+}
+
 function CustomerChannelsSection({ serverConnected }: { serverConnected: boolean }) {
   const [cfg, setCfg] = useState<DiscordChannelsConfig | null>(null);
   const [drafts, setDrafts] = useState<ChannelDraft[] | null>(null);
@@ -581,6 +665,9 @@ function CustomerChannelsSection({ serverConnected }: { serverConnected: boolean
           threadPerMessage: b.thread_per_message,
           companyId: b.company_id,
           autoreplyMode: b.autoreply_mode,
+          closeTag: b.close_tag,
+          closeArchive: b.close_archive,
+          closeLock: b.close_lock,
         })));
       })
       .catch(() => setLoadError(true));
@@ -600,6 +687,7 @@ function CustomerChannelsSection({ serverConnected }: { serverConnected: boolean
         guildId: b.guild_id, channelId: b.channel_id, kind: b.kind === "forum" ? "forum" : "text", mode: b.mode,
         requireThread: b.require_thread, threadPerMessage: b.thread_per_message, companyId: b.company_id,
         autoreplyMode: b.autoreply_mode,
+        closeTag: b.close_tag, closeArchive: b.close_archive, closeLock: b.close_lock,
       })));
       toast.success("Customer channels saved.");
     } catch {
@@ -722,6 +810,19 @@ function CustomerChannelsSection({ serverConnected }: { serverConnected: boolean
                 )}
               </div>
             </Disclosure>
+
+            {d.kind === "forum" && (
+              <div className="px-4 pb-4">
+                <ForumCloseSection
+                  guildId={d.guildId}
+                  channelId={d.channelId}
+                  closeTag={d.closeTag}
+                  closeArchive={d.closeArchive}
+                  closeLock={d.closeLock}
+                  onChange={(p) => patch(d._key, p)}
+                />
+              </div>
+            )}
           </div>
         );
       })}

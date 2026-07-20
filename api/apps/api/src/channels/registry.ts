@@ -33,6 +33,9 @@ export interface DispatchOptions {
   cc?: string[];
   /** The replying agent's display name — email renders it as a quiet signature line. */
   agentName?: string | null;
+  /** Email: the persisted agent message id — embeds a read-receipt pixel (/public/seen/:id) in the
+   *  reply HTML so an email open stamps seen_at. Best-effort; ignored by non-email channels. */
+  seenMessageId?: string | null;
   /** Discord channel-post broadcast (Phase 4): ping exactly this role (allowedMentions-gated). */
   mentionRoleId?: string | null;
   /** Discord channel-post broadcast (Phase 4): render as an embed titled by ctx.subject. */
@@ -102,7 +105,7 @@ const email: ChannelDriver = {
       ctx.subject,
       body,
       opts?.attachments,
-      { agentName: opts?.agentName ?? null, ...(opts?.cc?.length ? { cc: opts.cc } : {}) },
+      { agentName: opts?.agentName ?? null, ...(opts?.cc?.length ? { cc: opts.cc } : {}), ...(opts?.seenMessageId ? { seenMessageId: opts.seenMessageId } : {}) },
     ),
 };
 

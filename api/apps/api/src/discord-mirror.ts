@@ -446,20 +446,61 @@ export async function onTicketClosed(
 
 /** Reflect a Noola-side close of a Discord-origin (intake) ticket back onto its origin thread:
  *  a "resolved" notice + archive. A customer reply reopens the thread's ticket (ingest upsert). */
+/** Discord-side "solved" signals — a forum tag whose name matches marks a post resolved. */
+const SOLVED_TAG_RE = /solv|resolv|clos|done|complete|answered|fixed/i;
+
 async function archiveIntakeThreadOnClose(tenantId: string, ticketId: string, agentName: string | null): Promise<void> {
   const t = await withTenant(tenantId, (c) =>
     c.query(
-      "SELECT external_thread_id FROM tickets WHERE id = $1 AND channel_type = 'discord' AND external_thread_id IS NOT NULL",
+      "SELECT external_thread_id, external_parent_id, external_guild_id FROM tickets WHERE id = $1 AND channel_type = 'discord' AND external_thread_id IS NOT NULL",
       [ticketId],
     ),
   );
   if (!t.rowCount) return;
   const threadId = t.rows[0].external_thread_id as string;
+  const extParent = t.rows[0].external_parent_id as string | null;
+  const extGuild = t.rows[0].external_guild_id as string | null;
   const tp = transport();
   if (!tp) return;
   const by = agentName ? ` by ${agentName}` : "";
+
+  // Per-forum close config (the origin forum binding, if any): a chosen close_tag, whether to
+  // archive, whether to lock. Relay-scoped table — matched by the thread's parent forum + guild.
+  // No binding row → keep today's behavior (auto-detect Solved tag + archive, no lock).
+  let closeTag: string | null = null;
+  let closeArchive = true;
+  let closeLock = false;
+  if (extGuild && extParent) {
+    const b = await relayPool
+      .query(
+        "SELECT close_tag, close_archive, close_lock FROM discord_channel_bindings WHERE guild_id = $1 AND channel_id = $2",
+        [extGuild, extParent],
+      )
+      .catch(() => null);
+    if (b?.rowCount) {
+      closeTag = (b.rows[0].close_tag as string | null) ?? null;
+      closeArchive = (b.rows[0].close_archive as boolean) !== false;
+      closeLock = (b.rows[0].close_lock as boolean) === true;
+    }
+  }
+
+  // TAG: an explicit per-binding close tag wins; otherwise auto-detect the forum's own
+  // "Solved/Resolved/Closed"-style tag. Best-effort; needs Manage Posts on the forum.
+  if (closeTag) {
+    await tp.applyTags(threadId, [closeTag]).catch(() => {});
+  } else {
+    const tagNames = (await tp.forumTagNames?.(threadId).catch(() => [])) ?? [];
+    const solved = tagNames.find((n) => SOLVED_TAG_RE.test(n));
+    if (solved) await tp.applyTags(threadId, [solved]).catch(() => {});
+  }
+
+  // Always post the visible "resolved" notice.
   await tp.postToThread(threadId, `✅ Marked resolved${by}. Reply here if you still need help.`).catch(() => {});
-  await tp.setArchived(threadId, true).catch(() => {});
+
+  // ARCHIVE (default on) LAST — posting a message re-activates the thread.
+  if (closeArchive) await tp.setArchived(threadId, true).catch(() => {});
+  // LOCK (default off) after archive — a locked thread can't be replied to (harder to reopen).
+  if (closeLock) await tp.setLocked?.(threadId, true).catch(() => {});
 }
 
 // ── D3: forum post → ticket (note by default, 📤 promotes to reply) ───────────

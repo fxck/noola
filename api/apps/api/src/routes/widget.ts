@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { withTenant } from "@repo/db";
+import { withTenant, relayPool } from "@repo/db";
 import {
   SyntheticMessageInput,
   PublicAskInput,
@@ -17,6 +17,7 @@ import { createAttachment, claimAttachments, attachmentsForTicket, type Attachme
 import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
 import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
+import { wantsHuman } from "../model.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
@@ -24,6 +25,7 @@ import { deriveContactContext } from "../enrich.js";
 import { listPublicArticles, listPublicCollections, getPublicArticleBySlug, searchPublicArticles } from "../kb.js";
 import { WIDGET_JS } from "../widget-embed.js";
 import { ANSWERS_JS } from "../answers-embed.js";
+import { PIXEL_GIF } from "../tracking.js";
 
 // The customer-facing embeddable surface: the synthetic inbound channel, the Ask-AI widget lane,
 // the public help center + support-form deflection, the two-way messenger conversation poll, the
@@ -162,8 +164,10 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     // AI mode is authoritative on the ticket. Escalation MUTES the assistant (set BEFORE ingest so the
     // handoff message itself can't trigger a bot reply); "Ask the assistant" un-mutes it. Both target
     // the existing widget ticket by its conversation handle (external_channel_id).
-    if (conversationId && (escalate || resumeAi)) {
-      await setWidgetAssistantMode(wk.tenantId, conversationId, !escalate && resumeAi === true);
+    // A typed human-request ("talk to a human") ALSO mutes the assistant, same as the escalate button.
+    const humanRequest = wantsHuman(text);
+    if (conversationId && (escalate || humanRequest || resumeAi)) {
+      await setWidgetAssistantMode(wk.tenantId, conversationId, !escalate && !humanRequest && resumeAi === true);
     }
 
     // Persist the visitor's message onto the widget ticket (creates it on the first turn, then threads
@@ -193,7 +197,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
 
     // No AI on an attachment-only turn (a file is for a human to look at, not a RAG query), and none
     // in human mode — persist the message for the agent, bot stays silent (single source of truth).
-    if (!text || !(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
+    if (!text || humanRequest || !(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
       return { deferred: true, conversationId: inbound.ticketId, messageId: inbound.messageId, attachments: attached };
     }
 
@@ -258,6 +262,12 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       identName = null;
     }
 
+    // A typed human-request ("talk to a human", "live agent") mutes the assistant BEFORE ingest — the
+    // handoff message itself must not trigger a bot reply — and drops the conversation to the human
+    // queue. This SSE lane is the one a typed message actually uses, so the handoff has to happen here.
+    const humanRequest = wantsHuman(text);
+    if (humanRequest && conversationId) await setWidgetAssistantMode(wk.tenantId, conversationId, false);
+
     // Persist the visitor's message onto the widget ticket (creates/threads by identity), exactly
     // like /public/ask, BEFORE opening the stream — so a mid-stream disconnect never loses the ask.
     const inbound = await ingestInbound({
@@ -271,8 +281,9 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     });
     if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
 
-    // Not in AI mode → nothing to stream; tell the widget to fall back to its human-queue rendering.
-    if (!(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
+    // Not in AI mode, or the visitor just asked for a human → nothing to stream; the widget falls back
+    // to its human-queue rendering (hydrateThread flips to human mode on assistantEnabled=false).
+    if (humanRequest || !(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
       return reply.code(200).send({ deferred: true, conversationId: inbound.ticketId, messageId: inbound.messageId });
     }
 
@@ -532,6 +543,16 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           WHERE m.ticket_id = $1 ORDER BY m.created_at ASC LIMIT 200`,
         [t.rows[0].id],
       );
+      // Read receipt: `viewing` is true only when the widget panel is OPEN on this exact thread
+      // (foreground poll). The customer is looking right now, so watermark the agent replies as
+      // seen — the agent console then renders a "Seen" receipt. Best-effort; runs last so a stamp
+      // hiccup can never break the transcript we just read.
+      if (parsed.data.viewing === true) {
+        await c.query(
+          `UPDATE messages SET seen_at = now() WHERE ticket_id = $1 AND author_type = 'agent' AND seen_at IS NULL`,
+          [t.rows[0].id],
+        ).catch(() => {});
+      }
       return { ticketId: t.rows[0].id as string, status: t.rows[0].status as string, assistantEnabled: t.rows[0].assistant_enabled !== false, messages: m.rows };
     });
     if (!data) return { status: null, assistantEnabled: true, messages: [] };
@@ -661,6 +682,23 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       .header("cache-control", "private, max-age=3600")
       .header("content-disposition", `${inline ? "inline" : "attachment"}; filename="${meta.filename.replace(/"/g, "")}"`)
       .send(obj.body);
+  });
+
+  // Email read-receipt pixel. A reply email embeds <img src=".../public/seen/<agentMessageId>">;
+  // the first load stamps seen_at. No auth and no widget key — it's a bare 1x1 tracking pixel — so
+  // the message's tenant is resolved straight through the BYPASSRLS relayPool by its globally-unique
+  // UUID. Best-effort: email "Seen" only ever fires in clients that load remote images (Gmail/Outlook
+  // block by default), so a missing open never means "unread" — only a fired pixel is a positive
+  // signal. We always return the gif (even on a bad id / db hiccup) so reading is never disrupted.
+  app.get("/public/seen/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    await relayPool
+      .query(`UPDATE messages SET seen_at = now() WHERE id = $1 AND seen_at IS NULL`, [id])
+      .catch(() => {}); // non-uuid id / transient error → still serve the pixel
+    return reply
+      .header("content-type", "image/gif")
+      .header("cache-control", "no-store, no-cache, must-revalidate, private")
+      .send(PIXEL_GIF);
   });
 
   // Toggle the conversation's AI assistant on/off from the widget ("Talk to a human" mutes it,

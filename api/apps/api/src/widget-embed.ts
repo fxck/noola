@@ -835,7 +835,11 @@ export const WIDGET_JS = String.raw`(function () {
     // Don't reconcile a conversation whose AI answer is mid-stream — the persisted answer doesn't
     // exist yet, so rebuilding from the server would erase the live streaming bubble.
     if (streamingConv === convId) { if (cb) cb(); return; }
-    fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId }) })
+    // Read receipt: tell the server we are actively LOOKING at this thread only on a foreground poll
+    // (panel open + this exact conversation on screen). Background/closed polls send false, so agent
+    // replies are stamped seen only when the customer is genuinely viewing them.
+    var viewingReq = panelOpen && view === 'thread' && threadId === convId;
+    fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId, viewing: viewingReq }) })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         var c = getConv(convId); if (!c || !d) { if (cb) cb(); return; }

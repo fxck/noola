@@ -191,6 +191,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
         guildId: b.guildId, channelId: b.channelId, kind: b.kind, mode: b.mode,
         requireThread: b.requireThread, threadPerMessage: b.threadPerMessage,
         autoreplyMode: b.autoreplyMode ?? null,
+        closeTag: b.closeTag ?? null, closeArchive: b.closeArchive, closeLock: b.closeLock,
       })),
     );
     // Sync the account bindings: set where a company is chosen, clear where it isn't.
@@ -332,6 +333,22 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     if (typeof b.externalId !== "string" || !b.externalId) return reply.code(400).send({ error: "externalId required" });
     await upsertAgentChannelIdentity(tenantId, b.userId, b.externalId);
     return reply.code(201).send({ ok: true, userId: b.userId, externalId: b.externalId });
+  }));
+
+  // Forum tag names for a forum channel — feeds the per-forum "On close → tag" picker in the
+  // customer-channels editor. Read-only, admin-gated like the rest of the channel-config surface;
+  // returns [] when the bot is offline so the UI falls back to manual entry.
+  app.get("/discord/forum-tags", tenanted(async (_tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) {
+      return reply.code(403).send({ error: "admin role required" });
+    }
+    const q = (req.query ?? {}) as { guildId?: unknown; channelId?: unknown };
+    if (typeof q.channelId !== "string" || !q.channelId) {
+      return reply.code(400).send({ error: "channelId required" });
+    }
+    const tp = getMirrorTransport();
+    const tags = tp?.listForumTags ? await tp.listForumTags(q.channelId).catch(() => []) : [];
+    return { tags, botOnline: !!tp };
   }));
 
   // ---- Workspace identity (name + logo) ------------------------------------

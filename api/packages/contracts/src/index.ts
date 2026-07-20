@@ -316,6 +316,9 @@ export type AgentRunInput = z.infer<typeof AgentRunInput>;
 export const PublicConversationInput = z.object({
   key: z.string().min(1),
   conversationId: z.string().min(1).max(200),
+  // The widget sends viewing=true only when its panel is OPEN and showing this conversation — the
+  // signal that the customer is actually looking, so agent replies can be stamped seen (read receipt).
+  viewing: z.boolean().optional(),
 });
 export type PublicConversationInput = z.infer<typeof PublicConversationInput>;
 
@@ -1247,6 +1250,11 @@ export const DiscordChannelBindingInput = z.object({
   companyId: z.string().uuid().nullable().optional(),
   // Per-binding AI override (beats the channel-type mode): null = inherit workspace policy.
   autoreplyMode: z.enum(["off", "suggest", "auto"]).nullable().optional(),
+  // Per-forum close action (forum bindings): the tag NAME to apply as "resolved" on a Noola-side close
+  // (null = auto-detect a Solved/Resolved/Closed-style tag), plus whether to archive / lock the post.
+  closeTag: z.string().max(100).nullable().optional(),
+  closeArchive: z.boolean().default(true),
+  closeLock: z.boolean().default(false),
 });
 export type DiscordChannelBindingInput = z.infer<typeof DiscordChannelBindingInput>;
 

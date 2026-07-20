@@ -267,6 +267,11 @@ export interface DiscordChannelBinding {
   autoreply_mode: "off" | "suggest" | "auto" | null;
   company_id: string | null;
   company_name: string | null;
+  /** Per-forum close action: the tag NAME to apply as "resolved" (null = auto-detect), plus
+   *  whether to archive / lock the post on a Noola-side close. */
+  close_tag: string | null;
+  close_archive: boolean;
+  close_lock: boolean;
 }
 export interface DiscordChannelsConfig {
   bindings: DiscordChannelBinding[];
@@ -303,6 +308,11 @@ export interface DiscordChannelBindingInput {
   companyId?: string | null;
   /** Per-binding AI override — null inherits the workspace autoreply policy. */
   autoreplyMode?: "off" | "suggest" | "auto" | null;
+  /** Per-forum close action (forum bindings): resolved tag NAME (null = auto-detect a
+   *  Solved/Resolved/Closed-style tag), archive the post (default on), lock the post (default off). */
+  closeTag?: string | null;
+  closeArchive?: boolean;
+  closeLock?: boolean;
 }
 
 export async function fetchDiscordChannelsConfig(): Promise<DiscordChannelsConfig> {
@@ -310,6 +320,12 @@ export async function fetchDiscordChannelsConfig(): Promise<DiscordChannelsConfi
 }
 export async function saveDiscordChannelBindings(bindings: DiscordChannelBindingInput[]): Promise<{ bindings: DiscordChannelBinding[] }> {
   return api<{ bindings: DiscordChannelBinding[] }>("/settings/discord-channels", { method: "PUT", body: JSON.stringify({ bindings }) });
+}
+
+/** Available forum tag names for the per-forum "On close → tag" picker. [] when the bot is offline. */
+export async function fetchDiscordForumTags(guildId: string, channelId: string): Promise<string[]> {
+  const p = new URLSearchParams({ guildId, channelId });
+  return (await api<{ tags: string[] }>(`/discord/forum-tags?${p.toString()}`)).tags;
 }
 
 // ── Channels catalog (Wave 4) ────────────────────────────────────────────────

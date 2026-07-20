@@ -178,6 +178,7 @@ const PUBLIC_ROUTES = new Set([
   "POST /public/conversations",
   "POST /public/assistant-mode",
   "GET /public/attachment/:id",
+  "GET /public/seen/:id",
   "GET /public/config",
   "GET /public/team",
   "GET /public/instance",

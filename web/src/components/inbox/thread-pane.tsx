@@ -8,6 +8,7 @@ import {
   fetchMessages,
   assignTicket,
   setTicketOpen,
+  relativeTime,
 } from "@/lib/tickets";
 import { useQueue } from "@/lib/queue-context";
 import { type Note, fetchNotes } from "@/lib/notes";
@@ -179,6 +180,14 @@ export function ThreadPane({
   );
   const multiChannel = channels.size > 1;
 
+  // Read receipt (chat-style): the single NEWEST agent message the customer has seen. Messages are
+  // in created_at order, so the last agent message with a seen_at wins — we render ONE "Seen" line
+  // under it (never one per message). Stamped by the widget foreground poll or an email pixel open.
+  const lastSeenAgentMsg = (messages ?? []).reduce<Message | null>(
+    (acc, m) => (m.author_type === "agent" && m.seen_at ? m : acc),
+    null,
+  );
+
   async function runAction(fn: () => Promise<void>) {
     setActionBusy(true);
     try {
@@ -305,6 +314,13 @@ export function ThreadPane({
                         showChannel={multiChannel}
                         contactName={ticket.contact_name}
                       />
+                    )}
+                    {/* One chat-style read receipt, anchored under the newest agent message the
+                        customer has seen. Right-aligned + muted to match the agent bubble's meta line. */}
+                    {!item._note && lastSeenAgentMsg && item.id === lastSeenAgentMsg.id && lastSeenAgentMsg.seen_at && (
+                      <li className="-mt-2 flex justify-end px-1 text-micro text-muted-foreground/80">
+                        Seen · {relativeTime(lastSeenAgentMsg.seen_at)}
+                      </li>
                     )}
                   </Fragment>
                 );
