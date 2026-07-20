@@ -125,14 +125,17 @@ export const WIDGET_JS = String.raw`(function () {
   function totalUnread() { var n = 0; for (var i = 0; i < convs.length; i++) n += (convs[i].unread || 0); return n; }
 
   // ---- shadow-DOM shell ----
-  var host, root, styleEl, varStyle, wrapEl, bubbleEl, badgeEl, panelEl, stageEl;
-  var curScreen = null;        // the live (front-most) screen; all queries scope to it
+  var host, root, styleEl, varStyle, wrapEl, bubbleEl, badgeEl, panelEl, stageEl, hdwrapEl, navEl;
+  var curScreen = null;        // the live (front-most) BODY screen; body queries scope to it
+  var curHeader = null;        // the live header .hd element (persistent shell); header queries scope to it
   var pendingDir = 'none';     // transition direction for the next render (set by setView/openPanel)
   var prevBadge = 0;
 
-  // Queries scope to the active screen so a mid-transition outgoing screen (same ids) never matches.
+  // Body queries scope to the active screen so a mid-transition outgoing screen (same ids) never matches.
   function sel(s) { return curScreen ? curScreen.querySelector(s) : null; }
   function selAll(s) { return curScreen ? curScreen.querySelectorAll(s) : []; }
+  // Header queries scope to the live header element (the persistent shell may hold an outgoing copy mid-morph).
+  function selHd(s) { return curHeader ? curHeader.querySelector(s) : null; }
   function reducedMotion() { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
 
   function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
@@ -188,6 +191,12 @@ export const WIDGET_JS = String.raw`(function () {
     '@media (prefers-color-scheme:dark){.panel{border:1px solid var(--bd)}}' +
     '.pos-left .panel{left:20px;right:auto;transform-origin:bottom left}' +
     '.panel.on{opacity:1;transform:none}' +
+    // Persistent chrome: the header shell (#hdwrap) stays mounted and smoothly animates its HEIGHT
+    // between the tall home hero and the short sub-headers; its inner .hd cross-dissolves. Only the
+    // body (.stage) transitions per view, and the bottom nav is persistent — so nothing re-renders
+    // wholesale and buttons never flash on a tab switch.
+    '.hdwrap{position:relative;flex:0 0 auto;overflow:hidden;transition:height .34s var(--ease)}' +
+    '.hdwrap>.hd.leaving{position:absolute;top:0;left:0;right:0;z-index:1}' +
     '.stage{position:relative;flex:1;overflow:hidden;display:flex}' +
     '.screen{position:absolute;inset:0;display:flex;flex-direction:column;background:var(--bg);overflow:hidden}' +
     '.screen.enter-tab{opacity:0;transform:translateY(4px);transition:opacity .15s var(--ease),transform .15s var(--ease)}' +
@@ -212,9 +221,9 @@ export const WIDGET_JS = String.raw`(function () {
     '.hd.home{flex-direction:column;align-items:stretch;gap:0;padding:18px 20px 24px}' +
     '.hd.home .homeTop{display:flex;align-items:center;justify-content:flex-end;gap:12px;min-height:34px}' +
     '.hd.home .faces{display:flex;align-items:center}' +
-    // Overlapping avatar cluster. Initials fall back to a translucent-white disc (never a stark white
-    // circle on the dark hero); photos fill; the AI mark is the one accent disc.
-    '.hd.home .faces .fc{width:32px;height:32px;border-radius:50%;border:2px solid var(--hd-b);background:rgba(255,255,255,.16);overflow:hidden;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.35)}' +
+    // Overlapping avatar cluster. Initials fall back to an OPAQUE lifted-header disc — never translucent,
+    // so overlapping discs don\'t bleed into each other. Photos fill; the AI mark is the one accent disc.
+    '.hd.home .faces .fc{width:32px;height:32px;border-radius:50%;border:2px solid var(--hd-b);background:color-mix(in srgb,#fff 15%,var(--hd-a));overflow:hidden;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.35)}' +
     '.hd.home .faces .fc+.fc{margin-left:-10px}' +
     '.hd.home .faces .fc.ai{background:var(--ba);color:#fff}' +
     '.hd.home .faces .fc img{width:100%;height:100%;object-fit:cover}.hd.home .faces .fc svg{width:16px;height:16px}' +
@@ -250,10 +259,12 @@ export const WIDGET_JS = String.raw`(function () {
     '.hd-id .idsub{font-size:12.5px;color:rgba(255,255,255,.72);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
     '.hd.plain .hd-id .idsub{color:var(--fg2)}' +
     '.body{flex:1;overflow-y:auto;background:var(--bg)}' +
-    // Bottom nav (Intercom-style): fixed to the panel base, hairline top, active tab in accent.
-    '.tabbar{display:flex;background:var(--s1);border-top:1px solid var(--bd);padding-bottom:env(safe-area-inset-bottom,0);flex:0 0 auto}' +
+    // Bottom nav (Intercom-style): PERSISTENT across root views — only the active state toggles, so it
+    // never flashes. Collapses (max-height→0) when a thread/article takes over the panel.
+    '.tabbar{display:flex;background:var(--s1);border-top:1px solid var(--bd);padding-bottom:env(safe-area-inset-bottom,0);flex:0 0 auto;max-height:120px;opacity:1;overflow:hidden;transition:max-height .32s var(--ease),opacity .22s var(--ease),border-color .2s var(--ease)}' +
+    '.tabbar.navhide{max-height:0;opacity:0;pointer-events:none;border-top-color:transparent}' +
     '.tabbar button{flex:1;border:none;background:none;cursor:pointer;min-height:56px;padding:9px 4px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;color:var(--fg3);font-size:11px;font-weight:600;transition:color .15s var(--ease)}' +
-    '.tabbar button svg{width:22px;height:22px;transition:transform .18s var(--spring)}' +
+    '.tabbar button svg{width:22px;height:22px;transition:transform .2s var(--spring)}' +
     '.tabbar button.act{color:var(--ba)}' +
     '.tabbar button.act svg{transform:translateY(-1px)}' +
     '@media (hover:hover) and (pointer:fine){.tabbar button:not(.act):hover{color:var(--fg2)}}' +
@@ -412,6 +423,9 @@ export const WIDGET_JS = String.raw`(function () {
   function iconArrowUp() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>'; }
   function iconUser() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21a8 8 0 1 0-16 0"/><circle cx="12" cy="7" r="4"/></svg>'; }
   function iconSparkle() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.6L18.5 9.5 13.9 11.4 12 16l-1.9-4.6L5.5 9.5 10.1 7.6z"/></svg>'; }
+  // Noola\'s face: the brand "oo" mark — an open ring (the conversation loop) beside a filled dot
+  // (the answer/signal). Same geometry as the app nav mark; monochrome on the accent disc.
+  function iconNoola() { return '<svg viewBox="0 0 24 24" fill="none"><circle cx="7" cy="12" r="4.1" fill="none" stroke="currentColor" stroke-width="2.2"/><circle cx="16.4" cy="12" r="4.35" fill="currentColor"/></svg>'; }
   function iconClip() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg>'; }
   function iconFile() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>'; }
   function iconX() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>'; }
@@ -434,13 +448,19 @@ export const WIDGET_JS = String.raw`(function () {
         '<span class="g gchat">' + iconChat() + '</span><span class="g gclose">' + iconClose() + '</span>' +
       '</button>' +
       '<span class="badge" aria-hidden="true"></span>' +
-      '<div class="panel" role="dialog" aria-label="Support messenger"><div class="stage"></div></div>';
+      '<div class="panel" role="dialog" aria-label="Support messenger">' +
+        '<div class="hdwrap" id="hdwrap"></div>' +
+        '<div class="stage"></div>' +
+        '<nav class="tabbar navhide" id="nav" aria-label="Sections"></nav>' +
+      '</div>';
     root.appendChild(wrapEl);
 
     bubbleEl = wrapEl.querySelector('.bubble');
     badgeEl = wrapEl.querySelector('.badge');
     panelEl = wrapEl.querySelector('.panel');
     stageEl = panelEl.querySelector('.stage');
+    hdwrapEl = panelEl.querySelector('.hdwrap');
+    navEl = panelEl.querySelector('#nav');
     bubbleEl.addEventListener('click', function () { panelOpen ? closePanel() : openPanel(); });
 
     applyConfig();
@@ -456,6 +476,8 @@ export const WIDGET_JS = String.raw`(function () {
     // keep the default view on an enabled tab
     var tabs = enabledTabs();
     if ((view === 'home' || view === 'messages' || view === 'help') && tabs.indexOf(view) === -1) view = tabs[0] || 'home';
+    buildNav();
+    if (panelOpen) setNav(view);
   }
 
   function enabledTabs() {
@@ -538,12 +560,16 @@ export const WIDGET_JS = String.raw`(function () {
     var built = view === 'thread' ? renderThread() : view === 'article' ? renderArticle() :
       view === 'messages' ? renderMessages() : view === 'help' ? renderHelp() : renderHome();
     var dir = pendingDir; pendingDir = 'none';
+    // Persistent chrome: morph the header shell + toggle the persistent nav; only the body screen
+    // is appended + transitioned. Nothing else re-renders, so buttons never flash on a tab switch.
+    swapHeader(built.header, dir === 'none');
+    setNav(view);
     var screen = document.createElement('div');
     screen.className = 'screen';
-    screen.innerHTML = built.html;
+    screen.innerHTML = built.body;
     var outgoing = curScreen;
     stageEl.appendChild(screen);
-    curScreen = screen;                 // wire against the new screen (sel/selAll)
+    curScreen = screen;                 // body queries scope here; header queries scope to curHeader
     if (built.wire) built.wire();
     transitionScreens(screen, outgoing, dir);
     // live lane follows the open escalated thread
@@ -582,27 +608,77 @@ export const WIDGET_JS = String.raw`(function () {
     return h;
   }
   function wireHeader() {
-    var cl = sel('#cl'); if (cl) cl.addEventListener('click', closePanel);
-    var bk = sel('#bk'); if (bk) bk.addEventListener('click', function () { setView(backTarget()); });
+    var cl = selHd('#cl'); if (cl) cl.addEventListener('click', closePanel);
+    var bk = selHd('#bk'); if (bk) bk.addEventListener('click', function () { setView(backTarget()); });
   }
   function backTarget() { var t = enabledTabs(); return t.indexOf('messages') !== -1 ? 'messages' : t[0]; }
 
-  function tabbar() {
+  // ---- persistent bottom nav (built once per config; only the active state toggles on tab switch) ----
+  function buildNav() {
+    if (!navEl) return;
     var tabs = enabledTabs();
     var icons = { home: iconHome, messages: iconMsgs, help: iconHelp }, labels = { home: 'Home', messages: 'Messages', help: 'Help' };
-    if (tabs.length < 2) return '';
-    var b = '<div class="tabbar">';
+    if (tabs.length < 2) { navEl.innerHTML = ''; return; }
+    var b = '';
     for (var i = 0; i < tabs.length; i++) {
       var t = tabs[i];
-      b += '<button data-tab="' + t + '" class="' + (view === t ? 'act' : '') + '">' + icons[t]() + '<span>' + labels[t] + '</span></button>';
+      b += '<button data-tab="' + t + '" aria-label="' + labels[t] + '">' + icons[t]() + '<span>' + labels[t] + '</span></button>';
     }
-    return b + '</div>';
+    navEl.innerHTML = b;
+    var btns = navEl.querySelectorAll('button');
+    for (var j = 0; j < btns.length; j++) (function (btn) {
+      btn.addEventListener('click', function () { if (btn.getAttribute('data-tab') !== view) setView(btn.getAttribute('data-tab')); });
+    })(btns[j]);
   }
-  function wireTabs() {
-    var btns = selAll('.tabbar button');
-    for (var i = 0; i < btns.length; i++) (function (btn) {
-      btn.addEventListener('click', function () { setView(btn.getAttribute('data-tab')); });
-    })(btns[i]);
+  // Show the nav (root views only) + mark the active tab — never rebuilds, so no button flash.
+  function setNav(v) {
+    if (!navEl) return;
+    var tabs = enabledTabs();
+    var show = (v === 'home' || v === 'messages' || v === 'help') && tabs.length >= 2;
+    navEl.classList.toggle('navhide', !show);
+    if (!show) return;
+    var btns = navEl.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].className = (btns[i].getAttribute('data-tab') === v ? 'act' : '');
+  }
+
+  // Morph the persistent header shell to a new header: animate #hdwrap HEIGHT (tall hero <-> short
+  // sub-header) while the outgoing .hd cross-dissolves under the incoming one. instant skips it
+  // (first open / reduced motion).
+  function buildHd(html) { var d = document.createElement('div'); d.innerHTML = html; return d.firstChild; }
+  function swapHeader(html, instant) {
+    if (!hdwrapEl) return;
+    // Drop any outgoing header still mid-morph from a fast previous switch, so rapid tab taps can\'t
+    // stack stale .hd copies in the shell.
+    var stale = hdwrapEl.querySelectorAll('.hd.leaving');
+    for (var s = 0; s < stale.length; s++) if (stale[s].parentNode) stale[s].parentNode.removeChild(stale[s]);
+    var neu = buildHd(html);
+    if (!curHeader || !curHeader.parentNode || instant || reducedMotion()) {
+      while (hdwrapEl.firstChild) hdwrapEl.removeChild(hdwrapEl.firstChild);
+      hdwrapEl.appendChild(neu); curHeader = neu; hdwrapEl.style.height = 'auto';
+      return;
+    }
+    var old = curHeader;
+    var oldH = hdwrapEl.offsetHeight;
+    old.classList.add('leaving');                 // take the outgoing header out of flow (overlay)
+    neu.style.opacity = '0';
+    hdwrapEl.appendChild(neu);
+    var newH = neu.offsetHeight;                   // measured with only neu in flow
+    hdwrapEl.style.height = oldH + 'px';
+    void hdwrapEl.offsetWidth;                     // reflow so the height transition runs from oldH
+    hdwrapEl.style.height = newH + 'px';
+    old.style.transition = 'opacity .22s var(--ease)';
+    neu.style.transition = 'opacity .3s var(--ease)';
+    requestAnimationFrame(function () { requestAnimationFrame(function () { old.style.opacity = '0'; neu.style.opacity = '1'; }); });
+    curHeader = neu;
+    var done = false;
+    function cleanup() {
+      if (done) return; done = true;
+      if (old.parentNode) hdwrapEl.removeChild(old);
+      hdwrapEl.style.height = 'auto';
+      neu.style.position = ''; neu.style.transition = ''; neu.style.opacity = '';
+    }
+    hdwrapEl.addEventListener('transitionend', function te(e) { if (e.target === hdwrapEl && e.propertyName === 'height') { hdwrapEl.removeEventListener('transitionend', te); cleanup(); } });
+    setTimeout(cleanup, 480);
   }
 
   // The support team shown in the home header cluster (the "staffed" signal). Loaded once from
@@ -619,7 +695,7 @@ export const WIDGET_JS = String.raw`(function () {
   // The home header's stacked avatar cluster: the AI mark (a solid accent disc) leading up to three
   // real agent faces — a photo if the agent has one, else initials on a clean disc. Falls back to
   // any agent the visitor has already talked to, then to just the AI mark. Never fake stock faces.
-  function homeFaces(max) {
+  function homeFaces(max, noAi) {
     max = max || 3;
     var faces = [];
     if (team && team.length) {
@@ -634,7 +710,9 @@ export const WIDGET_JS = String.raw`(function () {
         }
       }
     }
-    var out = '<span class="fc ai">' + iconSparkle() + '</span>';
+    // noAi = human faces only (used where a Noola mark already appears elsewhere on the surface).
+    if (noAi && !faces.length) return '';
+    var out = noAi ? '' : '<span class="fc ai">' + iconNoola() + '</span>';
     for (var k = 0; k < faces.length; k++) {
       var f = faces[k];
       if (f.avatarUrl) out += '<span class="fc"><img src="' + esc(avatarUrl(f.avatarUrl)) + '" alt=""></span>';
@@ -669,13 +747,13 @@ export const WIDGET_JS = String.raw`(function () {
           (CFG.greeting ? '<p class="hsub">' + esc(CFG.greeting) + '</p>' : '') +
         '</div>' +
       '</div>';
-    var html =
-      homeHead +
+    var cardFaces = homeFaces(3, true); // human faces only — the ask card already leads with the Noola mark
+    var body =
       '<div class="body">' +
         '<button class="askcard" id="startc" style="margin-top:16px">' +
-          '<span class="ic">' + iconSparkle() + '</span>' +
-          '<span class="at"><span class="att">Ask a question</span><span class="ats">AI Agent &amp; team · instant answers</span></span>' +
-          '<span class="fcs">' + homeFaces(2) + '</span>' +
+          '<span class="ic">' + iconNoola() + '</span>' +
+          '<span class="at"><span class="att">Ask a question</span><span class="ats">Noola &amp; the team · instant answers</span></span>' +
+          (cardFaces ? '<span class="fcs">' + cardFaces + '</span>' : '<span class="chev">' + iconChev() + '</span>') +
         '</button>' +
         recentCard +
         (CFG.tabs.help ? (
@@ -683,15 +761,14 @@ export const WIDGET_JS = String.raw`(function () {
           '<div class="sect">Top articles</div><div id="tophelp"><div class="empty">Loading…</div></div>'
         ) : '') +
         '<div class="brand">Powered by Noola</div>' +
-      '</div>' +
-      tabbar();
-    return { html: html, wire: function () {
-      wireHeader(); wireTabs();
+      '</div>';
+    return { header: homeHead, body: body, wire: function () {
+      wireHeader();
       var sc = sel('#startc'); if (sc) sc.addEventListener('click', openOrStartConversation);
       var rc = sel('.rowlink[data-conv]'); if (rc) rc.addEventListener('click', function () { setView('thread', rc.getAttribute('data-conv')); });
       var hq = sel('#hq'); if (hq) hq.addEventListener('keydown', function (e) { if (e.key === 'Enter') { helpSeed = hq.value; setView('help'); } });
       if (CFG.tabs.help) loadTopArticles();
-      // Fill the header cluster with the real team once (progressive — the AI mark shows immediately).
+      // Fill the header cluster with the real team once (progressive — the Noola mark shows immediately).
       if (!teamSynced) { teamSynced = true; loadTeam(function (changed) { if (changed && panelOpen && view === 'home') { pendingDir = 'none'; render(); } }); }
     } };
   }
@@ -719,18 +796,16 @@ export const WIDGET_JS = String.raw`(function () {
       return '<div class="rowlink" data-conv="' + esc(c.id) + '">' +
         (c.unread ? '<span class="dot"></span>' : '') +
         '<div class="rt"><div class="rtitle">' + esc((last && last.body) || 'Conversation') + '</div>' +
-        '<div class="rsub">' + esc(c.escalated ? 'With the team' : 'AI assistant') + ' · ' + relTime(c.updatedAt || Date.now()) + '</div></div>' +
+        '<div class="rsub">' + esc(c.escalated ? 'With the team' : 'Noola') + ' · ' + relTime(c.updatedAt || Date.now()) + '</div></div>' +
         '<span class="chev">' + iconChev() + '</span></div>';
     }).join('') : '';
-    var html =
-      header('Messages') +
+    var body =
       '<div class="body">' +
         '<button class="cta" id="startc" style="margin-top:16px"><span>Start a new conversation</span>' + iconSend() + '</button>' +
         (rows ? '<div class="card">' + rows + '</div>' : '<div class="empty">No conversations yet.<br>Start one above.</div>') +
-      '</div>' +
-      tabbar();
-    return { html: html, wire: function () {
-      wireHeader(); wireTabs();
+      '</div>';
+    return { header: header('Messages'), body: body, wire: function () {
+      wireHeader();
       var sc = sel('#startc'); if (sc) sc.addEventListener('click', startConversation);
       var rows2 = selAll('.rowlink[data-conv]');
       for (var i = 0; i < rows2.length; i++) (function (r) { r.addEventListener('click', function () { setView('thread', r.getAttribute('data-conv')); }); })(rows2[i]);
@@ -764,12 +839,12 @@ export const WIDGET_JS = String.raw`(function () {
   // against the customer's own site (404). Prefix it with the API base the widget booted from.
   function avatarUrl(u) { return (u && u.charAt(0) === '/') ? API + u : u; }
   function avatarInner(m) {
-    if (m.role === 'ai') return '<span class="av ai">' + iconSparkle() + '</span>';
+    if (m.role === 'ai') return '<span class="av ai">' + iconNoola() + '</span>';
     if (m.authorAvatarUrl) return '<span class="av"><img src="' + esc(avatarUrl(m.authorAvatarUrl)) + '" alt=""></span>';
     var ini = initials(m.authorName);
     return '<span class="av">' + (ini ? esc(ini) : iconUser()) + '</span>';
   }
-  function whoName(m) { return m.role === 'ai' ? 'AI Assistant' : (m.authorName || 'Support'); }
+  function whoName(m) { return m.role === 'ai' ? 'Noola' : (m.authorName || 'Support'); }
   function sideOf(m) { return m.role === 'me' ? 'right' : 'left'; }
   // Group consecutive turns from the same author (Intercom-style): one avatar + name per run.
   function groupKey(m) { return m.role === 'me' ? 'me' : m.role === 'ai' ? 'ai' : ('agent:' + (m.authorName || m.authorAvatarUrl || '')); }
@@ -792,7 +867,7 @@ export const WIDGET_JS = String.raw`(function () {
   function threadLogHtml(c) {
     var out = '';
     if (!c.msgs.length && !c.escalated) {
-      out += mrowHtml({ role: 'ai', body: 'Hi! Ask me anything and I’ll answer instantly from our knowledge base. Prefer a person? Use “Talk to a human” below.' }, true, null);
+      out += mrowHtml({ role: 'ai', body: 'Hi, I’m Noola — your AI assistant. Ask me anything and I’ll answer instantly from the help center. Want a teammate instead? Tap “Talk to a human” any time.' }, true, null);
     }
     var prev = null;
     for (var i = 0; i < c.msgs.length; i++) {
@@ -811,7 +886,7 @@ export const WIDGET_JS = String.raw`(function () {
     // One toggle, driven by the authoritative AI mode: mute the bot ("Talk to a human") or turn it
     // back on ("Ask the assistant"). Always present so the visitor is never stuck in one mode.
     var toggle = c.escalated
-      ? '<button class="talk" id="resume" type="button">' + iconSparkle() + '<span>Ask the assistant</span></button>'
+      ? '<button class="talk" id="resume" type="button">' + iconNoola() + '<span>Ask Noola</span></button>'
       : '<button class="talk" id="talk" type="button">' + iconUser() + '<span>Talk to a human</span></button>';
     return out + toggle;
   }
@@ -887,9 +962,9 @@ export const WIDGET_JS = String.raw`(function () {
       avInner = agent ? avatarInner(agent) : '<span class="av">' + iconUser() + '</span>';
       sub = 'Connected · we’ll reply here';
     } else {
-      name = agent ? (agent.authorName || 'Support') : 'AI Assistant';
-      avInner = agent ? avatarInner(agent) : '<span class="av ai">' + iconSparkle() + '</span>';
-      sub = 'Replies instantly · talk to a human anytime';
+      name = agent ? (agent.authorName || 'Support') : 'Noola';
+      avInner = agent ? avatarInner(agent) : '<span class="av ai">' + iconNoola() + '</span>';
+      sub = agent ? 'Replies instantly · talk to a human anytime' : 'AI assistant · replies instantly';
     }
     return '<div class="hd plain">' +
       (back ? '<button class="iconbtn" id="bk" aria-label="Back">' + iconBack() + '</button>' : '') +
@@ -901,8 +976,7 @@ export const WIDGET_JS = String.raw`(function () {
   function renderThread() {
     var c = getConv(threadId) || newConv();
     threadId = c.id;
-    var html =
-      threadHeader(c) +
+    var body =
       '<div class="body"><div class="log" id="log">' + threadLogHtml(c) + '</div></div>' +
       '<div class="foot">' +
         '<div class="attprev" id="attprev"></div>' +
@@ -913,7 +987,7 @@ export const WIDGET_JS = String.raw`(function () {
           '<input type="file" id="fileinput" multiple accept="image/*,.pdf,.txt,.csv,.doc,.docx,.zip,.log" style="display:none">' +
         '</div>' +
       '</div>';
-    return { html: html, wire: function () {
+    return { header: threadHeader(c), body: body, wire: function () {
       wireHeader();
       pending = [];                              // fresh composer per thread open
       var q = sel('#q'), send = sel('#send');
@@ -1128,7 +1202,7 @@ export const WIDGET_JS = String.raw`(function () {
     streamingConv = convId;
     if (log) {
       thinking = document.createElement('div');
-      thinking.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconSparkle() + '</span></div><div class="mstack"><div class="rowm ai think"><span></span><span></span><span></span></div></div></div>';
+      thinking.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconNoola() + '</span></div><div class="mstack"><div class="rowm ai think"><span></span><span></span><span></span></div></div></div>';
       log.appendChild(thinking); log.scrollTop = log.scrollHeight;
     }
     function atBottom() { return log ? (log.scrollHeight - log.scrollTop - log.clientHeight < 60) : true; }
@@ -1140,7 +1214,7 @@ export const WIDGET_JS = String.raw`(function () {
     function mount() {
       if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); thinking = null;
       var wrap = document.createElement('div');
-      wrap.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconSparkle() + '</span></div><div class="mstack"><div class="mwho">' + esc('AI Assistant') + '</div><div class="rowm ai streaming"></div></div></div>';
+      wrap.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconNoola() + '</span></div><div class="mstack"><div class="mwho">' + esc('Noola') + '</div><div class="rowm ai streaming"></div></div></div>';
       bubbleRow = wrap.firstChild;
       if (!reducedMotion() && bubbleRow.classList) bubbleRow.classList.add('msg-enter');
       if (log) { var talk = log.querySelector('.talk'); if (talk) log.insertBefore(bubbleRow, talk); else log.appendChild(bubbleRow); }
@@ -1267,15 +1341,13 @@ export const WIDGET_JS = String.raw`(function () {
   // ---- Help center ----
   var helpTimer = null;
   function renderHelp() {
-    var html =
-      header('Help center', 'Search our knowledge base') +
+    var body =
       '<div class="body">' +
         '<div class="search" style="margin-top:16px"><span>' + iconSearch() + '</span><input id="hq" placeholder="Search for articles" autocomplete="off"></div>' +
         '<div id="hres"><div class="sect">Browse</div><div id="hbrowse"><div class="empty">Loading…</div></div></div>' +
-      '</div>' +
-      tabbar();
-    return { html: html, wire: function () {
-      wireHeader(); wireTabs();
+      '</div>';
+    return { header: header('Help center', 'Search our knowledge base'), body: body, wire: function () {
+      wireHeader();
       var hq = sel('#hq');
       if (typeof helpSeed === 'string' && helpSeed) { hq.value = helpSeed; runHelpSearch(helpSeed); helpSeed = null; }
       else loadBrowse();
@@ -1306,12 +1378,10 @@ export const WIDGET_JS = String.raw`(function () {
   }
 
   function renderArticle() {
-    var html =
-      header('Article', null, { back: true }) +
-      '<div class="body"><div class="art" id="art"><div class="empty">Loading…</div></div></div>';
-    return { html: html, wire: function () {
+    var body = '<div class="body"><div class="art" id="art"><div class="empty">Loading…</div></div></div>';
+    return { header: header('Article', null, { back: true }), body: body, wire: function () {
       wireHeader();
-      var bk = sel('#bk'); if (bk) { bk.onclick = function () { setView('help'); }; }
+      var bk = selHd('#bk'); if (bk) { bk.onclick = function () { setView('help'); }; }
       fetchKB('/public/kb/' + encodeURIComponent(articleSlug)).then(function (d) {
         var el = sel('#art'); if (!el) return;
         var a = d && d.article;

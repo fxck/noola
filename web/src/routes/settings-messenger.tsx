@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   MessagesSquare, Plus, Copy, Check, Trash2, Loader2, Home, MessageCircle, LifeBuoy,
-  ShieldCheck, KeyRound, RefreshCw, Eye, EyeOff, Sparkles,
+  ShieldCheck, KeyRound, RefreshCw, Eye, EyeOff,
 } from "lucide-react";
 import { toast } from "@/components/ui/toaster";
 import { SettingsPage } from "@/components/settings-page";
@@ -550,6 +550,16 @@ function TabToggle({
   );
 }
 
+// Noola's "oo" mark, monochrome (matches the widget's iconNoola): an open ring + a filled dot.
+function OoMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" aria-hidden="true">
+      <circle cx="7" cy="12" r="4.1" fill="none" stroke="currentColor" strokeWidth="2.2" />
+      <circle cx="16.4" cy="12" r="4.35" fill="currentColor" />
+    </svg>
+  );
+}
+
 function WidgetPreview({ cfg }: { cfg: WidgetConfig }) {
   const enabled = (["home", "messages", "help"] as const).filter((t) => cfg.tabs[t]);
   const tabIcon = { home: Home, messages: MessageCircle, help: LifeBuoy } as const;
@@ -570,7 +580,7 @@ function WidgetPreview({ cfg }: { cfg: WidgetConfig }) {
         <div className="relative px-3.5 pb-4 pt-3 text-white" style={{ background: heroBg }}>
           <div className="flex items-center justify-end">
             <span className="grid size-6 place-items-center rounded-full text-white ring-2 ring-[#13241d]" style={{ backgroundColor: cfg.accent }}>
-              <Sparkles className="size-3" />
+              <OoMark className="size-3.5" />
             </span>
             <span className="-ml-2.5 grid size-6 place-items-center rounded-full bg-white/[.16] text-[8px] font-semibold text-white ring-2 ring-[#13241d]">JS</span>
           </div>
@@ -584,11 +594,11 @@ function WidgetPreview({ cfg }: { cfg: WidgetConfig }) {
         <div className="flex-1 space-y-2 overflow-hidden bg-neutral-50 p-2.5 dark:bg-neutral-800/40">
           <div className="flex items-center gap-2 rounded-xl border bg-white p-2 shadow-sm dark:border-white/10 dark:bg-neutral-900">
             <span className="grid size-6 place-items-center rounded-full bg-neutral-100 dark:bg-neutral-800" style={{ color: cfg.accent }}>
-              <Sparkles className="size-3" />
+              <OoMark className="size-3.5" />
             </span>
             <div className="min-w-0 flex-1">
               <div className="text-[10px] font-semibold text-foreground">Ask a question</div>
-              <div className="truncate text-[9px] text-muted-foreground">AI Agent &amp; team · instant answers</div>
+              <div className="truncate text-[9px] text-muted-foreground">Noola &amp; the team · instant answers</div>
             </div>
           </div>
           {cfg.tabs.help && (
