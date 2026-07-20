@@ -37,6 +37,9 @@ export interface Ticket {
   contact_id?: string | null;
   contact_name?: string | null;
   contact_avatar_url?: string | null;
+  /** Derived server-side: the contact was seen within the 3-min online window — drives the inbox
+   *  presence dot (matches the contacts list/detail). */
+  contact_online?: boolean | null;
   /** The contact's company (account) — row/rail context. Optional (older api). */
   company_id?: string | null;
   company_name?: string | null;

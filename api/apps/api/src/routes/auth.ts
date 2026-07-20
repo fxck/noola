@@ -169,6 +169,62 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true, ...(name ? { name } : {}), ...(email ? { email } : {}) };
   });
 
+  // Self-service channel identities — a member links their OWN Discord/Slack id so their replies and
+  // reactions in those channels attribute to their Noola seat (same agent_channel_identities backend as
+  // the admin Settings → Members roster, scoped to the caller). Generic over channel_type so Slack (and
+  // anything else) is a one-line add. This is why "set discord id" was missing on the Profile page.
+  const CHANNEL_ID_RULES: Record<string, { re: RegExp; hint: string }> = {
+    discord: {
+      re: /^\d{5,25}$/,
+      hint: "Use the numeric Discord user ID (right-click yourself in Discord → Copy User ID; enable Developer Mode in Discord settings if you don't see it).",
+    },
+    slack: {
+      re: /^[UW][A-Z0-9]{6,}$/i,
+      hint: "Use your Slack member ID (your Slack profile → ⋯ → Copy member ID), e.g. U01AB2CD3.",
+    },
+  };
+
+  app.get("/me/channel-identities", async (req, reply) => {
+    const s = req.session;
+    if (!s) return reply.code(401).send({ error: "unauthorized" });
+    const rows = await withTenant(s.tenantId, (c) =>
+      c.query("SELECT channel_type, external_id FROM agent_channel_identities WHERE user_id = $1", [s.userId]),
+    );
+    const identities: Record<string, string | null> = { discord: null, slack: null };
+    for (const r of rows.rows as Array<{ channel_type: string; external_id: string }>) identities[r.channel_type] = r.external_id;
+    return { identities };
+  });
+
+  app.put("/me/channel-identity", async (req, reply) => {
+    const s = req.session;
+    if (!s) return reply.code(401).send({ error: "unauthorized" });
+    const b = (req.body ?? {}) as { channelType?: string; externalId?: string | null };
+    const channelType = (b.channelType ?? "").toString().trim().toLowerCase();
+    const rule = CHANNEL_ID_RULES[channelType];
+    if (!rule) return reply.code(400).send({ error: "unsupported channel" });
+    const externalId = (b.externalId ?? "").toString().trim();
+    if (!externalId) {
+      await removeAgentChannelIdentity(s.tenantId, s.userId, channelType);
+    } else {
+      if (!rule.re.test(externalId)) return reply.code(400).send({ error: rule.hint });
+      // Don't let a member steal a handle already linked to someone else (the upsert is last-write-wins).
+      const clash = await withTenant(s.tenantId, (c) =>
+        c.query(
+          "SELECT 1 FROM agent_channel_identities WHERE channel_type = $1 AND lower(external_id) = lower($2) AND user_id <> $3 LIMIT 1",
+          [channelType, externalId, s.userId],
+        ),
+      );
+      if (clash.rowCount) return reply.code(409).send({ error: "That ID is already linked to another member." });
+      await upsertAgentChannelIdentity(s.tenantId, s.userId, externalId, channelType);
+    }
+    void recordAudit(s.tenantId, {
+      actorId: s.userId, actorName: s.name ?? null,
+      action: externalId ? "me.channel_linked" : "me.channel_unlinked",
+      entityType: "user", entityId: s.userId, meta: { channelType, ...(externalId ? { externalId } : {}) },
+    });
+    return { ok: true, channelType, externalId: externalId || null };
+  });
+
   app.post("/auth/logout", async (req) => {
     // Revoke the better-auth session bound to the Bearer token (best-effort).
     await betterAuthLogout(req.headers);

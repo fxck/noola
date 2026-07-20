@@ -178,8 +178,13 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       // setAppliedTags on an archived thread 400s — unarchive/rearchive around it.
       const wasArchived = t.archived === true;
       if (wasArchived) await t.setArchived(false).catch(() => {});
-      await t.setAppliedTags(ids).catch(() => {});
-      if (wasArchived) await t.setArchived(true).catch(() => {});
+      try {
+        // PROPAGATE the real failure (e.g. Missing Permissions) — do NOT swallow it here, or the
+        // caller thinks the tag applied when Discord refused. Re-archive in finally regardless.
+        await t.setAppliedTags(ids);
+      } finally {
+        if (wasArchived) await t.setArchived(true).catch(() => {});
+      }
       return true;
     },
     async forumTagNames(threadId) {

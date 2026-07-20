@@ -412,9 +412,43 @@ export async function syncMirrorState(tenantId: string, ticketId: string): Promi
   if (!tp) return;
   const t = await loadTicketBrief(tenantId, ticketId);
   if (!t) return;
-  await tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)).catch(() => {});
-  await tp.setArchived(mirror.post_thread_id, t.status === "closed").catch(() => {});
+  const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+  await closeAction("tag", ctx, () => tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)));
+  await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, t.status === "closed"));
 }
+
+/** Discord "you lack the permission" signals — Missing Permissions (50013) / Missing Access (50001).
+ *  A close action that fails this way is almost always the bot missing "Manage Posts" on the forum. */
+function isMissingPerms(e: unknown): boolean {
+  const code = (e as { code?: number | string } | null)?.code;
+  return code === 50013 || code === 50001 || /missing (permission|access)/i.test((e as Error)?.message ?? "");
+}
+
+/** Run one forum close action (tag/archive/lock) and — unlike the old `.catch(() => {})` — LOG the
+ *  real Discord error instead of hiding it, and flag a permission refusal so the caller can post a
+ *  single actionable notice. This is why closes looked "half-done": the notice posted, the archive
+ *  silently 50013'd. Returns whether it succeeded and whether it failed on a missing permission. */
+async function closeAction(
+  action: "tag" | "archive" | "lock",
+  ctx: { tenantId: string; ticketId: string; threadId: string },
+  fn: () => Promise<unknown>,
+): Promise<{ ok: boolean; missingPerms: boolean }> {
+  try {
+    await fn();
+    return { ok: true, missingPerms: false };
+  } catch (e) {
+    const missingPerms = isMissingPerms(e);
+    console.warn(
+      `[discord-close] ${action} failed tenant=${ctx.tenantId} ticket=${ctx.ticketId} thread=${ctx.threadId} missingPerms=${missingPerms}: ${(e as Error)?.message ?? String(e)}`,
+    );
+    return { ok: false, missingPerms };
+  }
+}
+
+/** The one-line note we drop into the post when a close action was refused for lack of permission —
+ *  turns an invisible failure into something the team can act on. */
+const MANAGE_POSTS_HINT =
+  "⚠️ I marked this resolved in Noola, but couldn't archive/tag the post here — the Noola bot needs the **Manage Posts** permission in this forum (Server Settings → this forum → Permissions → the Noola bot's role → enable *Manage Posts*).";
 
 /**
  * Fired on `ticket.closed` (via the domain-event seam). Makes a close VISIBLE in Discord instead of a
@@ -436,8 +470,15 @@ export async function onTicketClosed(
     if (tp) {
       const by = opts.agentName ? ` by ${opts.agentName}` : "";
       await tp.postToThread(mirror.post_thread_id, `✅ **Resolved**${by} — closed in Noola.`).catch(() => {});
+      // Reflect the close onto the post (tag + archive), surfacing any permission refusal — the bot
+      // OWNS mirror posts, so this should normally succeed; when it doesn't, say why in the post.
+      const t = await loadTicketBrief(tenantId, ticketId);
+      const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+      let missingPerms = false;
+      if (t) missingPerms = (await closeAction("tag", ctx, () => tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)))).missingPerms || missingPerms;
+      missingPerms = (await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, true))).missingPerms || missingPerms;
+      if (missingPerms) await tp.postToThread(mirror.post_thread_id, MANAGE_POSTS_HINT).catch(() => {});
     }
-    await syncMirrorState(tenantId, ticketId).catch(() => {});
     return;
   }
   if (opts.source === "discord") return; // closed from the origin thread itself — nothing to push back
@@ -484,23 +525,29 @@ async function archiveIntakeThreadOnClose(tenantId: string, ticketId: string, ag
     }
   }
 
+  const ctx = { tenantId, ticketId, threadId };
+  let missingPerms = false;
+
   // TAG: an explicit per-binding close tag wins; otherwise auto-detect the forum's own
-  // "Solved/Resolved/Closed"-style tag. Best-effort; needs Manage Posts on the forum.
+  // "Solved/Resolved/Closed"-style tag. Needs Manage Posts on the forum — surfaced below if refused.
   if (closeTag) {
-    await tp.applyTags(threadId, [closeTag]).catch(() => {});
+    missingPerms = (await closeAction("tag", ctx, () => tp.applyTags(threadId, [closeTag]))).missingPerms || missingPerms;
   } else {
     const tagNames = (await tp.forumTagNames?.(threadId).catch(() => [])) ?? [];
     const solved = tagNames.find((n) => SOLVED_TAG_RE.test(n));
-    if (solved) await tp.applyTags(threadId, [solved]).catch(() => {});
+    if (solved) missingPerms = (await closeAction("tag", ctx, () => tp.applyTags(threadId, [solved]))).missingPerms || missingPerms;
   }
 
   // Always post the visible "resolved" notice.
   await tp.postToThread(threadId, `✅ Marked resolved${by}. Reply here if you still need help.`).catch(() => {});
 
   // ARCHIVE (default on) LAST — posting a message re-activates the thread.
-  if (closeArchive) await tp.setArchived(threadId, true).catch(() => {});
+  if (closeArchive) missingPerms = (await closeAction("archive", ctx, () => tp.setArchived(threadId, true))).missingPerms || missingPerms;
   // LOCK (default off) after archive — a locked thread can't be replied to (harder to reopen).
-  if (closeLock) await tp.setLocked?.(threadId, true).catch(() => {});
+  if (closeLock) missingPerms = (await closeAction("lock", ctx, () => tp.setLocked ? tp.setLocked(threadId, true) : Promise.resolve())).missingPerms || missingPerms;
+
+  // A permission refusal is otherwise invisible — tell the team exactly what to grant.
+  if (missingPerms) await tp.postToThread(threadId, MANAGE_POSTS_HINT).catch(() => {});
 }
 
 // ── D3: forum post → ticket (note by default, 📤 promotes to reply) ───────────

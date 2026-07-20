@@ -38,6 +38,7 @@ import { CopyId } from "@/components/live/nerd-stats";
 import { PopoverSelect } from "@/components/ui/menu";
 import { Popover } from "@/components/ui/popover";
 import { Avatar } from "@/components/ui/avatar";
+import { avatarSrc } from "@/lib/avatar-upload";
 import { AssigneePicker } from "@/components/inbox/assignee-picker";
 import { TeamPicker } from "@/components/inbox/team-picker";
 import { Input } from "@/components/ui/input";
@@ -203,14 +204,24 @@ export function ContextRail({
                 className="group/ct flex min-w-0 items-center justify-end gap-1.5 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 title="Open contact"
               >
-                <Avatar name={t.contact_name} className="size-4 text-[8px]" />
+                <span className="relative shrink-0">
+                  <Avatar name={t.contact_name} image={avatarSrc(t.contact_avatar_url)} className="size-4 text-[8px]" />
+                  {t.contact_online && (
+                    <span title="Active now" aria-label="Active now" className="absolute -bottom-0.5 -right-0.5 size-1.5 rounded-full border border-card bg-success" />
+                  )}
+                </span>
                 <span className="truncate underline-offset-2 group-hover/ct:underline">
                   {t.contact_name}
                 </span>
               </Link>
             ) : (
               <span className="flex min-w-0 items-center justify-end gap-1.5">
-                <Avatar name={t.contact_name} className="size-4 text-[8px]" />
+                <span className="relative shrink-0">
+                  <Avatar name={t.contact_name} image={avatarSrc(t.contact_avatar_url)} className="size-4 text-[8px]" />
+                  {t.contact_online && (
+                    <span title="Active now" aria-label="Active now" className="absolute -bottom-0.5 -right-0.5 size-1.5 rounded-full border border-card bg-success" />
+                  )}
+                </span>
                 <span className="truncate">{t.contact_name}</span>
               </span>
             )}

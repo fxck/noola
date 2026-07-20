@@ -170,9 +170,110 @@ export function SettingsProfilePage() {
               </div>
             </div>
 
+            <ConnectedAccountsCard />
+
             <TwoFactorCard />
           </div>
     </SettingsPage>
+  );
+}
+
+// ── Connected accounts ───────────────────────────────────────────────────────
+// Link your OWN chat IDs → your replies + reactions in those channels attribute to your Noola seat
+// (same agent_channel_identities backend as the admin Settings → Members roster; self-service here).
+// This is what was missing: "set your Discord ID" lived only on the admin roster, never on Profile.
+const CONNECTED_CHANNELS = [
+  {
+    key: "discord",
+    label: "Discord user ID",
+    placeholder: "e.g. 208401234567890123",
+    hint: "Right-click yourself in Discord → Copy User ID (enable Developer Mode in Discord settings if you don't see it). Your Discord replies then attribute to you here.",
+  },
+  {
+    key: "slack",
+    label: "Slack member ID",
+    placeholder: "e.g. U01AB2CD3",
+    hint: "Your Slack profile → ⋯ → Copy member ID.",
+  },
+] as const;
+
+function ConnectedAccountsCard() {
+  const [ids, setIds] = useState<Record<string, string>>({ discord: "", slack: "" });
+  const [saved, setSaved] = useState<Record<string, string>>({ discord: "", slack: "" });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let live = true;
+    api<{ identities: Record<string, string | null> }>("/me/channel-identities")
+      .then((r) => {
+        if (!live) return;
+        const next = { discord: r.identities.discord ?? "", slack: r.identities.slack ?? "" };
+        setIds(next);
+        setSaved(next);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  async function save(channel: string) {
+    setBusy(channel);
+    try {
+      const externalId = ids[channel].trim();
+      await api("/me/channel-identity", {
+        method: "PUT",
+        body: JSON.stringify({ channelType: channel, externalId: externalId || null }),
+      });
+      setSaved((s) => ({ ...s, [channel]: externalId }));
+      toast.success(externalId ? "Linked." : "Cleared.");
+    } catch (err) {
+      toast.error((err as ApiError).detail || "Couldn't save that ID. Please try again.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="mt-6 space-y-4 rounded-xl border bg-card p-6 shadow-sm">
+      <div>
+        <h2 className="text-sm font-semibold">Connected accounts</h2>
+        <p className="mt-0.5 text-small text-muted-foreground">
+          Link your chat IDs so your replies and reactions in those channels are attributed to you in Noola.
+        </p>
+      </div>
+      {CONNECTED_CHANNELS.map((ch) => {
+        const dirty = ids[ch.key].trim() !== saved[ch.key];
+        return (
+          <div key={ch.key} className="space-y-1.5">
+            <Label htmlFor={`ci-${ch.key}`}>{ch.label}</Label>
+            <div className="flex gap-2">
+              <Input
+                id={`ci-${ch.key}`}
+                value={ids[ch.key]}
+                onChange={(e) => setIds((s) => ({ ...s, [ch.key]: e.target.value }))}
+                placeholder={ch.placeholder}
+                disabled={loading}
+                className="flex-1"
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void save(ch.key)}
+                disabled={!dirty || busy === ch.key}
+              >
+                {busy === ch.key ? <Loader2 className="animate-spin" /> : ids[ch.key].trim() ? "Save" : "Clear"}
+              </Button>
+            </div>
+            <p className="text-micro text-muted-foreground">{ch.hint}</p>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

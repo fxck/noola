@@ -771,7 +771,7 @@ function CustomerChannelsSection({ serverConnected }: { serverConnected: boolean
               </Field>
             </div>
 
-            <Disclosure label="Options — account, AI replies, ticket-per-message" defaultOpen={optionsSet}>
+            <Disclosure label="Options — account, AI replies, forum & ticket-per-message" defaultOpen={optionsSet || d.kind === "forum"}>
               <div className="grid gap-4 pt-1 sm:grid-cols-2">
                 <Field label="Customer account" hint="Conversations here roll up to this account.">
                   <Combobox
@@ -793,6 +793,22 @@ function CustomerChannelsSection({ serverConnected }: { serverConnected: boolean
                     ]}
                   />
                 </Field>
+                {/* Explicit forum toggle — the picker auto-marks a forum, but a channel bound by raw ID
+                    (or a legacy binding) never got `kind`, which hid the whole "On close" config. This
+                    lets the user declare it so the close-tag/archive/lock settings always surface. */}
+                <label className="flex cursor-pointer items-center justify-between gap-3 rounded-lg border p-3 sm:col-span-2">
+                  <span>
+                    <span className="text-sm font-medium">Help forum (post = ticket)</span>
+                    <span className="block text-xs text-muted-foreground">
+                      This channel is a Discord forum — every post opens its own ticket, and the “On close” actions below apply.
+                    </span>
+                  </span>
+                  <Switch
+                    checked={d.kind === "forum"}
+                    onCheckedChange={(v) => patch(d._key, { kind: v ? "forum" : "text" })}
+                    aria-label="Help forum"
+                  />
+                </label>
                 {d.kind !== "forum" && (
                   <label className="flex cursor-pointer items-center justify-between gap-3 rounded-lg border p-3 sm:col-span-2">
                     <span>

@@ -70,20 +70,27 @@ export function MessageBubble({
   message,
   showChannel = false,
   contactName = null,
+  contactAvatarUrl = null,
 }: {
   message: Message;
   showChannel?: boolean;
-  /** The conversation's contact — customer bubbles carry their identity. */
+  /** The conversation's canonical contact — customer bubbles carry this identity. */
   contactName?: string | null;
+  contactAvatarUrl?: string | null;
 }) {
   const isAgent = message.author_type === "agent";
   // AI receipt shows only for genuine AI/autoreply messages — a translation-only meta must not
   // trigger it (it has no model/cost fields). Autoreply always stamps a `kind`.
   const isAi = message.meta?.kind != null || message.auto === true;
-  // Per-message external author (a Discord thread participant) wins over the single conversation
-  // contact, so a multi-participant thread renders DISTINCT authors per bubble instead of one name.
-  const authorName = message.author_name || contactName;
   const isCommunity = message.author_kind === "community";
+  // Customer identity: the ticket's OWN contact renders with the CANONICAL name + avatar (the same the
+  // ticket row and contact page use), so a Discord-MERGED contact looks identical everywhere — not
+  // "PA" on green here and "PB" on purple there (initials + color are hashed off the name string, so a
+  // divergent name = a different-looking person). A DISTINCT community participant keeps its own
+  // per-message author, so a multi-poster thread still shows different people.
+  const useCanonicalContact = !isCommunity && !!contactName;
+  const authorName = useCanonicalContact ? contactName : message.author_name || contactName;
+  const customerAvatarUrl = useCanonicalContact ? contactAvatarUrl : message.author_avatar_url;
 
   // Auto-translation: `body` is always the verbatim stored text; `translation.text` is its
   // other-language counterpart. `agentFacing` picks which the agent reads by default. The toggle
@@ -119,8 +126,8 @@ export function MessageBubble({
             {initials(message.author_name || "Agent")}
           </span>
         )
-      ) : authorName ? (
-        <Avatar name={authorName} className="mt-0.5 size-7 shrink-0 text-micro" />
+      ) : authorName || customerAvatarUrl ? (
+        <Avatar name={authorName || "Customer"} image={avatarSrc(customerAvatarUrl)} className="mt-0.5 size-7 shrink-0 text-micro" />
       ) : (
         <span
           className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground/60"

@@ -39,6 +39,9 @@ export interface TicketRow {
   contact_id: string | null;
   contact_name: string | null;
   contact_avatar_url: string | null;
+  /** Derived (list/detail): the contact's last_seen_at is within the 3-min online window. Drives the
+   *  inbox presence dot so it matches the contacts list/detail. */
+  contact_online: boolean;
   /** The contact's company (account), hydrated via contacts.company_id — row/rail context. */
   company_id: string | null;
   company_name: string | null;
@@ -67,6 +70,7 @@ const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_chann
               (SELECT tem.name FROM teams tem
                  WHERE tem.tenant_id = t.tenant_id AND tem.id = t.team_id) AS team_name,
               t.contact_id, co.name AS contact_name, co.avatar_url AS contact_avatar_url,
+              (co.last_seen_at IS NOT NULL AND co.last_seen_at > now() - interval '3 minutes') AS contact_online,
               co.company_id,
               (SELECT cp.name FROM companies cp
                  WHERE cp.tenant_id = t.tenant_id AND cp.id = co.company_id) AS company_name,

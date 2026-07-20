@@ -56,6 +56,7 @@ import { relativeTime } from "@/lib/tickets";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Avatar } from "@/components/ui/avatar";
+import { avatarSrc } from "@/lib/avatar-upload";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { MultiSelect, type ComboOption } from "@/components/ui/combobox";
 import { Spinner } from "@/components/ui/spinner";
@@ -124,7 +125,7 @@ const COLUMNS: ColumnDef<Contact>[] = [
     cell: ({ row }) => (
       <div className="flex min-w-0 items-center gap-2.5">
         <span className="relative shrink-0">
-          <Avatar name={contactDisplayName(row.original)} className="size-7 text-micro" />
+          <Avatar name={contactDisplayName(row.original)} image={avatarSrc(row.original.avatar_url)} className="size-7 text-micro" />
           {row.original.online && (
             <span
               title="Active now"

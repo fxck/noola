@@ -82,17 +82,25 @@ export function TicketRow({
         )}
       </span>
 
-      {ticket.contact_name ? (
-        <Avatar name={ticket.contact_name} image={avatarSrc(ticket.contact_avatar_url)} className="mt-0.5 size-6 shrink-0 text-micro" />
-      ) : (
-        // No contact identity — a neutral disc, never a loud hashed hue.
-        <span
-          className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground/60"
-          aria-hidden
-        >
-          <UserRound className="size-3" />
-        </span>
-      )}
+      {/* Contact avatar + presence dot — a contact seen within the online window gets the same green
+          dot the contacts list/detail show, so "who's here now" reads at a glance down the inbox. */}
+      <span className="relative mt-0.5 shrink-0">
+        {ticket.contact_name ? (
+          <Avatar name={ticket.contact_name} image={avatarSrc(ticket.contact_avatar_url)} className="size-6 text-micro" />
+        ) : (
+          // No contact identity — a neutral disc, never a loud hashed hue.
+          <span className="grid size-6 place-items-center rounded-full bg-muted text-muted-foreground/60" aria-hidden>
+            <UserRound className="size-3" />
+          </span>
+        )}
+        {ticket.contact_online && (
+          <span
+            title="Active now"
+            aria-label="Active now"
+            className="absolute -bottom-0.5 -right-0.5 size-2 rounded-full border-2 border-card bg-success"
+          />
+        )}
+      </span>
 
       <span className="min-w-0 flex-1">
         {/* line 1 — WHO (contact · company) + urgency + time */}

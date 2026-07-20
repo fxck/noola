@@ -313,6 +313,7 @@ export function ThreadPane({
                         message={item}
                         showChannel={multiChannel}
                         contactName={ticket.contact_name}
+                        contactAvatarUrl={ticket.contact_avatar_url}
                       />
                     )}
                     {/* One chat-style read receipt, anchored under the newest agent message the
