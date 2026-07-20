@@ -378,6 +378,37 @@ export async function routeEmailOutbound(
   });
 }
 
+/**
+ * Widget/away fallback (Intercom parity). The web widget has no outbound driver — it delivers agent
+ * replies by polling. So when a reply can't be pushed AND the contact isn't currently active in the
+ * widget (last_seen outside the 3-min online window) AND we have their email, ALSO send the reply as
+ * an email — otherwise an away customer never hears back until they happen to reopen the widget.
+ * Best-effort and no-op without an email or when the contact is live in the widget.
+ */
+export async function notifyContactByEmailIfAway(
+  tenantId: string,
+  args: { ticketId: string; subject: string | null; body: string; agentName?: string | null },
+): Promise<void> {
+  const info = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT co.email,
+              (co.last_seen_at IS NOT NULL AND co.last_seen_at > now() - interval '3 minutes') AS online
+         FROM tickets t JOIN contacts co ON co.tenant_id = t.tenant_id AND co.id = t.contact_id
+        WHERE t.id = $1`,
+      [args.ticketId],
+    );
+    return r.rowCount ? (r.rows[0] as { email: string | null; online: boolean }) : null;
+  });
+  if (!info?.email || info.online) return;
+  await routeEmailOutbound(
+    { tenantId, externalChannelId: info.email, ticketId: args.ticketId },
+    args.subject || "Support",
+    args.body,
+    undefined,
+    { agentName: args.agentName ?? null },
+  ).catch(() => {});
+}
+
 // ---- inbound poller (Mailpit; validated live) ---------------------------
 
 type Log = { info: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };

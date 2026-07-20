@@ -1286,8 +1286,14 @@ export function emitDomainEvent(tenantId: string, event: AutomationTrigger, seed
         .then((m) => m.evaluateAutoMirror(tenantId, ticketId, { recheck: event === "ticket.created" }))
         .catch(() => {});
     } else if (event === "ticket.closed") {
+      // A close is no longer a SILENT mirror archive: onTicketClosed posts a visible "Resolved"
+      // notice into the mirror post (then re-syncs tags/archive), and for a Discord-ORIGIN (intake)
+      // ticket closed in Noola it reflects the close onto the origin thread (notice + archive).
+      // Skipped for the origin thread when the close came FROM Discord (seed.source='discord').
+      const source = typeof seed.source === "string" ? seed.source : null;
+      const actorName = typeof seed.actorName === "string" ? seed.actorName : null;
       void import("./discord-mirror.js")
-        .then((m) => m.syncMirrorState(tenantId, ticketId))
+        .then((m) => m.onTicketClosed(tenantId, ticketId, { source, agentName: actorName }))
         .catch(() => {});
     }
   }

@@ -416,6 +416,52 @@ export async function syncMirrorState(tenantId: string, ticketId: string): Promi
   await tp.setArchived(mirror.post_thread_id, t.status === "closed").catch(() => {});
 }
 
+/**
+ * Fired on `ticket.closed` (via the domain-event seam). Makes a close VISIBLE in Discord instead of a
+ * silent archive:
+ *  - MIRRORED ticket: post a "✅ Resolved" notice into the forum post, then re-sync tags/archive.
+ *  - Discord-ORIGIN (intake) ticket closed IN NOOLA: reflect the close onto the origin thread (post a
+ *    notice + archive it). A later customer message reopens it via the ingest upsert.
+ * Skipped for the origin thread when the close came FROM Discord (source='discord') — the thread is
+ * already archived/locked there and re-posting would echo. Best-effort throughout.
+ */
+export async function onTicketClosed(
+  tenantId: string,
+  ticketId: string,
+  opts: { source?: string | null; agentName?: string | null } = {},
+): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId);
+  if (mirror) {
+    const tp = transport();
+    if (tp) {
+      const by = opts.agentName ? ` by ${opts.agentName}` : "";
+      await tp.postToThread(mirror.post_thread_id, `✅ **Resolved**${by} — closed in Noola.`).catch(() => {});
+    }
+    await syncMirrorState(tenantId, ticketId).catch(() => {});
+    return;
+  }
+  if (opts.source === "discord") return; // closed from the origin thread itself — nothing to push back
+  await archiveIntakeThreadOnClose(tenantId, ticketId, opts.agentName ?? null);
+}
+
+/** Reflect a Noola-side close of a Discord-origin (intake) ticket back onto its origin thread:
+ *  a "resolved" notice + archive. A customer reply reopens the thread's ticket (ingest upsert). */
+async function archiveIntakeThreadOnClose(tenantId: string, ticketId: string, agentName: string | null): Promise<void> {
+  const t = await withTenant(tenantId, (c) =>
+    c.query(
+      "SELECT external_thread_id FROM tickets WHERE id = $1 AND channel_type = 'discord' AND external_thread_id IS NOT NULL",
+      [ticketId],
+    ),
+  );
+  if (!t.rowCount) return;
+  const threadId = t.rows[0].external_thread_id as string;
+  const tp = transport();
+  if (!tp) return;
+  const by = agentName ? ` by ${agentName}` : "";
+  await tp.postToThread(threadId, `✅ Marked resolved${by}. Reply here if you still need help.`).catch(() => {});
+  await tp.setArchived(threadId, true).catch(() => {});
+}
+
 // ── D3: forum post → ticket (note by default, 📤 promotes to reply) ───────────
 
 export interface MirrorPostMessage {

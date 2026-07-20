@@ -78,6 +78,21 @@ export async function addNote(
        RETURNING id`,
       [ticketId, input.authorId ?? null, input.authorName ?? null, input.body, mentioned],
     );
+    // Realtime: publish note.added to the transactional outbox in the SAME txn (message.created's
+    // sibling) so the inbox notes panel updates live for every agent. The edge relays it on
+    // noola.events.<tenant>; the web refetches the ticket's notes on the event.
+    const envelope = {
+      id: ins.rows[0].id as string,
+      type: "note.added",
+      tenantId,
+      ticketId,
+      occurredAt: new Date().toISOString(),
+      data: { noteId: ins.rows[0].id as string, ticketId },
+    };
+    await c.query(
+      "INSERT INTO outbox (tenant_id, event_type, subject, payload) VALUES (current_tenant(), $1, 'noola.events.' || current_tenant(), $2::jsonb)",
+      ["note.added", JSON.stringify(envelope)],
+    );
     // Re-read on the same connection so mentioned_names hydrate from the just-written ids.
     const r = await c.query(`SELECT ${COLS} FROM ticket_notes n WHERE n.id = $1`, [ins.rows[0].id]);
     return r.rows[0] as NoteRow;

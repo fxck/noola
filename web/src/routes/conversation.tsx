@@ -5,7 +5,7 @@ import { ThreadPane } from "@/components/inbox/thread-pane";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useRealtime } from "@/lib/realtime-context";
-import { type Ticket, type AgentUser, fetchTicket, fetchUsers } from "@/lib/tickets";
+import { type Ticket, type AgentUser, fetchTicket, fetchUsers, markTicketRead } from "@/lib/tickets";
 
 const routeApi = getRouteApi("/tickets/$ticketId");
 
@@ -44,6 +44,13 @@ export function ConversationPage() {
       .finally(() => { if (live) setLoading(false); });
     fetchUsers().then((u) => { if (live) setUsers(u); }).catch(() => { if (live) setUsers([]); });
     return () => { live = false; };
+  }, [ticketId]);
+
+  // Opening a ticket here IS a deliberate open (URL-addressed, never a peek), so mark it
+  // read for this agent — the same server upsert the inbox fires on click, so reading a
+  // conversation from the table clears its unread flag in the inbox list too. Best-effort.
+  useEffect(() => {
+    void markTicketRead(ticketId).catch(() => {});
   }, [ticketId]);
 
   // Live updates: a realtime event touching THIS ticket bumps the thread to refetch.

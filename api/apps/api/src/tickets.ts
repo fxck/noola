@@ -465,8 +465,11 @@ export async function setTicketStatus(
 ): Promise<{ ticketId: string; status: string } | null> {
   const closedAt = status === "closed" ? "now()" : "NULL";
   const out = await withTenant(tenantId, async (c) => {
+    // status_category MUST move with status — historically it didn't, leaving closed tickets with
+    // status_category='open' (reporting/SLA read status_category). status ∈ {open,closed} == the
+    // category domain, so it reuses $1.
     const r = await c.query(
-      `UPDATE tickets SET status = $1, closed_at = ${closedAt}, updated_at = now() WHERE id = $2 RETURNING id`,
+      `UPDATE tickets SET status = $1, status_category = $1, closed_at = ${closedAt}, updated_at = now() WHERE id = $2 RETURNING id`,
       [status, ticketId],
     );
     return r.rowCount ? { ticketId: r.rows[0].id as string, status } : null;
@@ -498,10 +501,10 @@ export async function bulkTickets(
     switch (action) {
       case "close":
         // Only rows that were open transition — a re-close is not a fresh ticket.closed.
-        sql = `UPDATE tickets SET status='closed', closed_at=now(), updated_at=now() WHERE id = ANY($1::uuid[]) AND status <> 'closed'`;
+        sql = `UPDATE tickets SET status='closed', status_category='closed', closed_at=now(), updated_at=now() WHERE id = ANY($1::uuid[]) AND status <> 'closed'`;
         break;
       case "reopen":
-        sql = `UPDATE tickets SET status='open', closed_at=NULL, updated_at=now() WHERE id = ANY($1::uuid[]) AND status <> 'open'`;
+        sql = `UPDATE tickets SET status='open', status_category='open', closed_at=NULL, updated_at=now() WHERE id = ANY($1::uuid[]) AND status <> 'open'`;
         break;
       case "assign":
         params.push(value); // null = unassign

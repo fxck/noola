@@ -22,7 +22,7 @@ import { translateOutboundReply, stampOutboundTranslation } from "../translate.j
 import { claimAttachments, attachmentsForTicket } from "../attachments.js";
 import { getTicketMirror, pushTicketToDiscord, mirrorUrl, syncMirrorState, mirrorEligibility } from "../discord-mirror.js";
 import { getObject } from "../storage.js";
-import type { MailAttachment } from "../email.js";
+import { notifyContactByEmailIfAway, type MailAttachment } from "../email.js";
 
 // Attach computed SLA state to ticket rows (policy loaded once; null when disabled).
 async function withSla<T extends TicketRow>(tenantId: string, rows: T[]): Promise<(T & { sla: TicketSla | null })[]> {
@@ -231,7 +231,8 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     const out = await setTicketStatus(tenantId, id, "closed");
     if (!out) return reply.code(404).send({ error: "ticket_not_found" });
     void indexResolvedThread(tenantId, id).catch((err) => app.log.warn({ err, ticketId: id }, "index resolved thread failed"));
-    emitDomainEvent(tenantId, "ticket.closed", { ticketId: id });
+    // actorName drives the "Resolved by X" notice onTicketClosed posts into the mirror/origin thread.
+    emitDomainEvent(tenantId, "ticket.closed", { ticketId: id, actorName: req.session?.name ?? null });
     return out;
   }));
 
@@ -355,6 +356,18 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       : { delivered: false as boolean, reason: "no-driver" };
     if (driver?.dispatch && !out.delivered) {
       app.log.warn({ ticketId: id, channel: result.channelType, reason: out.reason }, "outbound not delivered");
+    }
+
+    // Widget/away fallback: a widget reply has no outbound driver (the widget polls). If the customer
+    // isn't currently in the widget and we have their email, ALSO email the reply so an away customer
+    // still hears back instead of it sitting unseen until they reopen the widget. Best-effort.
+    if (!out.delivered && (result.channelType === "widget" || out.reason === "no-driver")) {
+      void notifyContactByEmailIfAway(tenantId, {
+        ticketId: result.ticketId,
+        subject: result.subject,
+        body: dispatchBody,
+        agentName: req.session?.name ?? null,
+      }).catch((err) => app.log.warn({ err, ticketId: id }, "email fallback failed"));
     }
 
     return reply.code(201).send({

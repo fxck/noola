@@ -512,7 +512,18 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
 
   client.on(Events.ThreadUpdate, async (_old, thread) => {
     try {
-      await handleThreadUpdate(thread.guildId, thread.id, thread.locked ?? false);
+      // Resolve applied forum-tag ids → names — a "Solved/Resolved" tag is a close gesture. archived
+      // (manual resolve OR Discord's inactivity auto-archive) and locked also close the intake ticket.
+      const parent = thread.parent as { availableTags?: { id: string; name: string }[] } | null;
+      const available = parent?.availableTags ?? [];
+      const appliedTagNames = (thread.appliedTags ?? [])
+        .map((id) => available.find((t) => t.id === id)?.name)
+        .filter((n): n is string => Boolean(n));
+      await handleThreadUpdate(thread.guildId, thread.id, {
+        locked: thread.locked ?? false,
+        archived: thread.archived ?? false,
+        appliedTagNames,
+      });
     } catch (err) {
       log.error({ err }, "discord ThreadUpdate failed");
     }
@@ -561,6 +572,19 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
         reactorId: user.id,
         emoji: full.emoji.name ?? "",
       });
+      if (res.reason === "not_mirror") {
+        // Not an ops-mirror post — a close-mapped reaction (✅) by a marked teammate on a Discord-native
+        // (intake) support thread resolves that ticket. No-op for everything else.
+        const { handleIntakeReaction } = await import("./discord.js");
+        const ir = await handleIntakeReaction({
+          guildId: full.message.guildId,
+          threadId: full.message.channelId,
+          reactorId: user.id,
+          emoji: full.emoji.name ?? "",
+        });
+        if (ir.closed) log.info(`discord: intake thread ${full.message.channelId} closed via reaction`);
+        return;
+      }
       if (res.promoted) log.info(`discord-mirror: message ${full.message.id} promoted to reply`);
       else if (res.action && !res.reason) log.info(`discord-mirror: reaction triage '${res.action}' applied`);
       else if (res.reason && res.reason !== "not_mirror" && res.reason !== "unmapped_emoji")

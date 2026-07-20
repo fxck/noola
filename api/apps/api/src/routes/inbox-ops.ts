@@ -201,6 +201,10 @@ export default async function inboxOpsRoutes(app: FastifyInstance): Promise<void
       // survey flow (and any tenant ticket.closed automation) runs uniformly — fixes bulk closes
       // silently skipping CSAT. Post-commit, fire-and-forget.
       if (action === "close") for (const id of affected) emitDomainEvent(tenantId, "ticket.closed", { ticketId: id });
+      // A bulk reopen must also unarchive any mirror forum post (single /reopen already does this);
+      // without it a bulk-reopened mirrored ticket stays archived on Discord.
+      else if (action === "reopen")
+        for (const id of affected) void import("../discord-mirror.js").then((m) => m.syncMirrorState(tenantId, id)).catch(() => {});
       return { updated: affected.length };
     } catch (err) {
       if ((err as { code?: string }).code === "23503") return reply.code(400).send({ error: "invalid assignee or team" });

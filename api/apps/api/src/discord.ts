@@ -462,35 +462,87 @@ export async function handleMessageDelete(d: MessageDeleteInput): Promise<boolea
       [ticketId],
     );
     if ((remaining.rows[0].n as number) === 0) {
-      await c.query("UPDATE tickets SET status = 'closed', updated_at = now() WHERE id = $1", [ticketId]);
+      // Proper close (status_category + closed_at), then the domain event — so CSAT/QA/knowledge/mirror
+      // fire like any other close, not a bare status flip that also drops out of the closed view.
+      await c.query(
+        "UPDATE tickets SET status = 'closed', status_category = 'closed', closed_at = now(), updated_at = now() WHERE id = $1",
+        [ticketId],
+      );
+      const { emitDomainEvent } = await import("./automations.js");
+      emitDomainEvent(tenantId, "ticket.closed", { ticketId, source: "discord", closeReason: "last_customer_message_deleted" });
     }
     return true;
   });
 }
 
-/** ThreadUpdate (§5.6) — locked → solved; archived → no-op (a new message reopens via the upsert). */
-export async function handleThreadUpdate(guildId: string, threadId: string, locked: boolean): Promise<void> {
-  if (!locked) return;
-  const tenantId = await resolveTenant(guildId);
-  if (!tenantId) return;
-  await withTenant(tenantId, async (c) => {
-    await c.query(
-      "UPDATE tickets SET status = 'solved', updated_at = now() WHERE channel_type = 'discord' AND external_thread_id = $1",
+/** Close a Discord-origin (intake) ticket resolved from its thread, the SAME way the console close
+ *  route does — proper status/status_category/closed_at, resolved-thread knowledge indexing, and the
+ *  ticket.closed domain event (CSAT/QA/mirror). Idempotent: an already-closed ticket is a no-op, so
+ *  the archive→ThreadUpdate echo of a Noola-side close cannot loop. source:'discord' tells the seam
+ *  the close began on Discord (don't re-archive the very thread that triggered it). */
+async function closeIntakeTicketByThread(tenantId: string, threadId: string, reason: string): Promise<void> {
+  const found = await withTenant(tenantId, (c) =>
+    c.query(
+      "SELECT id FROM tickets WHERE channel_type = 'discord' AND external_thread_id = $1 AND status <> 'closed' LIMIT 1",
       [threadId],
-    );
-  });
+    ),
+  );
+  if (!found.rowCount) return;
+  const ticketId = found.rows[0].id as string;
+  const { setTicketStatus } = await import("./tickets.js");
+  await setTicketStatus(tenantId, ticketId, "closed");
+  const { indexResolvedThread } = await import("./threads.js");
+  void indexResolvedThread(tenantId, ticketId).catch(() => {});
+  const { emitDomainEvent } = await import("./automations.js");
+  emitDomainEvent(tenantId, "ticket.closed", { ticketId, source: "discord", closeReason: reason });
 }
 
-/** ThreadDelete (§5.6) — the thread is gone; close its ticket. */
+/** ThreadUpdate (§5.6) — a Discord-side RESOLVE gesture closes the intake ticket: the thread was
+ *  locked, archived, or tagged with a "solved/resolved/closed" forum tag. A plain edit is a no-op.
+ *  A later customer message reopens the ticket via the ingest upsert (status closed→open, §I.4). */
+export async function handleThreadUpdate(
+  guildId: string,
+  threadId: string,
+  state: { locked?: boolean; archived?: boolean; appliedTagNames?: string[] },
+): Promise<void> {
+  const solvedTag = (state.appliedTagNames ?? []).some((n) => /solv|resolv|clos|done|complete|answered|fixed/i.test(n));
+  if (!state.locked && !state.archived && !solvedTag) return;
+  const tenantId = await resolveTenant(guildId);
+  if (!tenantId) return;
+  const reason = state.archived ? "discord_archived" : state.locked ? "discord_locked" : "discord_solved_tag";
+  await closeIntakeTicketByThread(tenantId, threadId, reason);
+}
+
+/** ThreadDelete (§5.6) — the thread is gone; close its ticket (properly, with the close event). */
 export async function handleThreadDelete(guildId: string, threadId: string): Promise<void> {
   const tenantId = await resolveTenant(guildId);
   if (!tenantId) return;
-  await withTenant(tenantId, async (c) => {
-    await c.query(
-      "UPDATE tickets SET status = 'closed', updated_at = now() WHERE channel_type = 'discord' AND external_thread_id = $1",
-      [threadId],
-    );
-  });
+  await closeIntakeTicketByThread(tenantId, threadId, "discord_thread_deleted");
+}
+
+/** A reaction on a Discord-NATIVE (intake) support thread: a marked teammate reacting with a
+ *  close-mapped emoji (✅ by default) resolves the ticket — the intake analogue of ops-mirror triage.
+ *  Gated to an explicit teammate mark (agent_channel_identities) so a random member can't close
+ *  tickets. No-ops for non-intake threads (the mirror handler owns those, checked first upstream). */
+export async function handleIntakeReaction(r: {
+  guildId: string; threadId: string; reactorId: string; emoji: string;
+}): Promise<{ closed: boolean; reason?: string }> {
+  const tenantId = await resolveTenant(r.guildId);
+  if (!tenantId) return { closed: false, reason: "unbound" };
+  const found = await withTenant(tenantId, (c) =>
+    c.query(
+      "SELECT 1 FROM tickets WHERE channel_type = 'discord' AND external_thread_id = $1 AND status <> 'closed' LIMIT 1",
+      [r.threadId],
+    ),
+  );
+  if (!found.rowCount) return { closed: false, reason: "not_intake" };
+  const { canonicalEmojiName, getReactionMap } = await import("./classification.js");
+  const map = await getReactionMap(tenantId);
+  if (map[canonicalEmojiName(r.emoji)] !== "close") return { closed: false, reason: "unmapped_emoji" };
+  const { resolveTeammate } = await import("./discord-classify.js");
+  if (!(await resolveTeammate(tenantId, r.reactorId))) return { closed: false, reason: "not_teammate" };
+  await closeIntakeTicketByThread(tenantId, r.threadId, "discord_reaction");
+  return { closed: true };
 }
 
 /**
