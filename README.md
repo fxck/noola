@@ -19,22 +19,25 @@ and even that is bring-your-own-key.
 
 ## How it works
 
-A monorepo of five runtime services over six managed stores:
+A monorepo of seven runtime services over six managed stores:
 
 | Service | Stack | Role |
 |---|---|---|
 | **api** | Node 24 · Fastify · Bun | the domain core — auth (better-auth, 2FA, SSO/SCIM), tickets, contacts, teams, routing, SLA, broadcasts, KB, and the RAG pipeline; serves REST and emits domain events to NATS. |
 | **edge** | Elixir 1.16 · Phoenix Channels | fans the api's events out to browsers over WebSockets and hosts the Studio's collaborative (Yjs) canvas. |
 | **embedder** | Node 24 | a self-hosted all-MiniLM sidecar; the model is baked at build time, so the runtime is keyless and offline. |
+| **geo** | Node 24 | a self-hosted IP→location sidecar for live contact enrichment; the DB-IP City Lite database is baked at build, so lookups stay keyless and in-infra. |
 | **runner** | Docker-in-VM · Go | consumes automation-run jobs from NATS JetStream and launches one ephemeral container per run. |
 | **web** | Vite · React 19 · TanStack | the console SPA; reaches the api and edge over their public subdomains. |
+| **site** | Vite · React 19 · TanStack | the public marketing site, served as static nginx — separate from the console. |
 
 ```
                        ┌──────────────── NATS JetStream ────────────────┐
                        │                                                 │
   web ──REST(Bearer)──▶ api ──emit──▶ (events) ──▶ edge ──WebSocket──▶ web   (realtime + Studio canvas)
                        │  │                                  runner ──▶ ephemeral run containers
-                       │  └── embedder ──vectors──▶ Qdrant
+                       │  ├── embedder ──vectors──▶ Qdrant
+                       │  └── geo ──▶ ip → contact location
                        └── PostgreSQL · Valkey · Typesense · object storage
 ```
 
@@ -83,8 +86,10 @@ the exact wiring.
 api/             Node/Fastify API — domain core, auth, RAG, REST + events (Bun workspaces)
 edge/            Elixir/Phoenix — realtime WebSocket fan-out + collaborative canvas
 embedder/        Node — self-hosted all-MiniLM embedding sidecar
+geo/             Node — self-hosted IP→location sidecar (DB-IP City Lite, baked at build)
 runner/          Go — Docker-in-VM automation-run worker
 web/             Vite + React 19 SPA — the console
+site/            Vite + React 19 — the public marketing site (static nginx)
 zerops.yaml      build/run setups for every service (*dev + *prod)
 .zerops-recipe/  Zerops recipe variants (AI Agent · Remote CDE · Local · Stage · Small/HA Production)
 ```
