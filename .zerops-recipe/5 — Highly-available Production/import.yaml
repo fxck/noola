@@ -15,7 +15,7 @@ project:
     - support-platform
     - production
     - ha
-  envSecrets:
+  envVariables:
     AUTH_SECRET: <@generateRandomString(<48>)>
     MODEL_KEY_SECRET: <@generateRandomString(<48>)>
     EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
@@ -23,18 +23,23 @@ project:
     APP_DB_PASSWORD: <@generateRandomString(<32>)>
     RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
     AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
-    BOOTSTRAP_ADMIN_PASSWORD:                            # required — your first admin's password
-  envVariables:
+    # required — your first admin's password
+    BOOTSTRAP_ADMIN_PASSWORD:
+
     EMBED_URL: http://embedder:3001
     API_INTERNAL_URL: http://api:3000
     WEB_BASE_URL: ${web_zeropsSubdomain}
-    DISABLE_DEMO_SEED: "1"                               # no demo tenant in production
-    DISABLE_WORKSPACE_SIGNUP: "1"                        # single-admin instance — no public self-signup
-    BOOTSTRAP_ADMIN_EMAIL:                               # required — your first admin's email
-    BOOTSTRAP_ORG_NAME: Noola                            # the first workspace's name
+    # no demo tenant in production
+    DISABLE_DEMO_SEED: "1"
+    # single-admin instance — no public self-signup
+    DISABLE_WORKSPACE_SIGNUP: "1"
+    # required — your first admin's email
+    BOOTSTRAP_ADMIN_EMAIL:
+    # the first workspace's name
+    BOOTSTRAP_ORG_NAME: Noola
 
 services:
-  # ---- managed stores, HA clusters (start first) ----
+  # managed stores, HA clusters (start first)
   - hostname: db
     type: postgresql:ha@18
     profile: oltp-staging
@@ -57,7 +62,7 @@ services:
     objectStorageSize: 25
     priority: 10
 
-  # ---- shared always-on services (dedicated CPU) ----
+  # shared always-on services (dedicated CPU)
   - hostname: embedder
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
@@ -81,7 +86,7 @@ services:
     verticalAutoscaling:
       cpuMode: DEDICATED
 
-  # ---- app services (dedicated CPU, autoscale 2→4) ----
+  # app services (dedicated CPU, autoscale 2→4)
   - hostname: api
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola

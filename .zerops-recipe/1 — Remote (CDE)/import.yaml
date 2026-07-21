@@ -15,7 +15,7 @@ project:
     - noola
     - support-platform
     - remote-cde
-  envSecrets:
+  envVariables:
     AUTH_SECRET: <@generateRandomString(<48>)>
     MODEL_KEY_SECRET: <@generateRandomString(<48>)>
     EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
@@ -23,10 +23,13 @@ project:
     APP_DB_PASSWORD: <@generateRandomString(<32>)>
     RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
     AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
-  envVariables:
-    EMBED_URL: http://embedder:3001                     # api → shared embedder
-    API_INTERNAL_URL: http://localhost:3000             # if you also run edge in the box, it verifies against the local api
-    WEB_BASE_URL: ${app_zeropsSubdomain}                # the app box's own public origin (web runs inside it)
+
+    # api → shared embedder
+    EMBED_URL: http://embedder:3001
+    # if you also run edge in the box, it verifies against the local api
+    API_INTERNAL_URL: http://localhost:3000
+    # the app box's own public origin (web runs inside it)
+    WEB_BASE_URL: ${app_zeropsSubdomain}
     MAILPIT_API_URL: http://mailpit:8025
     SMTP_HOST: mailpit
     SMTP_PORT: "1025"
@@ -69,7 +72,8 @@ services:
   - hostname: app
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
-    zeropsSetup: apidev          # carries the whole monorepo; idles for the IDE / SSH
+    # carries the whole monorepo; idles for the IDE / SSH
+    zeropsSetup: apidev
     enableSubdomainAccess: true
     minContainers: 1
     maxContainers: 1

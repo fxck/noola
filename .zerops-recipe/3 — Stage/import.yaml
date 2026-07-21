@@ -12,7 +12,7 @@ project:
     - noola
     - support-platform
     - stage
-  envSecrets:
+  envVariables:
     AUTH_SECRET: <@generateRandomString(<48>)>
     MODEL_KEY_SECRET: <@generateRandomString(<48>)>
     EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
@@ -20,7 +20,7 @@ project:
     APP_DB_PASSWORD: <@generateRandomString(<32>)>
     RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
     AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
-  envVariables:
+
     EMBED_URL: http://embedder:3001
     API_INTERNAL_URL: http://api:3000
     WEB_BASE_URL: ${web_zeropsSubdomain}
@@ -29,7 +29,7 @@ project:
     SMTP_PORT: "1025"
 
 services:
-  # ---- managed stores (start first) ----
+  # managed stores (start first)
   - hostname: db
     type: postgresql:single@18
     profile: oltp-hobby
@@ -57,7 +57,7 @@ services:
     enableSubdomainAccess: true
     priority: 10
 
-  # ---- shared always-on services ----
+  # shared always-on services
   - hostname: embedder
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
@@ -71,7 +71,7 @@ services:
     minContainers: 1
     maxContainers: 1
 
-  # ---- app services (built from git with the *prod setups) ----
+  # app services (built from git with the *prod setups)
   - hostname: api
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola

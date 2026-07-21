@@ -20,24 +20,36 @@ project:
     - noola
     - support-platform
     - ai-agent
-  envSecrets:
-    AUTH_SECRET: <@generateRandomString(<48>)>          # better-auth session signing
-    MODEL_KEY_SECRET: <@generateRandomString(<48>)>     # encrypts per-tenant model keys at rest
-    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>   # api ↔ edge service-to-service auth
-    SECRET_KEY_BASE: <@generateRandomString(<64>)>      # Phoenix (edge) signing base
-    APP_DB_PASSWORD: <@generateRandomString(<32>)>      # app_user DB role
-    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>    # event_relay DB role
-    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>     # auth_user DB role
   envVariables:
-    EMBED_URL: http://embedder:3001                     # api → embedder (RAG)
-    API_INTERNAL_URL: http://api:3000                   # edge → api (socket-token verify)
-    WEB_BASE_URL: ${web_zeropsSubdomain}                # api → public web origin (links / CORS / invites)
-    MAILPIT_API_URL: http://mailpit:8025                # api reads caught mail
-    SMTP_HOST: mailpit                                  # outbound mail → Mailpit sink
+    # better-auth session signing
+    AUTH_SECRET: <@generateRandomString(<48>)>
+    # encrypts per-tenant model keys at rest
+    MODEL_KEY_SECRET: <@generateRandomString(<48>)>
+    # api ↔ edge service-to-service auth
+    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
+    # Phoenix (edge) signing base
+    SECRET_KEY_BASE: <@generateRandomString(<64>)>
+    # app_user DB role
+    APP_DB_PASSWORD: <@generateRandomString(<32>)>
+    # event_relay DB role
+    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
+    # auth_user DB role
+    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
+
+    # api → embedder (RAG)
+    EMBED_URL: http://embedder:3001
+    # edge → api (socket-token verify)
+    API_INTERNAL_URL: http://api:3000
+    # api → public web origin (links / CORS / invites)
+    WEB_BASE_URL: ${web_zeropsSubdomain}
+    # api reads caught mail
+    MAILPIT_API_URL: http://mailpit:8025
+    # outbound mail → Mailpit sink
+    SMTP_HOST: mailpit
     SMTP_PORT: "1025"
 
 services:
-  # ---- managed stores (start first) ----
+  # managed stores (start first)
   - hostname: db
     type: postgresql:single@18
     profile: oltp-hobby
@@ -65,7 +77,7 @@ services:
     enableSubdomainAccess: true
     priority: 10
 
-  # ---- shared always-on services ----
+  # shared always-on services
   - hostname: embedder
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
@@ -79,7 +91,7 @@ services:
     minContainers: 1
     maxContainers: 1
 
-  # ---- dev half (boots WITH source via the *dev setups; idle on `zsc noop` for the agent) ----
+  # dev half (boots WITH source via the *dev setups; idle on `zsc noop` for the agent)
   - hostname: apidev
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
@@ -102,7 +114,7 @@ services:
     minContainers: 1
     maxContainers: 1
 
-  # ---- stage half (built from git with the *prod setups; running reference) ----
+  # stage half (built from git with the *prod setups; running reference)
   - hostname: api
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
