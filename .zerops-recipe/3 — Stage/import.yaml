@@ -23,7 +23,7 @@ project:
 
     EMBED_URL: http://embedder:3001
     API_INTERNAL_URL: http://api:3000
-    WEB_BASE_URL: ${web_zeropsSubdomain}
+    WEB_BASE_URL: https://web-${zeropsSubdomainHost}.prg1.zerops.app
     MAILPIT_API_URL: http://mailpit:8025
     SMTP_HOST: mailpit
     SMTP_PORT: "1025"

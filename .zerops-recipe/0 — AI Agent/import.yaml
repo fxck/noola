@@ -41,7 +41,7 @@ project:
     # edge → api (socket-token verify)
     API_INTERNAL_URL: http://api:3000
     # api → public web origin (links / CORS / invites)
-    WEB_BASE_URL: ${web_zeropsSubdomain}
+    WEB_BASE_URL: https://web-${zeropsSubdomainHost}.prg1.zerops.app
     # api reads caught mail
     MAILPIT_API_URL: http://mailpit:8025
     # outbound mail → Mailpit sink

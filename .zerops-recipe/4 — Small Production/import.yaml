@@ -26,7 +26,7 @@ project:
 
     EMBED_URL: http://embedder:3001
     API_INTERNAL_URL: http://api:3000
-    WEB_BASE_URL: ${web_zeropsSubdomain}
+    WEB_BASE_URL: https://web-${zeropsSubdomainHost}.prg1.zerops.app
     # no demo tenant in production
     DISABLE_DEMO_SEED: "1"
     # single-admin instance — no public self-signup

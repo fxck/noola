@@ -318,8 +318,8 @@ zerops:
         # into the build shell directly by name (no RUNTIME_ prefix — that only mirrors a
         # service's own run.envVariables, and static web has none), so the buildCommand below
         # prefers the inherited VITE_API_URL / VITE_EDGE_URL when set and falls back here.
-        VITE_API_URL_DEFAULT: ${api_zeropsSubdomain}
-        VITE_EDGE_URL_DEFAULT: ${edge_zeropsSubdomain}
+        VITE_API_URL_DEFAULT: https://api-${zeropsSubdomainHost}-3000.prg1.zerops.app
+        VITE_EDGE_URL_DEFAULT: wss://edge-${zeropsSubdomainHost}-4000.prg1.zerops.app
       buildCommands:
         # Clean install every build — do NOT cache web/node_modules. A cached node_modules
         # from one platform poisons the next build: npm's optional-dependency bug (#4828)
@@ -328,7 +328,9 @@ zerops:
         # A clean install resolves the right binary from the lockfile.
         - cd web && npm install
         # Custom domain? Set project-env VITE_API_URL / VITE_EDGE_URL (e.g. https://api.example.com
-        # / wss://edge.example.com); they win here. Otherwise the api/edge Zerops subdomains.
+        # / wss://edge.example.com); they win here. Otherwise the *_DEFAULT below, assembled from
+        # the project subdomain ref (zeropsSubdomainHost) so they resolve at build with no
+        # dependency on api/edge having deployed yet (a sibling ${x_zeropsSubdomain} would race).
         # api.ts / realtime.ts throw on a prod build with neither — no silent fallback.
         - cd web && VITE_API_URL="${VITE_API_URL:-$VITE_API_URL_DEFAULT}" VITE_EDGE_URL="${VITE_EDGE_URL:-$VITE_EDGE_URL_DEFAULT}" npm run build
       deployFiles:
