@@ -36,6 +36,8 @@ zerops:
           httpSupport: true
       initCommands:
         - 'zsc execOnce ${appVersionId} --retryUntilSuccessful -- bash -c "cd /var/www/api && npx tsx packages/db/src/migrate.ts"'
+        # Rich demo seed (Acme). Self-gates on DISABLE_DEMO_SEED — prod tiers set it and skip.
+        - 'zsc execOnce ${appVersionId}-seed --retryUntilSuccessful -- bash -c "cd /var/www/api && npx tsx apps/api/src/seed-demo.ts --apply"'
       envVariables:
         NODE_ENV: development
         PORT: "3000"
@@ -82,6 +84,8 @@ zerops:
         # all deps inlined) — no node_modules, no tsx, no raw source at runtime.
         - cd api && bun build apps/api/src/server.ts --target=node --format=esm --outfile=dist/server.mjs
         - cd api && bun build packages/db/src/migrate.ts --target=node --format=esm --outfile=dist/migrate.mjs
+        # Rich demo seed bundle (self-contained; imports the scenario library + data engine).
+        - cd api && bun build apps/api/src/seed-demo.ts --target=node --format=esm --outfile=dist/seed-demo.mjs
         # The migrator reads its SQL files at runtime — ship them beside the bundle.
         - cd api && cp -r packages/db/migrations dist/migrations
       deployFiles:
@@ -101,6 +105,8 @@ zerops:
           httpSupport: true
       initCommands:
         - 'zsc execOnce ${appVersionId} --retryUntilSuccessful -- node migrate.mjs'
+        # Rich demo seed (Acme). Self-gates on DISABLE_DEMO_SEED — prod tiers set it and skip.
+        - 'zsc execOnce ${appVersionId}-seed --retryUntilSuccessful -- node seed-demo.mjs --apply'
       envVariables:
         NODE_ENV: production
         PORT: "3000"
