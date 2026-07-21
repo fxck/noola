@@ -106,6 +106,9 @@ services:
     enableSubdomainAccess: true
     minContainers: 1
     maxContainers: 1
+    verticalAutoscaling:
+      minRam: 2
+      minFreeRamGB: 0.25
   - hostname: webdev
     type: nodejs@22
     buildFromGit: https://github.com/fxck/noola
@@ -129,6 +132,9 @@ services:
     enableSubdomainAccess: true
     minContainers: 1
     maxContainers: 1
+    verticalAutoscaling:
+      minRam: 2
+      minFreeRamGB: 0.25
   - hostname: web
     type: static@1.0
     buildFromGit: https://github.com/fxck/noola

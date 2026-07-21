@@ -105,6 +105,9 @@ services:
     maxContainers: 4
     verticalAutoscaling:
       cpuMode: DEDICATED
+      minRam: 2
+      minFreeRamGB: 0.25
+      minFreeRamPercent: 15
   - hostname: web
     type: static@1.0
     buildFromGit: https://github.com/fxck/noola
