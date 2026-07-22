@@ -68,7 +68,7 @@ services:
   - hostname: embedder
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
-    zeropsSetup: embedder
+    zeropsSetup: embedderprod
     minContainers: 1
     maxContainers: 1
 

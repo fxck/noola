@@ -74,7 +74,7 @@ services:
   - hostname: embedder
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
-    zeropsSetup: embedder
+    zeropsSetup: embedderprod
     minContainers: 1
     maxContainers: 2
     verticalAutoscaling:
@@ -82,13 +82,13 @@ services:
   - hostname: geo
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
-    zeropsSetup: geo
+    zeropsSetup: geoprod
     minContainers: 1
     maxContainers: 2
   - hostname: runner
     type: docker@26.1.5
     buildFromGit: https://github.com/fxck/noola
-    zeropsSetup: runner
+    zeropsSetup: runnerprod
     minContainers: 2
     maxContainers: 2
     verticalAutoscaling:

@@ -1,11 +1,21 @@
 # Root manifest for the Noola monorepo — one repo, one zerops.yaml, every service.
 #
-# Two setups per app service: a *dev half (self-deploys the WHOLE monorepo via
-# deployFiles: ["."] and idles on `zsc noop`, so an AI agent / developer adopts the
-# mounted tree and drives the real dev server) and a *prod half (builds a lean,
-# self-contained runtime and ships only its own build output). `embedder` and
-# `runner` are single always-on setups (no dev/prod split). Stage == prod: the
-# Stage rung reuses the *prod setups at single-node scale.
+# EXACTLY TWO setups per service we own — *dev and *prod — and no third for stage. A stage
+# service is built with the *prod setup ON PURPOSE: stage exists to validate the artifact and
+# config that production will run, so giving it its own setup would test something that never
+# ships. There is no `*stage` setup anywhere in this file and there must never be one.
+#
+#   *dev  — self-deploys the WHOLE monorepo (deployFiles: ["."]) and idles on `zsc noop`, so the
+#           source tree is mountable and an agent / developer drives the real server. Only ever
+#           runs in a dev/stage project, so it MAY pin dev siblings (embedderdev, apidev, …).
+#   *prod — builds a lean, self-contained runtime and ships only its own build output. Runs the
+#           stage half of a dev/stage project AND the service of a production project, so it MUST
+#           NOT name any sibling: the api is `apistage` in one and `api` in the other. Every
+#           cross-service URL it needs comes from project env, set per project in
+#           .zerops-recipe/<rung>/import.yaml — the only layer that knows the project's shape.
+#
+# Managed stores (db, cache, broker, search, qdrant, storage) are shared singles with identical
+# names in both shapes, so referencing them directly (DB_HOST: db, ${broker_port}) is always safe.
 #
 # Cross-service URLs that vary by topology — EMBED_URL, API_INTERNAL_URL, and the
 # SMTP / Mailpit endpoint — plus every signing/DB secret are PROJECT-LEVEL env, set
@@ -42,6 +52,12 @@ zerops:
         NODE_ENV: development
         PORT: "3000"
         EMBED_DRIVER: service
+        # Dev half talks to DEV siblings. These SHADOW the project-level values, which name the
+        # stage half — correct for apiprod (shared with production), wrong for the dev container.
+        # Safe to pin literally here because a *dev setup only ever runs in a dev/stage project,
+        # where these hostnames are fixed by convention.
+        EMBED_URL: http://embedderdev:3001
+        GEO_URL: http://geodev:3002
         QDRANT_URL: http://qdrant:${qdrant_port}
         QDRANT_API_KEY: ${qdrant_apiKey}
         DB_HOST: db
@@ -165,6 +181,9 @@ zerops:
         - mix local.rebar --force
       start: zsc noop --silent
       envVariables:
+        # Dev half verifies socket tokens against the DEV api (shadowing the project var, which
+        # names the stage half) so a token change is testable without touching stage.
+        API_INTERNAL_URL: http://apidev:3000
         NATS_HOST: broker
         NATS_PORT: ${broker_port}
         NATS_USER: ${broker_user}
@@ -219,12 +238,36 @@ zerops:
         # API_INTERNAL_URL (edge → api socket-token verify) is project-level env, auto-inherited.
 
   # ═══ embedder — Node 24 · embedder/ (self-hosted all-MiniLM sidecar) ═════
-  # One always-on service shared across the whole project (a stateless text→vector
-  # sidecar — no per-environment state). The model is baked at build time
-  # (warmup.mjs → embedder/.cache) and shipped with the code, so the runtime is
-  # keyless + offline. The api calls POST /embed over the project network at the
-  # EMBED_URL project var (http://embedder:3001).
-  - setup: embedder
+  # A stateless text→vector sidecar. The model is baked at build time (warmup.mjs →
+  # embedder/.cache) and shipped with the code, so the runtime is keyless + offline.
+  # The api calls POST /embed over the project network at the EMBED_URL env var.
+  - setup: embedderdev
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd embedder && npm install
+        - cd embedder && node warmup.mjs        # bake all-MiniLM into embedder/.cache
+      deployFiles:
+        - .                            # self-deploy → whole monorepo, so the source is mountable
+      cache:
+        - embedder/node_modules
+        - embedder/.cache
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3001
+          httpSupport: true
+      verticalAutoscaling:
+        minRam: 1
+        maxRam: 4
+      start: zsc noop --silent          # dev: `node embedder/server.mjs` via zerops_dev_server
+      envVariables:
+        PORT: "3001"
+        OMP_NUM_THREADS: "1"
+
+  - setup: embedderprod
     build:
       base: nodejs@24
       os: ubuntu
@@ -259,9 +302,32 @@ zerops:
         OMP_NUM_THREADS: "1"
 
   # ═══ geo — IP→location sidecar · geo/ (bakes DB-IP City Lite mmdb) ══════
-  # Owns the heavy mmdb so the api artifact stays lean; the api calls it over
-  # the internal network (http://geo:3002/lookup?ip=). Single always-on service.
-  - setup: geo
+  # Owns the heavy mmdb so the api artifact stays lean; the api calls it over the internal
+  # network at the GEO_URL env var (/lookup?ip=). geoLookup degrades to null on any failure,
+  # so a rung that runs no geo service sets GEO_URL empty to disable it outright.
+  - setup: geodev
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd geo && npm install
+        - 'cd geo && (for M in $(date +%Y-%m) $(date -d "-1 month" +%Y-%m); do curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-$M.mmdb.gz" -o /tmp/geo.gz && break; done && gunzip -c /tmp/geo.gz > geoip.mmdb && ls -la geoip.mmdb) || echo "geo db download failed — lookups will be empty"'
+      deployFiles:
+        - .                            # self-deploy → whole monorepo, so the source is mountable
+      cache:
+        - geo/node_modules
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3002
+          httpSupport: true
+      start: zsc noop --silent          # dev: `node geo/server.mjs` via zerops_dev_server
+      envVariables:
+        PORT: "3002"
+        GEOIP_DB_PATH: /var/www/geo/geoip.mmdb
+
+  - setup: geoprod
     build:
       base: nodejs@24
       os: ubuntu
@@ -309,8 +375,10 @@ zerops:
       envVariables:
         # The Vite dev server reaches the running api/edge over their public
         # subdomains (the SPA is Bearer + cross-origin; the api sends CORS *).
-        VITE_API_URL: ${api_zeropsSubdomain}
-        VITE_EDGE_URL: ${edge_zeropsSubdomain}
+        # Dev half talks to DEV siblings (shadowing the project vars, which name the stage half),
+        # so editing api/edge code and reloading the SPA exercises what you just changed.
+        VITE_API_URL: ${apidev_zeropsSubdomain}
+        VITE_EDGE_URL: ${edgedev_zeropsSubdomain}
       start: zsc noop --silent          # dev: `vite dev` via zerops_dev_server (workDir /var/www/web)
 
   - setup: webprod
@@ -347,9 +415,47 @@ zerops:
   # ═══ runner — agent-studio execution runner · runner/ (Docker-in-VM, Go) ══
   # A Zerops docker service. The Go worker (a static CGO_ENABLED=0 binary) consumes
   # run jobs from the shared `broker` NATS JetStream and launches ONE ephemeral
-  # `docker run --rm --network=host` container per job. Single always-on setup — no
-  # dev/prod split; every rung that runs flows includes it.
-  - setup: runner
+  # `docker run --rm --network=host` container per job.
+  - setup: runnerdev
+    build:
+      base: go@1.22
+      envVariables:
+        CGO_ENABLED: "0"
+      buildCommands:
+        - cd runner && go mod tidy
+        - cd runner && go build -o runnerd .
+        - mkdir -p runner/flow-runner/flow-core && cp api/packages/flow-core/src/index.ts runner/flow-runner/flow-core/index.ts
+      deployFiles:
+        - .                            # self-deploy → whole monorepo, so the source is mountable
+      addToRunPrepare:
+        - runner/flow-runner
+      cache: true
+    run:
+      base: docker@26.1.5
+      # Same prepare-phase image bake as runnerprod — see the comment there for why this cannot
+      # live in initCommands. The dev half needs it too: without the image, flow-mode jobs fail.
+      prepareCommands:
+        - sh -c "timeout 180 sh -c 'until docker ps >/dev/null 2>&1; do sleep 2; done' || { echo 'dockerd unreachable in prepare phase'; exit 1; }; docker build -t noola-flow-runner:v1 /home/zerops/runner/flow-runner"
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        RUNNER_GLOBAL_MAX: "3"
+        RUNNER_IMAGE: alpine:3.20
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_USER: ${db_superUser}
+        DB_PASS: ${db_superUserPassword}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+      start: zsc noop --silent          # dev: `runner/runnerd` via zerops_dev_server (noHttpProbe)
+
+  - setup: runnerprod
     build:
       base: go@1.22
       envVariables:
@@ -416,6 +522,10 @@ zerops:
       start: runner/runnerd
 
   # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══
+  # DELIBERATELY referenced by no rung in .zerops-recipe/: the marketing site is not part of
+  # "deploy your own copy of Noola" (a fork wants the app, not our landing page). It ships in
+  # the separate noola.cc project, which builds from this same repo — so these two setups stay
+  # here and MUST NOT be deleted as dead code just because this recipe never imports them.
   - setup: sitedev
     build:
       base: nodejs@22
