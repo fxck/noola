@@ -363,9 +363,30 @@ zerops:
       deployFiles:
         - runner/runnerd
         - runner/flow-runner
+      addToRunPrepare:
+        - runner/flow-runner
       cache: true
     run:
       base: docker@26.1.5
+      # Bake the flow image into the RUNTIME IMAGE, not into each container. prepareCommands run
+      # once when the runtime image is built, so every container this service ever starts —
+      # including a scale-out replica — boots with the image already in its docker storage.
+      # Building it in initCommands instead cost a full chromium+ffmpeg build (~10 min) on every
+      # new container, which is exactly the horizontal-scaling problem.
+      #
+      # The build context comes from build.addToRunPrepare, which is the only way to get build
+      # output into the prepare phase (deploy files are NOT at /var/www/ yet). It lands under
+      # /home/zerops/ with its path preserved — /home/zerops/runner/flow-runner.
+      #
+      # Staleness is handled by the platform: prepareCommands are cached in the runtime base layer,
+      # and that layer is invalidated when the addToRunPrepare payload changes — so editing
+      # flow-runner/ (exec.mts, Dockerfile, package.json) rebuilds the image on the next deploy,
+      # while an unrelated deploy re-uses the cached layer and costs nothing.
+      #
+      # The daemon wait is bounded: if dockerd is not up in the prepare phase the deploy fails
+      # fast and loudly rather than hanging the pipeline on an unbounded `until` loop.
+      prepareCommands:
+        - sh -c "timeout 180 sh -c 'until docker ps >/dev/null 2>&1; do sleep 2; done' || { echo 'dockerd unreachable in prepare phase'; exit 1; }; docker build -t noola-flow-runner:v1 /home/zerops/runner/flow-runner"
       envVariables:
         NATS_HOST: broker
         NATS_PORT: ${broker_port}
@@ -386,20 +407,12 @@ zerops:
         STORAGE_SECRET_KEY: ${storage_secretAccessKey}
         STORAGE_BUCKET: ${storage_bucketName}
         STORAGE_REGION: us-east-1
-      # The single flow image worker.go launches per browser/AI flow job. This CANNOT move to
-      # run.prepareCommands: that stage builds the runtime image BEFORE deploy files land, and the
-      # build context (runner/flow-runner) is a deployFile — plus docker only exists on the VM at
-      # runtime, not while the image is being prepared. So it stays in initCommands, but gated on the
-      # deployed version instead of rebuilding on every container start: the tag carries
-      # ${appVersionId} and the build is skipped when that exact tag is already in this container's
-      # local docker storage, so a restart re-uses the image rather than re-running the multi-minute
-      # chromium+ffmpeg build. A new deploy carries a new appVersionId and rebuilds. The gate is
-      # per-container ON PURPOSE — `zsc execOnce` locks globally across containers, and this image
-      # lives in container-local storage, so a second container would find the gate claimed and come
-      # up with no image at all. The stable re-tag keeps worker.go's RUNNER_FLOW_IMAGE default
-      # (noola-flow-runner:v1) pointing at the current build.
+      # The flow image is built in run.prepareCommands above (baked into the runtime image), so no
+      # build happens here — container start must stay fast for scale-out. This only reports whether
+      # the baked image is present, so a regression in the prepare step is obvious in the logs
+      # instead of silently costing every new container a 10-minute rebuild.
       initCommands:
-        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker image inspect noola-flow-runner:v-${appVersionId} >/dev/null 2>&1 || docker build -t noola-flow-runner:v-${appVersionId} runner/flow-runner; docker tag noola-flow-runner:v-${appVersionId} noola-flow-runner:v1"
+        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker image inspect noola-flow-runner:v1 >/dev/null 2>&1 && echo 'flow image present (baked in runtime image)' || echo 'WARNING flow image MISSING — run.prepareCommands did not bake it'"
       start: runner/runnerd
 
   # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══

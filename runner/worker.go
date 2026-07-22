@@ -485,8 +485,9 @@ func main() {
 	}
 	dockerPull(runImage)
 	logf("run image ready: %s", runImage)
-	// The flow-runner image is built into the runner container at deploy (initCommands) as a local
-	// tag, so a registry `pull` will usually miss — that's fine. Report whether the tag is present.
+	// The flow-runner image is baked into the runtime image at deploy (run.prepareCommands) as a
+	// local tag, so a registry `pull` will usually miss — that's fine. Report whether the tag is
+	// present.
 	go func() {
 		dockerPull(flowRunnerImage)
 		if exec.Command("docker", "image", "inspect", flowRunnerImage).Run() == nil {
