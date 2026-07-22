@@ -472,11 +472,17 @@ export type AutoreplyPolicyInput = z.infer<typeof AutoreplyPolicyInput>;
 /** A directory contact. All fields optional, but at least one IDENTIFYING field
  *  (external_id / email / name / company) must be present — a bare attributes bag
  *  isn't a contact. `email` is format-checked when present; `attributes` is a
- *  free-form bag shallow-merged on upsert. */
+ *  free-form bag shallow-merged on upsert.
+ *
+ *  `external_id` and `email` are the two NULLABLE contact columns, so they accept null as
+ *  well as absence: a form that leaves an optional field blank sends null, and on PATCH null
+ *  is the only way to CLEAR a value that's already stored (omitting the key means "leave
+ *  alone"). Both read as "no value" for the identifying-field check below. The remaining text
+ *  fields stay non-nullable — name/company are NOT NULL columns that coalesce to ''. */
 export const ContactInput = z
   .object({
-    external_id: z.string().min(1).max(200).optional(),
-    email: z.string().email().max(320).optional(),
+    external_id: z.string().min(1).max(200).nullable().optional(),
+    email: z.string().email().max(320).nullable().optional(),
     name: z.string().max(300).optional(),
     company: z.string().max(300).optional(),
     company_id: z.guid().nullable().optional(),

@@ -386,10 +386,20 @@ zerops:
         STORAGE_SECRET_KEY: ${storage_secretAccessKey}
         STORAGE_BUCKET: ${storage_bucketName}
         STORAGE_REGION: us-east-1
-      # docker only exists on the VM at runtime (not build). Wait for the daemon, then build the
-      # single flow image worker.go launches per browser/AI flow job.
+      # The single flow image worker.go launches per browser/AI flow job. This CANNOT move to
+      # run.prepareCommands: that stage builds the runtime image BEFORE deploy files land, and the
+      # build context (runner/flow-runner) is a deployFile — plus docker only exists on the VM at
+      # runtime, not while the image is being prepared. So it stays in initCommands, but gated on the
+      # deployed version instead of rebuilding on every container start: the tag carries
+      # ${appVersionId} and the build is skipped when that exact tag is already in this container's
+      # local docker storage, so a restart re-uses the image rather than re-running the multi-minute
+      # chromium+ffmpeg build. A new deploy carries a new appVersionId and rebuilds. The gate is
+      # per-container ON PURPOSE — `zsc execOnce` locks globally across containers, and this image
+      # lives in container-local storage, so a second container would find the gate claimed and come
+      # up with no image at all. The stable re-tag keeps worker.go's RUNNER_FLOW_IMAGE default
+      # (noola-flow-runner:v1) pointing at the current build.
       initCommands:
-        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker build -t noola-flow-runner:v1 runner/flow-runner"
+        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker image inspect noola-flow-runner:v-${appVersionId} >/dev/null 2>&1 || docker build -t noola-flow-runner:v-${appVersionId} runner/flow-runner; docker tag noola-flow-runner:v-${appVersionId} noola-flow-runner:v1"
       start: runner/runnerd
 
   # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══

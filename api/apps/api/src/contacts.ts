@@ -33,10 +33,11 @@ export interface ContactRow {
   online?: boolean;
 }
 
-/** A partial patch for a contact — the fields a caller may set. Undefined = leave alone. */
+/** A partial patch for a contact — the fields a caller may set. Undefined = leave alone;
+ *  null on the two nullable columns (external_id / email) = clear the stored value. */
 export interface ContactInputShape {
-  external_id?: string;
-  email?: string;
+  external_id?: string | null;
+  email?: string | null;
   name?: string;
   company?: string;
   company_id?: string | null;
