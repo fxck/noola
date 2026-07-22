@@ -1,8 +1,15 @@
 // IP → geo via the internal `geo` sidecar, which owns the mmdb (keeps the api artifact lean). The
 // api calls it over the project's private network. Deliberately graceful: sidecar unreachable, no
-// db baked, or a slow lookup → null, never throws. GEO_URL overrides the default internal host.
+// db baked, or a slow lookup → null, never throws.
+//
+// GEO_URL is required, with no default. The sidecar's hostname differs per rung (`geo` in a
+// production-shaped project, `geodev`/`geostage` where halves are paired), so no single literal is
+// correct everywhere — it belongs in the rung's import.yaml. Set it empty on rungs that run no geo
+// sidecar; that disables enrichment outright instead of paying an 800ms timeout per lookup against
+// a host that does not resolve.
+import { requireEnv } from "./env.js";
 
-const GEO_URL = process.env.GEO_URL ?? "http://geo:3002";
+const GEO_URL = requireEnv("GEO_URL");
 
 export interface GeoResult {
   city?: string;
@@ -13,7 +20,7 @@ export interface GeoResult {
 }
 
 export async function geoLookup(ip: string | null): Promise<GeoResult | null> {
-  if (!ip) return null;
+  if (!ip || !GEO_URL) return null; // empty GEO_URL = no sidecar on this rung, skip the call
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 800); // enrichment must never stall the request

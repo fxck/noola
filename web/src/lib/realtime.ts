@@ -1,13 +1,14 @@
 import { Socket } from "phoenix";
 
 // The Phoenix edge relays outbox events (NATS → channel). Base URL only; the Phoenix client
-// appends `/websocket`. A production build MUST inject VITE_EDGE_URL; the dev/stage fallback to
-// the durable stage edge is scoped to `import.meta.env.DEV` so a prod build fails loud rather
-// than silently wiring realtime to stage. Stage builds set VITE_EDGE_URL explicitly (zerops.yaml).
+// appends `/websocket`. Every deployed rung injects VITE_EDGE_URL from project env, so the
+// fallback below is only for a bare `npm run dev` locally, against the developer's own edge. It
+// previously pointed at wss://edgestage-561-*, a host in a DIFFERENT Zerops project present in no
+// rung of this recipe. A production build still fails loud rather than guessing.
 function resolveEdgeUrl(): string {
   const explicit = import.meta.env.VITE_EDGE_URL as string | undefined;
   if (explicit) return explicit;
-  if (import.meta.env.DEV) return "wss://edgestage-561-4000.prg1.zerops.app";
+  if (import.meta.env.DEV) return "ws://localhost:4000";
   throw new Error(
     "VITE_EDGE_URL must be set for a production build — refusing to silently fall back to the stage edge.",
   );

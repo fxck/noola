@@ -1,11 +1,12 @@
-// API base. A production build MUST inject VITE_API_URL (prod api origin); the dev/stage
-// convenience fallback to the durable stage api is scoped to `import.meta.env.DEV` so a prod
-// build can never silently ship talking to stage — it fails loud instead (a separate prod
-// project has no apistage-561 host). Stage builds set VITE_API_URL explicitly (zerops.yaml).
+// API base. Every deployed rung injects VITE_API_URL from project env, so the fallback below is
+// only for a bare `npm run dev` on a developer's machine — where the api is the one they are
+// running locally. It previously pointed at https://apistage-561-*, a hostname in a DIFFERENT
+// Zerops project that exists in no rung of this recipe: an unset var silently sent the session
+// to someone else's backend. A production build still fails loud rather than guessing.
 function resolveApiUrl(): string {
   const explicit = import.meta.env.VITE_API_URL as string | undefined;
   if (explicit) return explicit;
-  if (import.meta.env.DEV) return "https://apistage-561-3000.prg1.zerops.app";
+  if (import.meta.env.DEV) return "http://localhost:3000";
   throw new Error(
     "VITE_API_URL must be set for a production build — refusing to silently fall back to the stage backend.",
   );

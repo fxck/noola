@@ -9,6 +9,8 @@
 // so a customer's "thanks, that fixed it!" doesn't sit forever in Needs-reply, and
 // an agent's "let me look into it" keeps the ball on our side.
 
+import { requireEnv } from "./env.js";
+
 export type WhoseTurn = "us" | "customer";
 
 export interface WhoseTurnInput {
@@ -568,7 +570,11 @@ class NoopEmbeddingDriver implements EmbeddingDriver {
  */
 class ServiceEmbeddingDriver implements EmbeddingDriver {
   readonly name = "service";
-  private readonly url = process.env.EMBED_URL ?? "http://embedderdev:3001";
+  // No default: the old fallback pointed at `embedderdev`, a hostname that exists in no rung, so a
+  // missing wire degraded to keyword-only retrieval forever instead of failing. Required only when
+  // EMBED_DRIVER selects this driver, and the module-level `embeddingDriver` const makes that a
+  // boot-time failure rather than a first-query one.
+  private readonly url = requireEnv("EMBED_URL");
 
   async embed(texts: string[]): Promise<number[][] | null> {
     if (texts.length === 0) return [];
