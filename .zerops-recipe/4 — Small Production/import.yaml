@@ -25,6 +25,8 @@ project:
     BOOTSTRAP_ADMIN_PASSWORD:
 
     EMBED_URL: http://embedder:3001
+    # api → geo (IP enrichment)
+    GEO_URL: http://geo:3002
     API_INTERNAL_URL: http://api:3000
     WEB_BASE_URL: https://web-${zeropsSubdomainHost}.prg1.zerops.app
     # no demo tenant in production

@@ -26,6 +26,9 @@ project:
 
     # api → shared embedder
     EMBED_URL: http://embedder:3001
+    # api → geo (IP enrichment). Empty = no geo sidecar in this box, enrichment off.
+    # Required-but-empty so the choice is explicit rather than a forgotten wire.
+    GEO_URL: ""
     # if you also run edge in the box, it verifies against the local api
     API_INTERNAL_URL: http://localhost:3000
     # the app box's own public origin (web runs inside it)

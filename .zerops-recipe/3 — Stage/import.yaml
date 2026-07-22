@@ -22,6 +22,10 @@ project:
     AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
 
     EMBED_URL: http://embedder:3001
+    # api → geo (IP enrichment). Empty = this rung runs no geo sidecar, enrichment off.
+    # NOTE: production (rungs 4/5) DOES run geo, so this path is unexercised before prod —
+    # add a geo service here and set http://geo:3002 to close that gap.
+    GEO_URL: ""
     API_INTERNAL_URL: http://api:3000
     WEB_BASE_URL: https://web-${zeropsSubdomainHost}.prg1.zerops.app
     MAILPIT_API_URL: http://mailpit:8025

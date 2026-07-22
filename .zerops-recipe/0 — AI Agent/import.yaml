@@ -38,6 +38,10 @@ project:
 
     # api → embedder (RAG)
     EMBED_URL: http://embedder:3001
+    # api → geo (IP enrichment). Empty = this rung runs no geo sidecar, so enrichment is off;
+    # the api requires the var to be present, so the "off" is a decision rather than an oversight.
+    # To enable, add a geo service here and set this to http://geo:3002.
+    GEO_URL: ""
     # edge → api (socket-token verify)
     API_INTERNAL_URL: http://api:3000
     # api → public web origin (links / CORS / invites)
