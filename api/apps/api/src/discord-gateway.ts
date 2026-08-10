@@ -454,6 +454,12 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   const send: Sender = async (channelId, content, opts) => {
     const ch = await client.channels.fetch(channelId);
     if (!(ch && ch.isTextBased() && "send" in ch)) return;
+    // A ticket thread Discord auto-archived after inactivity refuses new messages until it's
+    // unarchived — do it first (mirrors postToThread), so an agent reply into a quiet Discord-origin
+    // thread doesn't silently fail. Plain text channels aren't threads, so this no-ops for them.
+    if ("isThread" in ch && (ch as ThreadChannel).isThread() && (ch as ThreadChannel).archived) {
+      await (ch as ThreadChannel).setArchived(false).catch(() => {});
+    }
     const post = (ch as { send: (p: unknown) => Promise<unknown> }).send.bind(ch);
     // allowedMentions is ALWAYS locked down: by default nothing pings (parse: []); a channel-post
     // broadcast may opt exactly ONE role in. @everyone/@here and stray user pings can never fire —

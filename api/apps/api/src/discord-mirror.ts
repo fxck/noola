@@ -442,7 +442,7 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   const mirror = await getTicketMirror(tenantId, ticketId);
   if (!mirror) return;
   const tp = transport();
-  if (!tp) return;
+  if (!tp) { console.warn(`[discord-mirror] relay skipped: no live Discord transport (ticket ${ticketId})`); return; }
   const row = await withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT m.body, m.author_type, COALESCE(m.auto, false) AS auto,
@@ -458,7 +458,9 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   const isCustomer = row.author_type === "customer";
   const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
-  await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}`).catch(() => {});
+  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}`)
+    .catch((e) => { console.warn(`[discord-mirror] relay postToThread threw (ticket ${ticketId}, thread ${mirror.post_thread_id}): ${(e as Error)?.message ?? String(e)}`); return false; });
+  if (!posted) console.warn(`[discord-mirror] relay could not reach thread ${mirror.post_thread_id} (ticket ${ticketId}) — thread deleted or the bot lacks access/permission`);
   await syncMirrorState(tenantId, ticketId).catch(() => {});
 }
 
