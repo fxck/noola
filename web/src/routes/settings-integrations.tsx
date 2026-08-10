@@ -875,6 +875,19 @@ function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
   );
 }
 
+function StepBadge({ n, done }: { n: number; done: boolean }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex size-4 items-center justify-center rounded-full text-[10px] font-semibold",
+        done ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" : "bg-muted text-muted-foreground",
+      )}
+    >
+      {done ? <Check className="size-3" /> : n}
+    </span>
+  );
+}
+
 function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   const [provider, setProvider] = useState<EmailProvider | null | undefined>(undefined); // undefined=loading, null=not configured
   const [apiKey, setApiKey] = useState("");
@@ -965,38 +978,51 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
           {connected ? "Your workspace is using its own Resend account." : "Using the shared email account."} Only an admin can change this.
         </p>
       ) : (
-        <div className="space-y-3 rounded-lg border p-4">
+        <div className="space-y-4 rounded-lg border p-4">
+          {/* Step 1 — connect the account (API key). This alone enables outbound + the domain wizard. */}
           <div className="space-y-1.5">
-            <Label htmlFor="ep-key">Resend API key {provider?.hasApiKey && <span className="ml-1 text-micro text-muted-foreground">(configured — leave blank to keep)</span>}</Label>
+            <Label htmlFor="ep-key" className="flex items-center gap-1.5">
+              <StepBadge n={1} done={!!provider?.hasApiKey} /> Resend API key
+              {provider?.hasApiKey && <span className="text-micro font-normal text-muted-foreground">(configured — leave blank to keep)</span>}
+            </Label>
             <Input id="ep-key" type="password" autoComplete="off" placeholder={provider?.hasApiKey ? "•••••••••• stored" : "re_…"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
-            <p className="text-micro text-muted-foreground">Used for outbound sending (Resend SMTP), the domain wizard, and fetching inbound message bodies.</p>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="ep-whsec">Inbound webhook signing secret {provider?.hasWebhookSecret && <span className="ml-1 text-micro text-muted-foreground">(configured — leave blank to keep)</span>}</Label>
-            <Input id="ep-whsec" type="password" autoComplete="off" placeholder={provider?.hasWebhookSecret ? "•••••••••• stored" : "whsec_…"} value={webhookSecret} onChange={(e) => setWebhookSecret(e.target.value)} />
-            <p className="text-micro text-muted-foreground">From your Resend webhook (the <span className="font-mono">email.received</span> event). Verifies inbound is really from Resend.</p>
+            <p className="text-micro text-muted-foreground">Enables outbound sending (Resend SMTP), the domain wizard, and fetching inbound message bodies.</p>
           </div>
 
-          {connected && provider?.hasWebhookSecret && (
-            <div className="space-y-1.5">
-              <Label>Your inbound webhook URL</Label>
-              <div className="flex items-center gap-2">
-                <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-xs">{provider.inboundWebhookUrl}</code>
-                <Button variant="outline" size="icon" className="size-8 shrink-0" title="Copy URL" onClick={() => void onCopy(provider.inboundWebhookUrl)}>
-                  {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
-                </Button>
-              </div>
-              <p className="text-micro text-muted-foreground">
-                Paste this as the endpoint for your Resend <span className="font-mono">email.received</span> webhook.
-                <button type="button" className="ml-1 underline hover:text-foreground" onClick={() => void onRotate()}>Rotate URL</button> if it leaks.
+          {/* Step 2 — inbound. Sequential: the URL only exists once the account is connected, and you
+              need it to create the Resend webhook BEFORE Resend gives you the signing secret. */}
+          <div className="space-y-2">
+            <Label className="flex items-center gap-1.5">
+              <StepBadge n={2} done={!!provider?.hasWebhookSecret} /> Inbound webhook <span className="text-micro font-normal text-muted-foreground">(to receive email as tickets)</span>
+            </Label>
+            {!connected ? (
+              <p className="rounded-md border border-dashed px-3 py-2 text-micro text-muted-foreground">
+                Connect your API key first — we'll then show the webhook URL to point Resend at, and you paste its signing secret here.
               </p>
-            </div>
-          )}
+            ) : (
+              <div className="space-y-2.5">
+                <div className="space-y-1">
+                  <p className="text-micro text-muted-foreground">a. In Resend, add a webhook (event <span className="font-mono">email.received</span>) pointed at this URL:</p>
+                  <div className="flex items-center gap-2">
+                    <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-xs">{provider!.inboundWebhookUrl}</code>
+                    <Button variant="outline" size="icon" className="size-8 shrink-0" title="Copy URL" onClick={() => void onCopy(provider!.inboundWebhookUrl)}>
+                      {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
+                    </Button>
+                  </div>
+                  <button type="button" className="text-micro text-muted-foreground underline hover:text-foreground" onClick={() => void onRotate()}>Rotate URL</button>
+                </div>
+                <div className="space-y-1">
+                  <label htmlFor="ep-whsec" className="text-micro text-muted-foreground">b. Then paste that webhook's signing secret here {provider?.hasWebhookSecret && <span>(configured — leave blank to keep)</span>}:</label>
+                  <Input id="ep-whsec" type="password" autoComplete="off" placeholder={provider?.hasWebhookSecret ? "•••••••••• stored" : "whsec_…"} value={webhookSecret} onChange={(e) => setWebhookSecret(e.target.value)} />
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="flex items-center justify-between pt-1">
             <Button variant="outline" size="sm" className="h-8 gap-1.5" disabled={saving} onClick={() => void onSave()}>
               {saving ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-              {connected ? "Update credentials" : "Connect Resend"}
+              {connected ? "Save changes" : "Connect Resend"}
             </Button>
             {connected && (
               <Button variant="ghost" size="sm" className="h-8 text-muted-foreground hover:text-destructive" onClick={() => setDisconnect(true)}>
