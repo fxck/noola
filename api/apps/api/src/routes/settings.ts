@@ -26,6 +26,7 @@ import {
   sendingProviderEnabled, SendingProviderError,
 } from "../email-domains.js";
 import { verifySlackSignature, handleSlackEvent, listSlackConnections, upsertSlackConnection, deleteSlackConnection, resolveTenantByTeam } from "../slack.js";
+import { verifyResendSignature, ingestResendInbound } from "../resend-inbound.js";
 import { mdToSlack } from "../channels/format.js";
 import {
   handleSlackAskCommand, handleSlackDraftCommand, slackPostDraft,
@@ -470,6 +471,25 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     });
     // null = the recipient maps to no tenant route (or our own echo) — accepted, not ingested.
     return reply.code(result ? 201 : 202).send({ ok: true, ingested: !!result, ticketId: result?.ticketId ?? null });
+  });
+
+  // Native Resend Inbound (email.received) webhook — Svix-signed. Verifies the signature over the
+  // raw body, then ingestResendInbound fetches the parsed body + attachments back from Resend's
+  // Receiving API (its webhook carries metadata only) and rides the same handleInboundEmail spine.
+  // Gate: RESEND_WEBHOOK_SECRET must be set (503 otherwise) and the signature must verify (401).
+  // Point your Resend webhook (email.received event) at this URL — no external adapter needed.
+  app.post("/email/inbound/resend", async (req, reply) => {
+    const secret = process.env.RESEND_WEBHOOK_SECRET;
+    if (!secret) return reply.code(503).send({ error: "resend inbound disabled — RESEND_WEBHOOK_SECRET not set" });
+    const h = req.headers as Record<string, string | undefined>;
+    const ok = verifyResendSignature(
+      (req as { rawBody?: string }).rawBody ?? "",
+      { id: h["svix-id"], timestamp: h["svix-timestamp"], signature: h["svix-signature"] },
+      secret,
+    );
+    if (!ok) return reply.code(401).send({ error: "bad signature" });
+    const r = await ingestResendInbound((req.body ?? {}) as Parameters<typeof ingestResendInbound>[0]);
+    return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
   });
 
   // ---- Model-B: branded sending domains (Intercom "custom email domain") ----

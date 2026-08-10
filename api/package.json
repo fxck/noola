@@ -39,6 +39,7 @@
     "test:slack": "tsx apps/api/test/slack.test.ts",
     "test:broadcasts": "tsx apps/api/test/broadcasts.test.ts",
     "test:reply-email": "tsx apps/api/test/reply-email.test.ts",
+    "test:resend-inbound": "tsx apps/api/test/resend-inbound.test.ts",
     "test:integrations": "tsx apps/api/test/integrations.test.ts",
     "test:automations": "tsx apps/api/test/automations.test.ts",
     "test:tagrules": "tsx apps/api/test/tagrules.test.ts",

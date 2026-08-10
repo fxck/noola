@@ -165,6 +165,7 @@ const PUBLIC_ROUTES = new Set([
   "POST /join/:token",
   // External channel webhooks — HMAC/signature/token-gated in the handler.
   "POST /email/inbound",
+  "POST /email/inbound/resend",
   "POST /slack/events",
   "POST /slack/commands",
   "POST /slack/interactions",
