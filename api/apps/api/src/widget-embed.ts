@@ -56,6 +56,10 @@ export const WIDGET_JS = String.raw`(function () {
   var activeConvId = null;
   var pollTimer = null;
   var ws = null, wsHb = null, wsRef = 0;
+  // Gate for auto-open-on-inbound: false until the widget has settled after load, so the first
+  // poll/hydrate reconcile (or a WS re-join) of pre-existing history can't pop the panel — only a
+  // genuinely live arrival after this does.
+  var liveArmed = false;
   // While an AI answer streams token-by-token (SSE), the poll/WS/hydrate reconcilers must NOT
   // rebuild #log from the server — the answer isn't persisted until the stream's 'done', so a
   // mid-stream hydrate would wipe the live bubble. Set to the conversation id during a stream.
@@ -290,7 +294,7 @@ export const WIDGET_JS = String.raw`(function () {
     '.search input{flex:1;border:none;outline:none;font:inherit;font-size:15px;background:none;color:var(--fg)}' +
     '.sect{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--fg3);margin:20px 16px 8px}' +
     '.empty{padding:28px 20px;text-align:center;color:var(--fg2);font-size:14px;line-height:1.5}' +
-    '.log{padding:16px 16px 12px;display:flex;flex-direction:column;gap:2px}' +
+    '.log{padding:16px 16px 12px;display:flex;flex-direction:column;gap:2px;min-height:0}' +
     '.mrow{display:flex;gap:8px;align-items:flex-start;max-width:100%}' +
     '.mrow.left{justify-content:flex-start}' +
     '.mrow.right{justify-content:flex-end}' +
@@ -467,6 +471,9 @@ export const WIDGET_JS = String.raw`(function () {
     if (launcherHidden) bubbleEl.style.display = 'none'; // start-hidden embed — no launcher until shown
     renderBadge();
     resumeLive();
+    // Arm the auto-open a beat after boot: the immediate first poll/hydrate (t≈0) only seeds the
+    // badge from history; a message that lands after this is treated as live and pops the panel.
+    setTimeout(function () { liveArmed = true; }, 3500);
   }
 
   function applyConfig() {
@@ -535,6 +542,18 @@ export const WIDGET_JS = String.raw`(function () {
       });
     }
     renderBadge();
+  }
+
+  // A live inbound agent reply arrived while the messenger was closed — pop it open to that thread
+  // (Intercom-style) so the visitor actually sees the reply, not just a badge. Works even when the
+  // launcher is hidden (custom-launcher embeds). Call sites gate this on liveArmed so a load-time
+  // reconcile never auto-opens.
+  function autoOpenThread(convId) {
+    if (panelOpen) return;
+    if (!getConv(convId)) return;
+    view = 'thread'; threadId = convId; pendingDir = 'none';
+    openPanel();          // shows the panel + renders the thread (wire scrolls to the latest message)
+    markRead(convId);     // they're viewing it now — clear the unread badge
   }
 
   // Roots (tabbed) vs leaves (drilled-into) — decides the transition style.
@@ -933,6 +952,7 @@ export const WIDGET_JS = String.raw`(function () {
         var localIds = c.msgs.map(function (m) { return m.id || ''; }).join('|');
         var serverIds = server.map(function (m) { return m.id; }).join('|');
         var changed = localIds !== serverIds;
+        var poppable = false;
         if (changed) {
           // If the visitor isn't looking at this thread, count freshly-arrived agent/AI turns as unread
           // for the launcher badge (a background poll reconciles silently otherwise).
@@ -940,7 +960,7 @@ export const WIDGET_JS = String.raw`(function () {
           if (!viewing) {
             var known = {}; for (var i = 0; i < c.msgs.length; i++) if (c.msgs[i].id) known[c.msgs[i].id] = 1;
             var fresh = 0; for (var j = 0; j < server.length; j++) if ((server[j].role === 'agent' || server[j].role === 'ai') && !known[server[j].id]) fresh++;
-            if (fresh) { c.unread = (c.unread || 0) + fresh; renderBadge(); }
+            if (fresh) { c.unread = (c.unread || 0) + fresh; renderBadge(); if (liveArmed && !panelOpen) poppable = true; }
           }
           c.msgs = server; c.updatedAt = Date.now();
         }
@@ -953,6 +973,10 @@ export const WIDGET_JS = String.raw`(function () {
         } else if (changed) {
           saveConvs(); refreshLog(convId);
         }
+        // A live agent reply landed in a thread the visitor wasn't looking at while the panel was
+        // closed — pop the messenger open to it (done after msgs/escalated reconcile so the opened
+        // thread shows the just-arrived message).
+        if (poppable && !panelOpen) autoOpenThread(convId);
         if (cb) cb();
       })
       .catch(function () { if (cb) cb(); });
@@ -985,7 +1009,10 @@ export const WIDGET_JS = String.raw`(function () {
     var c = getConv(threadId) || newConv();
     threadId = c.id;
     var body =
-      '<div class="body"><div class="log" id="log">' + threadLogHtml(c) + '</div></div>' +
+      // #log IS the scroll container (has .body's flex:1 + overflow-y:auto AND .log's flex layout).
+      // The old nested .body>.log put overflow on .body while every scrollTop call targeted #log —
+      // a no-op — so long/old transcripts opened pinned at the top. Merged, #log scrolls for real.
+      '<div class="body log" id="log">' + threadLogHtml(c) + '</div>' +
       '<div class="foot">' +
         '<div class="attprev" id="attprev"></div>' +
         '<div class="footrow">' +
@@ -1309,9 +1336,18 @@ export const WIDGET_JS = String.raw`(function () {
 
   // ---- live lane (poll + WS) scoped to one escalated conversation ----
   function resumeLive() {
-    // on load, keep the newest escalated conversation live so unread accrues while closed
-    var esc2 = null; for (var i = 0; i < convs.length; i++) if (convs[i].escalated) { if (!esc2 || (convs[i].updatedAt || 0) > (esc2.updatedAt || 0)) esc2 = convs[i]; }
-    if (esc2) startLive(esc2.id);
+    // Keep one conversation live while the panel is closed so an inbound agent reply arrives in real
+    // time (badge + auto-open). Prefer the newest ESCALATED thread (a human is engaged there); fall
+    // back to the newest thread with any history, so an agent who jumps into an AI thread is caught too.
+    var esc2 = null, touched = null;
+    for (var i = 0; i < convs.length; i++) {
+      var c = convs[i];
+      if (!(c.msgs && c.msgs.length)) continue;              // never-used conversations need no live lane
+      if (!touched || (c.updatedAt || 0) > (touched.updatedAt || 0)) touched = c;
+      if (c.escalated && (!esc2 || (c.updatedAt || 0) > (esc2.updatedAt || 0))) esc2 = c;
+    }
+    var live = esc2 || touched;
+    if (live) startLive(live.id);
   }
   function startLive(convId) {
     if (activeConvId !== convId) { stopPoll(); closeWS(); activeConvId = convId; }
@@ -1328,6 +1364,7 @@ export const WIDGET_JS = String.raw`(function () {
     for (var i = 0; i < c.msgs.length; i++) if (c.msgs[i].id === mkey) return; // dedupe poll <-> socket
     c.msgs.push({ role: 'agent', id: mkey, body: bodyTxt, at: Date.now() });
     c.unread = (c.unread || 0) + 1; c.updatedAt = Date.now(); saveConvs(); renderBadge();
+    if (liveArmed && !panelOpen) autoOpenThread(convId);   // pop the messenger open on a live agent reply
   }
   // Poll = reconcile the open thread against the server (customer + agent + AI, correctly ordered).
   function poll() { if (activeConvId) hydrateThread(activeConvId); }
