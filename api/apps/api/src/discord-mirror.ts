@@ -731,12 +731,12 @@ export async function handleMirrorReaction(
   const claim = await relayPool.query(
     `UPDATE ticket_mirror_messages SET promoted_at = now()
       WHERE discord_message_id = $1 AND is_responder AND promoted_at IS NULL
-      RETURNING tenant_id, ticket_id, body, author_display_name, author_discord_id, author_user_id`,
+      RETURNING tenant_id, ticket_id, body, note_id, author_display_name, author_discord_id, author_user_id`,
     [r.discordMessageId],
   );
   if (!claim.rowCount) return { promoted: false, reason: "not_promotable" };
   const row = claim.rows[0] as {
-    tenant_id: string; ticket_id: string; body: string;
+    tenant_id: string; ticket_id: string; body: string; note_id: string | null;
     author_display_name: string | null; author_discord_id: string | null; author_user_id: string | null;
   };
 
@@ -764,6 +764,20 @@ export async function handleMirrorReaction(
     origin: "discord_mirror",
     idempotencyKey: `discord-mirror-promote:${r.discordMessageId}`,
   });
+
+  // A promoted message BECOMES the customer reply, so move any attachments the original Discord message
+  // carried from the internal note onto the reply (the widget + agent thread both render message
+  // attachments), then drop the now-duplicate note. The promote's own message.created event makes the
+  // web refetch messages + notes, so the reply appears with its image and the note disappears live.
+  if (row.note_id) {
+    await withTenant(row.tenant_id, async (c) => {
+      await c.query(
+        "UPDATE message_attachments SET message_id = $1, note_id = NULL WHERE note_id = $2 AND ticket_id = $3",
+        [result.messageId, row.note_id, row.ticket_id],
+      );
+      await c.query("DELETE FROM ticket_notes WHERE id = $1", [row.note_id]);
+    }).catch(() => {});
+  }
 
   const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, row.body);
   if (meta) void stampOutboundTranslation(row.tenant_id, result.messageId, meta);
