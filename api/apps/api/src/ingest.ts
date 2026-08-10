@@ -415,7 +415,7 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
   if (!result.replay && input.origin !== "discord_mirror" && result.channelType !== "discord") {
     void import("./discord-mirror.js")
       .then((m) => m.relayTicketMessage(result.tenantId, result.ticketId, result.messageId))
-      .catch(() => {});
+      .catch((e) => { try { console.warn(`[discord-mirror] relay hook failed: ${(e as Error)?.message ?? String(e)}`); } catch { /* noop */ } });
   }
 
   // Sentiment: classify each inbound customer message and stamp the ticket (best-effort, off the

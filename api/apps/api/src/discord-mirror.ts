@@ -442,7 +442,7 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   const mirror = await getTicketMirror(tenantId, ticketId);
   if (!mirror) return;
   const tp = transport();
-  if (!tp) return;
+  if (!tp) { console.warn(`[discord-mirror] relay skipped: no live Discord transport (ticket ${ticketId})`); return; }
   const row = await withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT m.body, m.author_type, COALESCE(m.auto, false) AS auto,
@@ -458,7 +458,9 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   const isCustomer = row.author_type === "customer";
   const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
-  await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}`).catch(() => {});
+  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}`)
+    .catch((e) => { console.warn(`[discord-mirror] relay postToThread threw (ticket ${ticketId}, thread ${mirror.post_thread_id}): ${(e as Error)?.message ?? String(e)}`); return false; });
+  if (!posted) console.warn(`[discord-mirror] relay could not reach thread ${mirror.post_thread_id} (ticket ${ticketId}) — thread deleted or the bot lacks access/permission`);
   await syncMirrorState(tenantId, ticketId).catch(() => {});
 }
 
@@ -778,6 +780,12 @@ export async function handleMirrorReaction(
       await c.query("DELETE FROM ticket_notes WHERE id = $1", [row.note_id]);
     }).catch(() => {});
   }
+
+  // A human promoted this Discord message to a customer reply — stand the assistant down on the ticket
+  // so ambient autoreply doesn't talk over the human (matches the console reply path). Idempotent.
+  await withTenant(row.tenant_id, async (c) => {
+    await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
+  }).catch(() => {});
 
   const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, row.body);
   if (meta) void stampOutboundTranslation(row.tenant_id, result.messageId, meta);
