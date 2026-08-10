@@ -17,7 +17,7 @@ import { prodSecret } from "./prod-secret.js";
 
 // Our own outbound is tagged so the inbound poller can never re-ingest it
 // (belt-and-suspenders on top of "To=customer resolves to no tenant route").
-const ORIGIN_HEADER = "X-Noola-Origin";
+export const ORIGIN_HEADER = "X-Noola-Origin";
 // Env is read at call time (not module load) so behavior tracks the live config
 // and tests can exercise the enabled/disabled paths deterministically.
 
