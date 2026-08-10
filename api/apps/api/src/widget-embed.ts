@@ -56,10 +56,6 @@ export const WIDGET_JS = String.raw`(function () {
   var activeConvId = null;
   var pollTimer = null;
   var ws = null, wsHb = null, wsRef = 0;
-  // Gate for auto-open-on-inbound: false until the widget has settled after load, so the first
-  // poll/hydrate reconcile (or a WS re-join) of pre-existing history can't pop the panel — only a
-  // genuinely live arrival after this does.
-  var liveArmed = false;
   // While an AI answer streams token-by-token (SSE), the poll/WS/hydrate reconcilers must NOT
   // rebuild #log from the server — the answer isn't persisted until the stream's 'done', so a
   // mid-stream hydrate would wipe the live bubble. Set to the conversation id during a stream.
@@ -471,9 +467,6 @@ export const WIDGET_JS = String.raw`(function () {
     if (launcherHidden) bubbleEl.style.display = 'none'; // start-hidden embed — no launcher until shown
     renderBadge();
     resumeLive();
-    // Arm the auto-open a beat after boot: the immediate first poll/hydrate (t≈0) only seeds the
-    // badge from history; a message that lands after this is treated as live and pops the panel.
-    setTimeout(function () { liveArmed = true; }, 3500);
   }
 
   function applyConfig() {
@@ -544,10 +537,11 @@ export const WIDGET_JS = String.raw`(function () {
     renderBadge();
   }
 
-  // A live inbound agent reply arrived while the messenger was closed — pop it open to that thread
-  // (Intercom-style) so the visitor actually sees the reply, not just a badge. Works even when the
-  // launcher is hidden (custom-launcher embeds). Call sites gate this on liveArmed so a load-time
-  // reconcile never auto-opens.
+  // An inbound agent reply the visitor hasn't seen — pop the messenger open to that thread
+  // (Intercom-style) so they actually see the reply, not just a badge. Fires both for live arrivals
+  // and for messages that landed while they were away (surfaced on the first reconcile after load).
+  // Works even when the launcher is hidden (custom-launcher embeds). Panel-closed only; markRead
+  // clears the badge and the reconcile persists the message, so it pops at most once per new message.
   function autoOpenThread(convId) {
     if (panelOpen) return;
     if (!getConv(convId)) return;
@@ -960,7 +954,7 @@ export const WIDGET_JS = String.raw`(function () {
           if (!viewing) {
             var known = {}; for (var i = 0; i < c.msgs.length; i++) if (c.msgs[i].id) known[c.msgs[i].id] = 1;
             var fresh = 0; for (var j = 0; j < server.length; j++) if ((server[j].role === 'agent' || server[j].role === 'ai') && !known[server[j].id]) fresh++;
-            if (fresh) { c.unread = (c.unread || 0) + fresh; renderBadge(); if (liveArmed && !panelOpen) poppable = true; }
+            if (fresh) { c.unread = (c.unread || 0) + fresh; renderBadge(); if (!panelOpen) poppable = true; }
           }
           c.msgs = server; c.updatedAt = Date.now();
         }
@@ -973,9 +967,9 @@ export const WIDGET_JS = String.raw`(function () {
         } else if (changed) {
           saveConvs(); refreshLog(convId);
         }
-        // A live agent reply landed in a thread the visitor wasn't looking at while the panel was
-        // closed — pop the messenger open to it (done after msgs/escalated reconcile so the opened
-        // thread shows the just-arrived message).
+        // An agent reply the visitor hasn't seen — arrived live, OR while they were away and now
+        // surfaced on the first reconcile after (re)load — pop the messenger open to it, panel-closed
+        // only. Done after msgs/escalated reconcile so the opened thread shows the message.
         if (poppable && !panelOpen) autoOpenThread(convId);
         if (cb) cb();
       })
@@ -1364,7 +1358,7 @@ export const WIDGET_JS = String.raw`(function () {
     for (var i = 0; i < c.msgs.length; i++) if (c.msgs[i].id === mkey) return; // dedupe poll <-> socket
     c.msgs.push({ role: 'agent', id: mkey, body: bodyTxt, at: Date.now() });
     c.unread = (c.unread || 0) + 1; c.updatedAt = Date.now(); saveConvs(); renderBadge();
-    if (liveArmed && !panelOpen) autoOpenThread(convId);   // pop the messenger open on a live agent reply
+    if (!panelOpen) autoOpenThread(convId);   // pop the messenger open on an inbound agent reply
   }
   // Poll = reconcile the open thread against the server (customer + agent + AI, correctly ordered).
   function poll() { if (activeConvId) hydrateThread(activeConvId); }
