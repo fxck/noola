@@ -904,11 +904,17 @@ export const WIDGET_JS = String.raw`(function () {
     // A resolved/closed ticket shows an "ended" divider (Intercom-style) above the toggle; the
     // visitor can still ask again, which reopens the thread server-side on the next turn.
     if (c.status === 'resolved' || c.status === 'closed') out += '<div class="ended">This conversation has ended</div>';
-    // One toggle, driven by the authoritative AI mode: mute the bot ("Talk to a human") or turn it
-    // back on ("Ask the assistant"). Always present so the visitor is never stuck in one mode.
+    // The toggle switches modes. A human agent is "in the loop" the moment they reply — even if the
+    // AI was never formally muted (an agent can jump into an AI thread). Then "Talk to a human" is
+    // wrong (they're already here), so hide it. "Ask Noola" shows only when the assistant is actually
+    // muted (escalated); a pure-AI thread with no human yet still offers "Talk to a human".
+    var humanReplied = false;
+    for (var hj = 0; hj < c.msgs.length; hj++) { if (c.msgs[hj].role === 'agent') { humanReplied = true; break; } }
     var toggle = c.escalated
       ? '<button class="talk" id="resume" type="button">' + iconNoola() + '<span>Ask Noola</span></button>'
-      : '<button class="talk" id="talk" type="button">' + iconUser() + '<span>Talk to a human</span></button>';
+      : (humanReplied
+          ? ''
+          : '<button class="talk" id="talk" type="button">' + iconUser() + '<span>Talk to a human</span></button>');
     return out + toggle;
   }
   function refreshLog(convId) {
@@ -990,7 +996,7 @@ export const WIDGET_JS = String.raw`(function () {
     } else {
       name = agent ? (agent.authorName || 'Support') : 'Noola';
       avInner = agent ? avatarInner(agent) : '<span class="av ai">' + iconNoola() + '</span>';
-      sub = agent ? 'Replies instantly · talk to a human anytime' : 'AI assistant · replies instantly';
+      sub = agent ? 'A teammate is replying' : 'AI assistant · replies instantly';
     }
     return '<div class="hd plain">' +
       (back ? '<button class="iconbtn" id="bk" aria-label="Back">' + iconBack() + '</button>' : '') +
