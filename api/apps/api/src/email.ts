@@ -5,6 +5,7 @@ import { ingestInbound, type IngestResult } from "./ingest.js";
 import { persistBufferAttachments } from "./attachments.js";
 import { renderReplyEmail } from "./emails/reply-email.js";
 import { prodSecret } from "./prod-secret.js";
+import { tenantResendApiKey } from "./email-provider.js";
 
 // The email channel — the second real channel after Discord, riding the same
 // ingestInbound() spine. Dev/stage use Mailpit (SMTP catch + HTTP API); a real
@@ -83,6 +84,19 @@ function smtpTransport(host: string, port: number): nodemailer.Transporter {
     port,
     secure: process.env.SMTP_SECURE === "1" || port === 465,
     ...(user && pass ? { auth: { user, pass } } : {}),
+  });
+}
+
+/** BYO Resend outbound: a tenant's own Resend account as the SMTP relay. Username is the literal
+ *  "resend"; the password is the tenant's API key. Port 587 with STARTTLS (25/465 are blocked in the
+ *  Zerops runtime; RESEND_SMTP_PORT overrides if a deployment needs a different submission port). */
+function resendSmtpTransport(apiKey: string): nodemailer.Transporter {
+  const port = Number(process.env.RESEND_SMTP_PORT ?? 587);
+  return nodemailer.createTransport({
+    host: process.env.RESEND_SMTP_HOST ?? "smtp.resend.com",
+    port,
+    secure: port === 465,
+    auth: { user: "resend", pass: apiKey },
   });
 }
 
@@ -258,12 +272,15 @@ export async function sendOutboundEmail(
   },
 ): Promise<{ delivered: boolean; reason?: string }> {
   if (!to) return { delivered: false, reason: "no-recipient" };
+  // BYO Resend: when the tenant brought their own key, send through THEIR Resend account (their
+  // verified domains, their reputation, their quota). Otherwise the shared env SMTP relay (Mailpit in
+  // dev). A BYO key enables sending even where the shared SMTP_HOST is unset.
+  const byoKey = await tenantResendApiKey(tenantId);
   const smtpHost = process.env.SMTP_HOST;
-  if (!smtpHost) return { delivered: false, reason: "email-disabled" };
-  const smtpPort = Number(process.env.SMTP_PORT ?? 1025);
+  if (!byoKey && !smtpHost) return { delivered: false, reason: "email-disabled" };
   const from = (await tenantSupportAddress(tenantId)) ?? "support@noola.local";
   const fromDomain = from.split("@")[1] ?? "noola.local";
-  const tx = smtpTransport(smtpHost, smtpPort);
+  const tx = byoKey ? resendSmtpTransport(byoKey) : smtpTransport(smtpHost!, Number(process.env.SMTP_PORT ?? 1025));
   await tx.sendMail({
     from,
     to,

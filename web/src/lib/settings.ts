@@ -409,6 +409,39 @@ export async function deleteSendingDomain(id: string): Promise<void> {
   await api(`/email/domains/${id}`, { method: "DELETE" });
 }
 
+// ── BYO Resend: per-tenant email provider (0103) ─────────────────────────────
+// A workspace brings their OWN Resend account so outbound (Resend SMTP), inbound (a per-tenant
+// webhook URL), and the sending-domain wizard all run on THEIR key — deliverability isolation, their
+// billing/quota, their key to rotate. Secrets are write-only: the API returns only the hasX flags +
+// the inbound webhook URL to paste into Resend. Absent → the shared platform account.
+
+export interface EmailProvider {
+  provider: string;
+  hasApiKey: boolean;
+  hasWebhookSecret: boolean;
+  inboundHandle: string;
+  inboundWebhookUrl: string;
+  active: boolean;
+  updatedAt: string | null;
+}
+
+export async function fetchEmailProvider(): Promise<EmailProvider | null> {
+  return (await api<{ provider: EmailProvider | null }>("/email/provider")).provider;
+}
+
+/** Partial: omit a field to leave it as-is, pass "" to clear it. */
+export async function saveEmailProvider(patch: { apiKey?: string; webhookSecret?: string; active?: boolean }): Promise<EmailProvider> {
+  return (await api<{ provider: EmailProvider }>("/email/provider", { method: "PUT", body: JSON.stringify(patch) })).provider;
+}
+
+export async function rotateEmailProviderHandle(): Promise<EmailProvider> {
+  return (await api<{ provider: EmailProvider }>("/email/provider/rotate-handle", { method: "POST", body: "{}" })).provider;
+}
+
+export async function deleteEmailProvider(): Promise<void> {
+  await api("/email/provider", { method: "DELETE" });
+}
+
 // ── Self-serve channel connections (0092) ────────────────────────────────────
 
 export interface ChannelConnection {
