@@ -313,6 +313,14 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       channelOverride: parsed.data.channel ?? null,
     });
 
+    // A human agent stepped in — stand the assistant down on this ticket so ambient autoreply doesn't
+    // talk over the human on the customer's next message (the human owns the thread until the AI is
+    // re-enabled via the assistant-mode toggle). whose_turn is left alone — the reply already moved the
+    // ball to the customer. Idempotent + cheap (a no-op once already muted).
+    await withTenant(tenantId, async (c) => {
+      await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
+    }).catch(() => {});
+
     // Claim any pre-uploaded attachments onto this agent message (best-effort, post-commit). Returns
     // the claimed files' storage info so an email reply can carry them as real attachments.
     const claimed = await claimAttachments(tenantId, result.ticketId, result.messageId, parsed.data.attachmentIds ?? [])

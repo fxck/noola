@@ -781,6 +781,12 @@ export async function handleMirrorReaction(
     }).catch(() => {});
   }
 
+  // A human promoted this Discord message to a customer reply — stand the assistant down on the ticket
+  // so ambient autoreply doesn't talk over the human (matches the console reply path). Idempotent.
+  await withTenant(row.tenant_id, async (c) => {
+    await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
+  }).catch(() => {});
+
   const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, row.body);
   if (meta) void stampOutboundTranslation(row.tenant_id, result.messageId, meta);
 
