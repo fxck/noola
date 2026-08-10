@@ -1227,6 +1227,15 @@ export const MirrorFilterInput = z.object({
 });
 export type MirrorFilterInput = z.infer<typeof MirrorFilterInput>;
 
+// One extra link rendered in the Discord mirror-post header (e.g. Backoffice). `url` may carry
+// {ticket_id}/{email}/{external_id}/{company}/{name} placeholders, filled per ticket; a link whose
+// placeholder has no value for a given ticket is skipped rather than rendered broken.
+export const QuickLinkInput = z.object({
+  label: z.string().min(1).max(40),
+  url: z.string().min(1).max(500),
+});
+export type QuickLinkInput = z.infer<typeof QuickLinkInput>;
+
 export const DiscordMirrorBindingInput = z.object({
   guildId: z.string().min(1).max(30),
   forumChannelId: z.string().min(1).max(30),
@@ -1235,6 +1244,7 @@ export const DiscordMirrorBindingInput = z.object({
   attributionMode: z.enum(["team", "collaborator"]).default("team"),
   attributionName: z.string().max(80).nullable().optional(),
   filter: MirrorFilterInput.default({}),
+  quickLinks: z.array(QuickLinkInput).max(8).default([]),
 });
 export type DiscordMirrorBindingInput = z.infer<typeof DiscordMirrorBindingInput>;
 

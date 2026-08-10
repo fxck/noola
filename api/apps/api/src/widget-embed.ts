@@ -764,7 +764,7 @@ export const WIDGET_JS = String.raw`(function () {
       '</div>';
     return { header: homeHead, body: body, wire: function () {
       wireHeader();
-      var sc = sel('#startc'); if (sc) sc.addEventListener('click', openOrStartConversation);
+      var sc = sel('#startc'); if (sc) sc.addEventListener('click', startConversation);
       var rc = sel('.rowlink[data-conv]'); if (rc) rc.addEventListener('click', function () { setView('thread', rc.getAttribute('data-conv')); });
       var hq = sel('#hq'); if (hq) hq.addEventListener('keydown', function (e) { if (e.key === 'Enter') { helpSeed = hq.value; setView('help'); } });
       if (CFG.tabs.help) loadTopArticles();
@@ -818,8 +818,16 @@ export const WIDGET_JS = String.raw`(function () {
     } };
   }
 
-  function openOrStartConversation() { var r = touchedConvs()[0]; if (r) setView('thread', r.id); else startConversation(); }
-  function startConversation() { var c = newConv(); setView('thread', c.id); }
+  // Start a fresh conversation from the home "Ask a question" card (and the Messages "Start a new
+  // conversation" button). Reuse the most-recent conversation ONLY when it's still blank (no
+  // messages) so repeated taps don't pile up empty conversations — otherwise always open a new one.
+  // Previously the home card resumed the latest conversation regardless of state, so "new" landed on
+  // an old/closed thread.
+  function startConversation() {
+    var r = touchedConvs()[0];
+    var c = (r && (!r.msgs || r.msgs.length === 0)) ? r : newConv();
+    setView('thread', c.id);
+  }
 
   // The contents of the message log for a conversation — intro (fresh AI convo only), the message
   // rows, and the mode toggle. Factored out so a live hydrate can rebuild #log in place without a

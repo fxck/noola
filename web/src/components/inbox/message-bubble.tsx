@@ -28,6 +28,11 @@ import { cn } from "@/lib/utils";
 /** Internal note in the thread — agent-only, visually distinct from customer/agent
  *  messages (never dispatched to a channel). Full-width, warning-tinted card. */
 export function NoteBubble({ note }: { note: Note }) {
+  // Notes can carry files too (e.g. a screenshot posted in a Discord mirror thread) — same inline
+  // image / file-chip treatment as a message.
+  const atts = note.attachments ?? [];
+  const imageAtts = atts.filter(isImageAttachment);
+  const fileAtts = atts.filter((a) => !isImageAttachment(a));
   return (
     <li>
       <div className="rounded-xl border border-warning/30 bg-warning/5 px-3.5 py-2.5">
@@ -48,6 +53,20 @@ export function NoteBubble({ note }: { note: Note }) {
               <span key={n} className="rounded-full bg-warning/15 px-1.5 py-0.5 font-medium text-warning">
                 @{n}
               </span>
+            ))}
+          </div>
+        )}
+        {imageAtts.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {imageAtts.map((a) => (
+              <AttachmentImage key={a.id} a={a} capped={imageAtts.length > 1} />
+            ))}
+          </div>
+        )}
+        {fileAtts.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {fileAtts.map((a) => (
+              <AttachmentChip key={a.id} a={a} />
             ))}
           </div>
         )}

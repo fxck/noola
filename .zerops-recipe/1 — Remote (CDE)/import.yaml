@@ -25,10 +25,9 @@ project:
     AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
 
     # api → shared embedder
-    EMBED_URL: http://embedder:3001
-    # api → geo (IP enrichment). Empty = no geo sidecar in this box, enrichment off.
-    # Required-but-empty so the choice is explicit rather than a forgotten wire.
-    GEO_URL: ""
+    EMBED_URL: http://embedderdev:3001
+    # api → geo (IP enrichment)
+    GEO_URL: http://geodev:3002
     # if you also run edge in the box, it verifies against the local api
     API_INTERNAL_URL: http://localhost:3000
     # the app box's own public origin (web runs inside it)
@@ -65,10 +64,18 @@ services:
     enableSubdomainAccess: true
     priority: 10
 
-  - hostname: embedder
+  # *dev siblings, because `app` below is built from the apidev setup — a box built with
+  # *dev setups gets *dev siblings, which is what those setups pin.
+  - hostname: embedderdev
     type: nodejs@24
     buildFromGit: https://github.com/fxck/noola
-    zeropsSetup: embedderprod
+    zeropsSetup: embedderdev
+    minContainers: 1
+    maxContainers: 1
+  - hostname: geodev
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: geodev
     minContainers: 1
     maxContainers: 1
 
