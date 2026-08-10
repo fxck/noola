@@ -237,6 +237,7 @@ function toDraft(b: DiscordMirrorBinding): Draft {
     attributionMode: b.attribution_mode,
     attributionName: b.attribution_name,
     filter: b.filter ?? {},
+    quickLinks: b.quick_links ?? [],
   };
 }
 
@@ -292,6 +293,7 @@ export function SettingsDiscordMirrorPage() {
         attributionMode: "team",
         attributionName: null,
         filter: {},
+        quickLinks: [],
       },
     ]);
   }
@@ -368,7 +370,8 @@ export function SettingsDiscordMirrorPage() {
                     !!b.attributionName ||
                     (b.filter.priorities?.length ?? 0) > 0 ||
                     (b.filter.tags?.length ?? 0) > 0 ||
-                    (b.filter.topics?.length ?? 0) > 0;
+                    (b.filter.topics?.length ?? 0) > 0 ||
+                    (b.quickLinks?.length ?? 0) > 0;
                   return (
                     <section key={b._key} className="overflow-hidden rounded-xl border bg-card shadow-sm">
                       <div className="flex items-center gap-2 border-b bg-muted/30 px-4 py-2.5">
@@ -528,6 +531,63 @@ export function SettingsDiscordMirrorPage() {
                                 />
                               </Field>
                             </div>
+                          </div>
+
+                          <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
+                            <div>
+                              <p className="text-sm font-medium">Quick links in the post header</p>
+                              <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
+                                Extra links shown under each mirrored ticket — e.g. a backoffice page. Use{" "}
+                                <code className="rounded bg-muted px-1">{"{external_id}"}</code>,{" "}
+                                <code className="rounded bg-muted px-1">{"{email}"}</code>,{" "}
+                                <code className="rounded bg-muted px-1">{"{company}"}</code>,{" "}
+                                <code className="rounded bg-muted px-1">{"{ticket_id}"}</code> or{" "}
+                                <code className="rounded bg-muted px-1">{"{name}"}</code> in the URL. A link whose
+                                placeholder has no value for a ticket is skipped.
+                              </p>
+                            </div>
+                            {(b.quickLinks ?? []).map((ql, i) => (
+                              <div key={i} className="flex gap-2">
+                                <Input
+                                  value={ql.label}
+                                  onChange={(e) => {
+                                    const next = [...(b.quickLinks ?? [])];
+                                    next[i] = { ...next[i], label: e.target.value };
+                                    patch(b._key, { quickLinks: next });
+                                  }}
+                                  placeholder="Backoffice"
+                                  className="h-9 w-40 shrink-0"
+                                />
+                                <Input
+                                  value={ql.url}
+                                  onChange={(e) => {
+                                    const next = [...(b.quickLinks ?? [])];
+                                    next[i] = { ...next[i], url: e.target.value };
+                                    patch(b._key, { quickLinks: next });
+                                  }}
+                                  placeholder="https://backoffice.acme.com/users/{external_id}"
+                                  className="h-9 flex-1 font-mono text-xs"
+                                />
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-9 shrink-0 text-muted-foreground hover:text-destructive"
+                                  aria-label="Remove link"
+                                  onClick={() =>
+                                    patch(b._key, { quickLinks: (b.quickLinks ?? []).filter((_, j) => j !== i) })
+                                  }
+                                >
+                                  <Trash2 className="size-4" />
+                                </Button>
+                              </div>
+                            ))}
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => patch(b._key, { quickLinks: [...(b.quickLinks ?? []), { label: "", url: "" }] })}
+                            >
+                              <Plus className="size-4" /> Add link
+                            </Button>
                           </div>
                         </div>
                       </Disclosure>

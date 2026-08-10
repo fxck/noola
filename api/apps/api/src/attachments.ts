@@ -56,7 +56,29 @@ export async function persistInboundAttachments(
   messageId: string,
   files: { url: string; filename: string; contentType: string; size: number }[],
 ): Promise<void> {
+  return persistInboundOwned(tenantId, ticketId, { messageId }, files);
+}
+
+/** Same as persistInboundAttachments, but the files hang off an internal NOTE (note_id) rather than a
+ *  message — e.g. a Discord mirror-thread message that lands as a note. */
+export async function persistInboundNoteAttachments(
+  tenantId: string,
+  ticketId: string,
+  noteId: string,
+  files: { url: string; filename: string; contentType: string; size: number }[],
+): Promise<void> {
+  return persistInboundOwned(tenantId, ticketId, { noteId }, files);
+}
+
+async function persistInboundOwned(
+  tenantId: string,
+  ticketId: string,
+  owner: { messageId: string } | { noteId: string },
+  files: { url: string; filename: string; contentType: string; size: number }[],
+): Promise<void> {
   if (files.length === 0) return;
+  const messageId = "messageId" in owner ? owner.messageId : null;
+  const noteId = "noteId" in owner ? owner.noteId : null;
   for (const f of files) {
     const safe = (f.filename || "file").replace(/^.*[\\/]/, "").replace(/[^\w.\- ]+/g, "_").slice(0, 120) || "file";
     const contentType = f.contentType || "application/octet-stream";
@@ -79,9 +101,9 @@ export async function persistInboundAttachments(
     }
     await withTenant(tenantId, async (c) => {
       await c.query(
-        `INSERT INTO message_attachments (tenant_id, ticket_id, message_id, uploaded_by, filename, content_type, size_bytes, storage_key)
-         VALUES (current_tenant(), $1, $2, NULL, $3, $4, $5, $6)`,
-        [ticketId, messageId, safe, contentType, sizeBytes, storageKey],
+        `INSERT INTO message_attachments (tenant_id, ticket_id, message_id, note_id, uploaded_by, filename, content_type, size_bytes, storage_key)
+         VALUES (current_tenant(), $1, $2, $3, NULL, $4, $5, $6, $7)`,
+        [ticketId, messageId, noteId, safe, contentType, sizeBytes, storageKey],
       );
     });
   }
@@ -160,6 +182,29 @@ export async function attachmentsForTicket(
       const list = by.get(row.message_id) ?? [];
       list.push({ id: row.id, filename: row.filename, content_type: row.content_type, size_bytes: row.size_bytes });
       by.set(row.message_id, list);
+    }
+    return by;
+  });
+}
+
+/** All attachments for a ticket's NOTES, grouped by note_id (for the notes read). */
+export async function attachmentsForNotes(
+  tenantId: string,
+  ticketId: string,
+): Promise<Map<string, AttachmentRow[]>> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT note_id, id, filename, content_type, size_bytes
+         FROM message_attachments
+        WHERE ticket_id = $1 AND note_id IS NOT NULL
+        ORDER BY created_at ASC`,
+      [ticketId],
+    );
+    const by = new Map<string, AttachmentRow[]>();
+    for (const row of r.rows as (AttachmentRow & { note_id: string })[]) {
+      const list = by.get(row.note_id) ?? [];
+      list.push({ id: row.id, filename: row.filename, content_type: row.content_type, size_bytes: row.size_bytes });
+      by.set(row.note_id, list);
     }
     return by;
   });

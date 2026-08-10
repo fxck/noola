@@ -1,4 +1,5 @@
 import { api } from "@/lib/api";
+import type { Attachment } from "@/lib/tickets";
 
 // Internal notes / side conversations — agent-only annotations on a ticket, never
 // dispatched to a channel. Interleaved into the thread by created_at, client-side.
@@ -12,6 +13,8 @@ export interface Note {
   mentioned_ids: string[];
   mentioned_names: string[];
   created_at: string;
+  /** Files attached to the note (e.g. a screenshot posted in a Discord mirror thread). */
+  attachments?: Attachment[];
 }
 
 export async function fetchNotes(ticketId: string): Promise<Note[]> {

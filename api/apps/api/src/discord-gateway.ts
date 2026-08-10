@@ -2,7 +2,7 @@ import {
   Client, GatewayIntentBits, Events, ChannelType, Partials,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
   type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
-  type ForumChannel, type ThreadChannel,
+  type ForumChannel, type ThreadChannel, type Message,
 } from "discord.js";
 import { relayPool } from "@repo/db";
 import { splitForDiscord } from "./channels/format.js";
@@ -56,6 +56,10 @@ export interface MirrorTransport {
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
   /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
   forumTagNames?(threadId: string): Promise<string[]>;
+  /** Current archived state of a thread. Used to make a Noola-side close idempotent — skip the
+   *  "Marked resolved" notice + re-archive when the origin thread is already archived (e.g. it was
+   *  closed on Discord but that close never synced back). null = couldn't read the thread. */
+  threadArchived?(threadId: string): Promise<boolean | null>;
   /** Available tag names on a FORUM channel (Settings picker for the per-binding close tag). */
   listForumTags?(channelId: string): Promise<string[]>;
   /** Lock a thread (per-binding close action). Optional, like forumTagNames. */
@@ -192,6 +196,10 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       if (!t || t.parent?.type !== ChannelType.GuildForum) return [];
       return (t.parent as ForumChannel).availableTags.map((tg) => tg.name);
     },
+    async threadArchived(threadId) {
+      const t = await thread(threadId);
+      return t ? (t.archived ?? false) : null;
+    },
     async listForumTags(channelId) {
       const f = await forum(channelId);
       return f ? f.availableTags.map((tg) => tg.name) : [];
@@ -218,6 +226,32 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       return member ? [...member.roles.cache.keys()] : [];
     },
   };
+}
+
+/** Replace Discord's raw mention tokens with human-readable text BEFORE the content is persisted as a
+ *  note or a ticket message — otherwise "<@741192238247313488> …" is stored verbatim (and later shown
+ *  to agents). Uses the resolved mentions discord.js already attaches to the payload, so there are NO
+ *  extra API calls: <@id>/<@!id> → @displayname, <#id> → #channel, <@&id> → @role. An id that isn't in
+ *  the payload (uncached) keeps its raw token rather than guessing. */
+function resolveMentions(msg: Message): string {
+  const text = msg.content ?? "";
+  if (!text.includes("<")) return text; // fast path — nothing to resolve
+  return text
+    .replace(/<@!?(\d+)>/g, (m, id: string) => {
+      const name =
+        msg.mentions.members?.get(id)?.displayName ??
+        msg.mentions.users.get(id)?.globalName ??
+        msg.mentions.users.get(id)?.username;
+      return name ? `@${name}` : m;
+    })
+    .replace(/<#(\d+)>/g, (m, id: string) => {
+      const ch = msg.mentions.channels.get(id) as { name?: string } | undefined;
+      return ch?.name ? `#${ch.name}` : m;
+    })
+    .replace(/<@&(\d+)>/g, (m, id: string) => {
+      const role = msg.mentions.roles.get(id);
+      return role ? `@${role.name}` : m;
+    });
 }
 
 /** Thread taxonomy from a discord.js channel: a thread whose parent is a forum is a forum_post,
@@ -465,6 +499,17 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
         if (fetched) member = fetched;
       }
       const tax = threadTaxonomy(msg.channel);
+      // Resolve <@id>/<#id>/<@&id> tokens to names ONCE, up front, so BOTH seams (mirror note +
+      // customer ingest) persist human-readable text instead of raw mention ids.
+      const resolvedContent = resolveMentions(msg);
+      // Discord CDN attachments (screenshots/files). Built up-front so BOTH seams can persist them —
+      // previously this ran AFTER the mirror-seam early-return, so internal notes lost every file.
+      const attachments = [...msg.attachments.values()].map((a) => ({
+        url: a.url,
+        filename: a.name ?? "file",
+        contentType: a.contentType ?? "application/octet-stream",
+        size: a.size ?? 0,
+      }));
 
       // Ops-mirror seam: a message inside a mirror forum post is team collaboration on the mirrored
       // ticket (note by default, 📤 promotes) — it must NEVER fall through to customer ingest. The
@@ -476,24 +521,19 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
         discordMessageId: msg.id,
         authorId: msg.author.id,
         authorDisplayName: member?.displayName ?? msg.author.globalName ?? msg.author.username,
-        content: msg.content ?? "",
+        content: resolvedContent,
         roleIds: member ? [...member.roles.cache.keys()] : [],
+        attachments,
         isBotOrWebhook: msg.author.bot || msg.webhookId != null,
       });
       if (mirrored.handled) return;
 
-      const attachments = [...msg.attachments.values()].map((a) => ({
-        url: a.url,
-        filename: a.name ?? "file",
-        contentType: a.contentType ?? "application/octet-stream",
-        size: a.size ?? 0,
-      }));
       const embeds = msg.embeds.map((e) => ({ title: e.title, description: e.description, url: e.url }));
       const r = await handleInboundMessage({
         guildId: msg.guildId,
         channelId: tax.threadId ?? msg.channelId,
         authorId: msg.author.id,
-        content: msg.content ?? "",
+        content: resolvedContent,
         discordMessageId: msg.id,
         threadId: tax.threadId,
         parentId: tax.parentId,

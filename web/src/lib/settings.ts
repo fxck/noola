@@ -218,6 +218,12 @@ export interface MirrorFilter {
   teamIds?: string[];
   channels?: string[];
 }
+/** One extra link rendered in the Discord mirror-post header. `url` may carry
+ *  {ticket_id}/{email}/{external_id}/{company}/{name} placeholders, filled per ticket. */
+export interface QuickLink {
+  label: string;
+  url: string;
+}
 export interface DiscordMirrorBinding {
   id: string;
   guild_id: string;
@@ -227,6 +233,7 @@ export interface DiscordMirrorBinding {
   attribution_mode: "team" | "collaborator";
   attribution_name: string | null;
   filter: MirrorFilter;
+  quick_links: QuickLink[];
 }
 export interface DiscordMirrorGuild {
   id: string;
@@ -246,6 +253,7 @@ export interface DiscordMirrorBindingInput {
   attributionMode: "team" | "collaborator";
   attributionName?: string | null;
   filter: MirrorFilter;
+  quickLinks?: QuickLink[];
 }
 
 export async function fetchDiscordMirrorConfig(): Promise<DiscordMirrorConfig> {

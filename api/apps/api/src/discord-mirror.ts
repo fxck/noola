@@ -1,6 +1,8 @@
 import { relayPool, withTenant } from "@repo/db";
 import { addNote } from "./notes.js";
+import { persistInboundNoteAttachments } from "./attachments.js";
 import { ingestInbound } from "./ingest.js";
+import { notifyContactByEmailIfAway } from "./email.js";
 import { getChannelDriver } from "./channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "./translate.js";
 import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport } from "./discord-gateway.js";
@@ -35,6 +37,13 @@ export interface MirrorFilter {
   channels?: string[];
 }
 
+/** One extra link shown in the mirror-post header. `url` may carry {ticket_id}/{email}/{external_id}/
+ *  {company}/{name} placeholders, filled per ticket. */
+export interface QuickLink {
+  label: string;
+  url: string;
+}
+
 export interface MirrorBinding {
   id: string;
   tenant_id: string;
@@ -45,6 +54,7 @@ export interface MirrorBinding {
   attribution_mode: "team" | "collaborator";
   attribution_name: string | null;
   filter: MirrorFilter;
+  quick_links: QuickLink[];
 }
 
 // Test seam: delegates to the gateway-level override so the mirror engine AND the VIP
@@ -73,6 +83,15 @@ function asFilter(v: unknown): MirrorFilter {
   return {};
 }
 
+function asQuickLinks(v: unknown): QuickLink[] {
+  const raw = typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return []; } })() : v;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e): e is { label: unknown; url: unknown } => !!e && typeof e === "object")
+    .map((e) => ({ label: String(e.label ?? "").slice(0, 40), url: String(e.url ?? "").slice(0, 500) }))
+    .filter((e) => e.label && e.url);
+}
+
 function rowToBinding(r: Record<string, unknown>): MirrorBinding {
   return {
     id: r.id as string,
@@ -84,6 +103,7 @@ function rowToBinding(r: Record<string, unknown>): MirrorBinding {
     attribution_mode: (r.attribution_mode as "team" | "collaborator") ?? "team",
     attribution_name: (r.attribution_name as string | null) ?? null,
     filter: asFilter(r.filter),
+    quick_links: asQuickLinks(r.quick_links),
   };
 }
 
@@ -104,22 +124,23 @@ export async function replaceMirrorBindings(
   bindings: Array<{
     guildId: string; forumChannelId: string; enabled: boolean;
     responderRoleId?: string | null; attributionMode?: "team" | "collaborator";
-    attributionName?: string | null; filter?: MirrorFilter;
+    attributionName?: string | null; filter?: MirrorFilter; quickLinks?: QuickLink[];
   }>,
 ): Promise<MirrorBinding[]> {
   const keep: string[] = [];
   for (const b of bindings) {
     const r = await relayPool.query(
       `INSERT INTO discord_mirror_bindings
-         (tenant_id, guild_id, forum_channel_id, enabled, responder_role_id, attribution_mode, attribution_name, filter)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+         (tenant_id, guild_id, forum_channel_id, enabled, responder_role_id, attribution_mode, attribution_name, filter, quick_links)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
        ON CONFLICT (tenant_id, forum_channel_id) DO UPDATE SET
          guild_id = EXCLUDED.guild_id, enabled = EXCLUDED.enabled,
          responder_role_id = EXCLUDED.responder_role_id, attribution_mode = EXCLUDED.attribution_mode,
-         attribution_name = EXCLUDED.attribution_name, filter = EXCLUDED.filter
+         attribution_name = EXCLUDED.attribution_name, filter = EXCLUDED.filter, quick_links = EXCLUDED.quick_links
        RETURNING id`,
       [tenantId, b.guildId, b.forumChannelId, b.enabled, b.responderRoleId ?? null,
-       b.attributionMode ?? "team", b.attributionName ?? null, JSON.stringify(b.filter ?? {})],
+       b.attributionMode ?? "team", b.attributionName ?? null, JSON.stringify(b.filter ?? {}),
+       JSON.stringify(asQuickLinks(b.quickLinks ?? []))],
     );
     keep.push(r.rows[0].id as string);
   }
@@ -141,13 +162,16 @@ interface TicketBrief {
   channel_type: string;
   contact_name: string | null;
   contact_email: string | null;
+  contact_external_id: string | null;
+  contact_company: string | null;
 }
 
 async function loadTicketBrief(tenantId: string, ticketId: string): Promise<TicketBrief | null> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT t.id, t.subject, t.status, t.priority, t.tags, t.topic, t.team_id, t.channel_type,
-              ct.name AS contact_name, ct.email AS contact_email
+              ct.name AS contact_name, ct.email AS contact_email,
+              ct.external_id AS contact_external_id, ct.company AS contact_company
          FROM tickets t
          LEFT JOIN contacts ct ON ct.tenant_id = t.tenant_id AND ct.id = t.contact_id
         WHERE t.id = $1`,
@@ -185,15 +209,50 @@ function postTitle(t: TicketBrief): string {
   return `${t.subject || "Support ticket"}`.slice(0, 96);
 }
 
-function postHeader(t: TicketBrief, latestBody: string | null): string {
+/** Fill a quick-link url template with this ticket's values (URL-encoded). Returns null when the
+ *  template references a placeholder that has no value for this ticket, so we skip a would-be-broken
+ *  link (e.g. `/users/`) rather than render it. */
+function fillLink(url: string, t: TicketBrief): string | null {
+  const vals: Record<string, string | null> = {
+    ticket_id: t.id,
+    email: t.contact_email,
+    external_id: t.contact_external_id,
+    company: t.contact_company,
+    name: t.contact_name,
+  };
+  let missing = false;
+  const filled = url.replace(/\{(ticket_id|email|external_id|company|name)\}/g, (_m, k: string) => {
+    const v = vals[k];
+    if (!v) { missing = true; return ""; }
+    return encodeURIComponent(v);
+  });
+  return missing ? null : filled;
+}
+
+function postHeader(t: TicketBrief, latestBody: string | null, quickLinks: QuickLink[] = []): string {
   const who = t.contact_name || t.contact_email || "Unknown contact";
   const lines = [
     `**${t.subject || "Support ticket"}**`,
     `From **${who}** · via ${t.channel_type} · priority **${t.priority}**`,
   ];
+  // Contact metadata — only the parts we actually have, and email only when it isn't already the
+  // "who", so we never print a bare or duplicated field.
+  const meta: string[] = [];
+  if (t.contact_email && t.contact_email !== who) meta.push(`Email: ${t.contact_email}`);
+  if (t.contact_external_id) meta.push(`ID: ${t.contact_external_id}`);
+  if (t.contact_company) meta.push(`Company: ${t.contact_company}`);
+  if (meta.length) lines.push(meta.join(" · "));
   if (latestBody) lines.push("", quote(latestBody));
   const base = webBase();
-  if (base) lines.push("", `Console: ${base}/tickets/${t.id}`);
+  const links: string[] = [];
+  if (base) links.push(`Console: ${base}/tickets/${t.id}`);
+  // Per-binding quick-links (Backoffice, …). Wrap each url in <> so N links don't each spawn a link
+  // preview embed. A link whose placeholder has no value for this ticket is skipped.
+  for (const ql of quickLinks) {
+    const u = fillLink(ql.url, t);
+    if (u) links.push(`${ql.label}: <${u}>`);
+  }
+  if (links.length) lines.push("", links.join("\n"));
   lines.push("", `_Messages here are internal notes. React ${PROMOTE_EMOJI} on a message to send it to the customer; ✅ closes, 🔄 reopens, 👀 assigns to you, 💤 snoozes._`);
   return lines.join("\n");
 }
@@ -262,7 +321,7 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
   });
 
   const created = await tp
-    .createForumPost(binding.forum_channel_id, postTitle(t), postHeader(t, latest), mirrorTagNames(t))
+    .createForumPost(binding.forum_channel_id, postTitle(t), postHeader(t, latest, binding.quick_links), mirrorTagNames(t))
     .catch(() => null);
   if (!created) {
     await relayPool.query("DELETE FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 AND post_thread_id LIKE 'pending:%'", [tenantId, ticketId]);
@@ -503,6 +562,15 @@ async function archiveIntakeThreadOnClose(tenantId: string, ticketId: string, ag
   const extGuild = t.rows[0].external_guild_id as string | null;
   const tp = transport();
   if (!tp) return;
+
+  // Idempotency: if the origin thread is ALREADY archived, a close was already reflected here (e.g.
+  // it was closed on Discord and that close never synced back to Noola, so Noola only now fires its
+  // own close). Re-posting the "Marked resolved" notice + re-archiving would spam an already-resolved
+  // thread — and posting even re-activates it first. Skip entirely. Best-effort: only a definite
+  // `true` short-circuits; null/undefined (unknown, or a transport without the probe) falls through
+  // to today's behavior so we never SILENTLY drop a real close notice.
+  if ((await tp.threadArchived?.(threadId)) === true) return;
+
   const by = agentName ? ` by ${agentName}` : "";
 
   // Per-forum close config (the origin forum binding, if any): a chosen close_tag, whether to
@@ -560,6 +628,7 @@ export interface MirrorPostMessage {
   authorDisplayName: string | null;
   content: string;
   roleIds: string[];
+  attachments?: { url: string; filename: string; contentType: string; size: number }[];
   isBotOrWebhook: boolean;
 }
 
@@ -576,7 +645,11 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
   if (!mirror) return { handled: false };
   if (m.isBotOrWebhook) return { handled: true }; // our relays / other bots: never notes, never ingest
   const body = (m.content ?? "").trim();
-  if (!body) return { handled: true };
+  const attachments = m.attachments ?? [];
+  if (!body && attachments.length === 0) return { handled: true };
+  // An attachment-only message (screenshot, no text) still becomes a note — label it with the file
+  // name(s) so the note isn't blank; the file itself attaches below.
+  const noteBody = body || attachments.map((a) => a.filename).join(", ") || "(attachment)";
 
   const binding = mirror.binding_id ? await loadBinding(mirror.binding_id) : null;
   // Resolve the Discord author to a Noola seat ONCE — reused to attribute the note AND gate promotion.
@@ -595,15 +668,20 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
   const note = await addNote(mirror.tenant_id, mirror.ticket_id, {
     authorId: agentId ?? null,
     authorName: `${name} (Discord)`,
-    body,
+    body: noteBody,
   }).catch(() => null);
+  // Carry any Discord attachments onto the note (best-effort, post-insert) so a screenshot posted in
+  // the mirror thread is visible on the ticket instead of being silently dropped.
+  if (note?.id && attachments.length) {
+    await persistInboundNoteAttachments(mirror.tenant_id, mirror.ticket_id, note.id, attachments).catch(() => {});
+  }
 
   await relayPool.query(
     `INSERT INTO ticket_mirror_messages
        (discord_message_id, tenant_id, ticket_id, post_thread_id, author_discord_id, author_display_name, is_responder, body, note_id, author_user_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (discord_message_id) DO NOTHING`,
-    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, body, note?.id ?? null, agentId ?? null],
+    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, noteBody, note?.id ?? null, agentId ?? null],
   );
   return { handled: true, noteId: note?.id };
 }
@@ -695,9 +773,24 @@ export async function handleMirrorReaction(
     ? await driver.dispatch(
         { tenantId: row.tenant_id, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId },
         dispatchBody,
-        { agentName: attribution },
+        // Read receipt: embed the pixel keyed to THIS agent message so an email open stamps seen_at —
+        // same as the web composer's reply route. Without it a promoted reply never shows "Seen".
+        { agentName: attribution, seenMessageId: result.messageId },
       ).catch(() => ({ delivered: false as const, reason: "dispatch_error" }))
     : { delivered: false as const, reason: "no-driver" };
+
+  // Widget/away fallback (parity with the web reply route): a widget reply has no outbound driver, so
+  // if the customer isn't currently in the widget and we have their email, ALSO email the promoted
+  // reply — otherwise an away customer never hears back until they reopen the widget. Best-effort.
+  if (!out.delivered && (result.channelType === "widget" || out.reason === "no-driver")) {
+    void notifyContactByEmailIfAway(row.tenant_id, {
+      ticketId: result.ticketId,
+      subject: result.subject,
+      body: dispatchBody,
+      agentName: attribution,
+      messageId: result.messageId,
+    }).catch(() => {});
+  }
 
   await relayPool.query(
     "UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1",

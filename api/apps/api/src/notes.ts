@@ -1,5 +1,6 @@
 import { withTenant } from "@repo/db";
 import type { PoolClient } from "pg";
+import { attachmentsForNotes, type AttachmentRow } from "./attachments.js";
 
 // Internal notes / side conversations — agent-only annotations on a ticket. NEVER
 // dispatched to a channel. Notes can @mention teammates: the mention tokens are resolved
@@ -14,20 +15,24 @@ export interface NoteRow {
   mentioned_ids: string[];
   mentioned_names: string[];
   created_at: string;
+  /** Files attached to the note (e.g. a screenshot posted in a Discord mirror thread). */
+  attachments: AttachmentRow[];
 }
 
 const COLS = `n.id, n.ticket_id, n.author_id, n.author_name, n.body, n.mentioned_ids, n.created_at,
   COALESCE((SELECT array_agg(u.name ORDER BY u.name) FROM users u WHERE u.id = ANY(n.mentioned_ids)), '{}') AS mentioned_names`;
 
-/** A ticket's internal notes, oldest first (thread order). */
+/** A ticket's internal notes, oldest first (thread order), each with its attachments hydrated. */
 export async function listNotes(tenantId: string, ticketId: string): Promise<NoteRow[]> {
-  return withTenant(tenantId, async (c) => {
+  const rows = await withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT ${COLS} FROM ticket_notes n WHERE n.ticket_id = $1 ORDER BY n.created_at ASC LIMIT 500`,
       [ticketId],
     );
-    return r.rows as NoteRow[];
+    return r.rows as Omit<NoteRow, "attachments">[];
   });
+  const byNote = await attachmentsForNotes(tenantId, ticketId);
+  return rows.map((n) => ({ ...n, attachments: byNote.get(n.id) ?? [] }));
 }
 
 /** Resolve @tokens in the body to member ids (match on full name or first name, case-insensitive). */
@@ -93,9 +98,11 @@ export async function addNote(
       "INSERT INTO outbox (tenant_id, event_type, subject, payload) VALUES (current_tenant(), $1, 'noola.events.' || current_tenant(), $2::jsonb)",
       ["note.added", JSON.stringify(envelope)],
     );
-    // Re-read on the same connection so mentioned_names hydrate from the just-written ids.
+    // Re-read on the same connection so mentioned_names hydrate from the just-written ids. A brand-new
+    // note carries no attachments yet (a Discord note persists them right after this returns; the
+    // note.added event then triggers a listNotes refetch that hydrates them).
     const r = await c.query(`SELECT ${COLS} FROM ticket_notes n WHERE n.id = $1`, [ins.rows[0].id]);
-    return r.rows[0] as NoteRow;
+    return { ...(r.rows[0] as Omit<NoteRow, "attachments">), attachments: [] };
   });
 }
 
