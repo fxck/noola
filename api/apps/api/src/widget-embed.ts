@@ -111,9 +111,10 @@ export const WIDGET_JS = String.raw`(function () {
           var existing = getConv(sc.conversationId);
           if (existing) {
             existing.escalated = sc.assistantEnabled === false;
+            existing.unseen = sc.unseen === true;
             if (!existing.msgs.length && preview.length) { existing.msgs = preview; existing.updatedAt = at; changed = true; }
           } else {
-            convs.push({ id: sc.conversationId, escalated: sc.assistantEnabled === false, updatedAt: at, unread: 0, msgs: preview });
+            convs.push({ id: sc.conversationId, escalated: sc.assistantEnabled === false, updatedAt: at, unread: 0, unseen: sc.unseen === true, msgs: preview });
             changed = true;
           }
         }
@@ -467,6 +468,7 @@ export const WIDGET_JS = String.raw`(function () {
     if (launcherHidden) bubbleEl.style.display = 'none'; // start-hidden embed — no launcher until shown
     renderBadge();
     resumeLive();
+    bootSyncPop();
   }
 
   function applyConfig() {
@@ -548,6 +550,24 @@ export const WIDGET_JS = String.raw`(function () {
     view = 'thread'; threadId = convId; pendingDir = 'none';
     openPanel();          // shows the panel + renders the thread (wire scrolls to the latest message)
     markRead(convId);     // they're viewing it now — clear the unread badge
+  }
+
+  // On boot, an identified visitor's unseen agent reply can live ONLY on the server — they were away,
+  // or on a fresh browser with nothing cached — and resumeLive() only watches locally-cached
+  // conversations, so it would never surface. Pull the server list once and pop the newest thread the
+  // server marks UNSEEN (an agent message past the read watermark). Opening it stamps it seen, so it
+  // pops at most once. Identified visitors only — anonymous ones have no server-side history.
+  function bootSyncPop() {
+    if (!isIdentified() || panelOpen || serverConvsSynced) return;
+    serverConvsSynced = true;
+    syncServerConvs(function () {
+      if (panelOpen) return;
+      var best = null;
+      for (var i = 0; i < convs.length; i++) {
+        if (convs[i].unseen && (!best || (convs[i].updatedAt || 0) > (best.updatedAt || 0))) best = convs[i];
+      }
+      if (best && !panelOpen) autoOpenThread(best.id);
+    });
   }
 
   // Roots (tabbed) vs leaves (drilled-into) — decides the transition style.

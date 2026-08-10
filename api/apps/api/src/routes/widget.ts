@@ -632,7 +632,9 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
                    ORDER BY m.created_at DESC LIMIT 1) AS last_body,
                 (SELECT m.author_type FROM messages m
                    WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
-                   ORDER BY m.created_at DESC LIMIT 1) AS last_author
+                   ORDER BY m.created_at DESC LIMIT 1) AS last_author,
+                EXISTS (SELECT 1 FROM messages m
+                         WHERE m.ticket_id = t.id AND m.author_type = 'agent' AND m.seen_at IS NULL) AS has_unseen
            FROM tickets t
           WHERE t.channel_type = 'widget' AND t.external_channel_id IS NOT NULL AND t.contact_id = $1
           ORDER BY t.updated_at DESC LIMIT 20`,
@@ -641,12 +643,13 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       return r.rows;
     });
     return {
-      conversations: (rows as Array<{ cid: string; assistant_enabled: boolean; updated_at: string; last_body: string | null; last_author: string | null }>).map((x) => ({
+      conversations: (rows as Array<{ cid: string; assistant_enabled: boolean; updated_at: string; last_body: string | null; last_author: string | null; has_unseen: boolean }>).map((x) => ({
         conversationId: x.cid,
         lastBody: x.last_body ?? "",
         lastFromAgent: x.last_author === "agent",
         assistantEnabled: x.assistant_enabled !== false,
         updatedAt: x.updated_at,
+        unseen: x.has_unseen === true,
       })),
     };
   });
