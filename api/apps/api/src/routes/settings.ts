@@ -27,6 +27,10 @@ import {
 } from "../email-domains.js";
 import { verifySlackSignature, handleSlackEvent, listSlackConnections, upsertSlackConnection, deleteSlackConnection, resolveTenantByTeam } from "../slack.js";
 import { verifyResendSignature, ingestResendInbound } from "../resend-inbound.js";
+import {
+  getTenantEmailProvider, saveTenantEmailProvider, deleteTenantEmailProvider, rotateInboundHandle,
+  resolveTenantByInboundHandle, EmailProviderSecretsUnavailableError,
+} from "../email-provider.js";
 import { mdToSlack } from "../channels/format.js";
 import {
   handleSlackAskCommand, handleSlackDraftCommand, slackPostDraft,
@@ -492,6 +496,80 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
   });
 
+  // ---- BYO Resend: per-tenant email provider credentials --------------------
+  // A workspace brings their OWN Resend account so outbound (Resend SMTP) + inbound (per-tenant
+  // webhook) + the sending-domain wizard all run on THEIR key — deliverability/reputation isolation,
+  // their billing/quota, their key to rotate. Secrets are write-only (GET returns only hasApiKey /
+  // hasWebhookSecret + the inbound webhook URL to paste into Resend). Absent → the shared env account.
+
+  // Absolute base of THIS api's public origin (zeropsSubdomain → dev on apidev, prod on the prod api),
+  // so the inbound webhook URL we hand the tenant lands on the right instance. Mirrors seenPixelUrl.
+  const publicBase = (): string => {
+    const sub = process.env.zeropsSubdomain;
+    const base = sub ? (/^https?:\/\//.test(sub) ? sub : `https://${sub}`) : `http://localhost:${process.env.PORT ?? 3000}`;
+    return base.replace(/\/+$/, "");
+  };
+  const providerView = (status: Awaited<ReturnType<typeof getTenantEmailProvider>>) =>
+    status ? { ...status, inboundWebhookUrl: `${publicBase()}/email/inbound/resend/${status.inboundHandle}` } : null;
+
+  app.get("/email/provider", tenanted(async (tenantId) => ({ provider: providerView(await getTenantEmailProvider(tenantId)) })));
+
+  app.put("/email/provider", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    const b = (req.body ?? {}) as Partial<{ apiKey: string; webhookSecret: string; active: boolean }>;
+    const patch: { apiKey?: string; webhookSecret?: string; active?: boolean } = {};
+    // Only carry through fields the client actually sent — omit = leave as-is, "" = clear.
+    if (typeof b.apiKey === "string") patch.apiKey = b.apiKey;
+    if (typeof b.webhookSecret === "string") patch.webhookSecret = b.webhookSecret;
+    if (typeof b.active === "boolean") patch.active = b.active;
+    if (patch.apiKey === undefined && patch.webhookSecret === undefined && patch.active === undefined) {
+      return reply.code(400).send({ error: "provide apiKey and/or webhookSecret (or active)" });
+    }
+    try {
+      return { provider: providerView(await saveTenantEmailProvider(tenantId, patch)) };
+    } catch (e) {
+      if (e instanceof EmailProviderSecretsUnavailableError) return reply.code(503).send({ error: e.message });
+      throw e;
+    }
+  }));
+
+  app.post("/email/provider/rotate-handle", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    const handle = await rotateInboundHandle(tenantId);
+    if (!handle) return reply.code(404).send({ error: "no email provider configured" });
+    return { provider: providerView(await getTenantEmailProvider(tenantId)) };
+  }));
+
+  app.delete("/email/provider", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    const gone = await deleteTenantEmailProvider(tenantId);
+    return reply.code(gone ? 200 : 404).send({ ok: gone });
+  }));
+
+  // Per-tenant native Resend inbound webhook (PUBLIC lane). The <handle> in the URL resolves the
+  // tenant BEFORE signature verification — the chicken-and-egg fix: Svix signs the raw body with the
+  // tenant's OWN secret, so we must know whose secret to verify with first. Then ingestResendInbound
+  // fetches body/attachments with that same tenant's key. Unknown handle → 404; unconfigured → 503;
+  // bad signature → 401. This is the BYO twin of the shared /email/inbound/resend above.
+  app.post("/email/inbound/resend/:handle", async (req, reply) => {
+    const { handle } = req.params as { handle: string };
+    const resolved = await resolveTenantByInboundHandle(handle);
+    if (!resolved) return reply.code(404).send({ error: "unknown inbound handle" });
+    if (!resolved.webhookSecret) return reply.code(503).send({ error: "resend inbound not configured for this workspace" });
+    const h = req.headers as Record<string, string | undefined>;
+    const ok = verifyResendSignature(
+      (req as { rawBody?: string }).rawBody ?? "",
+      { id: h["svix-id"], timestamp: h["svix-timestamp"], signature: h["svix-signature"] },
+      resolved.webhookSecret,
+    );
+    if (!ok) return reply.code(401).send({ error: "bad signature" });
+    const r = await ingestResendInbound(
+      (req.body ?? {}) as Parameters<typeof ingestResendInbound>[0],
+      { apiKey: resolved.apiKey },
+    );
+    return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
+  });
+
   // ---- Model-B: branded sending domains (Intercom "custom email domain") ----
   // A tenant verifies their OWN domain (e.g. zerops.io) so replies send AS support@theirdomain with
   // real DKIM. GET lists them + whether self-serve provisioning is on (RESEND_API_KEY set); POST
@@ -499,7 +577,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
   // re-checks; DELETE removes. Governs OUTBOUND identity only — inbound routing stays in email_routes.
   app.get("/email/domains", tenanted(async (tenantId) => ({
     domains: await listSendingDomains(tenantId),
-    providerEnabled: sendingProviderEnabled(),
+    providerEnabled: await sendingProviderEnabled(tenantId),
   })));
 
   app.post("/email/domains", tenanted(async (tenantId, req, reply) => {

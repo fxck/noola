@@ -1,4 +1,5 @@
 import { withTenant } from "@repo/db";
+import { resendApiKeyForTenant } from "./email-provider.js";
 
 // Model-B branded email — per-tenant custom SENDING domains (the Intercom "custom email domain"
 // feature). A tenant verifies their OWN domain so outbound ticket replies send AS
@@ -10,16 +11,18 @@ import { withTenant } from "@repo/db";
 // for verification. INBOUND routing (address→tenant) stays in email_routes; this governs OUTBOUND
 // identity only.
 //
-// Provider seam: only Resend today, behind RESEND_API_KEY. When the key is UNSET the wizard still
-// works in "local tracking" mode — the tenant adds the domain in the Resend dashboard by hand and
-// we just record the intent (status='not_started', no DNS records fetched). Set the key to make it
-// fully self-serve.
+// Provider seam: only Resend today. The key is resolved PER TENANT — a BYO tenant's own Resend key
+// (so their domains live in THEIR account with THEIR DKIM) else the shared RESEND_API_KEY. When
+// neither is set the wizard still works in "local tracking" mode — the tenant adds the domain in the
+// Resend dashboard by hand and we just record the intent (status='not_started', no DNS records
+// fetched). Set a key (BYO or shared) to make it fully self-serve.
 
 const RESEND_API = "https://api.resend.com";
 
-/** True when the platform can talk to the email provider's domain API (self-serve mode). */
-export function sendingProviderEnabled(): boolean {
-  return Boolean(process.env.RESEND_API_KEY);
+/** True when a tenant can talk to the email provider's domain API (self-serve mode) — via their BYO
+ *  key or the shared env key. */
+export async function sendingProviderEnabled(tenantId: string): Promise<boolean> {
+  return Boolean(await resendApiKeyForTenant(tenantId));
 }
 
 // ---- row shape ------------------------------------------------------------
@@ -61,9 +64,8 @@ interface ResendDomain {
   records?: DnsRecord[];
 }
 
-async function resendFetch(path: string, init: RequestInit): Promise<ResendDomain> {
-  const key = process.env.RESEND_API_KEY;
-  if (!key) throw new SendingProviderError("email provider not configured (RESEND_API_KEY unset)");
+async function resendFetch(path: string, init: RequestInit, key: string | null | undefined): Promise<ResendDomain> {
+  if (!key) throw new SendingProviderError("email provider not configured (no Resend API key)");
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 15_000);
   let res: Response;
@@ -112,11 +114,12 @@ async function getRow(tenantId: string, id: string): Promise<SendingDomainRow | 
  * duplicate raises 23505 for the route to map to 409.
  */
 export async function addSendingDomain(tenantId: string, domain: string): Promise<SendingDomainRow> {
+  const apiKey = await resendApiKeyForTenant(tenantId);
   let providerId: string | null = null;
   let status = "not_started";
   let records: DnsRecord[] = [];
-  if (sendingProviderEnabled()) {
-    const created = fromResend(await resendFetch("/domains", { method: "POST", body: JSON.stringify({ name: domain }) }));
+  if (apiKey) {
+    const created = fromResend(await resendFetch("/domains", { method: "POST", body: JSON.stringify({ name: domain }) }, apiKey));
     providerId = created.providerId;
     status = created.status;
     records = created.records;
@@ -139,7 +142,8 @@ export async function addSendingDomain(tenantId: string, domain: string): Promis
 export async function refreshSendingDomain(tenantId: string, id: string): Promise<SendingDomainRow | null> {
   const row = await getRow(tenantId, id);
   if (!row) return null;
-  if (!row.provider_id || !sendingProviderEnabled()) {
+  const apiKey = await resendApiKeyForTenant(tenantId);
+  if (!row.provider_id || !apiKey) {
     // Local-only row (or provider now unconfigured) — just stamp the check time.
     return withTenant(tenantId, async (c) => {
       const r = await c.query(
@@ -149,8 +153,8 @@ export async function refreshSendingDomain(tenantId: string, id: string): Promis
     });
   }
   // Ask the provider to (re)verify, then read the authoritative current state.
-  await resendFetch(`/domains/${row.provider_id}/verify`, { method: "POST" }).catch(() => ({}) as ResendDomain);
-  const fresh = fromResend(await resendFetch(`/domains/${row.provider_id}`, { method: "GET" }));
+  await resendFetch(`/domains/${row.provider_id}/verify`, { method: "POST" }, apiKey).catch(() => ({}) as ResendDomain);
+  const fresh = fromResend(await resendFetch(`/domains/${row.provider_id}`, { method: "GET" }, apiKey));
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `UPDATE email_sending_domains SET status = $2, records = $3::jsonb, last_checked_at = now()
@@ -165,8 +169,9 @@ export async function refreshSendingDomain(tenantId: string, id: string): Promis
 export async function deleteSendingDomain(tenantId: string, id: string): Promise<boolean> {
   const row = await getRow(tenantId, id);
   if (!row) return false;
-  if (row.provider_id && sendingProviderEnabled()) {
-    await resendFetch(`/domains/${row.provider_id}`, { method: "DELETE" }).catch(() => ({}) as ResendDomain);
+  const apiKey = await resendApiKeyForTenant(tenantId);
+  if (row.provider_id && apiKey) {
+    await resendFetch(`/domains/${row.provider_id}`, { method: "DELETE" }, apiKey).catch(() => ({}) as ResendDomain);
   }
   return withTenant(tenantId, async (c) => {
     const r = await c.query("DELETE FROM email_sending_domains WHERE id = $1", [id]);

@@ -134,12 +134,16 @@ function htmlToText(html: string): string {
  * inbound spine. Body/attachment fetch is best-effort — a ticket still lands from the webhook
  * metadata + threading token even if the fetch-back hiccups.
  */
-export async function ingestResendInbound(payload: ResendInboundPayload): Promise<ResendInboundResult> {
+export async function ingestResendInbound(
+  payload: ResendInboundPayload,
+  opts?: { apiKey?: string | null },
+): Promise<ResendInboundResult> {
   if (payload?.type && payload.type !== "email.received") return { status: 200, ingested: false, reason: "ignored-event" };
   const data = payload?.data ?? {};
   const emailId = data.email_id;
   if (!emailId) return { status: 400, ingested: false, reason: "missing email_id" };
-  const apiKey = process.env.RESEND_API_KEY;
+  // BYO: the per-tenant inbound route passes the tenant's own key; the shared route falls back to env.
+  const apiKey = opts?.apiKey ?? process.env.RESEND_API_KEY;
   if (!apiKey) return { status: 503, ingested: false, reason: "RESEND_API_KEY not set" };
 
   // One fetch serves the body, the echo-guard headers, and forwarding-recipient fallbacks.

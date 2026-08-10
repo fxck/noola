@@ -15,6 +15,9 @@ import {
   Pencil,
   Trash2,
   Loader2,
+  KeyRound,
+  Copy,
+  Check,
   type LucideIcon,
 } from "lucide-react";
 import { SettingsPage } from "@/components/settings-page";
@@ -45,6 +48,7 @@ import {
   fetchEmailRoute, saveEmailRoute,
   type SendingDomain, type DnsRecord,
   fetchSendingDomains, addSendingDomain, verifySendingDomain, deleteSendingDomain,
+  type EmailProvider, fetchEmailProvider, saveEmailProvider, rotateEmailProviderHandle, deleteEmailProvider,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -604,6 +608,9 @@ export function SettingsIntegrationsPage() {
                     </FormDialog>
                   </section>
 
+                  {/* ── BYO Resend: bring your own email provider account ── */}
+                  <EmailProviderSection isAdmin={isAdmin} />
+
                   {/* ── Branded sending domains (Model-B: send AS the customer's own domain) ── */}
                   <SendingDomainsSection isAdmin={isAdmin} />
 
@@ -865,6 +872,152 @@ function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
+  const [provider, setProvider] = useState<EmailProvider | null | undefined>(undefined); // undefined=loading, null=not configured
+  const [apiKey, setApiKey] = useState("");
+  const [webhookSecret, setWebhookSecret] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [disconnect, setDisconnect] = useState(false);
+  const [removing, setRemoving] = useState(false);
+
+  useEffect(() => {
+    void fetchEmailProvider().then(setProvider).catch(() => setProvider(null));
+  }, []);
+
+  async function onSave() {
+    // Only send fields the admin actually typed — omit = leave as-is (never blanks a stored secret).
+    const patch: { apiKey?: string; webhookSecret?: string } = {};
+    if (apiKey.trim()) patch.apiKey = apiKey.trim();
+    if (webhookSecret.trim()) patch.webhookSecret = webhookSecret.trim();
+    if (patch.apiKey === undefined && patch.webhookSecret === undefined) {
+      toast.error("Enter an API key or webhook signing secret to save.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const p = await saveEmailProvider(patch);
+      setProvider(p);
+      setApiKey(""); setWebhookSecret("");
+      toast.success("Resend account connected. Point your Resend inbound webhook at the URL below.");
+    } catch (e) {
+      const s = (e as { status?: number }).status;
+      toast.error(s === 503 ? "Server can't store secrets (encryption key unset)." : (e as { detail?: string }).detail || "Couldn't save those credentials.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function onCopy(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { toast.error("Couldn't copy — select and copy the URL manually."); }
+  }
+
+  async function onRotate() {
+    setSaving(true);
+    try {
+      setProvider(await rotateEmailProviderHandle());
+      toast.success("New inbound URL generated — update it in your Resend webhook settings.");
+    } catch {
+      toast.error("Couldn't rotate the inbound URL.");
+    } finally { setSaving(false); }
+  }
+
+  async function onDisconnect() {
+    setRemoving(true);
+    try {
+      await deleteEmailProvider();
+      setProvider(null);
+      setApiKey(""); setWebhookSecret("");
+      toast.success("Resend account disconnected — email falls back to the shared account.");
+      setDisconnect(false);
+    } catch {
+      toast.error("Couldn't disconnect.");
+    } finally { setRemoving(false); }
+  }
+
+  if (provider === undefined) return null; // loading
+  if (!isAdmin && !provider) return null;  // nothing to show a non-admin who hasn't set it up
+
+  const connected = !!provider && (provider.hasApiKey || provider.hasWebhookSecret);
+
+  return (
+    <section className="mt-8">
+      <div className="mb-1 flex items-center gap-2">
+        <KeyRound className="size-4 text-muted-foreground" />
+        <h2 className="text-sm font-semibold text-foreground">Bring your own Resend</h2>
+        {connected && <Badge variant="success" className="h-5 text-micro">Connected</Badge>}
+      </div>
+      <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
+        Connect your own <span className="font-mono">Resend</span> account so email sends and receives through your
+        credentials — your sending reputation, your billing and quota, your key to rotate. Leave this empty to use the
+        shared platform account. Your keys are encrypted at rest and never shown again after saving.
+      </p>
+
+      {!isAdmin ? (
+        <p className="rounded-lg border border-dashed px-4 py-3 text-xs text-muted-foreground">
+          {connected ? "Your workspace is using its own Resend account." : "Using the shared email account."} Only an admin can change this.
+        </p>
+      ) : (
+        <div className="space-y-3 rounded-lg border p-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="ep-key">Resend API key {provider?.hasApiKey && <span className="ml-1 text-micro text-muted-foreground">(configured — leave blank to keep)</span>}</Label>
+            <Input id="ep-key" type="password" autoComplete="off" placeholder={provider?.hasApiKey ? "•••••••••• stored" : "re_…"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+            <p className="text-micro text-muted-foreground">Used for outbound sending (Resend SMTP), the domain wizard, and fetching inbound message bodies.</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="ep-whsec">Inbound webhook signing secret {provider?.hasWebhookSecret && <span className="ml-1 text-micro text-muted-foreground">(configured — leave blank to keep)</span>}</Label>
+            <Input id="ep-whsec" type="password" autoComplete="off" placeholder={provider?.hasWebhookSecret ? "•••••••••• stored" : "whsec_…"} value={webhookSecret} onChange={(e) => setWebhookSecret(e.target.value)} />
+            <p className="text-micro text-muted-foreground">From your Resend webhook (the <span className="font-mono">email.received</span> event). Verifies inbound is really from Resend.</p>
+          </div>
+
+          {connected && provider?.hasWebhookSecret && (
+            <div className="space-y-1.5">
+              <Label>Your inbound webhook URL</Label>
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-xs">{provider.inboundWebhookUrl}</code>
+                <Button variant="outline" size="icon" className="size-8 shrink-0" title="Copy URL" onClick={() => void onCopy(provider.inboundWebhookUrl)}>
+                  {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
+                </Button>
+              </div>
+              <p className="text-micro text-muted-foreground">
+                Paste this as the endpoint for your Resend <span className="font-mono">email.received</span> webhook.
+                <button type="button" className="ml-1 underline hover:text-foreground" onClick={() => void onRotate()}>Rotate URL</button> if it leaks.
+              </p>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between pt-1">
+            <Button variant="outline" size="sm" className="h-8 gap-1.5" disabled={saving} onClick={() => void onSave()}>
+              {saving ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
+              {connected ? "Update credentials" : "Connect Resend"}
+            </Button>
+            {connected && (
+              <Button variant="ghost" size="sm" className="h-8 text-muted-foreground hover:text-destructive" onClick={() => setDisconnect(true)}>
+                Disconnect
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={disconnect}
+        title="Disconnect your Resend account?"
+        message={<>Email will fall back to the shared platform account. Your stored key and webhook secret are deleted. This can't be undone.</>}
+        confirmLabel="Disconnect"
+        destructive
+        busy={removing}
+        onConfirm={() => void onDisconnect()}
+        onCancel={() => setDisconnect(false)}
+      />
+    </section>
   );
 }
 
