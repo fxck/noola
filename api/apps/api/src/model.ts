@@ -24,6 +24,10 @@ export interface WhoseTurnInput {
 export interface DraftSource {
   title: string;
   text: string;
+  /** Absolute URL of the source (a crawled/url document's page URL, with domain). Present so the
+   *  model links to the source with its real domain instead of emitting a bare path. Omitted for
+   *  sources with no canonical URL (manual uploads, KB, threads). */
+  url?: string;
 }
 /** One prior turn of the conversation (oldest→newest), so the hosted model has context —
  *  who said what — and can CONTINUE its own previous reply instead of denying it exists. */
@@ -265,7 +269,9 @@ const DRAFT_SYSTEM =
   "You are a customer-support agent. Write a concise, friendly reply to the customer's message, " +
   "grounded ONLY in the provided sources. Do not invent facts, prices, or policies. If the sources " +
   "do not answer the question, say you are looking into it and will follow up. Reply in the same " +
-  "language the customer is writing in. Sign off politely.";
+  "language the customer is writing in. Sign off politely. " +
+  "When you reference a source that lists a URL, link to it in Markdown using that EXACT full URL " +
+  "(scheme and domain included) — never write a bare path, and never invent or guess a domain.";
 
 // Output ceiling for a drafted reply. 600 was too tight: non-English replies (Czech, German, …)
 // tokenize ~2-3x heavier than English, so a normal-length answer hit the cap and was sent truncated
@@ -273,7 +279,9 @@ const DRAFT_SYSTEM =
 const DRAFT_MAX_TOKENS = 1500;
 
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
-  const sources = input.sources.map((s, i) => `[${i + 1}] ${s.title}\n${s.text}`).join("\n\n");
+  const sources = input.sources
+    .map((s, i) => `[${i + 1}] ${s.title}${s.url ? ` — ${s.url}` : ""}\n${s.text}`)
+    .join("\n\n");
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.
   const persona = input.persona?.trim();

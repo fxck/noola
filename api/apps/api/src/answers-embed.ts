@@ -123,11 +123,19 @@ export const ANSWERS_JS = String.raw`(function () {
     }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (s) {
       var html = '<div class="ans">' + esc(s.answer || 'No answer found.') + '</div>';
       if (s.citations && s.citations.length) {
-        var names = [];
-        for (var i = 0; i < s.citations.length && names.length < 4; i++) {
-          if (names.indexOf(s.citations[i].title) < 0) names.push(s.citations[i].title);
+        var seen = [], cites = [];
+        for (var i = 0; i < s.citations.length && cites.length < 4; i++) {
+          var c = s.citations[i];
+          if (seen.indexOf(c.title) < 0) { seen.push(c.title); cites.push(c); }
         }
-        html += '<div class="src"><b>Sources:</b> ' + names.map(esc).join(' · ') + '</div>';
+        html += '<div class="src"><b>Sources:</b> ' + cites.map(function (c) {
+          // Link when the citation carries an absolute http(s) URL (url-connector docs); the source_key
+          // is our own crawled page URL, so it already has the real domain. Attribute-escape the quote
+          // (esc() only handles &<>). Plain text otherwise.
+          return (c.url && /^https?:\/\//i.test(c.url))
+            ? '<a href="' + esc(c.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer">' + esc(c.title) + '</a>'
+            : esc(c.title);
+        }).join(' · ') + '</div>';
       }
       out.innerHTML = html;
     }).catch(function () {

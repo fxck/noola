@@ -67,8 +67,12 @@ async function main() {
 
   // ---- seed A's knowledge: a KB article + a document, both mentioning MARK ----
   const art = await createArticle(A, "COPILOT Refund policy", `Our ${MARK} refund policy: a full refund within 30 days, prorated after.`);
+  // Ingested with a url-connector source_key (an absolute page URL) so a citation can link to the
+  // real source with its domain — the crux of the "right path, missing domain" fix.
+  const DOC_URL = "https://docs.example.com/copilot/guide";
   const doc = await ingestDocument(A, "COPILOT-guide.md", "text/markdown",
-    `# Guide\n\nThe ${MARK} escalation path: contact your account manager for anything urgent.`);
+    `# Guide\n\nThe ${MARK} escalation path: contact your account manager for anything urgent.`,
+    null, { sourceKey: DOC_URL });
   // Globex has its OWN doc with the same distinctive word — the isolation trap.
   const bdoc = await ingestDocument(B, "COPILOT-globex.md", "text/markdown",
     `# Globex\n\nGlobex ${MARK} secret internal runbook — must never leak to Acme.`);
@@ -89,6 +93,8 @@ async function main() {
     check("suggest basedOn reflects the customer message", !!s.basedOn && s.basedOn.includes(MARK));
     check("suggest cites A's KB article", s.citations.some((c) => c.kind === "kb" && c.id === art.id));
     check("suggest cites A's document", s.citations.some((c) => c.kind === "document" && c.id === doc.id));
+    check("a url-sourced document citation carries its absolute source URL",
+      s.citations.some((c) => c.kind === "document" && c.id === doc.id && c.url === DOC_URL));
     check("a KB citation carries a title + snippet", s.citations.some((c) => c.kind === "kb" && c.title.length > 0 && c.snippet.length > 0));
     check("the draft is grounded in A's knowledge (mentions the marker)", s.draft.includes(MARK));
     // THE isolation gate: A's suggestion must never cite Globex's document.

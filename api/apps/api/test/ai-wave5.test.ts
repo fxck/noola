@@ -230,22 +230,25 @@ async function main() {
     await new Promise((r) => setTimeout(r, 200));
   }
   check("scoping: agent audience retrieves the internal document", agentCites >= 1);
-  const sPub = await suggestForQuery(A, docQuery, { source: "eval", audience: "public" });
-  check("scoping: public audience cannot cite documents/threads",
-    sPub.citations.every((c) => c.kind === "kb"));
-  check("scoping: public audience found no internal-doc citation",
-    sPub.citations.filter((c) => c.kind === "document").length === 0);
-
-  // Configured override: allow documents for public → the doc becomes citable.
-  await putPolicy(A, { source_scopes: { public: ["kb", "document"] } }, { sweep: false });
+  // Public audience now defaults to kb+document (DEFAULT_SCOPES.public) — a public answer can ground
+  // on crawled Documents, not only curated KB. (Reverses the old KB-only default so a doc-only topic,
+  // e.g. "firewall", is citable publicly instead of deflected.)
   let pubDocCites = 0;
-  for (let i = 0; i < 10; i++) {
-    const s2 = await suggestForQuery(A, docQuery, { source: "eval", audience: "public" });
-    pubDocCites = s2.citations.filter((c) => c.kind === "document").length;
+  for (let i = 0; i < 20; i++) {
+    const s = await suggestForQuery(A, docQuery, { source: "eval", audience: "public" });
+    pubDocCites = s.citations.filter((c) => c.kind === "document").length;
     if (pubDocCites >= 1) break;
     await new Promise((r) => setTimeout(r, 200));
   }
-  check("scoping: configured public scope widens retrieval", pubDocCites >= 1);
+  check("scoping: public audience retrieves documents by default (kb+document)", pubDocCites >= 1);
+
+  // Configured narrowing: a tenant that restricts public to KB-only stops document citations.
+  await putPolicy(A, { source_scopes: { public: ["kb"] } }, { sweep: false });
+  const sPubKb = await suggestForQuery(A, docQuery, { source: "eval", audience: "public" });
+  check("scoping: narrowed public scope (kb-only) excludes documents",
+    sPubKb.citations.every((c) => c.kind === "kb"));
+  check("scoping: narrowed public scope found no internal-doc citation",
+    sPubKb.citations.filter((c) => c.kind === "document").length === 0);
   await putPolicy(A, { source_scopes: {} }, { sweep: false });
 
   // ═══ 5. Slack answer-bot ═══════════════════════════════════════════════════
@@ -341,8 +344,10 @@ async function main() {
     typeof ov.model.provider === "string" && typeof ov.policy.mode === "string" && typeof ov.queue.pending === "number");
   check("overview: 7d activity reflects this suite's work",
     ov.activity7d.agentRuns >= 3 && ov.activity7d.autoSent >= 1 && ov.activity7d.drafts >= 1);
-  check("overview: public source scope reported (default kb)",
-    Array.isArray(ov.policy.publicSourceKinds) && ov.policy.publicSourceKinds.includes("kb"));
+  check("overview: public source scope reported (default kb+document)",
+    Array.isArray(ov.policy.publicSourceKinds)
+      && ov.policy.publicSourceKinds.includes("kb")
+      && ov.policy.publicSourceKinds.includes("document"));
 
   // ---- restore: policy off so later suites/demo aren't affected; drop the test connection.
   await putPolicy(A, { mode: "off", min_agreement: 2, channel_modes: { synthetic: "auto", discord: "auto" }, min_confidence: null }, { sweep: false });

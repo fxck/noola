@@ -121,6 +121,9 @@ export interface Citation {
   id: string;
   title: string;
   snippet: string;
+  /** Absolute source URL when the citation has a canonical page (url-connector documents). Lets the
+   *  answer/UI link to the real source with its domain. Undefined for KB, threads, manual uploads. */
+  url?: string;
 }
 
 /** The signals the autoreply gate reads: how many distinct source kinds corroborate,
@@ -170,7 +173,7 @@ async function latestCustomerMessage(tenantId: string, ticketId: string): Promis
  *  customer's conversation can't leak into an anonymous answer. Only agents see the thread surface. */
 export type Audience = "public" | "agent";
 
-const DEFAULT_SCOPES: Record<Audience, string[]> = {
+export const DEFAULT_SCOPES: Record<Audience, string[]> = {
   public: ["kb", "document"],
   agent: ["kb", "thread", "document"],
 };
@@ -406,6 +409,13 @@ async function prepareDraft(
     const docs = await listDocuments(tenantId).catch(() => []);
     for (const d of docs) docNames.set(d.id, d.filename);
   }
+  // Chunk → absolute source URL, straight off the hit's source_key (url-connector docs only — a
+  // page URL with domain). Guarded to http(s) so a manual upload (null) or a github repo path
+  // never becomes a bogus link.
+  const docUrls = new Map<string, string>();
+  for (const ch of chunkTop) {
+    if (ch.source_key && /^https?:\/\//i.test(ch.source_key)) docUrls.set(ch.document_id, ch.source_key);
+  }
 
   const kbSources: Citation[] = kbTop.map((a) => ({
     kind: "kb", id: a.id, title: a.title, snippet: clip(a.body, 180),
@@ -415,6 +425,7 @@ async function prepareDraft(
   }));
   const docSources: Citation[] = chunkTop.map((ch) => ({
     kind: "document", id: ch.document_id, title: docNames.get(ch.document_id) ?? "Document", snippet: clip(ch.text, 180),
+    url: docUrls.get(ch.document_id),
   }));
   // Rank order: authored KB answers, then how we actually answered before (resolved
   // threads), then raw document passages.
@@ -437,12 +448,12 @@ async function prepareDraft(
   // Grounding text: fuller passages than the display snippets. Round-robin the three
   // sources so the draft draws from a DIVERSE set — the model only uses the top
   // couple, and we don't want two loose KB hits to crowd out a strong thread answer.
-  const bySource = [
+  const bySource: Array<Array<{ title: string; text: string; url?: string }>> = [
     kbTop.map((a) => ({ title: a.title, text: a.body })),
     threadTop.map((t) => ({ title: `Resolved: ${t.subject}`, text: t.text })),
-    chunkTop.map((ch) => ({ title: docNames.get(ch.document_id) ?? "Document", text: ch.text })),
+    chunkTop.map((ch) => ({ title: docNames.get(ch.document_id) ?? "Document", text: ch.text, url: docUrls.get(ch.document_id) })),
   ];
-  const grounding: Array<{ title: string; text: string }> = [];
+  const grounding: Array<{ title: string; text: string; url?: string }> = [];
   for (let i = 0; i < Math.max(0, ...bySource.map((s) => s.length)); i++) {
     for (const src of bySource) if (src[i]) grounding.push(src[i]);
   }
