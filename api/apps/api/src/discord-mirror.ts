@@ -517,6 +517,28 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   await syncMirrorState(tenantId, ticketId).catch(() => {});
 }
 
+/**
+ * Relay an internal note authored IN NOOLA into the ticket's mirror thread, so the team collaborating
+ * in Discord sees the note the same way they see one typed in the thread. Best-effort + echo-safe: it
+ * posts as the bot, and handleMirrorPostMessage swallows bot/webhook messages, so a note that ORIGINATED
+ * from Discord (already in the thread) is never posted back. Call only from the Noola-side note path.
+ */
+export async function relayNoteToMirror(
+  tenantId: string,
+  ticketId: string,
+  note: { authorName?: string | null; body: string },
+): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const name = note.authorName?.trim() || "Agent";
+  const label = `📝 **${name}** _(internal note)_:`;
+  await tp
+    .postToThread(mirror.post_thread_id, `${label}\n${note.body.slice(0, 1800)}`)
+    .catch((e) => console.warn(`[discord-mirror] note relay threw (ticket ${ticketId}): ${(e as Error)?.message ?? String(e)}`));
+}
+
 /** Re-apply forum tags from the ticket's current status/priority; archive on closed, unarchive
  *  otherwise (D4 lifecycle). Cheap + idempotent, so callers can fire it after any change. */
 export async function syncMirrorState(tenantId: string, ticketId: string): Promise<void> {
