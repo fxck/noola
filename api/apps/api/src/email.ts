@@ -181,6 +181,22 @@ function angled(messageId: string): string {
 
 // ---- inbound seam (testable without Mailpit) ----------------------------
 
+/** Curated technical headers snapshotted for the "view original" dialog. Providers expose these
+ *  differently (parsed map, name/value array, raw blob); each adapter normalizes into this shape. */
+export interface InboundHeaders {
+  from?: string;
+  to?: string;
+  cc?: string;
+  replyTo?: string;
+  subject?: string;
+  date?: string;
+  messageId?: string;
+  inReplyTo?: string;
+  references?: string;
+  authResults?: string; // Authentication-Results — the DKIM/SPF/DMARC verdicts
+  returnPath?: string;
+}
+
 export interface InboundEmail {
   messageId: string; // email Message-ID header — the idempotency key
   from: string; // customer address — the cross-channel identity + reply target
@@ -188,14 +204,37 @@ export interface InboundEmail {
   to: string; // tenant support address — resolves the tenant
   subject: string;
   body: string; // plaintext part (preferred). Quote-stripped before persist.
-  /** Raw HTML part, when the email carried one. Used only as the quote-strip fallback when
-   *  there's no usable plaintext body (structural excision of the quote container). */
+  /** Raw HTML part, when the email carried one. Used as the quote-strip fallback when there's no
+   *  usable plaintext body, and snapshotted onto meta.raw for the "view original" dialog. */
   html?: string | null;
+  /** Curated technical headers (From/To/Date/Message-ID/DKIM…) snapshotted onto meta.raw so the
+   *  "view original" dialog can show them. Each adapter fills what its provider exposes. */
+  headers?: InboundHeaders | null;
   /** Other recipients on the email (Cc + extra To, minus the support route) — stamped on the
    *  message's meta so the agent composer can default to reply-all. */
   cc?: string[];
   /** Raw file attachments from the email — persisted into object-storage onto the message. */
   attachments?: { filename: string; contentType: string; data: Buffer }[];
+}
+
+// Caps so a giant marketing/newsletter email can't bloat the message row unbounded.
+const RAW_TEXT_CAP = 64_000;
+const RAW_HTML_CAP = 256_000;
+
+/** Snapshot the untouched inbound (original text + HTML + curated headers) for the "view original"
+ *  dialog — but ONLY when it adds something the stripped bubble doesn't already show: an HTML part
+ *  or a stripped quote. A plain-text message with no quote needs no snapshot (nothing was hidden). */
+function buildRawSnapshot(
+  m: InboundEmail,
+  quoted: string | null,
+): { text?: string; html?: string; headers?: InboundHeaders } | null {
+  const hasHtml = !!(m.html && m.html.trim());
+  if (!hasHtml && !quoted) return null;
+  const raw: { text?: string; html?: string; headers?: InboundHeaders } = {};
+  if (m.body && m.body.trim()) raw.text = m.body.slice(0, RAW_TEXT_CAP);
+  if (hasHtml) raw.html = m.html!.slice(0, RAW_HTML_CAP);
+  if (m.headers && Object.values(m.headers).some((v) => v && v.trim())) raw.headers = m.headers;
+  return Object.keys(raw).length ? raw : null;
 }
 
 /** Post-ingest finish for an inbound email: persist attachments onto the message and stamp the
@@ -213,12 +252,17 @@ async function finishInboundEmail(result: IngestResult, m: InboundEmail, quoted?
       );
     }).catch(() => {});
   }
-  // Preserve the stripped quote history (capped) so a UI can offer a "show quoted text" expander.
-  if (quoted) {
+  // Stamp the stripped quote + a raw snapshot (original text / HTML / headers) onto the message meta
+  // so a "view original" dialog can show exactly what arrived. Best-effort, capped, one merge.
+  const extra: Record<string, unknown> = {};
+  if (quoted) extra.quoted = quoted.slice(0, 100_000);
+  const raw = buildRawSnapshot(m, quoted ?? null);
+  if (raw) extra.raw = raw;
+  if (Object.keys(extra).length) {
     await withTenant(result.tenantId, async (c) => {
       await c.query(
-        `UPDATE messages SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('quoted', $2::text) WHERE id = $1`,
-        [result.messageId, quoted.slice(0, 100_000)],
+        `UPDATE messages SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE id = $1`,
+        [result.messageId, JSON.stringify(extra)],
       );
     }).catch(() => {});
   }
@@ -535,6 +579,19 @@ interface MailpitMessage {
   Attachments?: { PartID: string; FileName: string; ContentType: string; Size: number }[] | null;
 }
 
+/** Pull curated headers out of Mailpit's `Record<name, string[]>` header map (case-insensitive). */
+function mailpitHeaders(h: Record<string, string[]> | undefined): InboundHeaders | null {
+  if (!h) return null;
+  const lower = new Map(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v?.[0]]));
+  const get = (name: string) => lower.get(name) || undefined;
+  return {
+    from: get("from"), to: get("to"), cc: get("cc"), replyTo: get("reply-to"),
+    subject: get("subject"), date: get("date"), messageId: get("message-id"),
+    inReplyTo: get("in-reply-to"), references: get("references"),
+    authResults: get("authentication-results"), returnPath: get("return-path"),
+  };
+}
+
 // Per-file / per-message caps for inbound attachment ingestion — matches the widget's ceiling.
 const INBOUND_ATTACH_MAX_BYTES = 10 * 1024 * 1024;
 const INBOUND_ATTACH_MAX_FILES = 10;
@@ -603,6 +660,7 @@ export async function pollEmail(log: Log): Promise<void> {
         subject: full.Subject ?? "",
         body: full.Text ?? "",
         html: full.HTML ?? null,
+        headers: mailpitHeaders(full.Headers),
         ...(cc.length ? { cc: [...new Set(cc)] } : {}),
         ...(files.length ? { attachments: files } : {}),
       });

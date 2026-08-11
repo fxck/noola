@@ -197,6 +197,9 @@ export interface Message {
   attachments?: Attachment[];
   /** The channel this message arrived/left on (omnichannel unification), or null/absent. */
   channel_type?: string | null;
+  /** True when an untouched original (raw HTML/quote/headers) was snapshotted at ingest — the thread
+   *  shows a "Show original" affordance that lazy-fetches it via fetchMessageOriginal. Email only. */
+  has_original?: boolean;
   /** Read receipt: when the customer last saw this (agent) message — set by the widget foreground
    *  poll or an email tracking-pixel open. Null/absent = not yet seen. Drives the "Seen" line. */
   seen_at?: string | null;
@@ -250,6 +253,20 @@ export async function fetchMessages(
 ): Promise<{ messages: Message[]; channels: ReplyChannels; emailCc: string[] }> {
   const r = await api<{ messages: Message[]; channels: ReplyChannels; emailCc?: string[] }>(`/tickets/${ticketId}/messages`);
   return { messages: r.messages, channels: r.channels, emailCc: r.emailCc ?? [] };
+}
+
+/** The untouched inbound snapshot for the "view original" dialog: original plaintext + HTML +
+ *  curated technical headers, and the stripped quote trailer. Lazy-fetched (the heavy HTML never
+ *  rides the messages list). Any field may be null. */
+export interface OriginalEmail {
+  text: string | null;
+  html: string | null;
+  headers: Record<string, string> | null;
+  quoted: string | null;
+}
+
+export async function fetchMessageOriginal(ticketId: string, messageId: string): Promise<OriginalEmail> {
+  return api<OriginalEmail>(`/tickets/${ticketId}/messages/${messageId}/original`);
 }
 
 // ---- Write actions (tenant is server-authoritative; bodies carry only the

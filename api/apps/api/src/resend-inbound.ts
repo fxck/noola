@@ -5,6 +5,7 @@ import {
   parseInboundAddress,
   ORIGIN_HEADER,
   type InboundEmail,
+  type InboundHeaders,
 } from "./email.js";
 import type { IngestResult } from "./ingest.js";
 
@@ -172,6 +173,14 @@ export async function ingestResendInbound(
   // and falling back to structural excision of the HTML quote container when there's no text.
   const body = email?.text ?? "";
   const html = email?.html ?? null;
+  const h = email?.headers;
+  const headers: InboundHeaders = {
+    from: headerValue(h, "from") ?? data.from, to: headerValue(h, "to"), cc: headerValue(h, "cc"),
+    replyTo: headerValue(h, "reply-to"), subject: headerValue(h, "subject") ?? data.subject,
+    date: headerValue(h, "date"), messageId: headerValue(h, "message-id") ?? data.message_id,
+    inReplyTo: headerValue(h, "in-reply-to"), references: headerValue(h, "references"),
+    authResults: headerValue(h, "authentication-results"), returnPath: headerValue(h, "return-path"),
+  };
   const from = parseAddress(data.from ?? email?.from);
   const cc = [...(data.to ?? []), ...(data.cc ?? []), ...asArray(email?.to)]
     .map((a) => parseAddress(a).address)
@@ -210,6 +219,7 @@ export async function ingestResendInbound(
       subject: data.subject ?? email?.subject ?? "",
       body,
       html,
+      headers,
       ...(cc.length ? { cc: [...new Set(cc)] } : {}),
       ...(files.length ? { attachments: files } : {}),
     },

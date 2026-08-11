@@ -145,6 +145,46 @@ async function main() {
     });
   }
 
+  // 5b — raw snapshot + quote stripping: an HTML email whose plaintext carries a quoted trailer
+  //      persists only the visible reply as the body, stashes the quote on meta.quoted, and snapshots
+  //      the original text+HTML+headers on meta.raw for the "view original" dialog.
+  {
+    const r = await handleInboundEmail({
+      messageId: "emailtest-a-raw",
+      from: CUST_A,
+      to: ROUTE_A,
+      subject: "EMAILTEST raw",
+      body: "EMAILTEST visible reply\n\nOn Mon, Aug 11 2026, Support wrote:\n> EMAILTEST old quoted line",
+      html: "<div>EMAILTEST visible reply</div><blockquote>old quoted</blockquote>",
+      headers: { from: CUST_A, subject: "EMAILTEST raw", messageId: "<emailtest-a-raw@x>" },
+    });
+    check("raw case: ingested", r !== null && r?.replay === false);
+    await withTenant(A, async (c) => {
+      const m = await c.query(
+        "SELECT body, meta FROM messages WHERE idempotency_key = 'email:emailtest-a-raw'",
+      );
+      const row = m.rows[0] as { body: string; meta: { quoted?: string; raw?: { text?: string; html?: string; headers?: Record<string, string> } } | null };
+      check("raw case: body is the stripped visible reply", row.body === "EMAILTEST visible reply");
+      check("raw case: quote preserved on meta.quoted", !!row.meta?.quoted && row.meta.quoted.includes("old quoted line"));
+      check("raw case: meta.raw snapshots original text + html", !!row.meta?.raw?.text && !!row.meta?.raw?.html);
+      check("raw case: meta.raw keeps curated headers", row.meta?.raw?.headers?.messageId === "<emailtest-a-raw@x>");
+    });
+  }
+
+  // 5c — a plain-text email with NO quote gets NO raw snapshot (nothing was hidden → no bloat).
+  {
+    await handleInboundEmail({
+      messageId: "emailtest-a-plain",
+      from: CUST_A, to: ROUTE_A,
+      subject: "EMAILTEST plain", body: "EMAILTEST just a plain line, no quote, no html",
+    });
+    await withTenant(A, async (c) => {
+      const m = await c.query("SELECT meta FROM messages WHERE idempotency_key = 'email:emailtest-a-plain'");
+      const meta = m.rows[0]?.meta as { raw?: unknown; quoted?: unknown } | null;
+      check("plain case: no raw snapshot stored", !meta?.raw && !meta?.quoted);
+    });
+  }
+
   // 6 — outbound seam (no live SMTP): reports disabled / no-recipient cleanly
   {
     const noRcpt = await routeEmailOutbound({ tenantId: A, externalChannelId: null }, "s", "b");

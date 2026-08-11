@@ -356,9 +356,40 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     // inbound provider AND already-landed tickets — not just newly parsed mail.
     const rawCc = Array.isArray(lastEmailMeta?.meta?.cc) ? lastEmailMeta.meta.cc : [];
     return {
-      messages: messages.map((m) => ({ ...m, attachments: byMsg.get(m.id) ?? [] })),
+      // Drop the heavy raw snapshot + quoted trailer from the list payload — they'd bloat every
+      // thread load. Ship a light `has_original` flag; the dialog lazy-fetches the body via
+      // GET /tickets/:id/messages/:messageId/original.
+      messages: messages.map((m) => {
+        const meta = (m as { meta?: Record<string, unknown> | null }).meta ?? null;
+        const hasOriginal = !!(meta && (meta.raw || meta.quoted));
+        const lightMeta = meta ? (({ raw: _r, quoted: _q, ...rest }) => rest)(meta) : meta;
+        return { ...m, meta: lightMeta, has_original: hasOriginal, attachments: byMsg.get(m.id) ?? [] };
+      }),
       channels: replyChannels,
       emailCc: stripOwnCcAddresses(rawCc, supportAddr, replyAddr),
+    };
+  }));
+
+  // "View original" — the untouched inbound snapshot (original plaintext + HTML + curated headers)
+  // and the stripped quote trailer, stashed on the message meta at ingest. Lazy-fetched by the
+  // thread's "Show original" dialog so the heavy HTML never rides the messages list.
+  app.get("/tickets/:id/messages/:messageId/original", tenanted(async (tenantId, req, reply) => {
+    const { id, messageId } = req.params as { id: string; messageId: string };
+    const row = await withTenant(tenantId, (c) =>
+      c.query(
+        "SELECT meta FROM messages WHERE ticket_id = $1 AND id = $2 AND deleted_at IS NULL",
+        [id, messageId],
+      ),
+    );
+    const meta = row.rows[0]?.meta as
+      | { raw?: { text?: string; html?: string; headers?: Record<string, string> }; quoted?: string }
+      | undefined;
+    if (!meta || (!meta.raw && !meta.quoted)) return reply.code(404).send({ error: "no_original" });
+    return {
+      text: meta.raw?.text ?? null,
+      html: meta.raw?.html ?? null,
+      headers: meta.raw?.headers ?? null,
+      quoted: meta.quoted ?? null,
     };
   }));
 

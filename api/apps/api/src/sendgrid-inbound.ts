@@ -4,6 +4,7 @@ import {
   parseInboundAddress,
   ORIGIN_HEADER,
   type InboundEmail,
+  type InboundHeaders,
 } from "./email.js";
 import { parseAddress } from "./resend-inbound.js";
 import type { IngestResult } from "./ingest.js";
@@ -109,6 +110,14 @@ export async function ingestSendgridInbound(
     from.address; // last resort: something non-empty so parseInboundAddress downstream is safe
   const body = fields.text ?? "";
   const html = fields.html ?? null; // spine strips the quote, preferring text, HTML as fallback
+  const sgHeaders: InboundHeaders = {
+    from: headerFromBlob(headers, "from") ?? fields.from, to: headerFromBlob(headers, "to"),
+    cc: headerFromBlob(headers, "cc"), replyTo: headerFromBlob(headers, "reply-to"),
+    subject: headerFromBlob(headers, "subject") ?? fields.subject, date: headerFromBlob(headers, "date"),
+    messageId: headerFromBlob(headers, "message-id"), inReplyTo: headerFromBlob(headers, "in-reply-to"),
+    references: headerFromBlob(headers, "references"),
+    authResults: headerFromBlob(headers, "authentication-results"), returnPath: headerFromBlob(headers, "return-path"),
+  };
   const cc = [...parseAddressList(fields.cc), ...parseAddressList(fields.to)]
     .map((a) => a.address)
     .filter((a) => a && a !== toAddr && a !== from.address);
@@ -138,6 +147,7 @@ export async function ingestSendgridInbound(
       subject: fields.subject ?? "",
       body,
       html,
+      headers: sgHeaders,
       ...(cc.length ? { cc: [...new Set(cc)] } : {}),
       ...(attachments.length ? { attachments } : {}),
     },
