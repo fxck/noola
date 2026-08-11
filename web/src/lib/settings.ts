@@ -539,3 +539,35 @@ export async function fetchPolicies(): Promise<TenantPolicies> {
 export async function savePolicies(patch: Partial<TenantPolicies>): Promise<TenantPolicies> {
   return api<TenantPolicies>("/settings/policies", { method: "PUT", body: JSON.stringify(patch) });
 }
+
+// ── Blocked senders (spam/block) ─────────────────────────────────────────────
+// The senders dropped before a ticket is ever created. "Mark as spam" adds entries here
+// automatically; admins can also manage the list by hand. A block is scoped to a single address
+// or a whole domain, per channel. Admin-only writes (a non-admin gets 403).
+
+export interface BlockedSender {
+  id: string;
+  channelType: string;
+  scope: "address" | "domain";
+  handle: string;
+  reason: string | null;
+  createdBy: string | null;
+  createdAt: string;
+}
+
+export async function fetchBlocklist(): Promise<BlockedSender[]> {
+  return (await api<{ blocked: BlockedSender[] }>("/blocklist")).blocked;
+}
+
+export async function addBlockedSender(input: {
+  handle: string;
+  scope?: "address" | "domain";
+  channelType?: string;
+  reason?: string | null;
+}): Promise<BlockedSender> {
+  return api<BlockedSender>("/blocklist", { method: "POST", body: JSON.stringify(input) });
+}
+
+export async function removeBlockedSender(id: string): Promise<void> {
+  await api(`/blocklist/${id}`, { method: "DELETE" });
+}

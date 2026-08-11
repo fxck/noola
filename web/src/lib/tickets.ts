@@ -31,6 +31,9 @@ export interface Ticket {
   merged_into?: string | null;
   /** When snoozed, the wake time (ISO) — hidden from open queues until then; else null/absent. */
   snoozed_until?: string | null;
+  /** When marked as spam, the time it was hidden (ISO) — drops it from every open queue and into the
+   *  Spam review lane until restored; else null/absent. Drives the "Not spam" restore affordance. */
+  spam_at?: string | null;
   /** Keyword-classified customer sentiment (positive/neutral/negative), or null/absent. */
   sentiment?: string | null;
   /** The contact this conversation belongs to (omnichannel unification), or null. */
@@ -213,7 +216,7 @@ export interface Message {
   author_external_avatar_url?: string | null;
 }
 
-export type ViewKey = "all" | "needs_reply" | "approval" | "unassigned" | "my" | "closed";
+export type ViewKey = "all" | "needs_reply" | "approval" | "unassigned" | "my" | "closed" | "spam";
 
 // ---- Fetchers (tenant is server-authoritative from the session token) ------
 
@@ -222,6 +225,10 @@ export async function fetchOpenTickets(): Promise<Ticket[]> {
 }
 export async function fetchClosedTickets(): Promise<Ticket[]> {
   return (await api<{ tickets: Ticket[] }>("/tickets?view=closed")).tickets;
+}
+/** The spam-hidden tickets — the low-traffic review lane. Same list endpoint, view=spam. */
+export async function fetchSpamTickets(): Promise<Ticket[]> {
+  return (await api<{ tickets: Ticket[] }>("/tickets?view=spam")).tickets;
 }
 export async function fetchUsers(): Promise<AgentUser[]> {
   return (await api<{ users: AgentUser[] }>("/users")).users;
@@ -439,6 +446,24 @@ export async function setTicketOpen(ticketId: string, open: boolean): Promise<vo
   });
 }
 
+/** Mark a ticket as spam: hides it (into the Spam view), optionally blocks the sender (by address or
+ *  whole domain) and drops the lead the ticket auto-created. All reversible via `unspamTicket`. */
+export async function markTicketSpam(
+  ticketId: string,
+  opts?: { block?: boolean; blockScope?: "address" | "domain"; dropLead?: boolean },
+): Promise<{ ticketId: string; spam: true; blocked: string | null; leadDropped: boolean }> {
+  return api(`/tickets/${ticketId}/spam`, {
+    method: "POST",
+    body: JSON.stringify(opts ?? {}),
+  });
+}
+
+/** Restore a spam-hidden ticket (the "not spam" undo): un-hides it, restores its lead and removes the
+ *  sender block. */
+export async function unspamTicket(ticketId: string): Promise<{ ticketId: string; spam: false }> {
+  return api(`/tickets/${ticketId}/unspam`, { method: "POST", body: "{}" });
+}
+
 // ---- View filtering (done client-side over one open + one closed fetch, so
 //      switching Views is instant and every count is always live) ------------
 
@@ -448,6 +473,7 @@ export function filterByView(
   closed: Ticket[],
   myId: string,
   approvalIds: ReadonlySet<string> = EMPTY_SET,
+  spam: Ticket[] = [],
 ): Ticket[] {
   switch (view) {
     case "needs_reply":
@@ -460,6 +486,8 @@ export function filterByView(
       return open.filter((t) => t.assignee_id === myId);
     case "closed":
       return closed;
+    case "spam":
+      return spam;
     case "all":
     default:
       return open;
@@ -473,6 +501,7 @@ export function viewCounts(
   closed: Ticket[],
   myId: string,
   approvalIds: ReadonlySet<string> = EMPTY_SET,
+  spam: Ticket[] = [],
 ): Record<ViewKey, number> {
   return {
     all: open.length,
@@ -481,6 +510,7 @@ export function viewCounts(
     unassigned: open.filter((t) => !t.assignee_id).length,
     my: open.filter((t) => t.assignee_id === myId).length,
     closed: closed.length,
+    spam: spam.length,
   };
 }
 

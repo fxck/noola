@@ -359,6 +359,27 @@ export const TicketTeamInput = z.object({
 });
 export type TicketTeamInput = z.infer<typeof TicketTeamInput>;
 
+/** Mark a ticket as spam. Soft-hides the ticket (reversible via unspam). `block` also blocklists the
+ *  sender so future inbound is dropped before a ticket/lead is created; `blockScope` picks exact
+ *  address (default) vs whole domain. `dropLead` soft-hides the auto-created contact too (only when
+ *  the spam ticket is that contact's sole conversation). All three default ON from the UI. */
+export const SpamTicketInput = z.object({
+  block: z.boolean().optional(),
+  blockScope: z.enum(["address", "domain"]).optional(),
+  dropLead: z.boolean().optional(),
+});
+export type SpamTicketInput = z.infer<typeof SpamTicketInput>;
+
+/** Add a sender to the blocklist (Settings manager). `handle` = an email address or bare domain;
+ *  `scope` must agree (a 'domain' scope reduces a full address to its domain). */
+export const BlockSenderInput = z.object({
+  handle: z.string().min(3).max(320),
+  scope: z.enum(["address", "domain"]).optional(),
+  channelType: z.string().max(32).optional(),
+  reason: z.string().max(280).nullish(),
+});
+export type BlockSenderInput = z.infer<typeof BlockSenderInput>;
+
 /** Routing v2 — per-agent routing signals (admin). `reassign` (with outOfOffice: true) also
  *  re-routes the agent's open tickets: team tickets round-robin to eligible teammates,
  *  the rest go back to Unassigned. */

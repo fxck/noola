@@ -18,6 +18,7 @@ import {
   KeyRound,
   Copy,
   Check,
+  ShieldBan,
   type LucideIcon,
 } from "lucide-react";
 import { SettingsPage } from "@/components/settings-page";
@@ -50,6 +51,7 @@ import {
   fetchSendingDomains, addSendingDomain, verifySendingDomain, deleteSendingDomain,
   type EmailProvider, type EmailProviderName, fetchEmailProvider, saveEmailProvider, rotateEmailProviderHandle, deleteEmailProvider,
   type EmailSenderSettings, fetchSenderMode, saveSenderMode,
+  type BlockedSender, fetchBlocklist, addBlockedSender, removeBlockedSender,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -617,6 +619,9 @@ export function SettingsIntegrationsPage() {
 
                   {/* ── Sending identity: shared support address vs each teammate's own address ── */}
                   <SenderModeSection isAdmin={isAdmin} />
+
+                  {/* ── Blocked senders: addresses/domains dropped before a ticket is created ── */}
+                  <BlockedSendersSection isAdmin={isAdmin} />
 
                   {/* ── Editor ── */}
                   <FormDialog
@@ -1360,6 +1365,181 @@ function SendingDomainsSection({ isAdmin }: { isAdmin: boolean }) {
           ) : undefined
         }
         confirmLabel="Remove"
+        destructive
+        busy={removing}
+        onConfirm={() => void onConfirmRemove()}
+        onCancel={() => setRemoveTarget(null)}
+      />
+    </section>
+  );
+}
+
+// ── Blocked senders ──────────────────────────────────────────────────────────
+// The senders dropped before a ticket is ever created — a single address or a whole domain. Populated
+// automatically by "Mark as spam" on a conversation, and manageable here by hand. Self-contained (own
+// state + fetch), gated to admins for writes like its sibling sections.
+
+function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
+  const [blocked, setBlocked] = useState<BlockedSender[] | null>(null);
+  const [handle, setHandle] = useState("");
+  const [scope, setScope] = useState<"address" | "domain">("address");
+  const [reason, setReason] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [removeTarget, setRemoveTarget] = useState<BlockedSender | null>(null);
+  const [removing, setRemoving] = useState(false);
+
+  useEffect(() => {
+    void fetchBlocklist()
+      .then(setBlocked)
+      .catch(() => setBlocked([]));
+  }, []);
+
+  async function onAdd() {
+    const h = handle.trim().toLowerCase();
+    if (!h) return;
+    setAdding(true);
+    try {
+      const b = await addBlockedSender({ handle: h, scope, ...(reason.trim() ? { reason: reason.trim() } : {}) });
+      setBlocked((xs) => [b, ...(xs ?? [])]);
+      setHandle("");
+      setReason("");
+      toast.success("Sender blocked.");
+    } catch (e) {
+      const s = (e as { status?: number }).status;
+      toast.error(
+        s === 403 ? "Only admins can manage blocked senders." : (e as { detail?: string }).detail || "Couldn't block that sender.",
+      );
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function onConfirmRemove() {
+    if (!removeTarget) return;
+    setRemoving(true);
+    try {
+      await removeBlockedSender(removeTarget.id);
+      setBlocked((xs) => (xs ?? []).filter((x) => x.id !== removeTarget.id));
+      toast.success("Sender unblocked.");
+      setRemoveTarget(null);
+    } catch {
+      toast.error("Couldn't unblock that sender.");
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  // Hidden until loaded; a non-admin with an empty list sees nothing to act on.
+  if (blocked === null) return null;
+  if (!isAdmin && blocked.length === 0) return null;
+
+  return (
+    <section className="mt-8">
+      <div className="mb-1 flex items-center gap-2">
+        <ShieldBan className="size-4 text-muted-foreground" />
+        <h2 className="text-sm font-semibold text-foreground">Blocked senders</h2>
+      </div>
+      <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
+        Addresses and domains dropped before a ticket is ever created — no conversation, no lead, no
+        notification. Marking a conversation as spam adds its sender here automatically.
+      </p>
+
+      <div className="space-y-2">
+        {blocked.map((b) => (
+          <div key={b.id} className="flex items-center gap-3 rounded-lg border px-4 py-3">
+            <span className="min-w-0 flex-1 truncate font-mono text-sm text-foreground" title={b.handle}>
+              {b.handle}
+            </span>
+            <Badge variant="outline" className="shrink-0 capitalize">
+              {b.scope}
+            </Badge>
+            {b.reason && (
+              <span className="hidden min-w-0 max-w-[12rem] truncate text-xs text-muted-foreground sm:block" title={b.reason}>
+                {b.reason}
+              </span>
+            )}
+            <span className="hidden shrink-0 text-micro text-muted-foreground/70 md:block">
+              {new Date(b.createdAt).toLocaleDateString()}
+            </span>
+            {isAdmin && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7 shrink-0 text-muted-foreground hover:text-destructive"
+                title="Unblock sender"
+                aria-label="Unblock sender"
+                onClick={() => setRemoveTarget(b)}
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            )}
+          </div>
+        ))}
+
+        {blocked.length === 0 && (
+          <p className="rounded-lg border border-dashed px-4 py-3 text-xs text-muted-foreground">
+            No blocked senders yet.
+          </p>
+        )}
+      </div>
+
+      {isAdmin && (
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="flex-1 space-y-1.5">
+            <Label htmlFor="block-handle">Address or domain</Label>
+            <Input
+              id="block-handle"
+              placeholder={scope === "domain" ? "spammer.com" : "spammer@example.com"}
+              value={handle}
+              onChange={(e) => setHandle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void onAdd();
+              }}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {(["address", "domain"] as const).map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setScope(s)}
+                className={cn(
+                  "rounded-lg border px-3 py-2 text-sm capitalize transition-colors",
+                  scope === s ? "border-primary bg-primary/5 text-foreground" : "text-muted-foreground hover:bg-muted",
+                )}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+          <Input
+            className="sm:max-w-[12rem]"
+            placeholder="Reason (optional)"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void onAdd();
+            }}
+          />
+          <Button variant="outline" size="sm" className="h-9 shrink-0 gap-1.5" disabled={adding || !handle.trim()} onClick={() => void onAdd()}>
+            {adding ? <Loader2 className="size-4 animate-spin" /> : <ShieldBan className="size-4" />}
+            Block
+          </Button>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!removeTarget}
+        title="Unblock sender?"
+        message={
+          removeTarget ? (
+            <>
+              <span className="font-mono text-foreground">{removeTarget.handle}</span> will be able to reach the inbox again —
+              new messages will create tickets.
+            </>
+          ) : undefined
+        }
+        confirmLabel="Unblock"
         destructive
         busy={removing}
         onConfirm={() => void onConfirmRemove()}

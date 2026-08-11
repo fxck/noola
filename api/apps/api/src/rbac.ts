@@ -77,6 +77,9 @@ export const ADMIN_ROUTES = new Set<string>([
   "POST /teams",
   "PATCH /teams/:id",
   "DELETE /teams/:id",
+  // The sender blocklist gates who can reach the inbox — authoring is admin (GET stays viewer+).
+  "POST /blocklist",
+  "DELETE /blocklist/:id",
   // Per-agent routing signals (skills/OOO/load cap) redirect the whole queue — admin.
   "PATCH /users/:id/routing",
   // Auto-survey toggles are a workspace policy — changing them is admin (GET stays viewer+).

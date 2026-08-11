@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Inbox, CornerUpLeft, ListChecks, CircleDashed, UserCheck, CheckCircle2, type LucideIcon } from "lucide-react";
+import { Inbox, CornerUpLeft, ListChecks, CircleDashed, UserCheck, CheckCircle2, ShieldBan, type LucideIcon } from "lucide-react";
 import { type ViewKey, avatarHue } from "@/lib/tickets";
 import type { Team } from "@/lib/teams";
 import { cn } from "@/lib/utils";
@@ -11,6 +11,7 @@ export const VIEWS: { key: ViewKey; label: string; icon: LucideIcon }[] = [
   { key: "unassigned", label: "Unassigned", icon: CircleDashed },
   { key: "my", label: "Mine", icon: UserCheck },
   { key: "closed", label: "Closed", icon: CheckCircle2 },
+  { key: "spam", label: "Spam", icon: ShieldBan },
 ];
 
 /** A team's identity mark — its emoji when set, else a small hue dot derived

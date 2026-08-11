@@ -8,6 +8,7 @@ import { prodSecret } from "./prod-secret.js";
 import { tenantEmailProviderCreds, tenantReplyAddress, type EmailProviderName } from "./email-provider.js";
 import { resolveFromIdentity } from "./email-sender.js";
 import { publicApiBase } from "./env.js";
+import { isSenderBlocked } from "./blocklist.js";
 
 // The email channel — the second real channel after Discord, riding the same
 // ingestInbound() spine. Dev/stage use Mailpit (SMTP catch + HTTP API); a real
@@ -236,6 +237,11 @@ export async function handleInboundEmail(
   // resolution, where an unrouted recipient genuinely has no owner.
   const tenantId = opts?.tenantId ?? (await resolveTenantByAddress(parsed.base));
   if (!tenantId) return null;
+
+  // Blocklist (spam): a blocked sender is dropped BEFORE any ticket/lead touch — the same quiet
+  // null-drop as an unrouted recipient, so the inbound route returns a 202 and nothing is created or
+  // reopened. Covers exact-address and domain blocks (see blocklist.ts).
+  if (m.from && (await isSenderBlocked(tenantId, "email", m.from))) return null;
 
   // Exact-ticket routing (P4): a verified reply-to token beats From-address threading — the reply
   // lands on THAT ticket (reopening it if it closed meanwhile), so a contact with several open

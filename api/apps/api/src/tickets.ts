@@ -1,7 +1,7 @@
 import { withTenant, relayPool } from "@repo/db";
 import type { PoolClient } from "pg";
 
-export type View = "my" | "unassigned" | "needs_reply" | "closed" | "all";
+export type View = "my" | "unassigned" | "needs_reply" | "closed" | "all" | "spam";
 
 export interface TicketRow {
   id: string;
@@ -18,6 +18,8 @@ export interface TicketRow {
   created_at: string;
   updated_at: string;
   closed_at: string | null;
+  /** When the ticket was soft-hidden as spam (null = live). Drives the Spam view + Restore footer. */
+  spam_at: string | null;
   /** First agent reply time (min agent-message created_at) — drives first-response SLA. */
   first_response_at: string | null;
   /** Tenant-defined ticket type (taxonomy), or null. Name/color hydrated from ticket_types. */
@@ -55,7 +57,7 @@ export interface TicketRow {
 // subquery (min agent-message time) so SLA state can be computed without a second round-trip.
 const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_channel_id,
               t.whose_turn, t.assignee_id, u.name AS assignee_name, u.avatar_url AS assignee_avatar_url, t.priority, t.tags,
-              t.created_at, t.updated_at, t.closed_at,
+              t.created_at, t.updated_at, t.closed_at, t.spam_at,
               (SELECT min(m.created_at) FROM messages m
                  WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id
                    AND m.author_type = 'agent') AS first_response_at,
@@ -102,11 +104,16 @@ export async function listTickets(
     where = "WHERE t.status = 'open' AND t.whose_turn = 'us' AND t.support_mode = 'staffed'";
   } else if (view === "closed") {
     where = "WHERE t.status = 'closed'";
+  } else if (view === "spam") {
+    // The one view that SHOWS spam — everything hidden by "Mark as spam", for review/unspam.
+    where = "WHERE t.spam_at IS NOT NULL";
   }
+  // Spam-hidden tickets drop out of every view except the dedicated Spam view.
+  if (view !== "spam") where += " AND t.spam_at IS NULL";
   // Snoozed tickets drop out of the open queues until their wake time (a closed-view listing still
   // shows them). The wake sweep clears the flag, but the predicate also resurfaces them the instant
   // the time passes even before the sweep runs.
-  if (view !== "closed") where += " AND (t.snoozed_until IS NULL OR t.snoozed_until <= now())";
+  if (view !== "closed" && view !== "spam") where += " AND (t.snoozed_until IS NULL OR t.snoozed_until <= now())";
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT ${TICKET_COLS}
@@ -134,6 +141,7 @@ export interface TicketQuery {
   sortDir?: "asc" | "desc";
   limit?: number;
   offset?: number;
+  spam?: boolean;            // true = show ONLY spam-hidden; default/false = hide spam
 }
 
 const TICKET_SORT_FIELDS = new Set(["updated_at", "created_at", "priority"]);
@@ -173,6 +181,8 @@ export async function queryTickets(
   else if (query.teamId) add("t.team_id = $?", query.teamId);
   if (query.channelType) add("t.channel_type = $?", query.channelType);
   if (query.q?.trim()) add("t.subject ILIKE $?", `%${query.q.trim()}%`);
+  // Spam-hidden tickets are excluded everywhere by default; `spam: true` shows only them.
+  clauses.push(query.spam ? "t.spam_at IS NOT NULL" : "t.spam_at IS NULL");
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const isSla = query.sortBy === "sla";
@@ -484,6 +494,41 @@ export async function setTicketStatus(
     void import("./qa.js").then((m) => m.scoreTicketBestEffort(tenantId, out.ticketId)).catch(() => {});
   }
   return out;
+}
+
+/** Soft-hide (spam=true) or restore (spam=false) a ticket. Returns the ticket's contact + the
+ *  sender's handle on its channel (contact email for email; the channel identity otherwise) so the
+ *  spam route can block that sender and drop the lead without re-querying. null = ticket not found. */
+export async function setTicketSpam(
+  tenantId: string,
+  ticketId: string,
+  spam: boolean,
+): Promise<{ ticketId: string; contactId: string | null; channelType: string; senderHandle: string | null } | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `UPDATE tickets SET spam_at = ${spam ? "now()" : "NULL"}, updated_at = now()
+        WHERE id = $1 RETURNING id, contact_id, channel_type`,
+      [ticketId],
+    );
+    if (!r.rowCount) return null;
+    const row = r.rows[0] as { id: string; contact_id: string | null; channel_type: string };
+    const contactId = row.contact_id ?? null;
+    const channelType = row.channel_type;
+    let senderHandle: string | null = null;
+    if (contactId) {
+      if (channelType === "email") {
+        const e = await c.query("SELECT NULLIF(email,'') AS h FROM contacts WHERE id = $1", [contactId]);
+        senderHandle = e.rowCount ? ((e.rows[0].h as string | null) ?? null) : null;
+      } else {
+        const idr = await c.query(
+          "SELECT external_id FROM contact_identities WHERE contact_id = $1 AND channel_type = $2 ORDER BY created_at DESC LIMIT 1",
+          [contactId, channelType],
+        );
+        senderHandle = idr.rowCount ? (idr.rows[0].external_id as string) : null;
+      }
+    }
+    return { ticketId: row.id, contactId, channelType, senderHandle };
+  });
 }
 
 export type BulkAction = "close" | "reopen" | "assign" | "team" | "priority" | "tag";

@@ -8,6 +8,7 @@ import {
   type AgentUser,
   fetchOpenTickets,
   fetchClosedTickets,
+  fetchSpamTickets,
   fetchUsers,
   searchTickets,
   filterByView,
@@ -40,6 +41,7 @@ const EMPTY_COPY: Record<ViewKey, string> = {
   unassigned: "Every open ticket has an owner.",
   my: "Nothing is assigned to you right now.",
   closed: "No closed tickets yet.",
+  spam: "No spam. Senders you mark as spam land here for review.",
 };
 
 const SHORTCUTS: [string[], string][] = [
@@ -107,6 +109,7 @@ export function InboxPage() {
   const { nerd } = useNerdMode();
   const [open, setOpen] = useState<Ticket[] | null>(null);
   const [closed, setClosed] = useState<Ticket[]>([]);
+  const [spam, setSpam] = useState<Ticket[]>([]);
   const [users, setUsers] = useState<AgentUser[]>([]);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -154,9 +157,15 @@ export function InboxPage() {
     setLoading(true);
     setError(false);
     try {
-      const [o, c, u] = await Promise.all([fetchOpenTickets(), fetchClosedTickets(), fetchUsers()]);
+      const [o, c, s, u] = await Promise.all([
+        fetchOpenTickets(),
+        fetchClosedTickets(),
+        fetchSpamTickets(),
+        fetchUsers(),
+      ]);
       setOpen(o);
       setClosed(c);
+      setSpam(s);
       setUsers(u);
       // Unread set is best-effort — never fail the inbox load over it.
       void fetchUnreadTicketIds()
@@ -257,8 +266,8 @@ export function InboxPage() {
   const { items: queueItems } = useQueue();
   const approvalIds = useMemo(() => new Set(queueItems.map((i) => i.ticket_id)), [queueItems]);
   const counts = useMemo(
-    () => viewCounts(open ?? [], closed, myId, approvalIds),
-    [open, closed, myId, approvalIds],
+    () => viewCounts(open ?? [], closed, myId, approvalIds, spam),
+    [open, closed, spam, myId, approvalIds],
   );
   const searchMode = query.trim().length > 0;
   const [sort, setSort] = useState<SortKey>("recent");
@@ -276,12 +285,12 @@ export function InboxPage() {
     if (searchMode) return searchResults ?? [];
     if (activeTeam)
       return sortTickets((open ?? []).filter((t) => t.team_id === activeTeam.id), sort);
-    return sortTickets(filterByView(view, open ?? [], closed, myId, approvalIds), sort);
-  }, [searchMode, searchResults, activeTeam, view, open, closed, myId, sort]);
+    return sortTickets(filterByView(view, open ?? [], closed, myId, approvalIds, spam), sort);
+  }, [searchMode, searchResults, activeTeam, view, open, closed, spam, myId, sort]);
 
   const selected = useMemo(
-    () => [...(open ?? []), ...closed, ...(searchResults ?? [])].find((t) => t.id === selectedId) ?? null,
-    [open, closed, searchResults, selectedId],
+    () => [...(open ?? []), ...closed, ...spam, ...(searchResults ?? [])].find((t) => t.id === selectedId) ?? null,
+    [open, closed, spam, searchResults, selectedId],
   );
   const activeView = VIEWS.find((v) => v.key === view)!;
 
