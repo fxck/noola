@@ -69,7 +69,10 @@ export async function resolveFromIdentity(
 ): Promise<FromIdentity> {
   const cfg = await senderConfig(tenantId);
   const agent = opts.agentName?.trim();
-  const name = agent ? `${agent} from ${cfg.workspace}` : cfg.workspace;
+  // Prefer the tenant's explicit brand_name (what senderBrand() uses) over the raw workspace name,
+  // so "Aleš from <Brand>" matches how the tenant wants to be seen — falling back to the workspace.
+  const brand = cfg.brandName || cfg.workspace;
+  const name = agent ? `${agent} from ${brand}` : brand;
   if (cfg.mode === "teammate" && opts.agentEmail) {
     const addr = opts.agentEmail.trim().toLowerCase();
     const domain = addr.split("@")[1];

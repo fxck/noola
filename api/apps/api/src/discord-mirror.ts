@@ -8,6 +8,7 @@ import { getChannelDriver } from "./channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "./translate.js";
 import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
 import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
+import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
@@ -958,7 +959,20 @@ async function applyMirrorTriage(
           .catch(() => {});
         return { promoted: false, action, reason: "no_seat" };
       }
-      await assignTicket(tenantId, ticketId, agentId);
+      // First 👀 claims the ticket (assignee); anyone reacting AFTER it's already assigned to someone
+      // else is looped in as a PARTICIPANT instead of silently stealing the assignment. Re-reacting as
+      // the current assignee is a no-op. There's one assignee_id — this is not multi-assignee.
+      {
+        const current = await withTenant(tenantId, async (c) => {
+          const r = await c.query("SELECT assignee_id FROM tickets WHERE id = $1", [ticketId]);
+          return r.rowCount ? ((r.rows[0].assignee_id as string | null) ?? null) : null;
+        });
+        if (!current) {
+          await assignTicket(tenantId, ticketId, agentId);
+        } else if (current !== agentId) {
+          await addParticipant(tenantId, ticketId, agentId).catch(() => null);
+        }
+      }
       break;
     case "unassign":
       await assignTicket(tenantId, ticketId, null);
