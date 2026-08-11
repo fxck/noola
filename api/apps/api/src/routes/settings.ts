@@ -29,8 +29,10 @@ import { verifySlackSignature, handleSlackEvent, listSlackConnections, upsertSla
 import { verifyResendSignature, ingestResendInbound } from "../resend-inbound.js";
 import {
   getTenantEmailProvider, saveTenantEmailProvider, deleteTenantEmailProvider, rotateInboundHandle,
-  resolveTenantByInboundHandle, EmailProviderSecretsUnavailableError,
+  resolveTenantByInboundHandle, EmailProviderSecretsUnavailableError, isEmailProvider,
 } from "../email-provider.js";
+import { ingestSendgridInbound, type SendgridPart } from "../sendgrid-inbound.js";
+import { getSenderSettingsView, setSenderMode } from "../email-sender.js";
 import { mdToSlack } from "../channels/format.js";
 import {
   handleSlackAskCommand, handleSlackDraftCommand, slackPostDraft,
@@ -496,11 +498,11 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
   });
 
-  // ---- BYO Resend: per-tenant email provider credentials --------------------
-  // A workspace brings their OWN Resend account so outbound (Resend SMTP) + inbound (per-tenant
-  // webhook) + the sending-domain wizard all run on THEIR key — deliverability/reputation isolation,
-  // their billing/quota, their key to rotate. Secrets are write-only (GET returns only hasApiKey /
-  // hasWebhookSecret + the inbound webhook URL to paste into Resend). Absent → the shared env account.
+  // ---- BYO email provider: per-tenant Resend OR SendGrid credentials --------
+  // A workspace brings their OWN ESP account so outbound (Resend/SendGrid SMTP) + inbound (per-tenant
+  // webhook) run on THEIR key — deliverability/reputation isolation, their billing/quota, their key to
+  // rotate. Secrets are write-only (GET returns only hasApiKey / hasWebhookSecret + the inbound webhook
+  // URL to paste into the provider). Absent → the shared env account.
 
   // Absolute base of THIS api's public origin (zeropsSubdomain → dev on apidev, prod on the prod api),
   // so the inbound webhook URL we hand the tenant lands on the right instance. Mirrors seenPixelUrl.
@@ -509,21 +511,28 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const base = sub ? (/^https?:\/\//.test(sub) ? sub : `https://${sub}`) : `http://localhost:${process.env.PORT ?? 3000}`;
     return base.replace(/\/+$/, "");
   };
+  // The inbound endpoint path differs per provider (Resend Svix vs SendGrid Inbound Parse).
   const providerView = (status: Awaited<ReturnType<typeof getTenantEmailProvider>>) =>
-    status ? { ...status, inboundWebhookUrl: `${publicBase()}/email/inbound/resend/${status.inboundHandle}` } : null;
+    status
+      ? { ...status, inboundWebhookUrl: `${publicBase()}/email/inbound/${status.provider}/${status.inboundHandle}` }
+      : null;
 
   app.get("/email/provider", tenanted(async (tenantId) => ({ provider: providerView(await getTenantEmailProvider(tenantId)) })));
 
   app.put("/email/provider", tenanted(async (tenantId, req, reply) => {
     if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
-    const b = (req.body ?? {}) as Partial<{ apiKey: string; webhookSecret: string; active: boolean }>;
-    const patch: { apiKey?: string; webhookSecret?: string; active?: boolean } = {};
+    const b = (req.body ?? {}) as Partial<{ provider: string; apiKey: string; webhookSecret: string; active: boolean }>;
+    if (b.provider !== undefined && !isEmailProvider(b.provider)) {
+      return reply.code(400).send({ error: "provider must be 'resend' or 'sendgrid'" });
+    }
+    const patch: { provider?: "resend" | "sendgrid"; apiKey?: string; webhookSecret?: string; active?: boolean } = {};
+    if (isEmailProvider(b.provider)) patch.provider = b.provider;
     // Only carry through fields the client actually sent — omit = leave as-is, "" = clear.
     if (typeof b.apiKey === "string") patch.apiKey = b.apiKey;
     if (typeof b.webhookSecret === "string") patch.webhookSecret = b.webhookSecret;
     if (typeof b.active === "boolean") patch.active = b.active;
-    if (patch.apiKey === undefined && patch.webhookSecret === undefined && patch.active === undefined) {
-      return reply.code(400).send({ error: "provide apiKey and/or webhookSecret (or active)" });
+    if (patch.provider === undefined && patch.apiKey === undefined && patch.webhookSecret === undefined && patch.active === undefined) {
+      return reply.code(400).send({ error: "provide provider, apiKey and/or webhookSecret (or active)" });
     }
     try {
       return { provider: providerView(await saveTenantEmailProvider(tenantId, patch)) };
@@ -555,6 +564,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const { handle } = req.params as { handle: string };
     const resolved = await resolveTenantByInboundHandle(handle);
     if (!resolved) return reply.code(404).send({ error: "unknown inbound handle" });
+    if (resolved.provider !== "resend") return reply.code(400).send({ error: "this workspace's provider is not resend" });
     if (!resolved.webhookSecret) return reply.code(503).send({ error: "resend inbound not configured for this workspace" });
     const h = req.headers as Record<string, string | undefined>;
     const ok = verifyResendSignature(
@@ -569,6 +579,55 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     );
     return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
   });
+
+  // Per-tenant SendGrid Inbound Parse webhook (PUBLIC lane). SendGrid can't sign its inbound POST, so
+  // the unguessable <handle> in the URL IS the shared secret (like Mailgun/Postmark inbound URLs). It
+  // POSTs the full email as multipart/form-data (body + attachment bytes inline — no fetch-back), which
+  // we drain via req.parts() and hand to the shared handleInboundEmail spine. Unknown handle → 404;
+  // wrong provider → 400.
+  app.post("/email/inbound/sendgrid/:handle", async (req, reply) => {
+    const { handle } = req.params as { handle: string };
+    const resolved = await resolveTenantByInboundHandle(handle);
+    if (!resolved) return reply.code(404).send({ error: "unknown inbound handle" });
+    if (resolved.provider !== "sendgrid") return reply.code(400).send({ error: "this workspace's provider is not sendgrid" });
+    if (!(req as { isMultipart?: () => boolean }).isMultipart?.()) {
+      return reply.code(415).send({ error: "expected multipart/form-data (SendGrid Inbound Parse)" });
+    }
+    const fields: Record<string, string> = {};
+    const files: SendgridPart[] = [];
+    try {
+      for await (const part of (req as unknown as { parts: () => AsyncIterableIterator<Record<string, unknown>> }).parts()) {
+        if (part.type === "file") {
+          const buf = await (part.toBuffer as () => Promise<Buffer>)();
+          files.push({
+            filename: (part.filename as string) || "file",
+            contentType: (part.mimetype as string) || "application/octet-stream",
+            data: buf,
+          });
+        } else {
+          fields[part.fieldname as string] = String((part as { value?: unknown }).value ?? "");
+        }
+      }
+    } catch (e) {
+      app.log.warn({ err: e }, "sendgrid inbound multipart parse failed");
+      return reply.code(400).send({ error: "malformed multipart payload" });
+    }
+    const r = await ingestSendgridInbound(fields, files);
+    return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
+  });
+
+  // ---- Email sending identity (teammate sending) ---------------------------
+  // 'shared' = reply From the support address (teammate name as display name); 'teammate' = From the
+  // teammate's own address when its domain is verified for sending, else fall back to support. Admin-only.
+  app.get("/email/sender-mode", tenanted(async (tenantId) => getSenderSettingsView(tenantId)));
+
+  app.put("/email/sender-mode", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    const mode = (req.body as { mode?: string } | undefined)?.mode;
+    if (mode !== "shared" && mode !== "teammate") return reply.code(400).send({ error: "mode must be 'shared' or 'teammate'" });
+    await setSenderMode(tenantId, mode);
+    return getSenderSettingsView(tenantId);
+  }));
 
   // ---- Model-B: branded sending domains (Intercom "custom email domain") ----
   // A tenant verifies their OWN domain (e.g. zerops.io) so replies send AS support@theirdomain with

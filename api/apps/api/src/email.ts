@@ -5,7 +5,8 @@ import { ingestInbound, type IngestResult } from "./ingest.js";
 import { persistBufferAttachments } from "./attachments.js";
 import { renderReplyEmail } from "./emails/reply-email.js";
 import { prodSecret } from "./prod-secret.js";
-import { tenantResendApiKey } from "./email-provider.js";
+import { tenantEmailProviderCreds, type EmailProviderName } from "./email-provider.js";
+import { resolveFromIdentity } from "./email-sender.js";
 
 // The email channel — the second real channel after Discord, riding the same
 // ingestInbound() spine. Dev/stage use Mailpit (SMTP catch + HTTP API); a real
@@ -87,16 +88,20 @@ function smtpTransport(host: string, port: number): nodemailer.Transporter {
   });
 }
 
-/** BYO Resend outbound: a tenant's own Resend account as the SMTP relay. Username is the literal
- *  "resend"; the password is the tenant's API key. Port 587 with STARTTLS (25/465 are blocked in the
- *  Zerops runtime; RESEND_SMTP_PORT overrides if a deployment needs a different submission port). */
-function resendSmtpTransport(apiKey: string): nodemailer.Transporter {
-  const port = Number(process.env.RESEND_SMTP_PORT ?? 587);
+/** BYO outbound: a tenant's own ESP account as the SMTP relay. Both supported providers are plain
+ *  SMTP, differing only in host + the fixed username (Resend: "resend"; SendGrid: "apikey"); the
+ *  password is the tenant's API key either way. Port 587 with STARTTLS (25/465 are blocked in the
+ *  Zerops runtime; env overrides host/port if a deployment needs something else). */
+function providerSmtpTransport(provider: EmailProviderName, apiKey: string): nodemailer.Transporter {
+  const spec =
+    provider === "sendgrid"
+      ? { host: process.env.SENDGRID_SMTP_HOST ?? "smtp.sendgrid.net", port: Number(process.env.SENDGRID_SMTP_PORT ?? 587), user: "apikey" }
+      : { host: process.env.RESEND_SMTP_HOST ?? "smtp.resend.com", port: Number(process.env.RESEND_SMTP_PORT ?? 587), user: "resend" };
   return nodemailer.createTransport({
-    host: process.env.RESEND_SMTP_HOST ?? "smtp.resend.com",
-    port,
-    secure: port === 465,
-    auth: { user: "resend", pass: apiKey },
+    host: spec.host,
+    port: spec.port,
+    secure: spec.port === 465,
+    auth: { user: spec.user, pass: apiKey },
   });
 }
 
@@ -269,28 +274,37 @@ export async function sendOutboundEmail(
     replyToTicketId?: string | null;
     /** The customer's last email Message-ID — threads the reply in their mail client. */
     inReplyTo?: string | null;
+    /** Sender identity (teammate sending): the replying agent's display name + signup email. The From
+     *  becomes "<name> from <workspace>", and in teammate mode with a verified domain it sends from the
+     *  agent's own address. Reply-To/Message-ID stay on the support address regardless. */
+    agentName?: string | null;
+    agentEmail?: string | null;
   },
 ): Promise<{ delivered: boolean; reason?: string }> {
   if (!to) return { delivered: false, reason: "no-recipient" };
-  // BYO Resend: when the tenant brought their own key, send through THEIR Resend account (their
-  // verified domains, their reputation, their quota). Otherwise the shared env SMTP relay (Mailpit in
-  // dev). A BYO key enables sending even where the shared SMTP_HOST is unset.
-  const byoKey = await tenantResendApiKey(tenantId);
+  // BYO email provider: when the tenant brought their own key, send through THEIR ESP (Resend or
+  // SendGrid — their verified domains, reputation, quota). Otherwise the shared env SMTP relay (Mailpit
+  // in dev). A BYO key enables sending even where the shared SMTP_HOST is unset.
+  const creds = await tenantEmailProviderCreds(tenantId);
   const smtpHost = process.env.SMTP_HOST;
-  if (!byoKey && !smtpHost) return { delivered: false, reason: "email-disabled" };
-  const from = (await tenantSupportAddress(tenantId)) ?? "support@noola.local";
-  const fromDomain = from.split("@")[1] ?? "noola.local";
-  const tx = byoKey ? resendSmtpTransport(byoKey) : smtpTransport(smtpHost!, Number(process.env.SMTP_PORT ?? 1025));
+  if (!creds && !smtpHost) return { delivered: false, reason: "email-disabled" };
+  const support = (await tenantSupportAddress(tenantId)) ?? "support@noola.local";
+  const supportDomain = support.split("@")[1] ?? "noola.local";
+  // From = teammate identity (name always; address = teammate's own in teammate mode + verified domain,
+  // else the support address). Reply-To/Message-ID below stay pinned to the support address so inbound
+  // routing + threading are unaffected by who the reply is From.
+  const fromIdentity = await resolveFromIdentity(tenantId, support, { agentName: opts?.agentName, agentEmail: opts?.agentEmail });
+  const tx = creds ? providerSmtpTransport(creds.provider, creds.apiKey) : smtpTransport(smtpHost!, Number(process.env.SMTP_PORT ?? 1025));
   await tx.sendMail({
-    from,
+    from: fromIdentity,
     to,
     ...(opts?.cc?.length ? { cc: opts.cc } : {}),
     subject,
     text: body,
     ...(opts?.replyToTicketId
       ? {
-          replyTo: ticketReplyAddress(from, opts.replyToTicketId),
-          messageId: `<t.${ticketEmailToken(opts.replyToTicketId)}.${Date.now().toString(36)}@${fromDomain}>`,
+          replyTo: ticketReplyAddress(support, opts.replyToTicketId),
+          messageId: `<t.${ticketEmailToken(opts.replyToTicketId)}.${Date.now().toString(36)}@${supportDomain}>`,
         }
       : {}),
     ...(opts?.inReplyTo ? { inReplyTo: angled(opts.inReplyTo), references: angled(opts.inReplyTo) } : {}),
@@ -376,7 +390,7 @@ export async function routeEmailOutbound(
   subject: string,
   body: string,
   attachments?: MailAttachment[],
-  opts?: { agentName?: string | null; cc?: string[]; seenMessageId?: string | null },
+  opts?: { agentName?: string | null; agentEmail?: string | null; cc?: string[]; seenMessageId?: string | null },
 ): Promise<{ delivered: boolean; reason?: string }> {
   const subj = /^re:/i.test(subject) ? subject : `Re: ${subject}`;
   // The tenant's flagged reply template (0072) restyles the frame; failures fall back to the
@@ -406,6 +420,8 @@ export async function routeEmailOutbound(
     ...(rendered?.html ? { html: rendered.html } : {}),
     ...(attachments?.length ? { attachments } : {}),
     ...(opts?.cc?.length ? { cc: opts.cc } : {}),
+    ...(opts?.agentName ? { agentName: opts.agentName } : {}),
+    ...(opts?.agentEmail ? { agentEmail: opts.agentEmail } : {}),
     replyToTicketId: routing.ticketId ?? null,
     inReplyTo,
   });
