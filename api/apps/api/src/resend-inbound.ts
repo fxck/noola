@@ -136,7 +136,7 @@ function htmlToText(html: string): string {
  */
 export async function ingestResendInbound(
   payload: ResendInboundPayload,
-  opts?: { apiKey?: string | null },
+  opts?: { apiKey?: string | null; tenantId?: string; supportAddress?: string | null },
 ): Promise<ResendInboundResult> {
   if (payload?.type && payload.type !== "email.received") return { status: 200, ingested: false, reason: "ignored-event" };
   const data = payload?.data ?? {};
@@ -160,9 +160,24 @@ export async function ingestResendInbound(
     headerValue(email?.headers, "delivered-to") ?? "",
     headerValue(email?.headers, "x-original-to") ?? "",
   ].map((a) => parseAddress(a).address).filter(Boolean);
+  // BYO handle path: the tenant is already fixed by the per-tenant :handle in the URL, so we never gate
+  // on the address table — a first-time sender lands as a lead + ticket even if the recipient address
+  // isn't pre-registered. Address only steers reply-token threading + the stored `to`. Shared lane (no
+  // tenantId): keep resolving by address, since one URL serves all tenants and an unrouted recipient
+  // genuinely has no owner.
   let toAddr: string | null = null;
-  for (const cand of candidates) {
-    if (await resolveTenantByAddress(parseInboundAddress(cand).base)) { toAddr = cand; break; }
+  if (opts?.tenantId) {
+    const supportBase = opts.supportAddress ? parseInboundAddress(opts.supportAddress).base.toLowerCase() : null;
+    toAddr =
+      candidates.find((c) => supportBase && parseInboundAddress(c).base.toLowerCase() === supportBase) ??
+      candidates.find((c) => parseInboundAddress(c).ticketId) ??
+      candidates[0] ??
+      opts.supportAddress ??
+      null;
+  } else {
+    for (const cand of candidates) {
+      if (await resolveTenantByAddress(parseInboundAddress(cand).base)) { toAddr = cand; break; }
+    }
   }
   if (!toAddr) return { status: 202, ingested: false, reason: "no tenant route" };
 
@@ -196,15 +211,18 @@ export async function ingestResendInbound(
     }
   }
 
-  const result: IngestResult | null = await handleInboundEmail({
-    messageId: data.message_id || email?.message_id || emailId,
-    from: from.address,
-    fromName: from.name,
-    to: toAddr,
-    subject: data.subject ?? email?.subject ?? "",
-    body,
-    ...(cc.length ? { cc: [...new Set(cc)] } : {}),
-    ...(files.length ? { attachments: files } : {}),
-  });
+  const result: IngestResult | null = await handleInboundEmail(
+    {
+      messageId: data.message_id || email?.message_id || emailId,
+      from: from.address,
+      fromName: from.name,
+      to: toAddr,
+      subject: data.subject ?? email?.subject ?? "",
+      body,
+      ...(cc.length ? { cc: [...new Set(cc)] } : {}),
+      ...(files.length ? { attachments: files } : {}),
+    },
+    opts?.tenantId ? { tenantId: opts.tenantId } : undefined,
+  );
   return { status: result ? 201 : 202, ingested: !!result, ticketId: result?.ticketId ?? null };
 }

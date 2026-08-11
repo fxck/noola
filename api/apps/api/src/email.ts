@@ -199,9 +199,16 @@ async function finishInboundEmail(result: IngestResult, m: InboundEmail): Promis
  * never loop back into a ticket. The Message-ID is the idempotency key, so a
  * re-polled message dedupes for free.
  */
-export async function handleInboundEmail(m: InboundEmail): Promise<IngestResult | null> {
+export async function handleInboundEmail(
+  m: InboundEmail,
+  opts?: { tenantId?: string },
+): Promise<IngestResult | null> {
   const parsed = parseInboundAddress(m.to);
-  const tenantId = await resolveTenantByAddress(parsed.base);
+  // A caller that already knows the tenant (BYO per-tenant inbound handle — the handle IS the routing
+  // key, like Intercom's connected inbox) passes it explicitly; we trust it and never second-guess via
+  // the address table. Only the shared inbound lane (one URL for all tenants) falls back to address
+  // resolution, where an unrouted recipient genuinely has no owner.
+  const tenantId = opts?.tenantId ?? (await resolveTenantByAddress(parsed.base));
   if (!tenantId) return null;
 
   // Exact-ticket routing (P4): a verified reply-to token beats From-address threading — the reply
