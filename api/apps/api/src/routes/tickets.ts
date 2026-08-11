@@ -1,13 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import { withTenant } from "@repo/db";
-import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput, SpamTicketInput } from "@repo/contracts";
-import { setContactSpam, contactLiveTicketCount } from "../contacts.js";
-import { blockSender, unblockByHandle } from "../blocklist.js";
+import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput, SpamTicketInput, ParticipantInput } from "@repo/contracts";
+import { markConversationSpam, unmarkConversationSpam } from "../spam.js";
+import { listParticipants, addParticipant, removeParticipant } from "../participants.js";
 import { tenanted } from "../http/tenant.js";
 import { getSlaPolicy, computeSla, type TicketSla } from "../sla.js";
 import {
   listTickets, queryTickets, getTicketDetail, getReplyChannels, patchTicket, listUsers, assignTicket, setTicketTeam, setTicketStatus,
-  snoozeTicket, mergeTicket, setTicketSpam, TICKET_PRIORITIES,
+  snoozeTicket, mergeTicket, TICKET_PRIORITIES,
   type View, type TicketQuery, type TicketPriority, type TicketRow,
 } from "../tickets.js";
 import { markTicketRead, unreadTicketIds } from "../reads.js";
@@ -22,7 +22,7 @@ import { suggestReply } from "../copilot.js";
 import { getChannelDriver } from "../channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "../translate.js";
 import { claimAttachments, attachmentsForTicket } from "../attachments.js";
-import { getTicketMirror, pushTicketToDiscord, mirrorUrl, syncMirrorState, mirrorEligibility } from "../discord-mirror.js";
+import { getTicketMirror, pushTicketToDiscord, mirrorUrl, syncMirrorState, mirrorEligibility, pingSeatInMirror } from "../discord-mirror.js";
 import { getObject } from "../storage.js";
 import { notifyContactByEmailIfAway, tenantSupportAddress, stripOwnCcAddresses, type MailAttachment } from "../email.js";
 import { tenantReplyAddress } from "../email-provider.js";
@@ -197,6 +197,8 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       const out = await assignTicket(tenantId, id, parsed.data.assigneeId);
       if (!out) return reply.code(404).send({ error: "ticket_not_found" });
       emitDomainEvent(tenantId, "ticket.assigned", { ticketId: id, assigneeId: parsed.data.assigneeId });
+      // @ping the assignee in the ops mirror (no-op when unassigning or no Discord ID mapped).
+      if (parsed.data.assigneeId) void pingSeatInMirror(tenantId, id, parsed.data.assigneeId, "was assigned this ticket in Noola.").catch(() => {});
       return out;
     } catch (e) {
       if ((e as { code?: string }).code === "23503") {
@@ -217,6 +219,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       if (!out) return reply.code(404).send({ error: "ticket_not_found" });
       if (out.assigneeId && parsed.data.autoAssign) {
         emitDomainEvent(tenantId, "ticket.assigned", { ticketId: id, assigneeId: out.assigneeId });
+        void pingSeatInMirror(tenantId, id, out.assigneeId, "was assigned this ticket in Noola.").catch(() => {});
       }
       return out;
     } catch (e) {
@@ -251,43 +254,54 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
 
   // Mark as spam — soft-hide the ticket, and (per the request body) block the sender so future inbound
   // is dropped before a ticket/lead is created, and drop the auto-created lead. All reversible via
-  // /unspam. Defaults (from the UI): block + dropLead ON, block scope = exact address.
+  // /unspam. Shares markConversationSpam with the Discord 🚫 reaction so both do the exact same thing.
   app.post("/tickets/:id/spam", tenanted(async (tenantId, req, reply) => {
     const { id } = req.params as { id: string };
     const parsed = SpamTicketInput.safeParse(req.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-    const out = await setTicketSpam(tenantId, id, true);
+    const out = await markConversationSpam(tenantId, id, {
+      block: parsed.data.block, blockScope: parsed.data.blockScope, dropLead: parsed.data.dropLead,
+      actorId: req.session?.userId ?? null,
+    });
     if (!out) return reply.code(404).send({ error: "ticket_not_found" });
-
-    let blocked: string | null = null;
-    if (parsed.data.block && out.senderHandle) {
-      const scope = parsed.data.blockScope ?? "address";
-      const row = await blockSender(tenantId, {
-        channelType: out.channelType, scope, handle: out.senderHandle,
-        reason: "marked spam", createdBy: req.session?.userId ?? null,
-      }).catch((err) => { app.log.warn({ err, ticketId: id }, "block sender failed"); return null; });
-      blocked = row?.handle ?? null;
-    }
-
-    // Drop the lead only when this spam ticket was the contact's ONLY conversation — never hide a
-    // contact who also has real tickets behind the spam one.
-    let leadDropped = false;
-    if (parsed.data.dropLead && out.contactId && (await contactLiveTicketCount(tenantId, out.contactId)) === 0) {
-      await setContactSpam(tenantId, out.contactId, true).catch((err) => app.log.warn({ err, ticketId: id }, "drop lead failed"));
-      leadDropped = true;
-    }
-    return { ticketId: out.ticketId, spam: true, blocked, leadDropped };
+    return { ticketId: out.ticketId, spam: true, blocked: out.blocked, leadDropped: out.leadDropped };
   }));
 
   // Undo — restore the ticket, its lead, and remove the sender block. The full reverse of /spam, so an
   // accidental "Mark as spam" is one click to recover.
   app.post("/tickets/:id/unspam", tenanted(async (tenantId, req, reply) => {
     const { id } = req.params as { id: string };
-    const out = await setTicketSpam(tenantId, id, false);
+    const out = await unmarkConversationSpam(tenantId, id);
     if (!out) return reply.code(404).send({ error: "ticket_not_found" });
-    if (out.contactId) await setContactSpam(tenantId, out.contactId, false).catch(() => {});
-    if (out.senderHandle) await unblockByHandle(tenantId, out.channelType, out.senderHandle).catch(() => {});
     return { ticketId: out.ticketId, spam: false };
+  }));
+
+  // Ticket participants — teammates pulled into THIS conversation (alongside the one assignee + team
+  // lane). Adding one @pings them in the ops mirror when their Discord ID is mapped. Any agent can
+  // manage participants (matches assignee/tags/team, which aren't admin-gated).
+  app.get("/tickets/:id/participants", tenanted(async (tenantId, req) => {
+    const { id } = req.params as { id: string };
+    return { participants: await listParticipants(tenantId, id) };
+  }));
+
+  app.post("/tickets/:id/participants", tenanted(async (tenantId, req, reply) => {
+    const { id } = req.params as { id: string };
+    const parsed = ParticipantInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const out = await addParticipant(tenantId, id, parsed.data.userId);
+    if (!out) return reply.code(404).send({ error: "ticket_or_user_not_found" });
+    // Ping only on a NEW add (idempotent re-add stays quiet), best-effort off the response path.
+    if (out.added) {
+      void pingSeatInMirror(tenantId, id, parsed.data.userId, "was added to this ticket in Noola.").catch(() => {});
+    }
+    return reply.code(201).send({ participant: out.participant });
+  }));
+
+  app.delete("/tickets/:id/participants/:userId", tenanted(async (tenantId, req, reply) => {
+    const { id, userId } = req.params as { id: string; userId: string };
+    const gone = await removeParticipant(tenantId, id, userId);
+    if (!gone) return reply.code(404).send({ error: "not found" });
+    return { ok: true };
   }));
 
   // Discord ops-mirror state for the context rail: mirrored → deep link; not mirrored → whether

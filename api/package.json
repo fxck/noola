@@ -41,6 +41,7 @@
     "test:reply-email": "tsx apps/api/test/reply-email.test.ts",
     "test:reply-all-cc": "tsx apps/api/test/reply-all-cc.test.ts",
     "test:blocklist": "tsx apps/api/test/blocklist.test.ts",
+    "test:participants": "tsx apps/api/test/participants.test.ts",
     "test:resend-inbound": "tsx apps/api/test/resend-inbound.test.ts",
     "test:sendgrid-inbound": "tsx apps/api/test/sendgrid-inbound.test.ts",
     "test:email-provider": "tsx apps/api/test/email-provider.test.ts",

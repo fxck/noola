@@ -9,7 +9,8 @@ import { translateOutboundReply, stampOutboundTranslation } from "./translate.js
 import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
 import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
-import { resolveTeammate } from "./discord-classify.js";
+import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
+import { markConversationSpam } from "./spam.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
 // (email/widget/…) can be selectively mirrored as ONE forum post in a Discord forum channel; the
@@ -254,7 +255,7 @@ function postHeader(t: TicketBrief, latestBody: string | null, quickLinks: Quick
     if (u) links.push(`${ql.label}: <${u}>`);
   }
   if (links.length) lines.push("", links.join("\n"));
-  lines.push("", `_Messages here are internal notes. React ${PROMOTE_EMOJI} on a message to send it to the customer; ✅ closes, 🔄 reopens, 👀 assigns to you, 💤 snoozes._`);
+  lines.push("", `_Messages here are internal notes. React ${PROMOTE_EMOJI} on a message to send it to the customer; ✅ closes, 🔄 reopens, 👀 assigns to you, 💤 snoozes, 🚫 marks spam._`);
   return lines.join("\n");
 }
 
@@ -278,6 +279,20 @@ export async function getTicketMirror(tenantId: string, ticketId: string): Promi
     [tenantId, ticketId],
   );
   return r.rowCount ? (r.rows[0] as MirrorRef) : null;
+}
+
+/** @ping a teammate in a ticket's mirror thread when they're pulled into the issue (assigned or added
+ *  as a participant). No-ops silently when the ticket isn't mirrored, the seat has no Discord ID
+ *  mapped, or the transport is down — a notification is best-effort, never blocks the action. The ping
+ *  is scoped to EXACTLY that one user id, so nobody else is pinged. */
+export async function pingSeatInMirror(tenantId: string, ticketId: string, userId: string, verb: string): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId).catch(() => null);
+  if (!mirror) return;
+  const discordId = await discordIdForSeat(tenantId, userId).catch(() => null);
+  if (!discordId) return;
+  const tp = transport();
+  if (!tp) return;
+  await tp.postToThread(mirror.post_thread_id, `<@${discordId}> ${verb}`, undefined, [discordId]).catch(() => {});
 }
 
 /** Reverse lookup: is this Discord thread a mirror post? Runs pre-tenant (relay), gateway hot path. */
@@ -909,6 +924,11 @@ async function applyMirrorTriage(
       break;
     case "unassign":
       await assignTicket(tenantId, ticketId, null);
+      break;
+    case "spam":
+      // 🚫 from the mirror = the same "Mark as spam" as the web: hide the ticket, block the sender,
+      // drop the lead (defaults on). Reversible from the web Spam view. Attributed to the reactor.
+      await markConversationSpam(tenantId, ticketId, { block: true, dropLead: true, actorId: agentId });
       break;
     default:
       // 'note'/'priority' need a value an emoji can't carry — Slack-only kinds, ignored here.

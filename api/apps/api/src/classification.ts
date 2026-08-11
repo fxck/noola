@@ -46,6 +46,7 @@ export const DEFAULT_REACTION_MAP: ReactionEntry[] = [
   { emoji: "arrows_counterclockwise", action: "reopen" },
   { emoji: "eyes", action: "assign_me" },
   { emoji: "zzz", action: "snooze" },
+  { emoji: "no_entry_sign", action: "spam" },
 ];
 
 // Unicode ⇄ Slack-name aliases for the shared reaction-triage map: Slack delivers colon-names
@@ -61,6 +62,7 @@ const EMOJI_ALIASES: Record<string, string> = {
   "👀": "eyes",
   "💤": "zzz",
   "😴": "sleeping",
+  "🚫": "no_entry_sign",
   "📤": "outbox_tray",
   "❌": "x",
   "👍": "+1",
