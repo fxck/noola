@@ -53,18 +53,6 @@ function parseAddressList(v: string | undefined): { address: string; name?: stri
   return v.split(",").map((s) => parseAddress(s)).filter((a) => a.address);
 }
 
-function htmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 /**
  * Normalize a SendGrid Inbound Parse payload (already parsed into fields + files by the multipart
  * route) and ingest via the shared inbound spine.
@@ -119,7 +107,8 @@ export async function ingestSendgridInbound(
     candidates[0] ??
     opts.supportAddress ??
     from.address; // last resort: something non-empty so parseInboundAddress downstream is safe
-  const body = fields.text && fields.text.trim() ? fields.text : fields.html ? htmlToText(fields.html) : "";
+  const body = fields.text ?? "";
+  const html = fields.html ?? null; // spine strips the quote, preferring text, HTML as fallback
   const cc = [...parseAddressList(fields.cc), ...parseAddressList(fields.to)]
     .map((a) => a.address)
     .filter((a) => a && a !== toAddr && a !== from.address);
@@ -148,6 +137,7 @@ export async function ingestSendgridInbound(
       to: toAddr,
       subject: fields.subject ?? "",
       body,
+      html,
       ...(cc.length ? { cc: [...new Set(cc)] } : {}),
       ...(attachments.length ? { attachments } : {}),
     },

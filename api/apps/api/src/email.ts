@@ -9,6 +9,7 @@ import { tenantEmailProviderCreds, tenantReplyAddress, type EmailProviderName } 
 import { resolveFromIdentity } from "./email-sender.js";
 import { publicApiBase } from "./env.js";
 import { isSenderBlocked } from "./blocklist.js";
+import { stripInboundQuote } from "./email-quote.js";
 
 // The email channel — the second real channel after Discord, riding the same
 // ingestInbound() spine. Dev/stage use Mailpit (SMTP catch + HTTP API); a real
@@ -186,7 +187,10 @@ export interface InboundEmail {
   fromName?: string; // customer display name (From header), when present
   to: string; // tenant support address — resolves the tenant
   subject: string;
-  body: string;
+  body: string; // plaintext part (preferred). Quote-stripped before persist.
+  /** Raw HTML part, when the email carried one. Used only as the quote-strip fallback when
+   *  there's no usable plaintext body (structural excision of the quote container). */
+  html?: string | null;
   /** Other recipients on the email (Cc + extra To, minus the support route) — stamped on the
    *  message's meta so the agent composer can default to reply-all. */
   cc?: string[];
@@ -196,7 +200,7 @@ export interface InboundEmail {
 
 /** Post-ingest finish for an inbound email: persist attachments onto the message and stamp the
  *  cc list into the message meta (both best-effort — a hiccup never loses the ticket). */
-async function finishInboundEmail(result: IngestResult, m: InboundEmail): Promise<void> {
+async function finishInboundEmail(result: IngestResult, m: InboundEmail, quoted?: string | null): Promise<void> {
   if (m.attachments?.length) {
     await persistBufferAttachments(result.tenantId, result.ticketId, result.messageId, m.attachments.slice(0, 10))
       .catch(() => {});
@@ -206,6 +210,15 @@ async function finishInboundEmail(result: IngestResult, m: InboundEmail): Promis
       await c.query(
         `UPDATE messages SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('cc', $2::jsonb) WHERE id = $1`,
         [result.messageId, JSON.stringify(m.cc!.slice(0, 10))],
+      );
+    }).catch(() => {});
+  }
+  // Preserve the stripped quote history (capped) so a UI can offer a "show quoted text" expander.
+  if (quoted) {
+    await withTenant(result.tenantId, async (c) => {
+      await c.query(
+        `UPDATE messages SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('quoted', $2::text) WHERE id = $1`,
+        [result.messageId, quoted.slice(0, 100_000)],
       );
     }).catch(() => {});
   }
@@ -243,6 +256,11 @@ export async function handleInboundEmail(
   // reopened. Covers exact-address and domain blocks (see blocklist.ts).
   if (m.from && (await isSenderBlocked(tenantId, "email", m.from))) return null;
 
+  // Strip the quoted reply history + signature the sender's mail client echoed back, so the
+  // conversation shows only what the customer typed THIS turn. The removed remainder rides
+  // onto messages.meta.quoted (in finishInboundEmail) for an optional "show quoted" expander.
+  const { visible: body, quoted } = stripInboundQuote({ text: m.body, html: m.html ?? null });
+
   // Exact-ticket routing (P4): a verified reply-to token beats From-address threading — the reply
   // lands on THAT ticket (reopening it if it closed meanwhile), so a contact with several open
   // conversations can answer each one's email correctly. Token invalid / ticket gone → fall
@@ -260,34 +278,34 @@ export async function handleInboundEmail(
       const result = await ingestInbound({
         tenantId,
         ticketId: parsed.ticketId,
-        body: m.body,
+        body,
         authorType: "customer",
         idempotencyKey: `email:${m.messageId}`,
-        subject: m.subject || m.body.slice(0, 80),
+        subject: m.subject || body.slice(0, 80),
         channelType: "email",
         externalChannelId: m.from.toLowerCase(),
         identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
         deferMirror: !!m.attachments?.length,
       });
-      if (!result.replay) await finishInboundEmail(result, m);
+      if (!result.replay) await finishInboundEmail(result, m, quoted);
       return result;
     }
   }
 
   const result = await ingestInbound({
     tenantId,
-    body: m.body,
+    body,
     authorType: "customer",
     idempotencyKey: `email:${m.messageId}`,
-    subject: m.subject || m.body.slice(0, 80),
+    subject: m.subject || body.slice(0, 80),
     channelType: "email",
     externalChannelId: m.from.toLowerCase(),
     // The From address is both the reply target and the cross-channel identity (email unifies).
     identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
     deferMirror: !!m.attachments?.length,
   });
-  // A replayed (idempotency-deduped) message already carried its files/cc the first time.
-  if (!result.replay) await finishInboundEmail(result, m);
+  // A replayed (idempotency-deduped) message already carried its files/cc/quote the first time.
+  if (!result.replay) await finishInboundEmail(result, m, quoted);
   return result;
 }
 
@@ -512,6 +530,7 @@ interface MailpitMessage {
   Cc?: { Address: string; Name: string }[] | null;
   Subject: string;
   Text: string;
+  HTML?: string | null;
   Headers?: Record<string, string[]>;
   Attachments?: { PartID: string; FileName: string; ContentType: string; Size: number }[] | null;
 }
@@ -583,6 +602,7 @@ export async function pollEmail(log: Log): Promise<void> {
         to,
         subject: full.Subject ?? "",
         body: full.Text ?? "",
+        html: full.HTML ?? null,
         ...(cc.length ? { cc: [...new Set(cc)] } : {}),
         ...(files.length ? { attachments: files } : {}),
       });

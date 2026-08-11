@@ -114,19 +114,6 @@ function asArray(v: string | string[] | null | undefined): string[] {
   return v ? (Array.isArray(v) ? v : [v]) : [];
 }
 
-// Crude HTML→text fallback for received emails that carry no plaintext part.
-function htmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 /**
  * Handle a verified Resend `email.received` event: fetch the parsed body + attachments back from
  * Resend, resolve the tenant from the recipient (direct-MX puts the +t.<token> address in `to`; a
@@ -181,7 +168,10 @@ export async function ingestResendInbound(
   }
   if (!toAddr) return { status: 202, ingested: false, reason: "no tenant route" };
 
-  const body = email?.text && email.text.trim() ? email.text : email?.html ? htmlToText(email.html) : "";
+  // Pass BOTH parts to the spine — it strips the quoted history, preferring the plaintext part
+  // and falling back to structural excision of the HTML quote container when there's no text.
+  const body = email?.text ?? "";
+  const html = email?.html ?? null;
   const from = parseAddress(data.from ?? email?.from);
   const cc = [...(data.to ?? []), ...(data.cc ?? []), ...asArray(email?.to)]
     .map((a) => parseAddress(a).address)
@@ -219,6 +209,7 @@ export async function ingestResendInbound(
       to: toAddr,
       subject: data.subject ?? email?.subject ?? "",
       body,
+      html,
       ...(cc.length ? { cc: [...new Set(cc)] } : {}),
       ...(files.length ? { attachments: files } : {}),
     },
