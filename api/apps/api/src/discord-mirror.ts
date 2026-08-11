@@ -247,7 +247,7 @@ function postHeader(t: TicketBrief, latestBody: string | null, quickLinks: Quick
   if (latestBody) lines.push("", quote(latestBody));
   const base = webBase();
   const links: string[] = [];
-  if (base) links.push(`Console: ${base}/tickets/${t.id}`);
+  if (base) links.push(`Console: <${base}/tickets/${t.id}>`); // <> suppresses Discord's link-preview embed (matches the quick-links below)
   // Per-binding quick-links (Backoffice, …). Wrap each url in <> so N links don't each spawn a link
   // preview embed. A link whose placeholder has no value for this ticket is skipped.
   for (const ql of quickLinks) {
