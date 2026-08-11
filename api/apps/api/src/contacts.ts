@@ -312,6 +312,40 @@ export async function getContact(tenantId: string, id: string): Promise<ContactR
   });
 }
 
+/** One plottable contact — a slim projection for the map view (no attributes bag, no ticket
+ *  rollups): identity + the IP-derived city-level coordinate enrichment stamped on the contact. */
+export interface ContactGeoPoint {
+  id: string;
+  name: string;
+  company: string;
+  city: string | null;
+  country: string | null;
+  avatar_url: string | null;
+  lat: number;
+  lng: number;
+}
+
+/** Every contact that carries plottable coordinates (the Latitude/Longitude enrichment attributes),
+ *  as a slim payload for the map. Spam-hidden contacts are excluded, mirroring the directory. The
+ *  numeric guard keeps a malformed attribute value (imported junk) from failing the ::float8 cast —
+ *  such a row is simply skipped rather than 500-ing the whole map. */
+export async function listContactGeoPoints(tenantId: string): Promise<ContactGeoPoint[]> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, name, company, avatar_url,
+              attributes->>'City'    AS city,
+              attributes->>'Country' AS country,
+              (attributes->>'Latitude')::float8  AS lat,
+              (attributes->>'Longitude')::float8 AS lng
+         FROM contacts
+        WHERE spam_at IS NULL
+          AND attributes->>'Latitude'  ~ '^-?[0-9]+(\\.[0-9]+)?$'
+          AND attributes->>'Longitude' ~ '^-?[0-9]+(\\.[0-9]+)?$'`,
+    );
+    return r.rows as ContactGeoPoint[];
+  });
+}
+
 /** Throttled presence bump — any widget touch (ask / poll / identify / track) marks the contact
  *  seen. The 60s throttle keeps the polling widget from writing on every poll; "online" derives
  *  from this at read time, so no disconnect hook is needed. Fire-and-forget at call sites. */

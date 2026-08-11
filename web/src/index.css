@@ -355,3 +355,54 @@
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* ── Customers → Map (MapLibre) ─────────────────────────────────────────────
+   Theme the popup to match the app surface (default MapLibre popups are white,
+   which reads wrong over the dark basemap), and give the contact-card popup its
+   compact look. Layer/basemap colors live in the component. */
+.maplibregl-popup-content {
+  background: var(--popover, var(--background));
+  color: var(--popover-foreground, var(--foreground));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  padding: 0;
+}
+.maplibregl-popup-tip {
+  border-top-color: var(--popover, var(--background));
+  border-bottom-color: var(--popover, var(--background));
+}
+.maplibregl-popup-close-button {
+  color: var(--muted-foreground);
+  font-size: 16px;
+  padding: 2px 6px;
+}
+.cm-pop-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 10px 26px 10px 12px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  border-radius: 10px;
+}
+.cm-pop-btn:hover {
+  background: color-mix(in srgb, var(--muted-foreground) 10%, transparent);
+}
+.cm-pop-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.cm-pop-sub {
+  font-size: 12px;
+  color: var(--foreground);
+  opacity: 0.85;
+}
+.cm-pop-place {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}

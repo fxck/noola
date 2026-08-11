@@ -8,6 +8,7 @@ import { tenanted } from "../http/tenant.js";
 import {
   listContacts, getContact, createContact, updateContact, deleteContact,
   upsertContact, bulkUpsertContacts, contactHistory, mergeContacts, listContactIdentities,
+  listContactGeoPoints,
 } from "../contacts.js";
 import { recordContactEvent, listContactEvents } from "../contact-events.js";
 import { listCompanies, countCompanies, getCompany, createCompany, updateCompany, deleteCompany, bulkUpsertCompanies, ensureCompaniesByName, type HealthBand } from "../companies.js";
@@ -71,6 +72,12 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
       q: q.q, company: q.company, attrKey: q.attrKey, attrValue: q.attrValue,
       conditions, conditionGroups, identity, sort, limit: num(q.limit), offset: num(q.offset),
     });
+  }));
+
+  // Map view: every contact with plottable IP-derived coordinates, as a slim points payload.
+  // Static path — registered before "/contacts/:id" so Fastify's router never treats "geo" as an id.
+  app.get("/contacts/geo", tenanted(async (tenantId) => {
+    return { points: await listContactGeoPoints(tenantId) };
   }));
 
   app.post("/contacts", tenanted(async (tenantId, req, reply) => {

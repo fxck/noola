@@ -22,6 +22,7 @@ import { AnalyticsPage } from "@/routes/analytics";
 import { KbPage } from "@/routes/kb";
 import { SourcesPage } from "@/routes/sources";
 import { ContactsPage } from "@/routes/contacts-list";
+import { ContactsMapPage } from "@/routes/contacts-map";
 import { ContactDetailPage } from "@/routes/contact-detail";
 import { KbArticlePage, KbNewPage, KbEditPage } from "@/routes/kb-detail";
 import { SourceDetailPage } from "@/routes/source-detail";
@@ -309,6 +310,16 @@ const contactsRoute = createRoute({
     if (!context.auth.isAuthed) throw redirect({ to: "/login" });
   },
   component: ContactsPage,
+});
+
+const contactsMapRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  // Static segment, so it wins over "/contacts/$contactId" (a "map" contact id is never routed here).
+  path: "/contacts/map",
+  beforeLoad: ({ context }) => {
+    if (!context.auth.isAuthed) throw redirect({ to: "/login" });
+  },
+  component: ContactsMapPage,
 });
 
 const contactDetailRoute = createRoute({
@@ -719,6 +730,7 @@ const routeTree = rootRoute.addChildren([
   sourceDetailRoute,
   documentDetailRoute,
   contactsRoute,
+  contactsMapRoute,
   contactDetailRoute,
   companiesRoute,
   companyDetailRoute,

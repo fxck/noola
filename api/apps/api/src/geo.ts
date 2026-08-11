@@ -17,6 +17,9 @@ export interface GeoResult {
   country?: string;
   continent?: string;
   continentCode?: string;
+  /** City-level coordinates from the IP record (approximate centroid), when the db carries them. */
+  latitude?: number;
+  longitude?: number;
 }
 
 export async function geoLookup(ip: string | null): Promise<GeoResult | null> {
@@ -27,10 +30,16 @@ export async function geoLookup(ip: string | null): Promise<GeoResult | null> {
     const res = await fetch(`${GEO_URL}/lookup?ip=${encodeURIComponent(ip)}`, { signal: ac.signal });
     clearTimeout(timer);
     if (!res.ok) return null;
-    const d = (await res.json()) as { country?: string; region?: string; city?: string; continent?: string };
+    const d = (await res.json()) as {
+      country?: string; region?: string; city?: string; continent?: string; lat?: number; lng?: number;
+    };
     if (!d || (!d.country && !d.city && !d.region && !d.continent)) return null;
+    const coord = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
     // The sidecar returns `continent` as the code (e.g. "EU") — mapped to Intercom's "Continent code".
-    return { city: d.city, region: d.region, country: d.country, continentCode: d.continent };
+    return {
+      city: d.city, region: d.region, country: d.country, continentCode: d.continent,
+      latitude: coord(d.lat), longitude: coord(d.lng),
+    };
   } catch {
     return null;
   }

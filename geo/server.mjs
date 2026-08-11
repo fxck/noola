@@ -23,11 +23,19 @@ function lookup(ip) {
     const r = reader.get(ip);
     if (!r) return {};
     const en = (o) => o?.names?.en;
+    // City-level lat/lng straight off the DB-IP record (the mmdb already carries them) — the
+    // approximate coordinate Intercom plots visitors at. Rounded to ~11m; a centroid, not a
+    // rooftop, so many visitors in one city collapse onto the same point (the map clusters them).
+    const lat = r.location?.latitude;
+    const lng = r.location?.longitude;
+    const num = (v) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v * 1e4) / 1e4 : undefined);
     return {
       country: en(r.country),
       region: en(r.subdivisions?.[0]),
       city: en(r.city),
       continent: r.continent?.code, // e.g. "EU" — matches Intercom's "Continent code"
+      lat: num(lat),
+      lng: num(lng),
     };
   } catch {
     return {};
