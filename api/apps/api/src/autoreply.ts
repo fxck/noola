@@ -320,9 +320,10 @@ export interface OnDemandResult {
  * policy.mode + assistant_enabled + per-channel routing (an explicit human request is not ambient),
  * but STILL honors the safety gates (checkHardGates — kill switch + classifyRisk; a risky /ask is
  * held, never answered publicly) and its OWN hourly cap (max_ondemand_per_hour, counted only over
- * source='on_demand' so it never touches the ambient throttle). Retrieval is FORCED to KB-only
- * regardless of the tenant's public source_scopes (§5.3 #2 — re-assert at the command layer, don't
- * trust the tenant scope). Records exactly one source='on_demand' decision (idempotent on messageId),
+ * source='on_demand' so it never touches the ambient throttle). Retrieval HONORS the tenant's public
+ * source_scopes (default kb+document) — same as the widget/public-API — so crawled Documents can
+ * ground a public /ask; a tenant that wants KB-only publicly narrows source_scopes.public itself.
+ * Records exactly one source='on_demand' decision (idempotent on messageId),
  * and takes the 'on_demand' answer claim so ambient autoreply / automations don't also answer this
  * turn. The caller (the Discord command handler) posts `text` when outcome==='answered'.
  */
@@ -365,9 +366,11 @@ export async function answerOnDemand(args: {
     return { outcome: "suppressed", reason: "ondemand_rate_limited", text: null, decisionId: id };
   }
 
-  // Draft — public audience, but KB-only FORCED (do not trust the tenant's public source_scopes).
+  // Draft — public audience. Honors the tenant's public source_scopes (default kb+document),
+  // so crawled Documents can ground public answers too, not only curated KB articles. A tenant
+  // that wants KB-only publicly narrows source_scopes.public itself.
   const suggestion = await suggestForQuery(tenantId, query, {
-    ticketId, messageId, source: "live", audience: "public", forceScope: ["kb"],
+    ticketId, messageId, source: "live", audience: "public",
   });
 
   // Arbitration: take the turn's single claim as 'on_demand'. A lost claim ⇒ another answerer

@@ -3,6 +3,7 @@ import { getModelConfig } from "./modelconfig.js";
 import { getPersona, DEFAULT_PERSONA } from "./persona.js";
 import { getPolicy } from "./autoreply.js";
 import { listSimulations } from "./simulate.js";
+import { DEFAULT_SCOPES } from "./copilot.js";
 
 // The governable-AI overview (Wave 5 item 22) — ONE aggregate behind the settings hub
 // that packages the story: which model answers (BYO), in whose voice (persona), under
@@ -67,7 +68,7 @@ export async function getAiOverview(tenantId: string): Promise<AiOverview> {
       killSwitch: policy.kill_switch,
       minConfidence: policy.min_confidence,
       channelOverrides: Object.keys(policy.channel_modes ?? {}).length,
-      publicSourceKinds: Array.isArray(publicScope) && publicScope.length > 0 ? publicScope : ["kb"],
+      publicSourceKinds: Array.isArray(publicScope) && publicScope.length > 0 ? publicScope : DEFAULT_SCOPES.public,
     },
     queue: { pending: Number(counts.pending) || 0 },
     lastEval: last

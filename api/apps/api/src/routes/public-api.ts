@@ -72,7 +72,7 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
       const uncertain = s.citations.length === 0 || (s.confidence ?? 0) < 0.5;
       return {
         answer: s.draft,
-        citations: s.citations.map((c) => ({ kind: c.kind, title: c.title, snippet: c.snippet })),
+        citations: s.citations.map((c) => ({ kind: c.kind, title: c.title, snippet: c.snippet, url: c.url })),
         confidence: s.confidence,
         uncertain,
         model: s.model,
