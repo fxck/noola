@@ -3,6 +3,7 @@ import { appPool, relayPool } from "@repo/db";
 import { createContact } from "../src/contacts.js";
 import {
   previewSegment,
+  previewRecipients,
   createBroadcast,
   getBroadcast,
   listBroadcasts,
@@ -109,6 +110,16 @@ async function main() {
     const empty = await previewSegment(A, { company: "NoSuchCo" });
     check("previewSegment empty segment → 0 everywhere",
       empty.total === 0 && Object.values(empty.reachable).every((n) => n === 0));
+
+    // previewRecipients: the "who exactly" drill-in behind the reach count.
+    const pr = await previewRecipients(A, SEG, "email");
+    check("previewRecipients email lists the deliverable recipients", pr.recipients.length === 3 && pr.reachable === 3 && pr.total === 4);
+    check("previewRecipients rows carry name+handle", pr.recipients.every((r) => typeof r.handle === "string" && r.handle.length > 0));
+    check("previewRecipients not truncated under the cap", pr.truncated === false);
+    const prTg = await previewRecipients(A, SEG, "telegram");
+    check("previewRecipients resolves a chat channel's handles", prTg.recipients.length === 3 && prTg.reachable === 3);
+    const prCap = await previewRecipients(A, SEG, "email", 2);
+    check("previewRecipients honors the limit + flags truncation", prCap.recipients.length === 2 && prCap.truncated === true && prCap.reachable === 3);
   }
 
   // ---- createBroadcast (draft) ----

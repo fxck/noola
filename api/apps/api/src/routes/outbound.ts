@@ -7,6 +7,7 @@ import { mdToSlack, mdToTelegramHtml, mdToWhatsApp, mdToPlain } from "../channel
 import { listWebhooks, createWebhook, updateWebhook, deleteWebhook, sendTestPing, listDeliveries } from "../webhooks.js";
 import {
   previewSegment,
+  previewRecipients,
   createBroadcast,
   listBroadcasts,
   getBroadcast,
@@ -103,6 +104,13 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
   app.post("/broadcasts/preview", tenanted(async (tenantId, req) => {
     const segment = ((req.body as { segment?: Record<string, unknown> } | undefined)?.segment) ?? {};
     return previewSegment(tenantId, segment);
+  }));
+
+  // List WHO a segment resolves to for a channel (deliverable set, suppression applied) — the
+  // "view recipients" drill-in behind the reach count, capped for the UI. Read-only.
+  app.post("/broadcasts/preview-recipients", tenanted(async (tenantId, req) => {
+    const b = (req.body ?? {}) as { segment?: Record<string, unknown>; channel?: string; limit?: number };
+    return previewRecipients(tenantId, b.segment ?? {}, typeof b.channel === "string" ? b.channel : "email", typeof b.limit === "number" ? b.limit : 200);
   }));
 
   app.post("/broadcasts", tenanted(async (tenantId, req, reply) => {

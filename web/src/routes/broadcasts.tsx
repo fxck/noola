@@ -50,9 +50,11 @@ import {
   type SegmentCondition,
   type SegmentPreview,
   type Suppression,
+  type RecipientsPreview,
   fetchBroadcasts,
   fetchBroadcast,
   previewSegment,
+  previewRecipients,
   previewBroadcastRender,
   sendBroadcastTest,
   createBroadcast,
@@ -1015,6 +1017,7 @@ function ComposeBroadcast({
   const [preview, setPreview] = useState<SegmentPreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [previewFailed, setPreviewFailed] = useState(false);
+  const [showRecipients, setShowRecipients] = useState(false);
 
   // A chip whose op needs a value but has none yet is still being built — it neither
   // filters the preview nor ships with the draft (same rule as the contacts directory).
@@ -1618,7 +1621,7 @@ function ComposeBroadcast({
                 const reach = preview.reachable[channel] ?? 0;
                 const unreachable = Math.max(0, preview.total - reach);
                 return (
-                  <span>
+                  <span className="flex-1">
                     Will send to <span className="font-semibold tabular-nums">{reach.toLocaleString()}</span>{" "}
                     {reach === 1 ? "contact" : "contacts"} via {CHANNEL_LABEL[channel]}
                     <span className="text-muted-foreground">
@@ -1635,9 +1638,28 @@ function ComposeBroadcast({
             ) : (
               <span className="text-muted-foreground">Refine the audience to preview reach.</span>
             )}
+            {/* view-recipients drill-in — the fix for "just a number": list exactly who receives */}
+            {preview && (preview.reachable[channel] ?? 0) > 0 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="ml-auto h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setShowRecipients(true)}
+              >
+                <Users className="size-3.5" />
+                View recipients
+              </Button>
+            )}
           </div>
         </div>
         )}
+        <RecipientPreviewDialog
+          open={showRecipients}
+          onClose={() => setShowRecipients(false)}
+          segment={segment}
+          channel={channel}
+        />
 
         {/* delivery timing — WHEN the broadcast goes out once its draft is
             sent. Radio cards: the header row is the radio; a card's extra
@@ -2604,6 +2626,87 @@ function SuppressionsDialog({ open, onClose }: { open: boolean; onClose: () => v
             </li>
           ))}
         </ul>
+      )}
+    </FormDialog>
+  );
+}
+
+/** "View recipients" drill-in — the deliverable set a segment resolves to for the chosen
+ *  channel, so a marketer can see exactly WHO receives before sending (closes the count-only
+ *  blindspot). Fetches a capped sample on open; the server applies the same suppression the
+ *  real send does, so this list IS the audience. */
+function RecipientPreviewDialog({
+  open,
+  onClose,
+  segment,
+  channel,
+}: {
+  open: boolean;
+  onClose: () => void;
+  segment: Segment;
+  channel: BroadcastChannel;
+}) {
+  const [data, setData] = useState<RecipientsPreview | null>(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setData(null);
+      setError(false);
+      return;
+    }
+    let live = true;
+    setError(false);
+    previewRecipients(segment, channel)
+      .then((d) => live && setData(d))
+      .catch(() => live && setError(true));
+    return () => {
+      live = false;
+    };
+  }, [open, segment, channel]);
+
+  return (
+    <FormDialog
+      open={open}
+      title="Recipients"
+      description={
+        data
+          ? `${data.reachable.toLocaleString()} will receive via ${CHANNEL_LABEL[channel]}${data.truncated ? ` — showing the first ${data.recipients.length}` : ""}`
+          : `Who receives via ${CHANNEL_LABEL[channel]}`
+      }
+      onClose={onClose}
+      footer={<div className="border-t px-5 py-3" />}
+    >
+      {error ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">Couldn't load the recipient list.</p>
+      ) : data === null ? (
+        <div className="grid place-items-center py-8">
+          <Loader2 className="size-4 animate-spin text-muted-foreground" />
+        </div>
+      ) : data.recipients.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">
+          No reachable recipients for this audience on {CHANNEL_LABEL[channel]}.
+        </p>
+      ) : (
+        <>
+          <ul className="divide-y divide-border/50 overflow-hidden rounded-lg border">
+            {data.recipients.map((r, i) => (
+              <li key={`${r.handle}-${i}`} className="flex items-center gap-3 px-3 py-2">
+                <ChannelIcon channel={channel} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm">{r.name || r.handle}</div>
+                  {r.name && <div className="truncate text-micro text-muted-foreground">{r.handle}</div>}
+                </div>
+                {r.company && <span className="shrink-0 truncate text-xs text-muted-foreground">{r.company}</span>}
+              </li>
+            ))}
+          </ul>
+          {data.truncated && (
+            <p className="mt-2 text-micro text-muted-foreground">
+              This is a sample of the first {data.recipients.length.toLocaleString()} of {data.reachable.toLocaleString()} recipients.
+            </p>
+          )}
+        </>
       )}
     </FormDialog>
   );
