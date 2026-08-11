@@ -283,6 +283,8 @@ export async function listContacts(
   // keyed only by conversation id, unidentified channel users).
   if (filters.identity === "identified") clauses.push("(coalesce(name,'') <> '' OR coalesce(email,'') <> '')");
   else if (filters.identity === "anonymous") clauses.push("(coalesce(name,'') = '' AND coalesce(email,'') = '')");
+  // Spam-hidden leads (dropped via "Mark as spam") never surface in the directory; Unspam restores them.
+  clauses.push("spam_at IS NULL");
   const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
 
   // Sort column is whitelisted (CORE_COL) so it's a safe identifier; direction is a literal.
@@ -392,6 +394,26 @@ export async function deleteContact(tenantId: string, id: string): Promise<boole
   return withTenant(tenantId, async (c) => {
     const r = await c.query("DELETE FROM contacts WHERE id = $1", [id]);
     return (r.rowCount ?? 0) > 0;
+  });
+}
+
+/** Soft-hide (spam=true) or restore (spam=false) a lead — the reversible "drop lead" of Mark-as-spam.
+ *  The contact stays in the DB (Unspam restores it); it just leaves the directory. */
+export async function setContactSpam(tenantId: string, id: string, spam: boolean): Promise<void> {
+  await withTenant(tenantId, async (c) => {
+    await c.query(
+      `UPDATE contacts SET spam_at = ${spam ? "now()" : "NULL"}, updated_at = now() WHERE id = $1`,
+      [id],
+    );
+  });
+}
+
+/** Count a contact's tickets that are NOT spam-hidden. The spam route only drops a lead when this is
+ *  zero — never hide a contact who also has real conversations behind the spam one. */
+export async function contactLiveTicketCount(tenantId: string, id: string): Promise<number> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT count(*)::int AS n FROM tickets WHERE contact_id = $1 AND spam_at IS NULL", [id]);
+    return (r.rows[0]?.n as number) ?? 0;
   });
 }
 

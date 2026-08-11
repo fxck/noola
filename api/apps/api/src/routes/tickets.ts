@@ -1,11 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import { withTenant } from "@repo/db";
-import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput } from "@repo/contracts";
+import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput, SpamTicketInput } from "@repo/contracts";
+import { setContactSpam, contactLiveTicketCount } from "../contacts.js";
+import { blockSender, unblockByHandle } from "../blocklist.js";
 import { tenanted } from "../http/tenant.js";
 import { getSlaPolicy, computeSla, type TicketSla } from "../sla.js";
 import {
   listTickets, queryTickets, getTicketDetail, getReplyChannels, patchTicket, listUsers, assignTicket, setTicketTeam, setTicketStatus,
-  snoozeTicket, mergeTicket, TICKET_PRIORITIES,
+  snoozeTicket, mergeTicket, setTicketSpam, TICKET_PRIORITIES,
   type View, type TicketQuery, type TicketPriority, type TicketRow,
 } from "../tickets.js";
 import { markTicketRead, unreadTicketIds } from "../reads.js";
@@ -245,6 +247,47 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     // No ticket.reopened trigger exists, so the ops-mirror unarchive is called directly here.
     void syncMirrorState(tenantId, id).catch(() => {});
     return out;
+  }));
+
+  // Mark as spam — soft-hide the ticket, and (per the request body) block the sender so future inbound
+  // is dropped before a ticket/lead is created, and drop the auto-created lead. All reversible via
+  // /unspam. Defaults (from the UI): block + dropLead ON, block scope = exact address.
+  app.post("/tickets/:id/spam", tenanted(async (tenantId, req, reply) => {
+    const { id } = req.params as { id: string };
+    const parsed = SpamTicketInput.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const out = await setTicketSpam(tenantId, id, true);
+    if (!out) return reply.code(404).send({ error: "ticket_not_found" });
+
+    let blocked: string | null = null;
+    if (parsed.data.block && out.senderHandle) {
+      const scope = parsed.data.blockScope ?? "address";
+      const row = await blockSender(tenantId, {
+        channelType: out.channelType, scope, handle: out.senderHandle,
+        reason: "marked spam", createdBy: req.session?.userId ?? null,
+      }).catch((err) => { app.log.warn({ err, ticketId: id }, "block sender failed"); return null; });
+      blocked = row?.handle ?? null;
+    }
+
+    // Drop the lead only when this spam ticket was the contact's ONLY conversation — never hide a
+    // contact who also has real tickets behind the spam one.
+    let leadDropped = false;
+    if (parsed.data.dropLead && out.contactId && (await contactLiveTicketCount(tenantId, out.contactId)) === 0) {
+      await setContactSpam(tenantId, out.contactId, true).catch((err) => app.log.warn({ err, ticketId: id }, "drop lead failed"));
+      leadDropped = true;
+    }
+    return { ticketId: out.ticketId, spam: true, blocked, leadDropped };
+  }));
+
+  // Undo — restore the ticket, its lead, and remove the sender block. The full reverse of /spam, so an
+  // accidental "Mark as spam" is one click to recover.
+  app.post("/tickets/:id/unspam", tenanted(async (tenantId, req, reply) => {
+    const { id } = req.params as { id: string };
+    const out = await setTicketSpam(tenantId, id, false);
+    if (!out) return reply.code(404).send({ error: "ticket_not_found" });
+    if (out.contactId) await setContactSpam(tenantId, out.contactId, false).catch(() => {});
+    if (out.senderHandle) await unblockByHandle(tenantId, out.channelType, out.senderHandle).catch(() => {});
+    return { ticketId: out.ticketId, spam: false };
   }));
 
   // Discord ops-mirror state for the context rail: mirrored → deep link; not mirrored → whether

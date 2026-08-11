@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { ArrowLeft, RotateCcw, ChevronDown, Users } from "lucide-react";
+import { ArrowLeft, RotateCcw, ChevronDown, Users, ShieldOff } from "lucide-react";
 import {
   type Ticket,
   type Message,
@@ -8,8 +8,10 @@ import {
   fetchMessages,
   assignTicket,
   setTicketOpen,
+  unspamTicket,
   relativeTime,
 } from "@/lib/tickets";
+import { toast } from "@/components/ui/toaster";
 import { useQueue } from "@/lib/queue-context";
 import { type Note, fetchNotes } from "@/lib/notes";
 import { ContextRail } from "@/components/inbox/context-rail";
@@ -118,6 +120,7 @@ export function ThreadPane({
   }).current;
 
   const isClosed = ticket.status === "closed";
+  const isSpam = !!ticket.spam_at;
   const isDiscord = ticket.channel_type === "discord";
 
   // Presence: broadcast that we're viewing this ticket; clear on leave/switch.
@@ -332,9 +335,28 @@ export function ThreadPane({
         <JumpToLatest />
       </StickToBottom>
 
-      {/* composer / closed-state footer — the composer renders the held AI
-          draft (approve/edit/dismiss) itself, with the thread in view */}
-      {isClosed ? (
+      {/* composer / spam / closed-state footer — the composer renders the held AI
+          draft (approve/edit/dismiss) itself, with the thread in view. A spam-hidden
+          ticket replaces the composer with a prominent restore ("Not spam"). */}
+      {isSpam ? (
+        <footer className="flex flex-wrap items-center justify-center gap-3 border-t bg-muted/30 px-4 py-4 text-sm text-muted-foreground">
+          <span>Marked as spam — hidden from the inbox.</span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={actionBusy}
+            onClick={() =>
+              runAction(async () => {
+                await unspamTicket(ticket.id);
+                toast.success("Restored");
+              })
+            }
+          >
+            <ShieldOff />
+            Not spam
+          </Button>
+        </footer>
+      ) : isClosed ? (
         <footer className="flex flex-wrap items-center justify-center gap-3 border-t bg-muted/30 px-4 py-4 text-sm text-muted-foreground">
           <span>This conversation is closed.</span>
           <Button

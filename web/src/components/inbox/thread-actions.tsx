@@ -10,6 +10,7 @@ import {
   MoreHorizontal,
   PanelRight,
   RotateCcw,
+  ShieldBan,
   Sparkles,
 } from "lucide-react";
 import type { Ticket } from "@/lib/tickets";
@@ -21,6 +22,7 @@ import { AgentRunPanel } from "@/components/agent-run-panel";
 import { SnoozePanel } from "@/components/snooze-panel";
 import { FeatureLinkPanel } from "@/components/feature-link-panel";
 import { MergePanel } from "@/components/merge-panel";
+import { SpamDialog } from "@/components/inbox/spam-dialog";
 import { cn } from "@/lib/utils";
 
 const ACTIONS = [
@@ -61,6 +63,7 @@ export function ThreadActions({
 }) {
   const [snoozeOpen, setSnoozeOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [spamOpen, setSpamOpen] = useState(false);
   const [panel, setPanel] = useState<ActionKey | null>(null);
   const snoozed =
     !!ticket.snoozed_until && new Date(ticket.snoozed_until).getTime() > Date.now();
@@ -68,6 +71,7 @@ export function ThreadActions({
   const iconBtn = "size-8 text-muted-foreground hover:text-foreground";
 
   return (
+    <>
     <div className="flex shrink-0 items-center gap-0.5">
       {/* snooze */}
       <Popover
@@ -137,6 +141,20 @@ export function ThreadActions({
                 <span className="flex-1">{a.label}</span>
               </button>
             ))}
+            {/* Destructive triage — separated from the AI/workflow panels above. Opens its own
+                confirm dialog (with block + drop-lead choices) rather than an in-popover panel. */}
+            <div className="my-1 h-px bg-border/60" />
+            <button
+              type="button"
+              onClick={() => {
+                setMoreOpen(false);
+                setSpamOpen(true);
+              }}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-small text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+            >
+              <ShieldBan className="size-3.5 shrink-0" />
+              <span className="flex-1">Mark as spam</span>
+            </button>
           </div>
         ) : (
           <div>
@@ -192,5 +210,13 @@ export function ThreadActions({
         <PanelRight />
       </Button>
     </div>
+
+    <SpamDialog
+      ticket={ticket}
+      open={spamOpen}
+      onClose={() => setSpamOpen(false)}
+      onSpammed={onMutated}
+    />
+    </>
   );
 }
