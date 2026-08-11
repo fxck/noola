@@ -97,6 +97,9 @@ export interface Broadcast {
    *  rows returned by the pre-list-stats API (graceful until the api ships them). */
   opened?: number;
   clicked?: number;
+  /** Provider bounces over all recipients (0109) — lets the list flag a bad send at a glance.
+   *  Absent until the delivery-events api ships. */
+  bounced?: number;
   /** Conversion goal: a contact_events name counted per recipient within
    *  `goal_days` of delivery. Null when the broadcast has no goal. */
   goal_event: string | null;
@@ -123,19 +126,41 @@ export interface Broadcast {
 export interface Recipient {
   /** Email address or channel handle, depending on the broadcast's channel. */
   handle: string;
+  /** pending | sent | delivered | bounced | complained | failed (0109). */
   status: string;
   error?: string;
   opened_at: string | null;
   clicked_at: string | null;
+  /** Provider delivery-event timestamps (0109) — null until a delivery-event webhook is wired. */
+  delivered_at?: string | null;
+  bounced_at?: string | null;
+  bounce_kind?: string | null; // 'hard' | 'soft'
+  complained_at?: string | null;
+  unsubscribed_at?: string | null; // this recipient opted out after receiving
 }
 
 /** Engagement aggregates over ALL of a broadcast's recipients (not just the
- *  capped detail list). `goal` is present only when the broadcast set one. */
+ *  capped detail list). `goal` is present only when the broadcast set one.
+ *  0109: `sent` = handed to the provider; `delivered`/`bounced`/`complained` are
+ *  provider-confirmed (0 until a delivery-event webhook is configured). */
 export interface BroadcastStats {
+  sent: number;
   delivered: number;
+  bounced: number;
+  complained: number;
+  unsubscribed: number;
   opened: number;
   clicked: number;
   goal: { event: string; days: number; conversions: number } | null;
+}
+
+/** One parked address on the suppression list — a hard bounce / spam complaint (auto) or a
+ *  manual add. A suppressed address is never re-sent (enforced server-side). */
+export interface Suppression {
+  address: string;
+  reason: string; // hard_bounce | complaint | manual | unsubscribe
+  broadcast_id: string | null;
+  created_at: string;
 }
 
 /** Create payload — the server owns the id, status, and tallies. */
@@ -352,4 +377,20 @@ export async function sendBroadcastTest(
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+// ---- Suppression list -----------------------------------------------------
+
+/** Addresses parked from future sends — auto (hard bounce / spam complaint) or manual. */
+export async function fetchSuppressions(): Promise<Suppression[]> {
+  return (await api<{ suppressions: Suppression[] }>("/broadcasts/suppressions")).suppressions;
+}
+
+export async function addSuppression(address: string): Promise<void> {
+  await api("/broadcasts/suppressions", { method: "POST", body: JSON.stringify({ address }) });
+}
+
+/** Un-suppress an address (a fixed mailbox, a mistaken complaint). */
+export async function removeSuppression(address: string): Promise<void> {
+  await api(`/broadcasts/suppressions/${encodeURIComponent(address)}`, { method: "DELETE" });
 }

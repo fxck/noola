@@ -601,8 +601,10 @@ async function main() {
       [A, cy.id],
     );
     const got1 = await getBroadcast(A, gb.id);
-    check("stats: delivered 3, opened 2 (click implies open), clicked 1",
-      got1?.stats.delivered === 3 && got1?.stats.opened === 2 && got1?.stats.clicked === 1);
+    // 0109: `sent` = handed to the provider; `delivered` is provider-confirmed (0 without a
+    // delivery-event webhook, which this suite doesn't fire).
+    check("stats: sent 3, delivered 0 (no provider events), opened 2 (click implies open), clicked 1",
+      got1?.stats.sent === 3 && got1?.stats.delivered === 0 && got1?.stats.opened === 2 && got1?.stats.clicked === 1);
     check("goal conversions count only in-window events",
       got1?.stats.goal?.event === "btest_signup" && got1?.stats.goal?.conversions === 1);
     await superPool.query("DELETE FROM contact_events WHERE name = 'btest_signup'");

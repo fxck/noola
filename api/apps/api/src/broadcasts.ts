@@ -69,6 +69,7 @@ export interface BroadcastRow {
   // Let the list answer "which send worked?" without opening each broadcast (UX diagnosis t4).
   opened: number;
   clicked: number;
+  bounced: number; // provider bounces (0109) — surfaced on the list to flag a bad send at a glance
   created_at: string;
   sent_at: string | null;
 }
@@ -78,18 +79,31 @@ export interface BroadcastRecipientRow {
   broadcast_id: string;
   contact_id: string | null;
   handle: string; // an email address (channel 'email') or a per-channel handle (chat id, phone…)
-  status: "pending" | "sent" | "failed";
+  // Derived delivery status (0109). 'sent' = handed to the provider; 'delivered'/'bounced'/
+  // 'complained' come from provider delivery-event webhooks (broadcast-events.ts).
+  status: "pending" | "sent" | "delivered" | "bounced" | "complained" | "failed";
   error: string | null;
   opened_at: string | null; // first tracked open (email pixel / implied by a click)
   clicked_at: string | null; // first tracked click
+  delivered_at: string | null; // provider confirmed delivery (0109)
+  bounced_at: string | null; // provider bounce (0109)
+  bounce_kind: string | null; // 'hard' | 'soft'
+  complained_at: string | null; // spam complaint (0109)
+  unsubscribed_at: string | null; // this recipient opted out after receiving (0109)
+  message_id: string | null; // stamped Message-ID for provider-event matching (0109)
   created_at: string;
 }
 
-/** The stats block a broadcast detail carries (0069). Opens/clicks are email-only signals
- *  (chat channels have no pixel); goal conversions count recipients whose contact emitted
- *  the goal_event within goal_days of THEIR send. */
+/** The stats block a broadcast detail carries (0069 + 0109 delivery events). `sent` = handed to
+ *  the provider; `delivered`/`bounced`/`complained` are provider-confirmed (0 until a delivery-event
+ *  webhook is wired). Opens/clicks are email-only signals (chat channels have no pixel); goal
+ *  conversions count recipients whose contact emitted the goal_event within goal_days of THEIR send. */
 export interface BroadcastStats {
-  delivered: number;
+  sent: number; // handed off to the provider (status not pending/failed)
+  delivered: number; // provider-confirmed delivery
+  bounced: number;
+  complained: number;
+  unsubscribed: number;
   opened: number;
   clicked: number;
   goal: { event: string; days: number; conversions: number } | null;
@@ -97,7 +111,7 @@ export interface BroadcastStats {
 
 const B_COLS =
   "id, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, blocks, segment, segment_id, mode, send_at, stop_at, goal_event, goal_days, window_days, window_start_min, window_end_min, window_tz_offset_min, status, recipient_count, sent_count, failed_count, created_at, sent_at";
-const R_COLS = "id, broadcast_id, contact_id, handle, status, error, opened_at, clicked_at, created_at";
+const R_COLS = "id, broadcast_id, contact_id, handle, status, error, opened_at, clicked_at, delivered_at, bounced_at, bounce_kind, complained_at, unsubscribed_at, message_id, created_at";
 
 // Cap the recipient set a single broadcast resolves (keeps the send bounded) and the
 // recipient rows a detail view returns.
@@ -114,8 +128,12 @@ export type BroadcastSendFn = (
   to: string,
   subject: string,
   body: string,
-  opts?: { html?: string; unsubscribeUrl?: string },
-) => Promise<{ delivered: boolean; reason?: string }>;
+  // `marketingId` is a per-recipient local token we want stamped into the Message-ID so a provider
+  // delivery-event webhook can match the event back to this exact recipient row (0109). The seam
+  // returns the FULL Message-ID it stamped (`<token@sending-domain>` unangled) so the caller stores
+  // the same value the provider will echo.
+  opts?: { html?: string; unsubscribeUrl?: string; marketingId?: string },
+) => Promise<{ delivered: boolean; reason?: string; messageId?: string }>;
 
 const defaultSend: BroadcastSendFn = (tenantId, to, subject, body, opts) =>
   sendOutboundEmail(tenantId, to, subject, body, opts);
@@ -256,6 +274,12 @@ function suppressedWhere(clauses: string[]): string {
     : "WHERE unsubscribed_at IS NULL";
 }
 
+// Address-level deliverability suppression (0109): a hard-bounced or spam-complained address is
+// parked in email_suppressions and must NEVER be re-sent — independent of contacts.unsubscribed_at
+// (that's a marketing opt-out on a KNOWN contact; a stale/typo address may have no contact at all).
+// Email path only (chat handles aren't email addresses). RLS scopes the subquery to the tenant.
+const NOT_EMAIL_SUPPRESSED = "NOT EXISTS (SELECT 1 FROM email_suppressions es WHERE es.address = lower(contacts.email))";
+
 /**
  * Preview a segment: how many contacts match, and — per sendable channel — how many
  * distinct deliverable handles it holds (only those can actually receive). Email counts
@@ -275,7 +299,9 @@ export async function previewSegment(
     // per-channel numbers are the true send-time audience.
     const r = await c.query(
       `SELECT count(*)::int AS total,
-              count(DISTINCT lower(email)) FILTER (WHERE email IS NOT NULL AND email <> '' AND unsubscribed_at IS NULL)::int AS with_email
+              count(DISTINCT lower(email)) FILTER (
+                WHERE email IS NOT NULL AND email <> '' AND unsubscribed_at IS NULL AND ${NOT_EMAIL_SUPPRESSED}
+              )::int AS with_email
          FROM contacts ${whereSql}`,
       params,
     );
@@ -321,7 +347,7 @@ async function resolveRecipients(
 ): Promise<ResolvedRecipient[]> {
   const { clauses, params } = buildContactWhere(segmentFilters(segment));
   if (channel === "email") {
-    const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> ''`;
+    const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> '' AND ${NOT_EMAIL_SUPPRESSED}`;
     const r = await c.query(
       `SELECT DISTINCT ON (lower(email)) id, email AS handle, name, email, company, attributes
          FROM contacts ${whereSql}
@@ -564,10 +590,10 @@ export async function listBroadcasts(tenantId: string): Promise<BroadcastRow[]> 
     // Engagement aggregates per broadcast via a LATERAL over recipients (RLS-scoped underneath),
     // so the list surfaces opened/clicked without a per-row round-trip.
     const r = await c.query(
-      `SELECT ${B_COLS}, s.opened, s.clicked
+      `SELECT ${B_COLS}, s.opened, s.clicked, s.bounced
          FROM broadcasts
          LEFT JOIN LATERAL (
-           SELECT count(opened_at)::int AS opened, count(clicked_at)::int AS clicked
+           SELECT count(opened_at)::int AS opened, count(clicked_at)::int AS clicked, count(bounced_at)::int AS bounced
              FROM broadcast_recipients r WHERE r.broadcast_id = broadcasts.id
          ) s ON true
         ORDER BY created_at DESC`,
@@ -591,7 +617,11 @@ export async function getBroadcast(
       [id, RECIPIENT_VIEW_CAP],
     );
     const agg = await c.query(
-      `SELECT count(*) FILTER (WHERE status = 'sent')::int AS delivered,
+      `SELECT count(*) FILTER (WHERE status IN ('sent','delivered','bounced','complained'))::int AS sent,
+              count(delivered_at)::int AS delivered,
+              count(bounced_at)::int AS bounced,
+              count(complained_at)::int AS complained,
+              count(unsubscribed_at)::int AS unsubscribed,
               count(opened_at)::int AS opened,
               count(clicked_at)::int AS clicked
          FROM broadcast_recipients WHERE broadcast_id = $1`,
@@ -615,7 +645,10 @@ export async function getBroadcast(
     return {
       broadcast,
       recipients: recips.rows as BroadcastRecipientRow[],
-      stats: { ...(agg.rows[0] as { delivered: number; opened: number; clicked: number }), goal },
+      stats: {
+        ...(agg.rows[0] as { sent: number; delivered: number; bounced: number; complained: number; unsubscribed: number; opened: number; clicked: number }),
+        goal,
+      },
     };
   });
 }
@@ -844,6 +877,7 @@ async function runSend(
   for (const rc of recipients) {
     let ok = false;
     let errMsg: string | null = null;
+    let messageId: string | null = null;
     try {
       const unsub = withUnsub ? unsubscribeUrl(tenantId, rc.contactId) : null;
       let sendText = rendered
@@ -870,22 +904,25 @@ async function runSend(
         ? await send(tenantId, rc.handle, sendSubject, sendText, {
             ...(sendHtml ? { html: sendHtml } : {}),
             ...(unsub ? { unsubscribeUrl: unsub } : {}),
+            marketingId: `b.${rc.id}`,
           })
         : await dispatch(
             { tenantId, channelType: channel, externalChannelId: rc.handle, subject: sendSubject },
             personalize ? applyMergeTags(chatBody, rc.merge) : chatBody,
           );
       ok = res.delivered;
+      messageId = (res as { messageId?: string }).messageId ?? null; // email seam only; dispatch has none
       if (!ok) errMsg = res.reason ?? "not-delivered";
     } catch (e) {
       ok = false;
       errMsg = (e as Error)?.message ?? "send-error";
     }
     await withTenant(tenantId, async (c) => {
-      await c.query("UPDATE broadcast_recipients SET status = $2, error = $3 WHERE id = $1", [
+      await c.query("UPDATE broadcast_recipients SET status = $2, error = $3, message_id = COALESCE($4, message_id) WHERE id = $1", [
         rc.id,
         ok ? "sent" : "failed",
         ok ? null : errMsg,
+        messageId,
       ]);
       await c.query(
         "UPDATE broadcasts SET sent_count = sent_count + $2, failed_count = failed_count + $3 WHERE id = $1",
