@@ -141,6 +141,17 @@ export function splitForDiscord(text: string, limit = 2000): string[] {
   return chunks.filter((c) => c.length);
 }
 
+/** Discord renders **bold**, _italic_, ~~strike~~, `code`, ```fences```, lists and #-headings
+ *  natively — the ONE markdown construct its plain message content does NOT render is a masked link
+ *  `[text](url)`, which shows up as raw markup. Rewrite just those to a readable `text (url)` (and to
+ *  a bare URL when the label already IS the URL) and leave everything else verbatim. Code spans are
+ *  protected so a bracketed example inside `code` is never touched. */
+export function mdToDiscord(md: string): string {
+  const { text, restore } = protectCode(md);
+  const s = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => (t === u ? u : `${t} (${u})`));
+  return restore(s);
+}
+
 /** Plain text: strip every marker (SMS-like surfaces, fallbacks). */
 export function mdToPlain(md: string): string {
   const { text, restore } = protectCode(md);

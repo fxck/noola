@@ -924,17 +924,14 @@ export const WIDGET_JS = String.raw`(function () {
     // A resolved/closed ticket shows an "ended" divider (Intercom-style) above the toggle; the
     // visitor can still ask again, which reopens the thread server-side on the next turn.
     if (c.status === 'resolved' || c.status === 'closed') out += '<div class="ended">This conversation has ended</div>';
-    // The toggle switches modes. A human agent is "in the loop" the moment they reply — even if the
-    // AI was never formally muted (an agent can jump into an AI thread). Then "Talk to a human" is
-    // wrong (they're already here), so hide it. "Ask Noola" shows only when the assistant is actually
-    // muted (escalated); a pure-AI thread with no human yet still offers "Talk to a human".
-    var humanReplied = false;
-    for (var hj = 0; hj < c.msgs.length; hj++) { if (c.msgs[hj].role === 'agent') { humanReplied = true; break; } }
+    // The toggle switches modes: when the assistant is muted (escalated) offer "Ask Noola" to resume
+    // it; otherwise offer "Talk to a human". We show "Talk to a human" whenever NOT escalated — even
+    // after a human has replied — so a customer who resumed the AI (or whose thread a human dipped
+    // into) can always escalate again. (The earlier version hid it once any agent had replied, which
+    // stranded the customer with no way back to a human after resuming.)
     var toggle = c.escalated
       ? '<button class="talk" id="resume" type="button">' + iconNoola() + '<span>Ask Noola</span></button>'
-      : (humanReplied
-          ? ''
-          : '<button class="talk" id="talk" type="button">' + iconUser() + '<span>Talk to a human</span></button>');
+      : '<button class="talk" id="talk" type="button">' + iconUser() + '<span>Talk to a human</span></button>';
     return out + toggle;
   }
   function refreshLog(convId) {

@@ -391,6 +391,12 @@ export async function cancelBroadcast(id: string): Promise<{ status: BroadcastSt
   return api<{ status: BroadcastStatus }>(`/broadcasts/${id}/cancel`, { method: "POST" });
 }
 
+/** Hard-delete a broadcast and its delivery rows. 409s while the send is in flight
+ *  ('sending'/'active') — cancel or stop it first, then delete. */
+export async function deleteBroadcast(id: string): Promise<void> {
+  await api(`/broadcasts/${id}`, { method: "DELETE" });
+}
+
 /** A draft's renderable pieces — what preview-render and the test send accept. */
 export interface BroadcastRenderInput {
   subject?: string;

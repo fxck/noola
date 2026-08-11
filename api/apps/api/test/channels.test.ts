@@ -2,7 +2,7 @@ import { appPool, relayPool } from "@repo/db";
 import { routeTelegramOutbound, telegramConfigured } from "../src/telegram.js";
 import { routeWhatsAppOutbound, whatsappConfigured, verifyWhatsAppChallenge } from "../src/whatsapp.js";
 import { CHANNEL_DRIVERS, getChannelDriver, channelCatalog } from "../src/channels/registry.js";
-import { splitForDiscord } from "../src/channels/format.js";
+import { splitForDiscord, mdToDiscord } from "../src/channels/format.js";
 
 // Wave 4 — channel registry + Telegram/WhatsApp driver seams. All checks run with NO channel creds in
 // the env, so every network-touching path must degrade to an honest no-op (never a throw, never a
@@ -86,6 +86,16 @@ async function main() {
     // A custom small limit exercises the boundary logic deterministically.
     const small = splitForDiscord("aaaa\n\nbbbb\n\ncccc", 10);
     check("respects a custom limit", small.every((c) => c.length <= 10) && small.join("").includes("aaaa"));
+  }
+
+  // ---- mdToDiscord: rewrite masked links (Discord plain content can't render them), keep the rest ----
+  {
+    check("masked link → 'text (url)'", mdToDiscord("see [the docs](https://docs.x.io/a)") === "see the docs (https://docs.x.io/a)");
+    check("link whose label IS the url → bare url", mdToDiscord("[https://x.io](https://x.io)") === "https://x.io");
+    check("native markdown passes through untouched", mdToDiscord("**bold** _italic_ `code` and - a bullet") === "**bold** _italic_ `code` and - a bullet");
+    check("a bracketed example inside code is not rewritten", mdToDiscord("`[x](https://y)`") === "`[x](https://y)`");
+    check("multiple links all rewritten", mdToDiscord("[a](https://a.io) then [b](https://b.io)") === "a (https://a.io) then b (https://b.io)");
+    check("plain text with no links is unchanged", mdToDiscord("just some words") === "just some words");
   }
 
   await appPool.end();

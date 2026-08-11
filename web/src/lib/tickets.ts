@@ -10,6 +10,9 @@ export interface Ticket {
   channel_type: string;
   external_channel_id: string | null;
   whose_turn: "us" | "customer" | null;
+  /** Per-ticket AI on/off. false = the assistant is muted; on a widget ticket that means the customer
+   *  escalated ("talk to a human"). true/absent = the AI answers. Drives the rail's AI-state pill. */
+  assistant_enabled?: boolean | null;
   assignee_id: string | null;
   assignee_name: string | null;
   assignee_avatar_url?: string | null;

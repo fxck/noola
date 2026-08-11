@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg";
 import { withTenant } from "@repo/db";
 
 // Delivery-event ingestion — the outbound twin of resend-inbound.ts. Email providers (Resend,
@@ -133,6 +134,40 @@ export async function recordDeliveryEvent(tenantId: string, ev: DeliveryEvent): 
 
     return { matched: !!rid, recipientId: rid, suppressed };
   });
+}
+
+/** Footer-link / preference-center opt-out → per-broadcast Unsubscribed. The unsubscribe token
+ *  only carries (tenant, contact) — it can't know which broadcast the link rode in — so the opt-out
+ *  is attributed to the contact's MOST-RECENT recipient row (the least-inflating proxy; almost
+ *  always the email they just acted on). `topicId` narrows the candidate rows to broadcasts on that
+ *  subscription topic. First-touch + idempotent: the outer `unsubscribed_at IS NULL` guard means a
+ *  re-click finds the same already-stamped head and no-ops, so the analytics event is appended once.
+ *  Runs inside the caller's tenant transaction; callers treat it as best-effort — a broadcasts-side
+ *  failure must never break the compliance opt-out itself. */
+export async function recordContactUnsubscribe(
+  c: PoolClient,
+  contactId: string,
+  opts?: { topicId?: string | null },
+): Promise<void> {
+  const topicId = opts?.topicId ?? null;
+  const r = await c.query(
+    `UPDATE broadcast_recipients SET unsubscribed_at = now()
+       WHERE id = (
+         SELECT id FROM broadcast_recipients
+          WHERE contact_id = $1
+            ${topicId ? "AND broadcast_id IN (SELECT id FROM broadcasts WHERE topic_id = $2)" : ""}
+          ORDER BY created_at DESC LIMIT 1
+       )
+       AND unsubscribed_at IS NULL
+     RETURNING id, broadcast_id, contact_id`,
+    topicId ? [contactId, topicId] : [contactId],
+  );
+  if (!r.rowCount) return;
+  const row = r.rows[0] as { id: string; broadcast_id: string; contact_id: string | null };
+  await c.query(
+    "INSERT INTO broadcast_events (broadcast_id, recipient_id, contact_id, type, address, meta, occurred_at) VALUES ($1,$2,$3,'unsubscribed',NULL,'{}'::jsonb, now())",
+    [row.broadcast_id, row.id, row.contact_id],
+  );
 }
 
 // ---- Suppression list management -----------------------------------------------------------
