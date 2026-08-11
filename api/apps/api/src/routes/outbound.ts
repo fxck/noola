@@ -11,6 +11,7 @@ import {
   createBroadcast,
   listBroadcasts,
   getBroadcast,
+  broadcastTimeseries,
   sendBroadcast,
   cancelBroadcast,
   InvalidChannelError,
@@ -212,6 +213,14 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
     const out = await getBroadcast(tenantId, (req.params as { id: string }).id);
     if (!out) return reply.code(404).send({ error: "not found" });
     return { broadcast: out.broadcast, recipients: out.recipients, stats: out.stats };
+  }));
+
+  // Delivery/engagement over time — the broadcast detail's "graphs over time" (sends, opens,
+  // clicks, bounces, unsubscribes bucketed by when they occurred; hour/day auto-selected).
+  app.get("/broadcasts/:id/timeseries", tenanted(async (tenantId, req, reply) => {
+    const series = await broadcastTimeseries(tenantId, (req.params as { id: string }).id);
+    if (!series) return reply.code(404).send({ error: "not found" });
+    return series;
   }));
 
   // The composer's live preview: render draft content (markdown body OR block list) through

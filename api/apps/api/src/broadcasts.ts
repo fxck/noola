@@ -111,6 +111,26 @@ export interface BroadcastStats {
   goal: { event: string; days: number; conversions: number } | null;
 }
 
+/** One time bucket of the delivery/engagement timeline. Counts are the events that OCCURRED in
+ *  that bucket (a recipient sent at t0 and opened at t3 lands in two different buckets), so the
+ *  series reads as an activity timeline, not a running total. */
+export interface BroadcastTimeseriesBucket {
+  t: string; // ISO start of the bucket
+  sent: number;
+  delivered: number;
+  opened: number;
+  clicked: number;
+  bounced: number;
+  complained: number;
+  unsubscribed: number;
+}
+
+export interface BroadcastTimeseries {
+  granularity: "hour" | "day";
+  buckets: BroadcastTimeseriesBucket[];
+  totals: Omit<BroadcastTimeseriesBucket, "t">;
+}
+
 const B_COLS =
   "id, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, topic_id, blocks, segment, segment_id, mode, send_at, stop_at, goal_event, goal_days, window_days, window_start_min, window_end_min, window_tz_offset_min, status, recipient_count, sent_count, failed_count, created_at, sent_at";
 const R_COLS = "id, broadcast_id, contact_id, handle, status, error, opened_at, clicked_at, delivered_at, bounced_at, bounce_kind, complained_at, unsubscribed_at, message_id, created_at";
@@ -747,6 +767,111 @@ export async function listRecipients(
       [broadcastId, cap],
     );
     return r.rows as BroadcastRecipientRow[];
+  });
+}
+
+/**
+ * The delivery/engagement timeline for one broadcast — "graphs over time". Derived directly from
+ * the broadcast_recipients timestamp columns (the derived head that broadcast-events.ts advances),
+ * so it works retroactively for every existing broadcast without a separate event log: each
+ * recipient's send (created_at), delivery, open, click, bounce, complaint and unsubscribe are
+ * bucketed by when they OCCURRED. Granularity auto-selects — hourly for a burst (≤3-day span),
+ * daily for a campaign that runs longer (continuous sends). Buckets are gapless (generate_series),
+ * so a quiet stretch reads as zero, not a missing bar. Returns null if the broadcast doesn't exist.
+ */
+export async function broadcastTimeseries(
+  tenantId: string,
+  broadcastId: string,
+): Promise<BroadcastTimeseries | null> {
+  const zero: Omit<BroadcastTimeseriesBucket, "t"> = {
+    sent: 0, delivered: 0, opened: 0, clicked: 0, bounced: 0, complained: 0, unsubscribed: 0,
+  };
+  return withTenant(tenantId, async (c) => {
+    const exists = await c.query("SELECT 1 FROM broadcasts WHERE id = $1", [broadcastId]);
+    if (!exists.rowCount) return null;
+
+    // Bounds over the recipients actually handed to the provider. `hi` folds every per-recipient
+    // timestamp through greatest() (coalesced to created_at) so late opens/clicks extend the window.
+    const bounds = await c.query(
+      `SELECT min(created_at) AS lo,
+              max(greatest(created_at,
+                    coalesce(delivered_at, created_at), coalesce(opened_at, created_at),
+                    coalesce(clicked_at, created_at), coalesce(bounced_at, created_at),
+                    coalesce(complained_at, created_at), coalesce(unsubscribed_at, created_at))) AS hi
+         FROM broadcast_recipients
+        WHERE broadcast_id = $1 AND status IN ('sent','delivered','bounced','complained')`,
+      [broadcastId],
+    );
+    const lo = bounds.rows[0]?.lo as Date | null;
+    const hi = bounds.rows[0]?.hi as Date | null;
+    if (!lo || !hi) return { granularity: "day", buckets: [], totals: { ...zero } };
+    const granularity: "hour" | "day" =
+      hi.getTime() - lo.getTime() <= 3 * 24 * 3600 * 1000 ? "hour" : "day";
+
+    // Gapless timeline: generate_series over the truncated grid LEFT JOINed to the per-bucket
+    // event counts. $2 is a fixed 'hour'|'day' literal (not user input) so date_trunc/the interval
+    // cast are safe. Truncation + stepping happen in SQL so DST/timezone stays correct.
+    const rows = await c.query(
+      `WITH r AS (
+         SELECT * FROM broadcast_recipients WHERE broadcast_id = $1
+       ),
+       bounds AS (
+         SELECT date_trunc($2, min(created_at)) AS lo,
+                date_trunc($2, max(greatest(created_at,
+                      coalesce(delivered_at, created_at), coalesce(opened_at, created_at),
+                      coalesce(clicked_at, created_at), coalesce(bounced_at, created_at),
+                      coalesce(complained_at, created_at), coalesce(unsubscribed_at, created_at)))) AS hi
+           FROM r WHERE status IN ('sent','delivered','bounced','complained')
+       ),
+       grid AS (
+         SELECT gs AS bucket
+           FROM bounds, generate_series(bounds.lo, bounds.hi, ('1 ' || $2)::interval) AS gs
+          WHERE bounds.lo IS NOT NULL
+       ),
+       ev AS (
+         SELECT created_at AS ts, 'sent' AS k FROM r WHERE status IN ('sent','delivered','bounced','complained')
+         UNION ALL SELECT delivered_at,    'delivered'    FROM r WHERE delivered_at IS NOT NULL
+         UNION ALL SELECT opened_at,       'opened'       FROM r WHERE opened_at IS NOT NULL
+         UNION ALL SELECT clicked_at,      'clicked'      FROM r WHERE clicked_at IS NOT NULL
+         UNION ALL SELECT bounced_at,      'bounced'      FROM r WHERE bounced_at IS NOT NULL
+         UNION ALL SELECT complained_at,   'complained'   FROM r WHERE complained_at IS NOT NULL
+         UNION ALL SELECT unsubscribed_at, 'unsubscribed' FROM r WHERE unsubscribed_at IS NOT NULL
+       ),
+       b AS (
+         SELECT date_trunc($2, ts) AS bucket, k, count(*)::int AS n FROM ev GROUP BY 1, 2
+       )
+       SELECT g.bucket AS bucket,
+              coalesce(sum(n) FILTER (WHERE k = 'sent'), 0)::int         AS sent,
+              coalesce(sum(n) FILTER (WHERE k = 'delivered'), 0)::int    AS delivered,
+              coalesce(sum(n) FILTER (WHERE k = 'opened'), 0)::int       AS opened,
+              coalesce(sum(n) FILTER (WHERE k = 'clicked'), 0)::int      AS clicked,
+              coalesce(sum(n) FILTER (WHERE k = 'bounced'), 0)::int      AS bounced,
+              coalesce(sum(n) FILTER (WHERE k = 'complained'), 0)::int   AS complained,
+              coalesce(sum(n) FILTER (WHERE k = 'unsubscribed'), 0)::int AS unsubscribed
+         FROM grid g LEFT JOIN b ON b.bucket = g.bucket
+        GROUP BY g.bucket
+        ORDER BY g.bucket`,
+      [broadcastId, granularity],
+    );
+
+    const totals = { ...zero };
+    const buckets: BroadcastTimeseriesBucket[] = rows.rows.map((row) => {
+      const bucket = row as { bucket: Date } & Omit<BroadcastTimeseriesBucket, "t">;
+      totals.sent += bucket.sent;
+      totals.delivered += bucket.delivered;
+      totals.opened += bucket.opened;
+      totals.clicked += bucket.clicked;
+      totals.bounced += bucket.bounced;
+      totals.complained += bucket.complained;
+      totals.unsubscribed += bucket.unsubscribed;
+      return {
+        t: bucket.bucket.toISOString(),
+        sent: bucket.sent, delivered: bucket.delivered, opened: bucket.opened,
+        clicked: bucket.clicked, bounced: bucket.bounced, complained: bucket.complained,
+        unsubscribed: bucket.unsubscribed,
+      };
+    });
+    return { granularity, buckets, totals };
   });
 }
 

@@ -52,8 +52,10 @@ import {
   type Suppression,
   type RecipientsPreview,
   type SubscriptionTopic,
+  type BroadcastTimeseries,
   fetchBroadcasts,
   fetchBroadcast,
+  fetchBroadcastTimeseries,
   previewSegment,
   previewRecipients,
   fetchTopics,
@@ -2139,6 +2141,7 @@ export function BroadcastDetail({
   const [broadcast, setBroadcast] = useState<Broadcast | null>(null);
   const [recipients, setRecipients] = useState<Recipient[] | null>(null);
   const [stats, setStats] = useState<BroadcastStats | null>(null);
+  const [series, setSeries] = useState<BroadcastTimeseries | null>(null);
   const [state, setState] = useState<DetailState>("loading");
   const [recipFilter, setRecipFilter] = useState<"all" | "failed" | "bounced" | "unsubscribed" | "sent">("all");
 
@@ -2153,10 +2156,16 @@ export function BroadcastDetail({
   // it. Keyed on broadcastId by the caller, so the closure's id is always current.
   const load = useRef(async () => {
     try {
-      const { broadcast: fresh, recipients: recs, stats: agg } = await fetchBroadcast(broadcastId);
+      // Timeseries rides alongside the detail (best-effort — an older server without the
+      // /timeseries route just leaves the over-time chart out, never blocking the page).
+      const [{ broadcast: fresh, recipients: recs, stats: agg }, ts] = await Promise.all([
+        fetchBroadcast(broadcastId),
+        fetchBroadcastTimeseries(broadcastId).catch(() => null),
+      ]);
       setBroadcast(fresh);
       setRecipients(recs ?? null);
       setStats(agg ?? null);
+      setSeries(ts);
       setState("ok");
     } catch (e) {
       setState((e as { status?: number }).status === 404 ? "notfound" : "error");
@@ -2407,6 +2416,18 @@ export function BroadcastDetail({
                     Bounces and delivery confirmations appear once a provider delivery-event webhook is connected.
                   </p>
                 )}
+              </section>
+            )}
+
+            {/* over-time — the send + engagement timeline (sends/opens/clicks/bounces/unsubs
+                bucketed by when they happened). Only worth showing once there's more than a
+                single bucket of activity (a one-instant send with nothing back yet is just a spike). */}
+            {showEngagement && series && series.buckets.length > 1 && series.totals.sent > 0 && (
+              <section className="mb-6">
+                <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Over time
+                </h3>
+                <ActivityChart series={series} />
               </section>
             )}
 
@@ -2911,6 +2932,87 @@ function RecipientPreviewDialog({
 
 /** One engagement figure — count first, its share of delivered beside it,
  *  an optional sub-line naming what was measured (the goal event). */
+// The over-time series shown on the broadcast detail. Stacked columns on the analytics
+// VolumeChart/SlaWeeklyChart idiom (CSS bars, hairline gridlines, hover tooltip) — each column is
+// one time bucket, each stack segment an event type that happened THEN. Sent sits at the base
+// (graphite); engagement (opened/clicked) and problems (bounced/unsub) stack above in signal colors.
+const ACTIVITY_SERIES = [
+  { key: "sent", label: "Sent", cls: "bg-foreground/25" },
+  { key: "opened", label: "Opened", cls: "bg-sky-500/70" },
+  { key: "clicked", label: "Clicked", cls: "bg-violet-500/70" },
+  { key: "bounced", label: "Bounced", cls: "bg-destructive/70" },
+  { key: "unsubscribed", label: "Unsub", cls: "bg-amber-500/70" },
+] as const satisfies ReadonlyArray<{ key: keyof BroadcastTimeseries["totals"]; label: string; cls: string }>;
+
+function ActivityChart({ series }: { series: BroadcastTimeseries }) {
+  const { granularity, buckets, totals } = series;
+  // A bucket's stack height reads against the busiest bucket's summed activity.
+  const perBucketTotal = (b: BroadcastTimeseries["buckets"][number]) =>
+    ACTIVITY_SERIES.reduce((n, s) => n + b[s.key], 0);
+  const max = useMemo(() => Math.max(1, ...buckets.map(perBucketTotal)), [buckets]);
+  // Only legend the series that actually occurred, so a clean send shows a short legend.
+  const legend = ACTIVITY_SERIES.filter((s) => totals[s.key] > 0);
+
+  const fmt = (iso: string) => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return granularity === "hour"
+      ? d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric" })
+      : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  };
+
+  return (
+    <div>
+      <div className="relative">
+        {/* hairline gridlines give the columns a baseline to read against */}
+        <div className="pointer-events-none absolute inset-0 flex flex-col justify-between" aria-hidden>
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="border-t border-border/60" />
+          ))}
+        </div>
+        <div className="relative flex h-32 items-stretch gap-px sm:gap-0.5">
+          {buckets.map((b) => {
+            const total = perBucketTotal(b);
+            const h = Math.max((total / max) * 100, total > 0 ? 3 : 0);
+            return (
+              <div key={b.t} className="group relative flex flex-1 flex-col justify-end">
+                {/* the stacked bar: fixed to `h`% of the column, segments proportional within it */}
+                <div className="flex w-full flex-col overflow-hidden rounded-t" style={{ height: `${h}%` }}>
+                  {/* top-to-bottom DOM = top-to-bottom visual, so render the stack reversed (sent last = bottom) */}
+                  {[...ACTIVITY_SERIES].reverse().map((s) => (
+                    <div key={s.key} className={s.cls} style={{ flexGrow: b[s.key], flexShrink: 0 }} />
+                  ))}
+                </div>
+                <div className="pointer-events-none absolute -top-7 left-1/2 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded bg-foreground px-1.5 py-1 text-micro font-medium tabular-nums text-background opacity-0 transition-opacity group-hover:block group-hover:opacity-100">
+                  <div className="mb-0.5 text-background/70">{fmt(b.t)}</div>
+                  {legend.map((s) => (
+                    <span key={s.key} className="mr-2 last:mr-0">
+                      {b[s.key]} {s.label.toLowerCase()}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {/* axis endpoints + legend */}
+      <div className="mt-1.5 flex items-center justify-between gap-3 text-micro tabular-nums text-muted-foreground/70">
+        <span>{buckets[0] ? fmt(buckets[0].t) : ""}</span>
+        <span>{buckets.length > 1 ? fmt(buckets[buckets.length - 1].t) : ""}</span>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+        {legend.map((s) => (
+          <span key={s.key} className="inline-flex items-center gap-1.5 text-micro text-muted-foreground">
+            <span className={cn("size-2 rounded-sm", s.cls)} aria-hidden />
+            {s.label} <span className="tabular-nums text-foreground/70">{totals[s.key].toLocaleString()}</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function EngagementStat({
   label,
   value,
