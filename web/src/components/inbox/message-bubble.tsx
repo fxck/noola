@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound } from "lucide-react";
 import {
   type Message,
@@ -19,6 +19,7 @@ import { localeName } from "@/lib/settings";
 import { HoverPopover } from "@/components/live/hover-popover";
 import { NerdStats, CopyId, compactNum, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { estimateCost, fmtCost, isLocalModel, shortModel } from "@/lib/model-cost";
+import { ImageLightbox } from "@/components/inbox/image-lightbox";
 import { cn } from "@/lib/utils";
 
 // The thread's message-rendering family: customer/agent bubbles (with auto-translation display),
@@ -56,13 +57,7 @@ export function NoteBubble({ note }: { note: Note }) {
             ))}
           </div>
         )}
-        {imageAtts.length > 0 && (
-          <div className="mt-2 flex flex-wrap gap-2">
-            {imageAtts.map((a) => (
-              <AttachmentImage key={a.id} a={a} capped={imageAtts.length > 1} />
-            ))}
-          </div>
-        )}
+        {imageAtts.length > 0 && <ImageAttachments atts={imageAtts} className="mt-2" />}
         {fileAtts.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-1.5">
             {fileAtts.map((a) => (
@@ -209,13 +204,7 @@ export function MessageBubble({
             </button>
           </div>
         )}
-        {imageAtts.length > 0 && (
-          <div className={cn("flex flex-wrap gap-2", isAgent && "justify-end")}>
-            {imageAtts.map((a) => (
-              <AttachmentImage key={a.id} a={a} capped={imageAtts.length > 1} />
-            ))}
-          </div>
-        )}
+        {imageAtts.length > 0 && <ImageAttachments atts={imageAtts} className={cn(isAgent && "justify-end")} />}
         {fileAtts.length > 0 && (
           <div className={cn("flex flex-wrap gap-1.5", isAgent && "justify-end")}>
             {fileAtts.map((a) => (
@@ -242,31 +231,97 @@ function isImageAttachment(a: Attachment): boolean {
   return false;
 }
 
+/** The inline image grid for a bubble/note, plus the lightbox it opens into. Owns the ONE
+ *  id→objectURL cache the thumbnails and the full-size viewer share, so opening an image
+ *  reuses the bytes its thumbnail already fetched instead of re-hitting the authed serve
+ *  route. All minted URLs are revoked here (on unmount) — the single owner, so nothing leaks. */
+function ImageAttachments({ atts, className }: { atts: Attachment[]; className?: string }) {
+  const urlsRef = useRef<Record<string, string>>({});
+  const [urls, setUrls] = useState<Record<string, string>>({});
+  const [openAt, setOpenAt] = useState<number | null>(null);
+  const capped = atts.length > 1;
+
+  const resolveUrl = useCallback((id: string, url: string) => {
+    // First writer wins — a raced second fetch's URL is revoked instead of orphaned.
+    if (urlsRef.current[id]) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    urlsRef.current[id] = url;
+    setUrls((prev) => ({ ...prev, [id]: url }));
+  }, []);
+
+  // A rendered message is a stable set — revoke every URL once, when the block unmounts
+  // (thread scroll-recycle / navigation away).
+  useEffect(
+    () => () => {
+      for (const u of Object.values(urlsRef.current)) URL.revokeObjectURL(u);
+      urlsRef.current = {};
+    },
+    [],
+  );
+
+  return (
+    <>
+      <div className={cn("flex flex-wrap gap-2", className)}>
+        {atts.map((a, i) => (
+          <AttachmentImage
+            key={a.id}
+            a={a}
+            capped={capped}
+            url={urls[a.id] ?? null}
+            onResolveUrl={resolveUrl}
+            onOpen={() => setOpenAt(i)}
+          />
+        ))}
+      </div>
+      {openAt != null && (
+        <ImageLightbox
+          images={atts}
+          index={openAt}
+          urls={urls}
+          onIndexChange={setOpenAt}
+          onResolveUrl={resolveUrl}
+          onClose={() => setOpenAt(null)}
+        />
+      )}
+    </>
+  );
+}
+
 /** An image attachment shown inline under the bubble. The serve route is Bearer-authed
  *  (and downloads-only), so a plain <img src> can't reach it — fetch the bytes with the
- *  token and display via an object URL, revoked on unmount. Click opens full size in a
- *  new tab; any failure falls back to the downloadable chip. */
-function AttachmentImage({ a, capped }: { a: Attachment; capped: boolean }) {
-  const [url, setUrl] = useState<string | null>(null);
+ *  token and display via an object URL held in the parent's shared cache. Click opens the
+ *  in-app lightbox (not a raw blob tab); any failure falls back to the downloadable chip. */
+function AttachmentImage({
+  a,
+  capped,
+  url,
+  onResolveUrl,
+  onOpen,
+}: {
+  a: Attachment;
+  capped: boolean;
+  url: string | null;
+  onResolveUrl: (id: string, url: string) => void;
+  onOpen: () => void;
+}) {
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    if (url) return; // already in the shared cache — no refetch
     let cancelled = false;
-    let obj: string | null = null;
     fetchAttachmentBlob(a.id)
       .then((blob) => {
-        if (cancelled) return;
-        obj = URL.createObjectURL(blob);
-        setUrl(obj);
+        if (!cancelled) onResolveUrl(a.id, URL.createObjectURL(blob));
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
       });
     return () => {
       cancelled = true;
-      if (obj) URL.revokeObjectURL(obj);
     };
-  }, [a.id]);
+  }, [a.id, url, onResolveUrl]);
 
   if (failed) return <AttachmentChip a={a} />;
   if (!url)
@@ -281,12 +336,11 @@ function AttachmentImage({ a, capped }: { a: Attachment; capped: boolean }) {
       />
     );
   return (
-    <a
-      href={url}
-      target="_blank"
-      rel="noreferrer"
-      title={`${a.filename} · ${formatBytes(a.size_bytes)} — open full size`}
-      className="block max-w-full overflow-hidden rounded-lg border border-border/60"
+    <button
+      type="button"
+      onClick={onOpen}
+      title={`${a.filename} · ${formatBytes(a.size_bytes)} — view`}
+      className="block max-w-full cursor-zoom-in overflow-hidden rounded-lg border border-border/60 transition-colors hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
     >
       <img
         src={url}
@@ -295,7 +349,7 @@ function AttachmentImage({ a, capped }: { a: Attachment; capped: boolean }) {
         onError={() => setFailed(true)}
         className={cn("block max-w-full object-contain", capped ? "max-h-48" : "max-h-72")}
       />
-    </a>
+    </button>
   );
 }
 
