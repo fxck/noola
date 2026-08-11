@@ -34,6 +34,26 @@ export const authPool = new Pool({
   max: 5,
 });
 
+// A pooled client can emit 'error' ASYNCHRONOUSLY while sitting idle in the pool — the
+// backend goes away out from under us (Postgres restart, network blip, admin
+// pg_terminate_backend, idle_in_transaction_session_timeout). node-postgres re-emits that
+// on the Pool; with no 'error' listener it propagates as an uncaught exception and the whole
+// process exits (seen in prod: a pg Client dumped to stdout followed by `node server.mjs => 1`,
+// taking down every in-flight request). Listening here keeps the process alive — pg has
+// already removed the dead client from the pool, so the next connect() just makes a fresh one.
+for (const [name, pool] of [
+  ["app", appPool],
+  ["relay", relayPool],
+  ["auth", authPool],
+] as const) {
+  pool.on("error", (err) => {
+    console.error(
+      `[db] idle client error on ${name}Pool (dropped & evicted, pool will reconnect):`,
+      err instanceof Error ? err.message : err,
+    );
+  });
+}
+
 /**
  * Run `fn` in a tenant-scoped transaction on the app pool.
  * set_config(..., true) is transaction-local (like SET LOCAL) and resets to ''
