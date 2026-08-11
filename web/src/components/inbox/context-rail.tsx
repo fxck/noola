@@ -710,62 +710,55 @@ function ParticipantsPanel({ ticketId, users }: { ticketId: string; users: Agent
 function ParticipantAdder({ users, onAdd }: { users: AgentUser[]; onAdd: (userId: string) => void }) {
   const [open, setOpen] = useState(false);
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
-
   function pick(id: string) {
     setOpen(false);
     onAdd(id);
   }
 
+  // Portal-based Popover (like the Tags adder above) so the menu escapes the rail's
+  // overflow-y-auto clip and flips above the trigger when it wouldn't fit below.
   return (
-    <div className="relative self-start">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        className="inline-flex h-6 items-center gap-1 rounded-md border border-dashed border-border/80 px-2 text-xs text-muted-foreground transition-colors hover:border-border hover:bg-muted/50 hover:text-foreground"
-      >
-        <Plus className="size-3" /> Add
-      </button>
-
-      {open && (
-        <>
-          {/* click-away backdrop */}
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden />
-          <ul
-            role="listbox"
-            className="motion-pop absolute left-0 z-50 mt-1 max-h-72 w-52 origin-top-left overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
-          >
-            {users.length === 0 ? (
-              <li className="px-2 py-1.5 text-xs text-muted-foreground">Everyone's already added.</li>
-            ) : (
-              users.map((u) => (
-                <li key={u.id}>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={false}
-                    onClick={() => pick(u.id)}
-                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent"
-                  >
-                    <Avatar name={u.name} image={avatarSrc(u.avatar_url)} className="size-5 text-[9px]" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate">{u.name}</span>
-                      <span className="block truncate text-xs capitalize text-muted-foreground">{u.role}</span>
-                    </span>
-                  </button>
-                </li>
-              ))
-            )}
-          </ul>
-        </>
-      )}
-    </div>
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      align="start"
+      width={208}
+      triggerClassName="self-start"
+      trigger={
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          className="inline-flex h-6 items-center gap-1 rounded-md border border-dashed border-border/80 px-2 text-xs text-muted-foreground transition-colors hover:border-border hover:bg-muted/50 hover:text-foreground"
+        >
+          <Plus className="size-3" /> Add
+        </button>
+      }
+    >
+      <ul role="listbox" className="max-h-72 overflow-y-auto p-1">
+        {users.length === 0 ? (
+          <li className="px-2 py-1.5 text-xs text-muted-foreground">Everyone's already added.</li>
+        ) : (
+          users.map((u) => (
+            <li key={u.id}>
+              <button
+                type="button"
+                role="option"
+                aria-selected={false}
+                onClick={() => pick(u.id)}
+                className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent"
+              >
+                <Avatar name={u.name} image={avatarSrc(u.avatar_url)} className="size-5 text-[9px]" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{u.name}</span>
+                  <span className="block truncate text-xs capitalize text-muted-foreground">{u.role}</span>
+                </span>
+              </button>
+            </li>
+          ))
+        )}
+      </ul>
+    </Popover>
   );
 }

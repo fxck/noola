@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
 import type { AgentUser } from "@/lib/tickets";
 import { Avatar } from "@/components/ui/avatar";
+import { Popover } from "@/components/ui/popover";
 import { avatarSrc } from "@/lib/avatar-upload";
 import { cn } from "@/lib/utils";
 
@@ -20,13 +21,6 @@ export function AssigneePicker({
 }) {
   const [open, setOpen] = useState(false);
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
-
   function pick(id: string | null) {
     setOpen(false);
     if (id !== assigneeId) onChange(id);
@@ -34,57 +28,56 @@ export function AssigneePicker({
 
   const assignee = assigneeId ? users.find((u) => u.id === assigneeId) : undefined;
 
+  // Portal-based Popover so the listbox escapes the detail rail's overflow-y-auto clip and
+  // flips above the trigger when it wouldn't fit below.
   return (
-    <div className="relative">
-      <button
-        type="button"
-        disabled={busy}
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        className={cn(
-          // Quiet inline trigger — reads as a rail value-row, not a button.
-          "group/asg -my-0.5 flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-small transition-colors hover:bg-muted/60 disabled:opacity-50",
-          assigneeId ? "text-foreground" : "text-muted-foreground",
-        )}
-      >
-        {assigneeId ? (
-          <Avatar name={assigneeName} image={avatarSrc(assignee?.avatar_url)} className="size-4 text-[8px]" />
-        ) : (
-          <Avatar unassigned className="size-4" />
-        )}
-        <span className="truncate">{assigneeId ? assigneeName : "Unassigned"}</span>
-        <ChevronDown className="size-3 shrink-0 text-muted-foreground/50 transition-colors group-hover/asg:text-muted-foreground" />
-      </button>
-
-      {open && (
-        <>
-          {/* click-away backdrop */}
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden />
-          <ul
-            role="listbox"
-            className="motion-pop absolute right-0 z-50 mt-1 max-h-72 w-52 origin-top-right overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
-          >
-            <Option
-              label="Unassigned"
-              selected={!assigneeId}
-              onClick={() => pick(null)}
-              leading={<Avatar unassigned className="size-5" />}
-            />
-            {users.map((u) => (
-              <Option
-                key={u.id}
-                label={u.name}
-                sub={u.role}
-                selected={assigneeId === u.id}
-                onClick={() => pick(u.id)}
-                leading={<Avatar name={u.name} image={avatarSrc(u.avatar_url)} className="size-5 text-[9px]" />}
-              />
-            ))}
-          </ul>
-        </>
-      )}
-    </div>
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      align="end"
+      width={208}
+      trigger={
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => setOpen((v) => !v)}
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          className={cn(
+            // Quiet inline trigger — reads as a rail value-row, not a button.
+            "group/asg -my-0.5 flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-small transition-colors hover:bg-muted/60 disabled:opacity-50",
+            assigneeId ? "text-foreground" : "text-muted-foreground",
+          )}
+        >
+          {assigneeId ? (
+            <Avatar name={assigneeName} image={avatarSrc(assignee?.avatar_url)} className="size-4 text-[8px]" />
+          ) : (
+            <Avatar unassigned className="size-4" />
+          )}
+          <span className="truncate">{assigneeId ? assigneeName : "Unassigned"}</span>
+          <ChevronDown className="size-3 shrink-0 text-muted-foreground/50 transition-colors group-hover/asg:text-muted-foreground" />
+        </button>
+      }
+    >
+      <ul role="listbox" className="max-h-72 overflow-y-auto p-1">
+        <Option
+          label="Unassigned"
+          selected={!assigneeId}
+          onClick={() => pick(null)}
+          leading={<Avatar unassigned className="size-5" />}
+        />
+        {users.map((u) => (
+          <Option
+            key={u.id}
+            label={u.name}
+            sub={u.role}
+            selected={assigneeId === u.id}
+            onClick={() => pick(u.id)}
+            leading={<Avatar name={u.name} image={avatarSrc(u.avatar_url)} className="size-5 text-[9px]" />}
+          />
+        ))}
+      </ul>
+    </Popover>
   );
 }
 
