@@ -39,6 +39,7 @@
     "test:slack": "tsx apps/api/test/slack.test.ts",
     "test:broadcasts": "tsx apps/api/test/broadcasts.test.ts",
     "test:broadcast-events": "tsx apps/api/test/broadcast-events.test.ts",
+    "test:subscription-topics": "tsx apps/api/test/subscription-topics.test.ts",
     "test:reply-email": "tsx apps/api/test/reply-email.test.ts",
     "test:email-quote": "tsx apps/api/test/email-quote.test.ts",
     "test:reply-all-cc": "tsx apps/api/test/reply-all-cc.test.ts",

@@ -51,10 +51,15 @@ import {
   type SegmentPreview,
   type Suppression,
   type RecipientsPreview,
+  type SubscriptionTopic,
   fetchBroadcasts,
   fetchBroadcast,
   previewSegment,
   previewRecipients,
+  fetchTopics,
+  createTopic,
+  updateTopic,
+  deleteTopic,
   previewBroadcastRender,
   sendBroadcastTest,
   createBroadcast,
@@ -583,6 +588,7 @@ export function BroadcastsPage() {
   // The draft being re-edited (null = composing a NEW broadcast).
   const [editing, setEditing] = useState<Broadcast | null>(null);
   const [showSuppressions, setShowSuppressions] = useState(false);
+  const [showTopics, setShowTopics] = useState(false);
 
   const load = useRef(async () => {
     try {
@@ -717,7 +723,11 @@ export function BroadcastsPage() {
         {/* ── pane header (h-12, §3) ─────────────────────────────────────── */}
         <header className="flex h-12 shrink-0 items-center gap-2 px-4">
           <h1 className="text-sm font-semibold tracking-tight">Broadcasts</h1>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-1">
+            <Button variant="ghost" size="sm" className="gap-1.5 text-muted-foreground" onClick={() => setShowTopics(true)}>
+              <Tag className="size-3.5" />
+              Topics
+            </Button>
             <Button variant="ghost" size="sm" className="gap-1.5 text-muted-foreground" onClick={() => setShowSuppressions(true)}>
               <MailX className="size-3.5" />
               Suppressions
@@ -725,6 +735,7 @@ export function BroadcastsPage() {
           </div>
         </header>
         <SuppressionsDialog open={showSuppressions} onClose={() => setShowSuppressions(false)} />
+        <TopicsDialog open={showTopics} onClose={() => setShowTopics(false)} />
 
         {state === "unavailable" ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
@@ -849,6 +860,30 @@ function ComposeBroadcast({
   // server default so the picker starts there.
   const [templateId, setTemplateId] = useState(draft?.template_id ?? "branded");
   const [templates, setTemplates] = useState<EmailTemplate[]>([]);
+  // Subscription topic (0110): which list this belongs to — drives the recipient's per-topic
+  // unsubscribe. "" = untopiced (footer opts out globally). Reloaded on open so a just-created
+  // topic appears without a full refresh.
+  const [topicId, setTopicId] = useState<string>(draft?.topic_id ?? "");
+  const [topics, setTopics] = useState<SubscriptionTopic[]>([]);
+  const [addingTopic, setAddingTopic] = useState(false);
+  const [newTopicName, setNewTopicName] = useState("");
+  const reloadTopics = useRef(() => {
+    fetchTopics().then(setTopics).catch(() => setTopics([]));
+  }).current;
+  useEffect(() => reloadTopics(), [reloadTopics]);
+  async function addTopicInline() {
+    const name = newTopicName.trim();
+    if (!name) return;
+    try {
+      const t = await createTopic({ name });
+      setTopics((prev) => [...prev, t].sort((a, b) => a.name.localeCompare(b.name)));
+      setTopicId(t.id);
+      setNewTopicName("");
+      setAddingTopic(false);
+    } catch (e) {
+      toast.error((e as ApiError)?.detail ?? "Couldn't create the topic.");
+    }
+  }
   useEffect(() => {
     fetchEmailTemplates().then(setTemplates).catch(() => setTemplates([]));
   }, []);
@@ -1046,7 +1081,7 @@ function ComposeBroadcast({
     setPreviewFailed(false);
     const t = setTimeout(async () => {
       try {
-        const p = await previewSegment(segment);
+        const p = await previewSegment(segment, topicId || null);
         if (live) setPreview(p);
       } catch {
         if (live) {
@@ -1061,7 +1096,7 @@ function ComposeBroadcast({
       live = false;
       clearTimeout(t);
     };
-  }, [segment, isDiscord]);
+  }, [segment, isDiscord, topicId]);
 
   // What ships for the email channel (ids stripped, empty text blocks dropped)
   // and the one reason it can't yet — mirrors the server's schema so Create
@@ -1252,6 +1287,7 @@ function ComposeBroadcast({
             : {}),
           segment,
           ...(segmentId ? { segmentId } : {}),
+          topicId: topicId || null,
           mode: timing === "continuous" ? "continuous" : "oneshot",
           sendAt: sendAt ?? "",
           stopAt: stopAt ?? "",
@@ -1280,6 +1316,7 @@ function ComposeBroadcast({
           : {}),
         segment,
         segmentId,
+        topicId: topicId || null,
         // Timing rides on the draft; arming happens later, from Send.
         ...(timing === "continuous" ? { mode: "continuous" as const } : {}),
         ...(sendAt ? { sendAt } : {}),
@@ -1603,6 +1640,50 @@ function ComposeBroadcast({
             )}
           </div>
 
+          {/* subscription topic (0110) — scopes the recipient's unsubscribe to this list, so opting
+              out of one topic leaves the others intact. Omit for a global-footer send. */}
+          {!isDiscord && (
+            <div className="space-y-1">
+              <Label className="text-xs">Subscription topic <span className="font-normal text-muted-foreground">(optional)</span></Label>
+              <div className="flex items-center gap-2">
+                <select
+                  value={topicId}
+                  onChange={(e) => setTopicId(e.target.value)}
+                  className="h-8 flex-1 rounded-md border bg-background px-2 text-xs"
+                >
+                  <option value="">No topic — unsubscribe opts out of everything</option>
+                  {topics.map((t) => (
+                    <option key={t.id} value={t.id}>{t.name}</option>
+                  ))}
+                </select>
+                {!addingTopic && (
+                  <Button type="button" size="sm" variant="outline" className="h-8 shrink-0 gap-1 px-2 text-xs" onClick={() => setAddingTopic(true)}>
+                    <Plus className="size-3.5" /> New
+                  </Button>
+                )}
+              </div>
+              {addingTopic && (
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={newTopicName}
+                    onChange={(e) => setNewTopicName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void addTopicInline(); } }}
+                    placeholder="e.g. Product updates"
+                    className="h-8 flex-1 text-xs"
+                    autoFocus
+                  />
+                  <Button type="button" size="sm" className="h-8 px-2 text-xs" onClick={() => void addTopicInline()} disabled={!newTopicName.trim()}>Add</Button>
+                  <Button type="button" size="sm" variant="ghost" className="h-8 px-2 text-xs" onClick={() => { setAddingTopic(false); setNewTopicName(""); }}>Cancel</Button>
+                </div>
+              )}
+              <p className="text-micro text-muted-foreground">
+                {topicId
+                  ? "Recipients can opt out of just this topic; other topics still reach them."
+                  : "The footer unsubscribe opts recipients out of all marketing."}
+              </p>
+            </div>
+          )}
+
           {/* live reach preview */}
           <div className="flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-sm">
             <Users className="size-4 shrink-0 text-muted-foreground" />
@@ -1659,6 +1740,7 @@ function ComposeBroadcast({
           onClose={() => setShowRecipients(false)}
           segment={segment}
           channel={channel}
+          topicId={topicId || null}
         />
 
         {/* delivery timing — WHEN the broadcast goes out once its draft is
@@ -2518,6 +2600,119 @@ const SUPPRESSION_REASON_LABEL: Record<string, string> = {
   manual: "Added manually",
 };
 
+/** Subscription-topics manager — the named lists a broadcast can be tagged with. Create, rename,
+ *  and delete. A contact opts out of a topic (not everything) via the email footer / preference
+ *  center; deleting a topic falls its broadcasts back to a global-footer send. */
+function TopicsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [rows, setRows] = useState<SubscriptionTopic[] | null>(null);
+  const [error, setError] = useState(false);
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useRef(async () => {
+    try {
+      setError(false);
+      setRows(await fetchTopics(true));
+    } catch {
+      setError(true);
+    }
+  }).current;
+
+  useEffect(() => {
+    if (open) void load();
+    else setRows(null);
+  }, [open, load]);
+
+  async function add() {
+    const n = name.trim();
+    if (!n || busy) return;
+    setBusy(true);
+    try {
+      await createTopic({ name: n, description: description.trim() || undefined });
+      setName("");
+      setDescription("");
+      await load();
+    } catch (e) {
+      toast.error((e as ApiError)?.detail ?? "Couldn't create the topic.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleArchive(t: SubscriptionTopic) {
+    setBusy(true);
+    try {
+      await updateTopic(t.id, { archived: !t.archived });
+      await load();
+    } catch {
+      toast.error("Couldn't update the topic.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(t: SubscriptionTopic) {
+    setBusy(true);
+    try {
+      await deleteTopic(t.id);
+      setRows((prev) => prev?.filter((x) => x.id !== t.id) ?? null);
+    } catch {
+      toast.error("Couldn't delete the topic.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <FormDialog
+      open={open}
+      title="Subscription topics"
+      description="Named lists a broadcast can belong to. Recipients opt out of a topic without unsubscribing from everything."
+      onClose={onClose}
+      busy={busy}
+      footer={<div className="border-t px-5 py-3" />}
+    >
+      <div className="space-y-2">
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Topic name (e.g. Product updates)" className="h-8" />
+        <div className="flex items-center gap-2">
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Short description (optional)" className="h-8" />
+          <Button type="button" size="sm" onClick={() => void add()} disabled={busy || !name.trim()}>Add</Button>
+        </div>
+      </div>
+
+      {error ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">Couldn't load topics.</p>
+      ) : rows === null ? (
+        <div className="grid place-items-center py-8"><Loader2 className="size-4 animate-spin text-muted-foreground" /></div>
+      ) : rows.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">No topics yet. Add one above to offer topic-level opt-out.</p>
+      ) : (
+        <ul className="divide-y divide-border/50 overflow-hidden rounded-lg border">
+          {rows.map((t) => (
+            <li key={t.id} className="flex items-center gap-3 px-3 py-2">
+              <Tag className="size-3.5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className={cn("truncate text-sm", t.archived && "text-muted-foreground line-through")}>{t.name}</span>
+                  {t.archived && <span className="rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">archived</span>}
+                </div>
+                {t.description && <div className="truncate text-micro text-muted-foreground">{t.description}</div>}
+              </div>
+              <Button type="button" variant="ghost" size="sm" className="shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground" onClick={() => void toggleArchive(t)} disabled={busy}>
+                {t.archived ? "Restore" : "Archive"}
+              </Button>
+              <Button type="button" variant="ghost" size="sm" className="shrink-0 px-2 text-xs text-muted-foreground hover:text-destructive" onClick={() => void remove(t)} disabled={busy}>
+                Delete
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </FormDialog>
+  );
+}
+
 function SuppressionsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [rows, setRows] = useState<Suppression[] | null>(null);
   const [error, setError] = useState(false);
@@ -2640,11 +2835,13 @@ function RecipientPreviewDialog({
   onClose,
   segment,
   channel,
+  topicId,
 }: {
   open: boolean;
   onClose: () => void;
   segment: Segment;
   channel: BroadcastChannel;
+  topicId?: string | null;
 }) {
   const [data, setData] = useState<RecipientsPreview | null>(null);
   const [error, setError] = useState(false);
@@ -2657,13 +2854,13 @@ function RecipientPreviewDialog({
     }
     let live = true;
     setError(false);
-    previewRecipients(segment, channel)
+    previewRecipients(segment, channel, 200, topicId ?? null)
       .then((d) => live && setData(d))
       .catch(() => live && setError(true));
     return () => {
       live = false;
     };
-  }, [open, segment, channel]);
+  }, [open, segment, channel, topicId]);
 
   return (
     <FormDialog

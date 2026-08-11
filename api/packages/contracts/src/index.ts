@@ -648,6 +648,10 @@ export const BroadcastInput = z.object({
   // Email design template: a built-in slug ('branded'/'personal') or a custom email_templates
   // row id. Validated server-side; defaults to 'branded'. Ignored by chat channels.
   templateId: z.string().min(1).max(64).optional(),
+  // Subscription topic (0110): the list this broadcast belongs to, so the recipient's footer +
+  // List-Unsubscribe opt out of THIS topic (multi-level unsubscribe). A live topic id; null/absent
+  // = untopiced (footer opts out globally, as before). Validated server-side.
+  topicId: z.guid().nullish(),
   // Block-composer body (see BroadcastBlock). When present it is the authored content: email
   // renders the blocks; `body` (if also sent) is ignored — the server derives the chat/plain
   // representation from the blocks itself.

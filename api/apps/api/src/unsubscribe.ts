@@ -84,11 +84,15 @@ export function verifyUnsubscribeToken(token: string): { tenantId: string; conta
 }
 
 /** Absolute public URL for one contact's opt-out page, or null when unsignable. Points at THIS api's
- *  public origin (API_BASE_URL in prod, else the Zerops subdomain). */
-export function unsubscribeUrl(tenantId: string, contactId: string): string | null {
+ *  public origin (API_BASE_URL in prod, else the Zerops subdomain). A `topicId` scopes the one-click
+ *  opt-out to that subscription topic (0110); without it the link opts out globally (legacy). The
+ *  topic rides as a query param — the token still authorizes exactly one (tenant, contact), so the
+ *  topic can only ever change THAT contact's own subscription (no new authority). */
+export function unsubscribeUrl(tenantId: string, contactId: string, topicId?: string | null): string | null {
   const token = mintUnsubscribeToken(tenantId, contactId);
   if (!token) return null;
-  return `${publicApiBase()}/u/${token}`;
+  const q = topicId && /^[0-9a-f-]{36}$/i.test(topicId) ? `?t=${topicId}` : "";
+  return `${publicApiBase()}/u/${token}${q}`;
 }
 
 /** Flip one contact's marketing subscription. Returns the contact's email-ish display handle

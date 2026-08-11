@@ -252,9 +252,12 @@ const PUBLIC_ROUTES = new Set([
   "GET /avatar/*",
   // Marketing opt-out — signed token IS the auth (./routes/unsubscribe.ts). POST is the
   // RFC 8058 one-click endpoint mail clients hit from the List-Unsubscribe header.
+  "GET /u/preview",
   "GET /u/:token",
   "POST /u/:token",
   "GET /u/:token/undo",
+  "GET /u/:token/preferences",
+  "POST /u/:token/preferences",
   // Engagement tracking — open pixel + signed click redirect (./routes/tracking.ts).
   "GET /t/o/:token",
   "GET /t/c/:token",
