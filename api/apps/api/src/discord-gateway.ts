@@ -59,7 +59,7 @@ export interface MirrorTransport {
   /** Anchor a thread on an existing channel message (VIP thread-per-message bindings, D5). */
   createMessageThread(channelId: string, messageId: string, name: string): Promise<{ threadId: string } | null>;
   /** Post into a thread; optional `files` upload as Discord attachments (on the first content chunk). */
-  postToThread(threadId: string, content: string, files?: MirrorFile[]): Promise<boolean>;
+  postToThread(threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[]): Promise<boolean>;
   setArchived(threadId: string, archived: boolean): Promise<boolean>;
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
   /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
@@ -172,15 +172,19 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       const t = await msg.startThread({ name: name.slice(0, 100) || "Conversation" }).catch(() => null);
       return t ? { threadId: t.id } : null;
     },
-    async postToThread(threadId, content, files) {
+    async postToThread(threadId, content, files, mentionUserIds) {
       const t = await thread(threadId);
       if (!t) return false;
       if (t.archived) await t.setArchived(false).catch(() => {});
       const chunks = splitForDiscord(content, 2000);
       const df = toDiscordFiles(files);
+      // Mentions stay locked down by default (parse: []); a caller may opt in EXACTLY the user ids it
+      // wants to ping (assignee / participant notifications) — @everyone/@here and stray pings never fire.
+      const allow = mentionUserIds?.length ? { users: mentionUserIds, parse: [] as never[] } : { parse: [] as never[] };
       for (let i = 0; i < chunks.length; i++) {
-        // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads.
-        await t.send({ content: chunks[i], allowedMentions: { parse: [] }, ...(i === 0 && df.length ? { files: df } : {}) });
+        // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads. The ping
+        // rides the first chunk (where the <@id> mention text is).
+        await t.send({ content: chunks[i], allowedMentions: i === 0 ? allow : { parse: [] }, ...(i === 0 && df.length ? { files: df } : {}) });
       }
       return true;
     },

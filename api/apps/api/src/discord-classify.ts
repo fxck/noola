@@ -77,6 +77,18 @@ export async function resolveTeammate(tenantId: string, discordUserId: string): 
   });
 }
 
+/** The inverse of resolveTeammate: a Noola user seat → their registered Discord user id (for @pinging
+ *  an assignee/participant in the ops mirror). null when they haven't mapped a Discord ID. */
+export async function discordIdForSeat(tenantId: string, userId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      "SELECT external_id FROM agent_channel_identities WHERE channel_type = 'discord' AND user_id = $1 LIMIT 1",
+      [userId],
+    );
+    return r.rowCount ? (r.rows[0].external_id as string) : null;
+  });
+}
+
 /** Resolve the guild default_author_kind → a classification (the lowest-precedence tier). */
 function defaultClassification(kind: string): DiscordAuthorClassification {
   if (kind === "community") return { action: "ingest", authorType: "agent", authorKind: "community", authorId: null };

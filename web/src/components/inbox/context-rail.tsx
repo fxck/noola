@@ -9,15 +9,20 @@ import {
   MessagesSquare,
   Plus,
   Tags,
+  Users,
   X,
 } from "lucide-react";
 import {
   type Ticket,
   type TicketPriority,
   type AgentUser,
+  type Participant,
   TICKET_PRIORITIES,
   patchTicket,
   assignTicket,
+  fetchParticipants,
+  addParticipant,
+  removeParticipant,
   relativeTime,
 } from "@/lib/tickets";
 import { type Team, fetchTeams, setTicketTeam } from "@/lib/teams";
@@ -368,6 +373,10 @@ export function ContextRail({
           <TagEditor tags={t.tags} saving={savingTags} onCommit={(next) => void commitTags(next)} />
         </RailSection>
 
+        <RailSection id="participants" icon={Users} title="Participants">
+          <ParticipantsPanel ticketId={ticket.id} users={users} />
+        </RailSection>
+
         <AgentRunsSection ticketId={ticket.id} />
 
         <DiscordMirrorSection ticketId={ticket.id} />
@@ -611,6 +620,152 @@ function TagEditor({
           <p className="pt-1.5 text-micro text-muted-foreground/70">Enter adds — keep typing for more.</p>
         </div>
       </Popover>
+    </div>
+  );
+}
+
+/** The ticket's participant roster — teammates looped in on the conversation.
+ *  Lists current participants (avatar + name, remove-× on hover) and an Add
+ *  control that reuses the assignee dropdown's teammate list (the `users` the
+ *  rail already holds). Fetches on ticket change; add/remove are optimistic. */
+function ParticipantsPanel({ ticketId, users }: { ticketId: string; users: AgentUser[] }) {
+  const [participants, setParticipants] = useState<Participant[] | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setParticipants(null);
+    fetchParticipants(ticketId)
+      .then((p) => live && setParticipants(p))
+      .catch(() => live && setParticipants([]));
+    return () => {
+      live = false;
+    };
+  }, [ticketId]);
+
+  async function add(userId: string) {
+    const user = users.find((u) => u.id === userId);
+    if (!user) return;
+    const prev = participants ?? [];
+    if (prev.some((p) => p.userId === userId)) return;
+    const optimistic: Participant = { userId, name: user.name, avatarUrl: user.avatar_url ?? null };
+    setParticipants([...prev, optimistic]);
+    try {
+      const saved = await addParticipant(ticketId, userId);
+      setParticipants((cur) => (cur ?? []).map((p) => (p.userId === userId ? saved : p)));
+    } catch {
+      setParticipants(prev);
+      toast.error("Couldn't add the participant.");
+    }
+  }
+
+  async function remove(userId: string) {
+    const prev = participants ?? [];
+    setParticipants(prev.filter((p) => p.userId !== userId));
+    try {
+      await removeParticipant(ticketId, userId);
+    } catch {
+      setParticipants(prev);
+      toast.error("Couldn't remove the participant.");
+    }
+  }
+
+  const current = participants ?? [];
+  const addable = users.filter((u) => !current.some((p) => p.userId === u.id));
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {participants === null ? (
+        <p className="py-1 text-xs text-muted-foreground/70">Loading…</p>
+      ) : current.length === 0 ? (
+        <p className="py-1 text-xs text-muted-foreground/70">No participants yet.</p>
+      ) : (
+        <ul className="-mx-1.5 flex flex-col">
+          {current.map((p) => (
+            <li
+              key={p.userId}
+              className="group/pt flex items-center gap-2 rounded-md px-1.5 py-1 text-small transition-colors hover:bg-muted/60"
+            >
+              <Avatar name={p.name} image={avatarSrc(p.avatarUrl)} className="size-5 text-[9px]" />
+              <span className="min-w-0 flex-1 truncate">{p.name ?? "Unknown"}</span>
+              <button
+                type="button"
+                onClick={() => void remove(p.userId)}
+                aria-label={`Remove ${p.name ?? "participant"}`}
+                className="rounded-sm p-0.5 text-muted-foreground/50 opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/pt:opacity-100"
+              >
+                <X className="size-3.5" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <ParticipantAdder users={addable} onAdd={(id) => void add(id)} />
+    </div>
+  );
+}
+
+/** The "Add" teammate picker for participants — mirrors the assignee dropdown's
+ *  user list (same Avatar + name/role rows, click-away backdrop, Esc-to-close),
+ *  scoped to teammates not already participating. */
+function ParticipantAdder({ users, onAdd }: { users: AgentUser[]; onAdd: (userId: string) => void }) {
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  function pick(id: string) {
+    setOpen(false);
+    onAdd(id);
+  }
+
+  return (
+    <div className="relative self-start">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        className="inline-flex h-6 items-center gap-1 rounded-md border border-dashed border-border/80 px-2 text-xs text-muted-foreground transition-colors hover:border-border hover:bg-muted/50 hover:text-foreground"
+      >
+        <Plus className="size-3" /> Add
+      </button>
+
+      {open && (
+        <>
+          {/* click-away backdrop */}
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden />
+          <ul
+            role="listbox"
+            className="motion-pop absolute left-0 z-50 mt-1 max-h-72 w-52 origin-top-left overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+          >
+            {users.length === 0 ? (
+              <li className="px-2 py-1.5 text-xs text-muted-foreground">Everyone's already added.</li>
+            ) : (
+              users.map((u) => (
+                <li key={u.id}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={false}
+                    onClick={() => pick(u.id)}
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent"
+                  >
+                    <Avatar name={u.name} image={avatarSrc(u.avatar_url)} className="size-5 text-[9px]" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">{u.name}</span>
+                      <span className="block truncate text-xs capitalize text-muted-foreground">{u.role}</span>
+                    </span>
+                  </button>
+                </li>
+              ))
+            )}
+          </ul>
+        </>
+      )}
     </div>
   );
 }

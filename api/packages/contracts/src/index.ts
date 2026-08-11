@@ -370,6 +370,12 @@ export const SpamTicketInput = z.object({
 });
 export type SpamTicketInput = z.infer<typeof SpamTicketInput>;
 
+/** Add a teammate as a participant on a ticket (an "attendee" pulled into the issue). */
+export const ParticipantInput = z.object({
+  userId: z.guid(),
+});
+export type ParticipantInput = z.infer<typeof ParticipantInput>;
+
 /** Add a sender to the blocklist (Settings manager). `handle` = an email address or bare domain;
  *  `scope` must agree (a 'domain' scope reduces a full address to its domain). */
 export const BlockSenderInput = z.object({

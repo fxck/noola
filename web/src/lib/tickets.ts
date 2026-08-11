@@ -385,6 +385,37 @@ export async function assignTicket(ticketId: string, assigneeId: string | null):
   });
 }
 
+// ---- Ticket participants ("attendees") — named teammates looped in on a ticket
+//      (the api also pings them on Discord; the client just manages the roster). --
+
+/** A teammate looped in on a ticket. `name`/`avatarUrl` are hydrated server-side
+ *  from the user row (null when absent — render the initials fallback). */
+export interface Participant {
+  userId: string;
+  name: string | null;
+  avatarUrl: string | null;
+}
+
+/** The teammates currently participating on a ticket. */
+export async function fetchParticipants(ticketId: string): Promise<Participant[]> {
+  return (await api<{ participants: Participant[] }>(`/tickets/${ticketId}/participants`)).participants;
+}
+
+/** Add a teammate as a participant. Idempotent server-side — re-adding is a no-op. */
+export async function addParticipant(ticketId: string, userId: string): Promise<Participant> {
+  return (
+    await api<{ participant: Participant }>(`/tickets/${ticketId}/participants`, {
+      method: "POST",
+      body: JSON.stringify({ userId }),
+    })
+  ).participant;
+}
+
+/** Remove a teammate from a ticket's participants. */
+export async function removeParticipant(ticketId: string, userId: string): Promise<void> {
+  await api(`/tickets/${ticketId}/participants/${userId}`, { method: "DELETE" });
+}
+
 // ---- Deep ticketing: the filterable/sortable/paginated ticket table ----------
 export interface TicketQuery {
   status?: "open" | "closed" | "all";
