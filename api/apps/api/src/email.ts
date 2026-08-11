@@ -383,8 +383,13 @@ export async function sendOutboundEmail(
      *  agent's own address. Reply-To/Message-ID stay on the support address regardless. */
     agentName?: string | null;
     agentEmail?: string | null;
+    /** Marketing send (broadcast): a per-recipient local token stamped into the Message-ID
+     *  (`<token@sending-domain>`) so a provider delivery-event webhook can match the event back to
+     *  the recipient row (0109). Mutually exclusive with replyToTicketId (a marketing send is not a
+     *  ticket reply). The returned `messageId` is the unangled full id the provider will echo. */
+    marketingId?: string | null;
   },
-): Promise<{ delivered: boolean; reason?: string }> {
+): Promise<{ delivered: boolean; reason?: string; messageId?: string }> {
   if (!to) return { delivered: false, reason: "no-recipient" };
   // BYO email provider: when the tenant brought their own key, send through THEIR ESP (Resend or
   // SendGrid — their verified domains, reputation, quota). Otherwise the shared env SMTP relay (Mailpit
@@ -415,6 +420,10 @@ export async function sendOutboundEmail(
           messageId: `<t.${ticketEmailToken(opts.replyToTicketId)}.${Date.now().toString(36)}@${replyDomain}>`,
         }
       : {}),
+    // Marketing send (0109): stamp a deterministic per-recipient Message-ID so a provider
+    // delivery-event webhook can match the event back to the recipient row. Skipped when this is
+    // a ticket reply (that path owns the Message-ID for threading).
+    ...(opts?.marketingId && !opts?.replyToTicketId ? { messageId: `<${opts.marketingId}@${replyDomain}>` } : {}),
     ...(opts?.inReplyTo ? { inReplyTo: angled(opts.inReplyTo), references: angled(opts.inReplyTo) } : {}),
     // A rich HTML alternative (React Email render) when the caller supplies one — mail clients that
     // can, show it; plaintext `text` stays the fallback. Attachments ride the same nodemailer send.
@@ -432,7 +441,8 @@ export async function sendOutboundEmail(
         : {}),
     },
   });
-  return { delivered: true };
+  const marketingMessageId = opts?.marketingId && !opts?.replyToTicketId ? `${opts.marketingId}@${replyDomain}` : undefined;
+  return { delivered: true, ...(marketingMessageId ? { messageId: marketingMessageId } : {}) };
 }
 
 /** A file attached to an outbound email (nodemailer's attachment shape, narrowed to what we send). */

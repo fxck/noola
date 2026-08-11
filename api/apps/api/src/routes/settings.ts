@@ -27,6 +27,7 @@ import {
 } from "../email-domains.js";
 import { verifySlackSignature, handleSlackEvent, listSlackConnections, upsertSlackConnection, deleteSlackConnection, resolveTenantByTeam } from "../slack.js";
 import { verifyResendSignature, ingestResendInbound } from "../resend-inbound.js";
+import { recordDeliveryEvent, parseResendDeliveryEvent, parseSendgridDeliveryEvents } from "../broadcast-events.js";
 import {
   getTenantEmailProvider, saveTenantEmailProvider, deleteTenantEmailProvider, rotateInboundHandle,
   resolveTenantByInboundHandle, EmailProviderSecretsUnavailableError, isEmailProvider,
@@ -624,6 +625,51 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     if (r.ingested) app.log.info(logCtx, "sendgrid inbound ingested");
     else app.log.warn(logCtx, "sendgrid inbound not ingested");
     return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
+  });
+
+  // ---- Outbound delivery-event webhooks (PUBLIC lane) ----------------------
+  // The outbound twin of the inbound webhooks above. Providers POST delivery-lifecycle events
+  // (delivered / bounced / complained / opened / clicked) for broadcast sends; we match each back
+  // to its broadcast_recipients row, advance its status, append the analytics event, and suppress
+  // hard bounces + complaints. Same <handle> → tenant resolution as inbound (unguessable handle in
+  // the URL; Resend additionally Svix-signs the body with the tenant's own secret). Unknown handle
+  // → 404; wrong provider → 400; bad signature → 401. Always 200 on accepted events so the provider
+  // doesn't retry-storm on a single unmatchable address.
+  app.post("/email/events/resend/:handle", async (req, reply) => {
+    const { handle } = req.params as { handle: string };
+    const resolved = await resolveTenantByInboundHandle(handle);
+    if (!resolved) return reply.code(404).send({ error: "unknown handle" });
+    if (resolved.provider !== "resend") return reply.code(400).send({ error: "this workspace's provider is not resend" });
+    if (!resolved.webhookSecret) return reply.code(503).send({ error: "resend webhook not configured for this workspace" });
+    const h = req.headers as Record<string, string | undefined>;
+    const ok = verifyResendSignature(
+      (req as { rawBody?: string }).rawBody ?? "",
+      { id: h["svix-id"], timestamp: h["svix-timestamp"], signature: h["svix-signature"] },
+      resolved.webhookSecret,
+    );
+    if (!ok) return reply.code(401).send({ error: "bad signature" });
+    const ev = parseResendDeliveryEvent(req.body);
+    if (!ev) return reply.code(200).send({ ok: true, ignored: true });
+    const r = await recordDeliveryEvent(resolved.tenantId, ev);
+    return reply.code(200).send({ ok: true, matched: r.matched, suppressed: r.suppressed });
+  });
+
+  // SendGrid Event Webhook — a JSON ARRAY of events. SendGrid can't Svix-sign this the way Resend
+  // does, so the unguessable <handle> in the URL IS the shared secret (as with its inbound parse).
+  app.post("/email/events/sendgrid/:handle", async (req, reply) => {
+    const { handle } = req.params as { handle: string };
+    const resolved = await resolveTenantByInboundHandle(handle);
+    if (!resolved) return reply.code(404).send({ error: "unknown handle" });
+    if (resolved.provider !== "sendgrid") return reply.code(400).send({ error: "this workspace's provider is not sendgrid" });
+    const events = parseSendgridDeliveryEvents(req.body);
+    let matched = 0;
+    let suppressed = 0;
+    for (const ev of events) {
+      const r = await recordDeliveryEvent(resolved.tenantId, ev);
+      if (r.matched) matched++;
+      if (r.suppressed) suppressed++;
+    }
+    return reply.code(200).send({ ok: true, received: events.length, matched, suppressed });
   });
 
   // ---- Email sending identity (teammate sending) ---------------------------

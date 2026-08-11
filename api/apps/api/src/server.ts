@@ -177,6 +177,9 @@ const PUBLIC_ROUTES = new Set([
   "POST /email/inbound/resend",
   "POST /email/inbound/resend/:handle",
   "POST /email/inbound/sendgrid/:handle",
+  // Outbound delivery-event webhooks — handle resolves the tenant; Resend also Svix-signs the body.
+  "POST /email/events/resend/:handle",
+  "POST /email/events/sendgrid/:handle",
   "POST /slack/events",
   "POST /slack/commands",
   "POST /slack/interactions",

@@ -28,6 +28,7 @@ import {
   mergeTokens,
 } from "../email-templates.js";
 import { renderBroadcastEmail } from "../emails/broadcast-email.js";
+import { listSuppressions, addSuppression, removeSuppression } from "../broadcast-events.js";
 
 // Outbound messaging: subscriber webhooks (HMAC-signed event delivery + attempt log),
 // broadcasts (mass-send a filtered contact segment over ONE channel — email via the
@@ -77,6 +78,25 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
   // mass-send through that channel's driver (email → Mailpit in dev, chat channels →
   // registry dispatch). POST /:id/send kicks the send in the background.
   app.get("/broadcasts", tenanted(async (tenantId) => ({ broadcasts: await listBroadcasts(tenantId) })));
+
+  // ---- Suppression list ----------------------------------------------------
+  // Addresses parked by a hard bounce / spam complaint (auto, via the delivery-event webhook) or
+  // manually. A suppressed address is never re-sent (enforced in resolveRecipients/previewSegment).
+  app.get("/broadcasts/suppressions", tenanted(async (tenantId) => ({ suppressions: await listSuppressions(tenantId) })));
+
+  app.post("/broadcasts/suppressions", tenanted(async (tenantId, req, reply) => {
+    const address = (req.body as { address?: string } | undefined)?.address;
+    if (!address || typeof address !== "string") return reply.code(400).send({ error: "address is required" });
+    await addSuppression(tenantId, address, "manual");
+    return reply.code(201).send({ ok: true });
+  }));
+
+  // Un-suppress (a fixed mailbox, a mistaken complaint). Address is URL-encoded in the path.
+  app.delete("/broadcasts/suppressions/:address", tenanted(async (tenantId, req, reply) => {
+    const gone = await removeSuppression(tenantId, decodeURIComponent((req.params as { address: string }).address));
+    if (!gone) return reply.code(404).send({ error: "not suppressed" });
+    return { ok: true };
+  }));
 
   // Preview a segment before composing: how many contacts match + per-channel reachable
   // handle counts → { total, reachable: { email: n, discord: n, … } }.

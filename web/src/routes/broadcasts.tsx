@@ -49,6 +49,7 @@ import {
   type Segment,
   type SegmentCondition,
   type SegmentPreview,
+  type Suppression,
   fetchBroadcasts,
   fetchBroadcast,
   previewSegment,
@@ -57,6 +58,9 @@ import {
   createBroadcast,
   updateBroadcast,
   isBroadcastsUnavailable,
+  fetchSuppressions,
+  addSuppression,
+  removeSuppression,
 } from "@/lib/broadcasts";
 import { type ChannelStatus, fetchChannels } from "@/lib/settings";
 import { type EmailTemplate, fetchEmailTemplates } from "@/lib/email-templates";
@@ -95,6 +99,7 @@ import { relativeTime } from "@/lib/tickets";
 import { toast } from "@/components/ui/toaster";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { ArticleBody } from "@/components/editor/article-body";
+import { FormDialog } from "@/components/ui/form-dialog";
 import { FactRow, RailSection } from "@/components/ui/rail";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -419,6 +424,20 @@ function buildBroadcastColumns(onEdit: (b: Broadcast) => void, onDuplicate: (b: 
         return <span className="tabular-nums text-muted-foreground" title={`${(b.clicked ?? 0).toLocaleString()} clicked`}>{rate(b.clicked, b.sent_count)}</span>;
       },
     }),
+    bcolHelp.accessor((b) => b.bounced ?? 0, {
+      id: "bounced",
+      header: "Bounced",
+      meta: { label: "Bounced", align: "right" },
+      cell: ({ row }) => {
+        const b = row.original;
+        const n = b.bounced ?? 0;
+        return n > 0 ? (
+          <span className="tabular-nums text-destructive" title={`${n.toLocaleString()} bounced`}>{rate(n, b.sent_count)}</span>
+        ) : (
+          <span className="text-muted-foreground/50">—</span>
+        );
+      },
+    }),
     bcolHelp.display({
       id: "goal",
       header: "Goal",
@@ -561,6 +580,7 @@ export function BroadcastsPage() {
   const [composing, setComposing] = useState(false);
   // The draft being re-edited (null = composing a NEW broadcast).
   const [editing, setEditing] = useState<Broadcast | null>(null);
+  const [showSuppressions, setShowSuppressions] = useState(false);
 
   const load = useRef(async () => {
     try {
@@ -695,7 +715,14 @@ export function BroadcastsPage() {
         {/* ── pane header (h-12, §3) ─────────────────────────────────────── */}
         <header className="flex h-12 shrink-0 items-center gap-2 px-4">
           <h1 className="text-sm font-semibold tracking-tight">Broadcasts</h1>
+          <div className="ml-auto">
+            <Button variant="ghost" size="sm" className="gap-1.5 text-muted-foreground" onClick={() => setShowSuppressions(true)}>
+              <MailX className="size-3.5" />
+              Suppressions
+            </Button>
+          </div>
         </header>
+        <SuppressionsDialog open={showSuppressions} onClose={() => setShowSuppressions(false)} />
 
         {state === "unavailable" ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
@@ -2009,7 +2036,7 @@ export function BroadcastDetail({
   const [recipients, setRecipients] = useState<Recipient[] | null>(null);
   const [stats, setStats] = useState<BroadcastStats | null>(null);
   const [state, setState] = useState<DetailState>("loading");
-  const [recipFilter, setRecipFilter] = useState<"all" | "failed" | "sent">("all");
+  const [recipFilter, setRecipFilter] = useState<"all" | "failed" | "bounced" | "unsubscribed" | "sent">("all");
 
   // Templates resolve the email template id into its name (best-effort — the
   // built-in map covers "branded"/"personal" if the fetch fails).
@@ -2107,14 +2134,28 @@ export function BroadcastDetail({
     );
   }
 
-  // Recipients: failed-first (delivery problems are what an operator scans for), with a status filter.
+  // Recipients: problems-first (delivery failures are what an operator scans for), with a status
+  // filter. A "problem" is a send failure, a provider bounce, or a spam complaint (0109).
   const isRecipFailed = (r: Recipient) => r.status.toLowerCase() === "failed" || !!r.error;
+  const isBounced = (r: Recipient) => r.status.toLowerCase() === "bounced" || r.status.toLowerCase() === "complained" || !!r.bounced_at;
+  const isUnsub = (r: Recipient) => !!r.unsubscribed_at;
+  const isProblem = (r: Recipient) => isRecipFailed(r) || isBounced(r);
   const sortedRecipients = [...(recipients ?? [])].sort(
-    (a, c) => Number(isRecipFailed(c)) - Number(isRecipFailed(a)),
+    (a, c) => Number(isProblem(c)) - Number(isProblem(a)),
   );
   const recipFailedCount = sortedRecipients.filter(isRecipFailed).length;
+  const recipBouncedCount = sortedRecipients.filter(isBounced).length;
+  const recipUnsubCount = sortedRecipients.filter(isUnsub).length;
   const shownRecipients = sortedRecipients.filter((r) =>
-    recipFilter === "all" ? true : recipFilter === "failed" ? isRecipFailed(r) : !isRecipFailed(r),
+    recipFilter === "all"
+      ? true
+      : recipFilter === "failed"
+        ? isRecipFailed(r)
+        : recipFilter === "bounced"
+          ? isBounced(r)
+          : recipFilter === "unsubscribed"
+            ? isUnsub(r)
+            : !isProblem(r), // "sent" = the clean rows
   );
 
   // Template is an email fact only; pre-template rows default to "branded".
@@ -2125,6 +2166,10 @@ export function BroadcastDetail({
   // signals (pixel + wrapped links); chat broadcasts keep delivered/failed only.
   const preSend = b.status === "draft" || b.status === "scheduled";
   const showEngagement = isEmailB && !preSend && stats != null;
+  // Provider delivery-event data exists once anything beyond the raw handoff has landed. Until
+  // then delivered/bounced/complained are all 0 and we rate engagement against `sent`.
+  const hasProviderData = !!stats && (stats.delivered > 0 || stats.bounced > 0 || stats.complained > 0);
+  const engagementBase = stats ? stats.delivered || stats.sent : 0;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
@@ -2207,27 +2252,57 @@ export function BroadcastDetail({
                 <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                   Engagement
                 </h3>
-                <div className={cn("grid grid-cols-2 gap-2", stats.goal ? "sm:grid-cols-4" : "sm:grid-cols-3")}>
-                  <EngagementStat label="Delivered" value={stats.delivered} />
+                {/* `sent` is the provider handoff; `delivered`/`bounced`/`complained` are
+                    provider-confirmed and stay 0 until a delivery-event webhook is wired, so we
+                    surface them only once real data exists (`hasProviderData`) and rate opens/clicks
+                    against delivered-or-sent so the shares read sensibly either way. */}
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+                  <EngagementStat label="Sent" value={stats.sent} sub={hasProviderData ? undefined : "handed to provider"} />
+                  {hasProviderData && (
+                    <EngagementStat
+                      label="Delivered"
+                      value={stats.delivered}
+                      share={pctOfDelivered(stats.delivered, stats.sent)}
+                    />
+                  )}
                   <EngagementStat
                     label="Opened"
                     value={stats.opened}
-                    share={pctOfDelivered(stats.opened, stats.delivered)}
+                    share={pctOfDelivered(stats.opened, engagementBase)}
                   />
                   <EngagementStat
                     label="Clicked"
                     value={stats.clicked}
-                    share={pctOfDelivered(stats.clicked, stats.delivered)}
+                    share={pctOfDelivered(stats.clicked, engagementBase)}
                   />
+                  {(stats.bounced > 0 || hasProviderData) && (
+                    <EngagementStat
+                      label="Bounced"
+                      value={stats.bounced}
+                      share={pctOfDelivered(stats.bounced, stats.sent)}
+                      tone="bad"
+                    />
+                  )}
+                  {stats.complained > 0 && (
+                    <EngagementStat label="Complained" value={stats.complained} tone="bad" />
+                  )}
+                  {stats.unsubscribed > 0 && (
+                    <EngagementStat label="Unsubscribed" value={stats.unsubscribed} tone="warn" />
+                  )}
                   {stats.goal && (
                     <EngagementStat
                       label="Goal met"
                       value={stats.goal.conversions}
-                      share={pctOfDelivered(stats.goal.conversions, stats.delivered)}
+                      share={pctOfDelivered(stats.goal.conversions, engagementBase)}
                       sub={`${stats.goal.event} within ${stats.goal.days} ${stats.goal.days === 1 ? "day" : "days"}`}
                     />
                   )}
                 </div>
+                {!hasProviderData && (
+                  <p className="mt-2 text-micro text-muted-foreground">
+                    Bounces and delivery confirmations appear once a provider delivery-event webhook is connected.
+                  </p>
+                )}
               </section>
             )}
 
@@ -2255,7 +2330,13 @@ export function BroadcastDetail({
                     Recipients
                   </h3>
                   <div className="inline-flex rounded-md border p-0.5 text-xs">
-                    {(["all", "failed", "sent"] as const).map((k) => (
+                    {([
+                      { k: "all" as const },
+                      { k: "failed" as const, count: recipFailedCount, tone: "bad" as const },
+                      ...(recipBouncedCount > 0 ? [{ k: "bounced" as const, count: recipBouncedCount, tone: "bad" as const }] : []),
+                      ...(recipUnsubCount > 0 ? [{ k: "unsubscribed" as const, count: recipUnsubCount, tone: "warn" as const }] : []),
+                      { k: "sent" as const },
+                    ]).map(({ k, count, tone }) => (
                       <button
                         key={k}
                         type="button"
@@ -2263,13 +2344,12 @@ export function BroadcastDetail({
                         className={cn(
                           "rounded px-2 py-0.5 font-medium capitalize transition-colors",
                           recipFilter === k ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
-                          k === "failed" && recipFailedCount > 0 && recipFilter !== "failed" && "text-destructive",
+                          tone === "bad" && (count ?? 0) > 0 && recipFilter !== k && "text-destructive",
+                          tone === "warn" && (count ?? 0) > 0 && recipFilter !== k && "text-amber-600 dark:text-amber-500",
                         )}
                       >
                         {k}
-                        {k === "failed" && recipFailedCount > 0 && (
-                          <span className="ml-1 tabular-nums">{recipFailedCount}</span>
-                        )}
+                        {count != null && count > 0 && <span className="ml-1 tabular-nums">{count}</span>}
                       </button>
                     ))}
                   </div>
@@ -2287,7 +2367,11 @@ export function BroadcastDetail({
                     </li>
                   )}
                   {shownRecipients.map((r, i) => {
-                    const failed = isRecipFailed(r);
+                    const bad = isRecipFailed(r) || isBounced(r); // failure/bounce/complaint earn red
+                    const unsub = isUnsub(r);
+                    // What the status cell shows: an unsubscribe is a post-delivery fact the raw
+                    // status ('sent'/'delivered') doesn't carry, so surface it explicitly.
+                    const statusLabel = unsub && !bad ? "unsubscribed" : r.status;
                     return (
                       <li key={`${r.handle}-${i}`} className="flex items-center gap-3 px-4 py-2.5">
                         <ChannelIcon channel={b.channel} />
@@ -2306,16 +2390,16 @@ export function BroadcastDetail({
                             <EngagementMoment iso={r.clicked_at} what="Clicked" />
                           </>
                         )}
-                        {/* delivered is the norm — only failure earns color (§4) */}
+                        {/* delivered is the norm — only a problem/opt-out earns color (§4) */}
                         <span
                           className={cn(
                             "shrink-0 text-xs capitalize",
                             isEmailB && "w-16 truncate text-right",
-                            failed ? "text-destructive" : "text-muted-foreground",
+                            bad ? "text-destructive" : unsub ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
                           )}
-                          title={r.status}
+                          title={statusLabel}
                         >
-                          {r.status}
+                          {statusLabel}
                         </span>
                       </li>
                     );
@@ -2402,6 +2486,129 @@ function pctOfDelivered(n: number, delivered: number): string {
   return delivered > 0 ? `${Math.round((n / delivered) * 100)}%` : "0%";
 }
 
+/** Suppression-list manager — the parked addresses a broadcast will never re-send to. Rows land
+ *  here automatically on a hard bounce or spam complaint (via the provider delivery-event webhook)
+ *  and can be added by hand; un-suppressing restores reach (a fixed mailbox, a mistaken complaint). */
+const SUPPRESSION_REASON_LABEL: Record<string, string> = {
+  hard_bounce: "Hard bounce",
+  complaint: "Spam complaint",
+  unsubscribe: "Unsubscribed",
+  manual: "Added manually",
+};
+
+function SuppressionsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [rows, setRows] = useState<Suppression[] | null>(null);
+  const [error, setError] = useState(false);
+  const [adding, setAdding] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useRef(async () => {
+    try {
+      setError(false);
+      setRows(await fetchSuppressions());
+    } catch {
+      setError(true);
+    }
+  }).current;
+
+  useEffect(() => {
+    if (open) void load();
+    else setRows(null);
+  }, [open, load]);
+
+  async function add() {
+    const address = adding.trim().toLowerCase();
+    if (!address || busy) return;
+    setBusy(true);
+    try {
+      await addSuppression(address);
+      setAdding("");
+      await load();
+    } catch (e) {
+      toast.error((e as ApiError)?.detail ?? "Couldn't add that address.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(address: string) {
+    setBusy(true);
+    try {
+      await removeSuppression(address);
+      setRows((prev) => prev?.filter((r) => r.address !== address) ?? null);
+    } catch {
+      toast.error("Couldn't un-suppress that address.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <FormDialog
+      open={open}
+      title="Suppressed addresses"
+      description="Addresses a broadcast will never send to. Hard bounces and spam complaints land here automatically."
+      onClose={onClose}
+      busy={busy}
+      footer={<div className="border-t px-5 py-3" />}
+    >
+      <div className="flex items-center gap-2">
+        <Input
+          value={adding}
+          onChange={(e) => setAdding(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void add();
+            }
+          }}
+          placeholder="name@example.com"
+          type="email"
+          className="h-8"
+        />
+        <Button type="button" size="sm" onClick={() => void add()} disabled={busy || !adding.trim()}>
+          Suppress
+        </Button>
+      </div>
+
+      {error ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">Couldn't load the suppression list.</p>
+      ) : rows === null ? (
+        <div className="grid place-items-center py-8">
+          <Loader2 className="size-4 animate-spin text-muted-foreground" />
+        </div>
+      ) : rows.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">
+          No suppressed addresses. Bounces and complaints will appear here.
+        </p>
+      ) : (
+        <ul className="divide-y divide-border/50 overflow-hidden rounded-lg border">
+          {rows.map((r) => (
+            <li key={r.address} className="flex items-center gap-3 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{r.address}</div>
+                <div className="text-micro text-muted-foreground">
+                  {SUPPRESSION_REASON_LABEL[r.reason] ?? r.reason} · {relativeTime(r.created_at)}
+                </div>
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => void remove(r.address)}
+                disabled={busy}
+              >
+                Un-suppress
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </FormDialog>
+  );
+}
+
 /** One engagement figure — count first, its share of delivered beside it,
  *  an optional sub-line naming what was measured (the goal event). */
 function EngagementStat({
@@ -2409,19 +2616,24 @@ function EngagementStat({
   value,
   share,
   sub,
+  tone = "default",
 }: {
   label: string;
   value: number;
   share?: string;
   sub?: string;
+  /** "bad" (bounces/complaints) and "warn" (unsubscribes) tint the number when it's non-zero,
+   *  so a delivery problem reads at a glance the way a failed recipient row does. */
+  tone?: "default" | "bad" | "warn";
 }) {
+  const toneCls = value > 0 && tone === "bad" ? "text-destructive" : value > 0 && tone === "warn" ? "text-amber-600 dark:text-amber-500" : "";
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="text-micro font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </div>
       <div className="mt-1 flex items-baseline gap-1.5">
-        <span className="text-xl font-semibold tabular-nums tracking-tight">
+        <span className={cn("text-xl font-semibold tabular-nums tracking-tight", toneCls)}>
           {value.toLocaleString()}
         </span>
         {share && (
