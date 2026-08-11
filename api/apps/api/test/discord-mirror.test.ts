@@ -5,7 +5,9 @@ import {
   evaluateAutoMirror, pushTicketToDiscord, getTicketMirror, mirrorByThread, mirrorUrl,
   matchesMirrorFilter, relayTicketMessage, syncMirrorState,
   handleMirrorPostMessage, handleMirrorReaction, PROMOTE_EMOJI,
+  onConversationSpam, onConversationUnspam,
 } from "../src/discord-mirror.js";
+import { markConversationSpam, unmarkConversationSpam } from "../src/spam.js";
 import type { MirrorTransport } from "../src/discord-gateway.js";
 import { ingestInbound } from "../src/ingest.js";
 import { persistBufferAttachments } from "../src/attachments.js";
@@ -338,6 +340,31 @@ async function main() {
     if (prevMark.rowCount) await upsertAgentChannelIdentity(A, seatId, prevMark.rows[0].external_id as string);
     await sleep(300); // let close-event automations settle before cleanup
   }
+
+  // ── spam → Discord: a spammed conversation gets a notice + archive; restore reopens ────────
+  // Direct hook (deterministic): onConversationSpam posts the notice then archives the post.
+  calls.length = 0;
+  archived.set(thread1, false);
+  await onConversationSpam(A, t1, { actorId: null, blocked: true });
+  check("spam posts a 'Marked as spam' notice", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("Marked as spam")));
+  check("spam notice reports the sender was blocked", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("blocked")));
+  check("spam archives the mirror post", archived.get(thread1) === true);
+
+  calls.length = 0;
+  await onConversationUnspam(A, t1);
+  check("restore unarchives the mirror post", archived.get(thread1) === false);
+  check("restore posts a 'Restored from spam' notice", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("Restored from spam")));
+
+  // End-to-end: markConversationSpam (shared by the web route AND the 🚫 reaction) reflects onto
+  // Discord via the fire-and-forget hook — a settle-sleep like the promotion/close paths above.
+  calls.length = 0;
+  archived.set(thread1, false);
+  await markConversationSpam(A, t1, { block: false, dropLead: false });
+  await sleep(300);
+  check("markConversationSpam reflects spam onto Discord (notice + archive)",
+    calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("Marked as spam")) && archived.get(thread1) === true);
+  await unmarkConversationSpam(A, t1); // leave the ticket un-hidden for teardown
+  await sleep(200);
 
   // ── binding removal cascades its mirrors ───────────────────────────────────
   await replaceMirrorBindings(A, []);

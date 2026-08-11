@@ -37,6 +37,14 @@ export async function markConversationSpam(
     await setContactSpam(tenantId, out.contactId, true).catch(() => {});
     leadDropped = true;
   }
+
+  // Reflect the spam onto Discord (best-effort, fire-and-forget): notice + archive the ops-mirror post,
+  // so a spammed conversation doesn't linger as an open thread. Dynamic import breaks the
+  // discord-mirror ↔ spam module cycle. No-ops when the ticket isn't mirrored.
+  void import("./discord-mirror.js")
+    .then((m) => m.onConversationSpam(tenantId, ticketId, { actorId: opts.actorId ?? null, blocked: blocked !== null }))
+    .catch(() => {});
+
   return { ticketId: out.ticketId, blocked, leadDropped };
 }
 
@@ -46,5 +54,11 @@ export async function unmarkConversationSpam(tenantId: string, ticketId: string)
   if (!out) return null;
   if (out.contactId) await setContactSpam(tenantId, out.contactId, false).catch(() => {});
   if (out.senderHandle) await unblockByHandle(tenantId, out.channelType, out.senderHandle).catch(() => {});
+
+  // Reopen the ops-mirror post on restore (best-effort, fire-and-forget) — the inverse of the spam hook.
+  void import("./discord-mirror.js")
+    .then((m) => m.onConversationUnspam(tenantId, ticketId))
+    .catch(() => {});
+
   return { ticketId: out.ticketId };
 }

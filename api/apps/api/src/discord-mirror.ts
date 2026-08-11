@@ -672,6 +672,44 @@ async function archiveIntakeThreadOnClose(tenantId: string, ticketId: string, ag
   if (missingPerms) await tp.postToThread(threadId, MANAGE_POSTS_HINT).catch(() => {});
 }
 
+/**
+ * Fired when a conversation is marked as spam — from the web Mark-as-spam route OR the 🚫 mirror
+ * reaction, both via markConversationSpam. Gives spam the SAME Discord visibility + close treatment a
+ * resolved ticket gets: post a "🚫 Marked as spam" notice into the forum post, then archive it, so a
+ * spammed conversation doesn't linger as an open ops-mirror thread. Notice FIRST (posting re-activates
+ * an archived thread), archive LAST. Best-effort — no-op when the ticket isn't mirrored or the
+ * transport is down; a permission refusal on archive surfaces the Manage-Posts hint.
+ */
+export async function onConversationSpam(
+  tenantId: string,
+  ticketId: string,
+  opts: { actorId?: string | null; blocked?: boolean } = {},
+): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId).catch(() => null);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const actorName = opts.actorId ? await teammateName(tenantId, opts.actorId).catch(() => null) : null;
+  const by = actorName ? ` by ${actorName}` : "";
+  const blockNote = opts.blocked ? " The sender was blocked." : "";
+  await tp.postToThread(mirror.post_thread_id, `🚫 **Marked as spam**${by} — hidden in Noola.${blockNote}`).catch(() => {});
+  const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+  const { missingPerms } = await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, true));
+  if (missingPerms) await tp.postToThread(mirror.post_thread_id, MANAGE_POSTS_HINT).catch(() => {});
+}
+
+/** Reverse of onConversationSpam: a conversation restored from spam reopens its mirror post — un-archive
+ *  it and post a "restored" notice, so the team sees it back in the forum. Best-effort. */
+export async function onConversationUnspam(tenantId: string, ticketId: string): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId).catch(() => null);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+  await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, false));
+  await tp.postToThread(mirror.post_thread_id, "♻️ **Restored from spam** — back in Noola.").catch(() => {});
+}
+
 // ── D3: forum post → ticket (note by default, 📤 promotes to reply) ───────────
 
 export interface MirrorPostMessage {
@@ -928,8 +966,11 @@ async function applyMirrorTriage(
     case "spam":
       // 🚫 from the mirror = the same "Mark as spam" as the web: hide the ticket, block the sender,
       // drop the lead (defaults on). Reversible from the web Spam view. Attributed to the reactor.
+      // markConversationSpam already posts the spam notice + archives THIS post — so return early
+      // rather than fall through to syncMirrorState, which would un-archive it (spam ≠ status=closed).
       await markConversationSpam(tenantId, ticketId, { block: true, dropLead: true, actorId: agentId });
-      break;
+      await transport()?.react(mirror.post_thread_id, r.discordMessageId, TRIAGED_EMOJI).catch(() => {});
+      return { promoted: false, action };
     default:
       // 'note'/'priority' need a value an emoji can't carry — Slack-only kinds, ignored here.
       return { promoted: false, action, reason: "unsupported_action" };
