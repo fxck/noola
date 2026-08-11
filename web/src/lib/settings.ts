@@ -415,8 +415,10 @@ export async function deleteSendingDomain(id: string): Promise<void> {
 // billing/quota, their key to rotate. Secrets are write-only: the API returns only the hasX flags +
 // the inbound webhook URL to paste into Resend. Absent → the shared platform account.
 
+export type EmailProviderName = "resend" | "sendgrid";
+
 export interface EmailProvider {
-  provider: string;
+  provider: EmailProviderName;
   hasApiKey: boolean;
   hasWebhookSecret: boolean;
   inboundHandle: string;
@@ -430,8 +432,26 @@ export async function fetchEmailProvider(): Promise<EmailProvider | null> {
 }
 
 /** Partial: omit a field to leave it as-is, pass "" to clear it. */
-export async function saveEmailProvider(patch: { apiKey?: string; webhookSecret?: string; active?: boolean }): Promise<EmailProvider> {
+export async function saveEmailProvider(patch: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean }): Promise<EmailProvider> {
   return (await api<{ provider: EmailProvider }>("/email/provider", { method: "PUT", body: JSON.stringify(patch) })).provider;
+}
+
+// ── Email sending identity (teammate sending) ────────────────────────────────
+
+export type EmailSenderMode = "shared" | "teammate";
+
+export interface EmailSenderSettings {
+  mode: EmailSenderMode;
+  hasVerifiedDomain: boolean;
+  workspace: string;
+}
+
+export async function fetchSenderMode(): Promise<EmailSenderSettings> {
+  return api<EmailSenderSettings>("/email/sender-mode");
+}
+
+export async function saveSenderMode(mode: EmailSenderMode): Promise<EmailSenderSettings> {
+  return api<EmailSenderSettings>("/email/sender-mode", { method: "PUT", body: JSON.stringify({ mode }) });
 }
 
 export async function rotateEmailProviderHandle(): Promise<EmailProvider> {

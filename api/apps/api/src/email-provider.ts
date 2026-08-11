@@ -20,9 +20,17 @@ import { encryptSecret, decryptSecret, encryptionAvailable } from "./crypto.js";
 
 export class EmailProviderSecretsUnavailableError extends Error {}
 
+/** The email providers a workspace can bring. Both are SMTP for outbound; they differ on inbound
+ *  (Resend = Svix-signed webhook + fetch-back; SendGrid = Inbound Parse multipart, body inline). */
+export type EmailProviderName = "resend" | "sendgrid";
+export const EMAIL_PROVIDERS: EmailProviderName[] = ["resend", "sendgrid"];
+export function isEmailProvider(v: unknown): v is EmailProviderName {
+  return v === "resend" || v === "sendgrid";
+}
+
 /** Safe (secret-free) view of a tenant's provider settings, for the Settings UI. */
 export interface EmailProviderStatus {
-  provider: string;
+  provider: EmailProviderName;
   hasApiKey: boolean;
   hasWebhookSecret: boolean;
   inboundHandle: string;
@@ -47,7 +55,7 @@ export async function getTenantEmailProvider(tenantId: string): Promise<EmailPro
     if (!r.rowCount) return null;
     const row = r.rows[0] as Record<string, unknown>;
     return {
-      provider: row.provider as string,
+      provider: (isEmailProvider(row.provider) ? row.provider : "resend"),
       hasApiKey: Boolean(row.has_api_key),
       hasWebhookSecret: Boolean(row.has_webhook_secret),
       inboundHandle: row.inbound_handle as string,
@@ -65,7 +73,7 @@ export async function getTenantEmailProvider(tenantId: string): Promise<EmailPro
  */
 export async function saveTenantEmailProvider(
   tenantId: string,
-  input: { apiKey?: string; webhookSecret?: string; active?: boolean },
+  input: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean },
 ): Promise<EmailProviderStatus> {
   if (!encryptionAvailable()) {
     throw new EmailProviderSecretsUnavailableError("MODEL_KEY_SECRET is not set — cannot store email provider credentials");
@@ -75,16 +83,18 @@ export async function saveTenantEmailProvider(
   // Empty string clears; a non-empty value encrypts; undefined leaves the column as-is.
   const apiKeyEnc = setApiKey ? (input.apiKey ? encryptSecret(input.apiKey.trim()) : null) : null;
   const webhookEnc = setWebhook ? (input.webhookSecret ? encryptSecret(input.webhookSecret.trim()) : null) : null;
+  const provider = input.provider ?? null; // null = keep existing (insert defaults to 'resend')
   await withTenant(tenantId, async (c) => {
     await c.query(
-      `INSERT INTO email_provider_settings (tenant_id, inbound_handle, api_key_enc, webhook_secret_enc, active)
-       VALUES (current_tenant(), $1, $2, $3, COALESCE($4, true))
+      `INSERT INTO email_provider_settings (tenant_id, provider, inbound_handle, api_key_enc, webhook_secret_enc, active)
+       VALUES (current_tenant(), COALESCE($7, 'resend'), $1, $2, $3, COALESCE($4, true))
        ON CONFLICT (tenant_id) DO UPDATE SET
+         provider           = COALESCE($7, email_provider_settings.provider),
          api_key_enc        = CASE WHEN $5 THEN $2 ELSE email_provider_settings.api_key_enc END,
          webhook_secret_enc = CASE WHEN $6 THEN $3 ELSE email_provider_settings.webhook_secret_enc END,
          active             = COALESCE($4, email_provider_settings.active),
          updated_at         = now()`,
-      [newInboundHandle(), apiKeyEnc, webhookEnc, input.active ?? null, setApiKey, setWebhook],
+      [newInboundHandle(), apiKeyEnc, webhookEnc, input.active ?? null, setApiKey, setWebhook, provider],
     );
   });
   const status = await getTenantEmailProvider(tenantId);
@@ -113,45 +123,58 @@ export async function rotateInboundHandle(tenantId: string): Promise<string | nu
 
 // ---- credential resolution (send + fetch paths) ---------------------------
 
-/** The tenant's own Resend API key (decrypted), or null when they haven't brought one. */
-export async function tenantResendApiKey(tenantId: string): Promise<string | null> {
-  const row = await withTenant(tenantId, async (c) => {
-    const r = await c.query(
-      "SELECT api_key_enc FROM email_provider_settings WHERE tenant_id = current_tenant() AND active = true",
-    );
-    return r.rowCount ? (r.rows[0].api_key_enc as string | null) : null;
-  });
-  return row ? decryptSecret(row) : null;
+export interface TenantProviderCreds {
+  provider: EmailProviderName;
+  apiKey: string;
 }
 
-/** The Resend key to use for a tenant's OUTBOUND provider calls: their BYO key, else the shared env
- *  key. The domain wizard uses this so a BYO tenant's domains live in THEIR account, a shared tenant's
- *  in the platform account. Null → no provider configured at all (local-only tracking). */
+/** The tenant's own email-provider credentials (provider + decrypted key), or null when they haven't
+ *  brought one. Drives the outbound transport (Resend vs SendGrid SMTP) and the inbound fetch-back. */
+export async function tenantEmailProviderCreds(tenantId: string): Promise<TenantProviderCreds | null> {
+  const row = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      "SELECT provider, api_key_enc FROM email_provider_settings WHERE tenant_id = current_tenant() AND active = true",
+    );
+    return r.rowCount ? (r.rows[0] as { provider: string; api_key_enc: string | null }) : null;
+  });
+  if (!row?.api_key_enc) return null;
+  const apiKey = decryptSecret(row.api_key_enc);
+  if (!apiKey) return null;
+  return { provider: isEmailProvider(row.provider) ? row.provider : "resend", apiKey };
+}
+
+/** The Resend key to use for a tenant's OUTBOUND provider calls (the DOMAIN WIZARD, Resend-only): the
+ *  tenant's BYO key when they're on Resend, else the shared env key. A SendGrid BYO tenant never lends
+ *  its key to the Resend API — it falls back to env (or null = local-only tracking). */
 export async function resendApiKeyForTenant(tenantId: string): Promise<string | null> {
-  return (await tenantResendApiKey(tenantId)) ?? process.env.RESEND_API_KEY ?? null;
+  const creds = await tenantEmailProviderCreds(tenantId);
+  if (creds?.provider === "resend") return creds.apiKey;
+  return process.env.RESEND_API_KEY ?? null;
 }
 
 // ---- pre-tenant inbound resolution (webhook handle → tenant) --------------
 
 export interface InboundHandleResolution {
   tenantId: string;
+  provider: EmailProviderName;  // how to parse/verify the inbound (Resend Svix vs SendGrid Inbound Parse)
   apiKey: string | null;        // for the Resend body/attachment fetch-back
-  webhookSecret: string | null; // for Svix signature verification
+  webhookSecret: string | null; // for Resend's Svix signature verification (unused by SendGrid)
 }
 
-/** Resolve a BYO inbound webhook handle to its tenant + decrypted secrets. BYPASSRLS relay read
- *  (pre-tenant, like email_routes) — the whole point is to identify the tenant before we can verify
- *  the signature. Null when the handle is unknown or the row is inactive. */
+/** Resolve a BYO inbound webhook handle to its tenant + provider + decrypted secrets. BYPASSRLS relay
+ *  read (pre-tenant, like email_routes) — the whole point is to identify the tenant before we can
+ *  verify/parse. Null when the handle is unknown or the row is inactive. */
 export async function resolveTenantByInboundHandle(handle: string): Promise<InboundHandleResolution | null> {
   if (!handle) return null;
   const r = await relayPool.query(
-    "SELECT tenant_id, api_key_enc, webhook_secret_enc FROM email_provider_settings WHERE inbound_handle = $1 AND active = true",
+    "SELECT tenant_id, provider, api_key_enc, webhook_secret_enc FROM email_provider_settings WHERE inbound_handle = $1 AND active = true",
     [handle],
   );
   if (!r.rowCount) return null;
-  const row = r.rows[0] as { tenant_id: string; api_key_enc: string | null; webhook_secret_enc: string | null };
+  const row = r.rows[0] as { tenant_id: string; provider: string; api_key_enc: string | null; webhook_secret_enc: string | null };
   return {
     tenantId: row.tenant_id,
+    provider: isEmailProvider(row.provider) ? row.provider : "resend",
     apiKey: row.api_key_enc ? decryptSecret(row.api_key_enc) : null,
     webhookSecret: row.webhook_secret_enc ? decryptSecret(row.webhook_secret_enc) : null,
   };

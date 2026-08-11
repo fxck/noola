@@ -31,8 +31,12 @@ export interface DispatchOptions {
   attachments?: MailAttachment[];
   /** Email: carbon-copy recipients (reply-all). Channels without cc semantics ignore it. */
   cc?: string[];
-  /** The replying agent's display name — email renders it as a quiet signature line. */
+  /** The replying agent's display name — email renders it as a quiet signature line and as the From
+   *  display name ("<name> from <workspace>"). */
   agentName?: string | null;
+  /** The replying agent's signup email — email uses it as the From address in teammate sending mode
+   *  when the address's domain is verified. Ignored by non-email channels. */
+  agentEmail?: string | null;
   /** Email: the persisted agent message id — embeds a read-receipt pixel (/public/seen/:id) in the
    *  reply HTML so an email open stamps seen_at. Best-effort; ignored by non-email channels. */
   seenMessageId?: string | null;
@@ -105,7 +109,7 @@ const email: ChannelDriver = {
       ctx.subject,
       body,
       opts?.attachments,
-      { agentName: opts?.agentName ?? null, ...(opts?.cc?.length ? { cc: opts.cc } : {}), ...(opts?.seenMessageId ? { seenMessageId: opts.seenMessageId } : {}) },
+      { agentName: opts?.agentName ?? null, ...(opts?.agentEmail ? { agentEmail: opts.agentEmail } : {}), ...(opts?.cc?.length ? { cc: opts.cc } : {}), ...(opts?.seenMessageId ? { seenMessageId: opts.seenMessageId } : {}) },
     ),
 };
 

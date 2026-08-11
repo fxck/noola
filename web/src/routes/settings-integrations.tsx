@@ -48,7 +48,8 @@ import {
   fetchEmailRoute, saveEmailRoute,
   type SendingDomain, type DnsRecord,
   fetchSendingDomains, addSendingDomain, verifySendingDomain, deleteSendingDomain,
-  type EmailProvider, fetchEmailProvider, saveEmailProvider, rotateEmailProviderHandle, deleteEmailProvider,
+  type EmailProvider, type EmailProviderName, fetchEmailProvider, saveEmailProvider, rotateEmailProviderHandle, deleteEmailProvider,
+  type EmailSenderSettings, fetchSenderMode, saveSenderMode,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -614,6 +615,9 @@ export function SettingsIntegrationsPage() {
                   {/* ── Branded sending domains (Model-B: send AS the customer's own domain) ── */}
                   <SendingDomainsSection isAdmin={isAdmin} />
 
+                  {/* ── Sending identity: shared support address vs each teammate's own address ── */}
+                  <SenderModeSection isAdmin={isAdmin} />
+
                   {/* ── Editor ── */}
                   <FormDialog
                     open={!!draft}
@@ -888,8 +892,11 @@ function StepBadge({ n, done }: { n: number; done: boolean }) {
   );
 }
 
+const PROVIDER_LABEL: Record<EmailProviderName, string> = { resend: "Resend", sendgrid: "SendGrid" };
+
 function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   const [provider, setProvider] = useState<EmailProvider | null | undefined>(undefined); // undefined=loading, null=not configured
+  const [sel, setSel] = useState<EmailProviderName>("resend"); // selected provider in the UI
   const [apiKey, setApiKey] = useState("");
   const [webhookSecret, setWebhookSecret] = useState("");
   const [saving, setSaving] = useState(false);
@@ -898,24 +905,32 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   const [removing, setRemoving] = useState(false);
 
   useEffect(() => {
-    void fetchEmailProvider().then(setProvider).catch(() => setProvider(null));
+    void fetchEmailProvider()
+      .then((p) => { setProvider(p); if (p) setSel(p.provider); })
+      .catch(() => setProvider(null));
   }, []);
 
+  const pname = PROVIDER_LABEL[sel];
+  const keyPrefix = sel === "sendgrid" ? "SG.…" : "re_…";
+  const needsSecret = sel === "resend"; // Resend inbound is Svix-signed; SendGrid Inbound Parse isn't.
+  const providerChanged = !!provider && provider.provider !== sel;
+  // The inbound URL path follows the provider; reflect the *selected* provider even before saving.
+  const inboundUrl = provider ? provider.inboundWebhookUrl.replace(/\/email\/inbound\/(resend|sendgrid)\//, `/email/inbound/${sel}/`) : "";
+
   async function onSave() {
-    // Only send fields the admin actually typed — omit = leave as-is (never blanks a stored secret).
-    const patch: { apiKey?: string; webhookSecret?: string } = {};
+    const patch: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string } = { provider: sel };
     if (apiKey.trim()) patch.apiKey = apiKey.trim();
-    if (webhookSecret.trim()) patch.webhookSecret = webhookSecret.trim();
-    if (patch.apiKey === undefined && patch.webhookSecret === undefined) {
-      toast.error("Enter an API key or webhook signing secret to save.");
+    if (needsSecret && webhookSecret.trim()) patch.webhookSecret = webhookSecret.trim();
+    if (!patch.apiKey && !patch.webhookSecret && !providerChanged) {
+      toast.error("Enter an API key to save.");
       return;
     }
     setSaving(true);
     try {
       const p = await saveEmailProvider(patch);
-      setProvider(p);
+      setProvider(p); setSel(p.provider);
       setApiKey(""); setWebhookSecret("");
-      toast.success("Resend account connected. Point your Resend inbound webhook at the URL below.");
+      toast.success(`${PROVIDER_LABEL[p.provider]} connected. Point its inbound webhook at the URL below.`);
     } catch (e) {
       const s = (e as { status?: number }).status;
       toast.error(s === 503 ? "Server can't store secrets (encryption key unset)." : (e as { detail?: string }).detail || "Couldn't save those credentials.");
@@ -935,8 +950,9 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   async function onRotate() {
     setSaving(true);
     try {
-      setProvider(await rotateEmailProviderHandle());
-      toast.success("New inbound URL generated — update it in your Resend webhook settings.");
+      const p = await rotateEmailProviderHandle();
+      setProvider(p); setSel(p.provider);
+      toast.success("New inbound URL generated — update it in your provider's webhook settings.");
     } catch {
       toast.error("Couldn't rotate the inbound URL.");
     } finally { setSaving(false); }
@@ -946,9 +962,9 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
     setRemoving(true);
     try {
       await deleteEmailProvider();
-      setProvider(null);
+      setProvider(null); setSel("resend");
       setApiKey(""); setWebhookSecret("");
-      toast.success("Resend account disconnected — email falls back to the shared account.");
+      toast.success("Provider disconnected — email falls back to the shared account.");
       setDisconnect(false);
     } catch {
       toast.error("Couldn't disconnect.");
@@ -958,54 +974,88 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   if (provider === undefined) return null; // loading
   if (!isAdmin && !provider) return null;  // nothing to show a non-admin who hasn't set it up
 
-  const connected = !!provider && (provider.hasApiKey || provider.hasWebhookSecret);
+  const connected = !!provider && provider.hasApiKey;
+  const step2Done = sel === "sendgrid" ? connected : !!provider?.hasWebhookSecret;
 
   return (
     <section className="mt-8">
       <div className="mb-1 flex items-center gap-2">
         <KeyRound className="size-4 text-muted-foreground" />
-        <h2 className="text-sm font-semibold text-foreground">Bring your own Resend</h2>
-        {connected && <Badge variant="success" className="h-5 text-micro">Connected</Badge>}
+        <h2 className="text-sm font-semibold text-foreground">Bring your own email provider</h2>
+        {connected && <Badge variant="success" className="h-5 text-micro">{PROVIDER_LABEL[provider!.provider]} connected</Badge>}
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
-        Connect your own <span className="font-mono">Resend</span> account so email sends and receives through your
-        credentials — your sending reputation, your billing and quota, your key to rotate. Leave this empty to use the
-        shared platform account. Your keys are encrypted at rest and never shown again after saving.
+        Connect your own <span className="font-mono">Resend</span> or <span className="font-mono">SendGrid</span> account so email
+        sends and receives through your credentials — your sending reputation, your billing and quota, your key to rotate. Leave
+        this empty to use the shared platform account. Your keys are encrypted at rest and never shown again after saving.
       </p>
 
       {!isAdmin ? (
         <p className="rounded-lg border border-dashed px-4 py-3 text-xs text-muted-foreground">
-          {connected ? "Your workspace is using its own Resend account." : "Using the shared email account."} Only an admin can change this.
+          {connected ? `Your workspace is using its own ${PROVIDER_LABEL[provider!.provider]} account.` : "Using the shared email account."} Only an admin can change this.
         </p>
       ) : (
         <div className="space-y-4 rounded-lg border p-4">
-          {/* Step 1 — connect the account (API key). This alone enables outbound + the domain wizard. */}
+          {/* Provider picker */}
           <div className="space-y-1.5">
-            <Label htmlFor="ep-key" className="flex items-center gap-1.5">
-              <StepBadge n={1} done={!!provider?.hasApiKey} /> Resend API key
-              {provider?.hasApiKey && <span className="text-micro font-normal text-muted-foreground">(configured — leave blank to keep)</span>}
-            </Label>
-            <Input id="ep-key" type="password" autoComplete="off" placeholder={provider?.hasApiKey ? "•••••••••• stored" : "re_…"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
-            <p className="text-micro text-muted-foreground">Enables outbound sending (Resend SMTP), the domain wizard, and fetching inbound message bodies.</p>
+            <Label>Provider</Label>
+            <div className="grid max-w-sm grid-cols-2 gap-2">
+              {(["resend", "sendgrid"] as const).map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => setSel(p)}
+                  className={cn(
+                    "rounded-lg border px-3 py-2 text-sm transition-colors",
+                    sel === p ? "border-primary bg-primary/5 text-foreground" : "text-muted-foreground hover:bg-muted",
+                  )}
+                >
+                  {PROVIDER_LABEL[p]}
+                </button>
+              ))}
+            </div>
           </div>
 
-          {/* Step 2 — inbound. Sequential: the URL only exists once the account is connected, and you
-              need it to create the Resend webhook BEFORE Resend gives you the signing secret. */}
+          {/* Step 1 — connect the account (API key). Alone this enables outbound (+ the domain wizard on Resend). */}
+          <div className="space-y-1.5">
+            <Label htmlFor="ep-key" className="flex items-center gap-1.5">
+              <StepBadge n={1} done={!!provider?.hasApiKey && !providerChanged} /> {pname} API key
+              {provider?.hasApiKey && !providerChanged && <span className="text-micro font-normal text-muted-foreground">(configured — leave blank to keep)</span>}
+            </Label>
+            <Input id="ep-key" type="password" autoComplete="off" placeholder={provider?.hasApiKey && !providerChanged ? "•••••••••• stored" : keyPrefix} value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+            <p className="text-micro text-muted-foreground">
+              Enables outbound sending ({pname} SMTP){sel === "sendgrid" ? "" : ", the domain wizard,"} and fetching inbound message bodies.
+              {sel === "sendgrid" && " (SendGrid domain/DKIM is set up in the SendGrid dashboard.)"}
+            </p>
+          </div>
+
+          {/* Step 2 — inbound. Sequential: the URL only exists once the account is connected. */}
           <div className="space-y-2">
             <Label className="flex items-center gap-1.5">
-              <StepBadge n={2} done={!!provider?.hasWebhookSecret} /> Inbound webhook <span className="text-micro font-normal text-muted-foreground">(to receive email as tickets)</span>
+              <StepBadge n={2} done={step2Done} /> Inbound {sel === "sendgrid" ? "parse" : "webhook"} <span className="text-micro font-normal text-muted-foreground">(to receive email as tickets)</span>
             </Label>
             {!connected ? (
               <p className="rounded-md border border-dashed px-3 py-2 text-micro text-muted-foreground">
-                Connect your API key first — we'll then show the webhook URL to point Resend at, and you paste its signing secret here.
+                Connect your API key first — we'll then show the URL to point {pname} at{needsSecret ? ", and you paste its signing secret here." : "."}
               </p>
+            ) : sel === "sendgrid" ? (
+              <div className="space-y-1">
+                <p className="text-micro text-muted-foreground">In SendGrid → Settings → <span className="font-mono">Inbound Parse</span>, add your receiving host (an MX subdomain) and set its Destination URL to:</p>
+                <div className="flex items-center gap-2">
+                  <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-xs">{inboundUrl}</code>
+                  <Button variant="outline" size="icon" className="size-8 shrink-0" title="Copy URL" onClick={() => void onCopy(inboundUrl)}>
+                    {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
+                  </Button>
+                </div>
+                <p className="text-micro text-muted-foreground">No signing secret needed — this unguessable URL is the shared secret. <button type="button" className="underline hover:text-foreground" onClick={() => void onRotate()}>Rotate URL</button> if it leaks.</p>
+              </div>
             ) : (
               <div className="space-y-2.5">
                 <div className="space-y-1">
                   <p className="text-micro text-muted-foreground">a. In Resend, add a webhook (event <span className="font-mono">email.received</span>) pointed at this URL:</p>
                   <div className="flex items-center gap-2">
-                    <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-xs">{provider!.inboundWebhookUrl}</code>
-                    <Button variant="outline" size="icon" className="size-8 shrink-0" title="Copy URL" onClick={() => void onCopy(provider!.inboundWebhookUrl)}>
+                    <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-xs">{inboundUrl}</code>
+                    <Button variant="outline" size="icon" className="size-8 shrink-0" title="Copy URL" onClick={() => void onCopy(inboundUrl)}>
                       {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
                     </Button>
                   </div>
@@ -1022,7 +1072,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
           <div className="flex items-center justify-between pt-1">
             <Button variant="outline" size="sm" className="h-8 gap-1.5" disabled={saving} onClick={() => void onSave()}>
               {saving ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-              {connected ? "Save changes" : "Connect Resend"}
+              {connected ? "Save changes" : `Connect ${pname}`}
             </Button>
             {connected && (
               <Button variant="ghost" size="sm" className="h-8 text-muted-foreground hover:text-destructive" onClick={() => setDisconnect(true)}>
@@ -1035,7 +1085,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
 
       <ConfirmDialog
         open={disconnect}
-        title="Disconnect your Resend account?"
+        title="Disconnect your email provider?"
         message={<>Email will fall back to the shared platform account. Your stored key and webhook secret are deleted. This can't be undone.</>}
         confirmLabel="Disconnect"
         destructive
@@ -1043,6 +1093,84 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
         onConfirm={() => void onDisconnect()}
         onCancel={() => setDisconnect(false)}
       />
+    </section>
+  );
+}
+
+function SenderModeSection({ isAdmin }: { isAdmin: boolean }) {
+  const [settings, setSettings] = useState<EmailSenderSettings | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void fetchSenderMode().then(setSettings).catch(() => setSettings(null));
+  }, []);
+
+  async function onPick(mode: EmailSenderSettings["mode"]) {
+    if (!settings || settings.mode === mode || saving) return;
+    setSaving(true);
+    const prev = settings;
+    setSettings({ ...settings, mode }); // optimistic
+    try {
+      setSettings(await saveSenderMode(mode));
+    } catch {
+      setSettings(prev);
+      toast.error("Couldn't change the sending address setting.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!settings) return null;
+  if (!isAdmin) return null;
+
+  const OPTIONS: { value: EmailSenderSettings["mode"]; title: string; desc: string }[] = [
+    { value: "shared", title: "Shared support address", desc: "All replies send from your support address, with the teammate's name shown (e.g. \"Alex from " + settings.workspace + "\")." },
+    { value: "teammate", title: "Each teammate's own address", desc: "Replies send from the teammate's own email (e.g. alex@yourdomain.com) when that domain is verified below — otherwise they fall back to the support address." },
+  ];
+
+  return (
+    <section className="mt-8">
+      <div className="mb-1 flex items-center gap-2">
+        <Send className="size-4 text-muted-foreground" />
+        <h2 className="text-sm font-semibold text-foreground">Reply sending address</h2>
+      </div>
+      <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
+        Which address outgoing email replies are sent from. Customer replies always thread back to the right conversation
+        either way.
+      </p>
+
+      <div className="space-y-2">
+        {OPTIONS.map((o) => {
+          const active = settings.mode === o.value;
+          return (
+            <button
+              key={o.value}
+              type="button"
+              disabled={saving}
+              onClick={() => void onPick(o.value)}
+              className={cn(
+                "flex w-full items-start gap-3 rounded-lg border px-4 py-3 text-left transition-colors",
+                active ? "border-primary bg-primary/5" : "hover:bg-muted",
+              )}
+            >
+              <span className={cn("mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border", active ? "border-primary" : "border-muted-foreground/40")}>
+                {active && <span className="size-2 rounded-full bg-primary" />}
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-foreground">{o.title}</span>
+                <span className="block text-xs text-muted-foreground">{o.desc}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      {settings.mode === "teammate" && !settings.hasVerifiedDomain && (
+        <p className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          No verified sending domain yet — add and verify one under “Branded sending domains” above, or teammate replies
+          will keep sending from the shared support address.
+        </p>
+      )}
     </section>
   );
 }

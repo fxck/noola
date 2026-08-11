@@ -1,5 +1,6 @@
 import Fastify, { type FastifyRequest } from "fastify";
 import fastifyCors, { type FastifyCorsOptions } from "@fastify/cors";
+import fastifyMultipart from "@fastify/multipart";
 import { connect, StringCodec, type JetStreamClient } from "nats";
 import { setNatsConnection } from "./nats-conn.js";
 import { appPool, relayPool } from "@repo/db";
@@ -132,6 +133,13 @@ await app.register(
     },
 );
 
+// Multipart — only the SendGrid Inbound Parse webhook (POST /email/inbound/sendgrid/:handle) sends
+// multipart/form-data (fields + attachment files). Everything else stays JSON/urlencoded. Routes read
+// it via req.parts(); caps mirror the inbound attachment ceiling (10 files / 10 MB each).
+await app.register(fastifyMultipart, {
+  limits: { fileSize: 10 * 1024 * 1024, files: 10, fields: 40 },
+});
+
 // Bearer-token session: resolve the token to a session on every request. better-auth is the
 // SOLE authority — the token is resolved against better-auth's server API; no legacy Valkey path
 // remains. Routes read req.session; tenant derives from it (http/tenant.ts's tenantOf/tenanted).
@@ -167,6 +175,7 @@ const PUBLIC_ROUTES = new Set([
   "POST /email/inbound",
   "POST /email/inbound/resend",
   "POST /email/inbound/resend/:handle",
+  "POST /email/inbound/sendgrid/:handle",
   "POST /slack/events",
   "POST /slack/commands",
   "POST /slack/interactions",

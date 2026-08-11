@@ -41,6 +41,7 @@
     "test:reply-email": "tsx apps/api/test/reply-email.test.ts",
     "test:resend-inbound": "tsx apps/api/test/resend-inbound.test.ts",
     "test:email-provider": "tsx apps/api/test/email-provider.test.ts",
+    "test:email-sender": "tsx apps/api/test/email-sender.test.ts",
     "test:integrations": "tsx apps/api/test/integrations.test.ts",
     "test:automations": "tsx apps/api/test/automations.test.ts",
     "test:tagrules": "tsx apps/api/test/tagrules.test.ts",

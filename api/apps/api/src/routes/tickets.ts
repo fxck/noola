@@ -359,6 +359,9 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
             ...(mailAttachments?.length ? { attachments: mailAttachments } : {}),
             ...(parsed.data.cc?.length && result.channelType === "email" ? { cc: parsed.data.cc } : {}),
             agentName: req.session?.name ?? null,
+            // Teammate sending: the agent's signup email becomes the From address when the workspace is
+            // in teammate mode and that domain is verified (else it's just the display name on support@).
+            agentEmail: req.session?.email ?? null,
             // Read receipt: embed a tracking pixel keyed to THIS agent message so an email open stamps seen_at.
             seenMessageId: result.messageId,
           },

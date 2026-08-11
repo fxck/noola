@@ -7,7 +7,7 @@ process.env.MODEL_KEY_SECRET = process.env.MODEL_KEY_SECRET || "test-model-key-s
 
 const {
   saveTenantEmailProvider, getTenantEmailProvider, deleteTenantEmailProvider,
-  tenantResendApiKey, resolveTenantByInboundHandle, rotateInboundHandle,
+  tenantEmailProviderCreds, resolveTenantByInboundHandle, rotateInboundHandle,
 } = await import("../src/email-provider.js");
 
 // BYO Resend provider store: encrypted round-trip, write-only masking, partial update, and the
@@ -45,20 +45,30 @@ async function main() {
     const got = await getTenantEmailProvider(A);
     check("get masks the secrets (no plaintext fields)", !!got && !("apiKey" in got) && !("webhookSecret" in got));
 
-    // The key round-trips through decryption for the send path.
-    check("tenantResendApiKey decrypts the stored key", (await tenantResendApiKey(A)) === KEY);
+    // The key round-trips through decryption for the send path; default provider is resend.
+    const creds = await tenantEmailProviderCreds(A);
+    check("tenantEmailProviderCreds decrypts the stored key", creds?.apiKey === KEY);
+    check("default provider is resend", creds?.provider === "resend");
 
-    // Pre-tenant handle resolution decrypts both secrets + names the tenant (the inbound webhook path).
+    // Pre-tenant handle resolution decrypts both secrets + names the tenant + provider (the inbound path).
     const byHandle = await resolveTenantByInboundHandle(saved.inboundHandle);
     check("handle resolves to the tenant", byHandle?.tenantId === A);
+    check("handle resolution carries the provider", byHandle?.provider === "resend");
     check("handle resolution decrypts the api key", byHandle?.apiKey === KEY);
     check("handle resolution decrypts the webhook secret", byHandle?.webhookSecret === WHSEC);
     check("unknown handle resolves to null", (await resolveTenantByInboundHandle("nope-not-a-handle")) === null);
 
+    // Switching provider to SendGrid updates it (and keeps the key); inbound URL path follows provider.
+    await saveTenantEmailProvider(A, { provider: "sendgrid" });
+    check("provider switches to sendgrid", (await getTenantEmailProvider(A))?.provider === "sendgrid");
+    check("sendgrid creds keep the key", (await tenantEmailProviderCreds(A))?.provider === "sendgrid");
+    check("handle now resolves as sendgrid", (await resolveTenantByInboundHandle(saved.inboundHandle))?.provider === "sendgrid");
+    await saveTenantEmailProvider(A, { provider: "resend" });
+
     // Partial update: setting only the webhook secret leaves the api key intact.
     const NEW_WHSEC = "whsec_rotated";
     const patched = await saveTenantEmailProvider(A, { webhookSecret: NEW_WHSEC });
-    check("partial update keeps the api key", (await tenantResendApiKey(A)) === KEY);
+    check("partial update keeps the api key", (await tenantEmailProviderCreds(A))?.apiKey === KEY);
     check("partial update replaces the webhook secret", (await resolveTenantByInboundHandle(patched.inboundHandle))?.webhookSecret === NEW_WHSEC);
 
     // Rotating the handle invalidates the old URL.
@@ -69,7 +79,7 @@ async function main() {
 
     // Clearing the api key with an empty string drops it but keeps the row.
     await saveTenantEmailProvider(A, { apiKey: "" });
-    check("empty string clears the api key", (await tenantResendApiKey(A)) === null);
+    check("empty string clears the api key", (await tenantEmailProviderCreds(A)) === null);
     check("clearing the key keeps the row", (await getTenantEmailProvider(A))?.hasApiKey === false);
 
     // Delete removes the row entirely (revert to shared env).
