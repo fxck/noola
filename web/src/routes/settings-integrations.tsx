@@ -899,6 +899,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   const [sel, setSel] = useState<EmailProviderName>("resend"); // selected provider in the UI
   const [apiKey, setApiKey] = useState("");
   const [webhookSecret, setWebhookSecret] = useState("");
+  const [replyAddress, setReplyAddress] = useState("");
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [disconnect, setDisconnect] = useState(false);
@@ -906,7 +907,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     void fetchEmailProvider()
-      .then((p) => { setProvider(p); if (p) setSel(p.provider); })
+      .then((p) => { setProvider(p); if (p) { setSel(p.provider); setReplyAddress(p.replyAddress ?? ""); } })
       .catch(() => setProvider(null));
   }, []);
 
@@ -917,11 +918,14 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
   // The inbound URL path follows the provider; reflect the *selected* provider even before saving.
   const inboundUrl = provider ? provider.inboundWebhookUrl.replace(/\/email\/inbound\/(resend|sendgrid)\//, `/email/inbound/${sel}/`) : "";
 
+  const replyChanged = replyAddress.trim().toLowerCase() !== (provider?.replyAddress ?? "");
+
   async function onSave() {
-    const patch: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string } = { provider: sel };
+    const patch: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; replyAddress?: string } = { provider: sel };
     if (apiKey.trim()) patch.apiKey = apiKey.trim();
     if (needsSecret && webhookSecret.trim()) patch.webhookSecret = webhookSecret.trim();
-    if (!patch.apiKey && !patch.webhookSecret && !providerChanged) {
+    if (replyChanged) patch.replyAddress = replyAddress.trim();
+    if (!patch.apiKey && !patch.webhookSecret && patch.replyAddress === undefined && !providerChanged) {
       toast.error("Enter an API key to save.");
       return;
     }
@@ -929,7 +933,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
     try {
       const p = await saveEmailProvider(patch);
       setProvider(p); setSel(p.provider);
-      setApiKey(""); setWebhookSecret("");
+      setApiKey(""); setWebhookSecret(""); setReplyAddress(p.replyAddress ?? "");
       toast.success(`${PROVIDER_LABEL[p.provider]} connected. Point its inbound webhook at the URL below.`);
     } catch (e) {
       const s = (e as { status?: number }).status;
@@ -1067,6 +1071,27 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
                 </div>
               </div>
             )}
+          </div>
+
+          {/* Step 3 — reply routing. Optional: only when the inbound receiving domain differs from the
+              branded From address (e.g. you forward support@you.com into Parse on a subdomain). */}
+          <div className="space-y-1.5">
+            <Label htmlFor="ep-reply" className="flex items-center gap-1.5">
+              <StepBadge n={3} done={!!provider?.replyAddress} /> Reply address <span className="text-micro font-normal text-muted-foreground">(optional — where replies are received)</span>
+            </Label>
+            <Input
+              id="ep-reply"
+              type="email"
+              autoComplete="off"
+              placeholder="support@inbound.yourdomain.com"
+              value={replyAddress}
+              onChange={(e) => setReplyAddress(e.target.value)}
+            />
+            <p className="text-micro text-muted-foreground">
+              Set this when your inbound domain differs from your public support address — e.g. you send <span className="font-mono">From</span> your
+              branded <span className="font-mono">support@yourdomain.com</span> but <span className="font-mono">forward</span> it into {sel === "sendgrid" ? "Inbound Parse" : "Resend inbound"} on a
+              receiving subdomain. Replies get a <span className="font-mono">Reply-To</span> on this address so they route back and thread to the right ticket. Leave blank if From and inbound share a domain.
+            </p>
           </div>
 
           <div className="flex items-center justify-between pt-1">
