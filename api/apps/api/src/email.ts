@@ -190,6 +190,14 @@ async function finishInboundEmail(result: IngestResult, m: InboundEmail): Promis
       );
     }).catch(() => {});
   }
+  // Ingest deferred the Discord ops-mirror relay when this email had attachments (deferMirror), so the
+  // mirror waits for the files. Now that they're persisted, fire the relay — it no-ops if the ticket
+  // isn't mirrored. No attachments → ingest already relayed inline, so we skip here.
+  if (m.attachments?.length) {
+    void import("./discord-mirror.js")
+      .then((mm) => mm.relayTicketMessage(result.tenantId, result.ticketId, result.messageId))
+      .catch(() => {});
+  }
 }
 
 /**
@@ -228,6 +236,7 @@ export async function handleInboundEmail(m: InboundEmail): Promise<IngestResult 
         channelType: "email",
         externalChannelId: m.from.toLowerCase(),
         identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
+        deferMirror: !!m.attachments?.length,
       });
       if (!result.replay) await finishInboundEmail(result, m);
       return result;
@@ -244,6 +253,7 @@ export async function handleInboundEmail(m: InboundEmail): Promise<IngestResult 
     externalChannelId: m.from.toLowerCase(),
     // The From address is both the reply target and the cross-channel identity (email unifies).
     identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
+    deferMirror: !!m.attachments?.length,
   });
   // A replayed (idempotency-deduped) message already carried its files/cc the first time.
   if (!result.replay) await finishInboundEmail(result, m);

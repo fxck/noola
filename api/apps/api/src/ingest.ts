@@ -57,6 +57,11 @@ export interface IngestInput {
   /** §5.3 — suppress the post-commit ambient autoreply dispatch (used by /ask + thread pre-seat so
    *  ingesting a question doesn't also fire ambient autoreply on the same turn). */
   skipAutoreply?: boolean;
+  /** Suppress the in-ingest Discord ops-mirror relay so the CALLER can fire it after it has persisted
+   *  this message's attachments (attachments are stored post-ingest — an auto-relay here would mirror
+   *  the message before its files exist). The caller must call relayTicketMessage() itself once the
+   *  attachments are on the message. Only set by paths that attach files (email/widget inbound). */
+  deferMirror?: boolean;
 }
 
 export interface IngestResult {
@@ -412,7 +417,7 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
   // into its forum post (two-way timeline mirror). Discord-origin tickets are skipped (the team is
   // already there), and origin 'discord_mirror' (a promoted reply) never echoes back into the post
   // it came from. Best-effort, off the ingest path — no-ops instantly when the ticket isn't mirrored.
-  if (!result.replay && input.origin !== "discord_mirror" && result.channelType !== "discord") {
+  if (!result.replay && !input.deferMirror && input.origin !== "discord_mirror" && result.channelType !== "discord") {
     void import("./discord-mirror.js")
       .then((m) => m.relayTicketMessage(result.tenantId, result.ticketId, result.messageId))
       .catch((e) => { try { console.warn(`[discord-mirror] relay hook failed: ${(e as Error)?.message ?? String(e)}`); } catch { /* noop */ } });

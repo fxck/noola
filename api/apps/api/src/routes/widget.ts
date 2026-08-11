@@ -182,11 +182,19 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       externalChannelId: conversationId ?? null,
       subject: body.slice(0, 80),
       identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
+      // Attachments are stored just below (post-ingest); defer the Discord mirror so it waits for them.
+      deferMirror: files.length > 0,
     });
 
     // Store + claim any inline files onto the persisted message (first-class attachments the agent
     // console renders natively; the widget re-fetches them via /public/attachment).
     const attached = files.length ? await persistWidgetAttachments(wk.tenantId, inbound.ticketId, inbound.messageId, files) : [];
+    // Files are on the message now — fire the deferred ops-mirror relay (no-ops if not mirrored).
+    if (files.length) {
+      void import("../discord-mirror.js")
+        .then((mm) => mm.relayTicketMessage(wk.tenantId, inbound.ticketId, inbound.messageId))
+        .catch(() => {});
+    }
     if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId); // presence, best-effort
 
     // Escalation: the question is already persisted above (whose_turn='us' → human queue) and the
