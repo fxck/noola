@@ -371,6 +371,59 @@ async function resolveRecipients(
   return r.rows as ResolvedRecipient[];
 }
 
+export interface RecipientPreviewRow {
+  name: string | null;
+  handle: string;
+  company: string | null;
+}
+
+/**
+ * List the deliverable recipients a segment resolves to for one channel — the SAME set
+ * resolveRecipients would send to (unsubscribe + address suppression applied), capped for the
+ * UI. Answers "who exactly gets this" before sending, closing the count-only blindspot. Returns
+ * the capped rows plus the true total/reachable counts (from previewSegment) and whether the
+ * list was truncated. Read-only — inserts nothing.
+ */
+export async function previewRecipients(
+  tenantId: string,
+  segment: Record<string, unknown> | null | undefined,
+  channel: string,
+  limit = 200,
+): Promise<{ total: number; reachable: number; recipients: RecipientPreviewRow[]; truncated: boolean }> {
+  const cap = Math.min(Math.max(1, Math.floor(limit) || 200), 1000);
+  const counts = await previewSegment(tenantId, segment); // true total + per-channel reachable
+  const { clauses, params } = buildContactWhere(segmentFilters(segment));
+  const rows = await withTenant(tenantId, async (c) => {
+    if (channel === "email") {
+      const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> '' AND ${NOT_EMAIL_SUPPRESSED}`;
+      const r = await c.query(
+        `SELECT DISTINCT ON (lower(email)) name, email AS handle, company
+           FROM contacts ${whereSql}
+          ORDER BY lower(email), updated_at DESC
+          LIMIT $${params.length + 1}`,
+        [...params, cap + 1], // +1 to detect truncation
+      );
+      return r.rows as RecipientPreviewRow[];
+    }
+    const r = await c.query(
+      `SELECT DISTINCT ON (lower(ci.external_id)) mc.name, ci.external_id AS handle, mc.company
+         FROM (SELECT id, updated_at, name, company FROM contacts ${suppressedWhere(clauses)}) mc
+         JOIN contact_identities ci ON ci.contact_id = mc.id AND ci.channel_type = $${params.length + 1}
+        ORDER BY lower(ci.external_id), mc.updated_at DESC
+        LIMIT $${params.length + 2}`,
+      [...params, channel, cap + 1],
+    );
+    return r.rows as RecipientPreviewRow[];
+  });
+  const truncated = rows.length > cap;
+  return {
+    total: counts.total,
+    reachable: counts.reachable[channel] ?? 0,
+    recipients: truncated ? rows.slice(0, cap) : rows,
+    truncated,
+  };
+}
+
 /** Create a draft broadcast on ONE channel (default 'email'). recipient_count is seeded
  *  from the segment's reachable count for that channel (the actual recipients are resolved
  *  again at send time). Throws InvalidChannelError (→ 400) for a channel that isn't a

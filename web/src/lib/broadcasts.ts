@@ -230,6 +230,22 @@ export interface SegmentPreview {
   reachable: Record<string, number>;
 }
 
+/** One deliverable recipient in the "view recipients" drill-in behind the reach count. */
+export interface RecipientPreviewRow {
+  name: string | null;
+  handle: string;
+  company: string | null;
+}
+
+/** The recipient drill-in: the capped deliverable set for a channel plus the true totals. */
+export interface RecipientsPreview {
+  total: number;
+  reachable: number;
+  recipients: RecipientPreviewRow[];
+  /** True when more recipients match than the returned cap — the list is a sample. */
+  truncated: boolean;
+}
+
 /** True when an error is a 404 — the broadcasts API isn't deployed on this server yet. */
 export function isBroadcastsUnavailable(e: unknown): boolean {
   return (e as ApiError | undefined)?.status === 404;
@@ -265,6 +281,19 @@ export async function previewSegment(segment: Segment): Promise<SegmentPreview> 
   return api<SegmentPreview>("/broadcasts/preview", {
     method: "POST",
     body: JSON.stringify({ segment: cleanSegment(segment) }),
+  });
+}
+
+/** List WHO a segment resolves to for a channel — the deliverable set (suppression applied),
+ *  capped server-side. Powers the "view recipients" drill-in behind the reach count. */
+export async function previewRecipients(
+  segment: Segment,
+  channel: BroadcastChannel,
+  limit = 200,
+): Promise<RecipientsPreview> {
+  return api<RecipientsPreview>("/broadcasts/preview-recipients", {
+    method: "POST",
+    body: JSON.stringify({ segment: cleanSegment(segment), channel, limit }),
   });
 }
 
