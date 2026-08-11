@@ -20,6 +20,7 @@ import { HoverPopover } from "@/components/live/hover-popover";
 import { NerdStats, CopyId, compactNum, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { estimateCost, fmtCost, isLocalModel, shortModel } from "@/lib/model-cost";
 import { ImageLightbox } from "@/components/inbox/image-lightbox";
+import { OriginalEmailDialog } from "@/components/inbox/original-email-dialog";
 import { cn } from "@/lib/utils";
 
 // The thread's message-rendering family: customer/agent bubbles (with auto-translation display),
@@ -111,6 +112,8 @@ export function MessageBubble({
   // swaps between them; the badge names the source language.
   const tr = message.meta?.translation ?? null;
   const [showOriginal, setShowOriginal] = useState(false);
+  // "View original" dialog: the untouched inbound email (raw HTML/quote/headers), lazy-fetched.
+  const [showOriginalEmail, setShowOriginalEmail] = useState(false);
   const shownText = tr ? (tr.agentFacing === "text" ? (showOriginal ? message.body : tr.text) : (showOriginal ? tr.text : message.body)) : message.body;
   const badge = tr
     ? tr.agentFacing === "text"
@@ -203,6 +206,25 @@ export function MessageBubble({
               {showOriginal ? "Show translation" : "Show original"}
             </button>
           </div>
+        )}
+        {!isAgent && message.has_original && (
+          <div className="px-1 text-micro text-muted-foreground/80">
+            <button
+              type="button"
+              onClick={() => setShowOriginalEmail(true)}
+              className="underline-offset-2 hover:text-foreground hover:underline"
+              title="View the untouched email as it arrived — full HTML, quoted history, and headers"
+            >
+              View original
+            </button>
+          </div>
+        )}
+        {showOriginalEmail && (
+          <OriginalEmailDialog
+            ticketId={message.ticket_id}
+            messageId={message.id}
+            onClose={() => setShowOriginalEmail(false)}
+          />
         )}
         {imageAtts.length > 0 && <ImageAttachments atts={imageAtts} className={cn(isAgent && "justify-end")} />}
         {fileAtts.length > 0 && (
