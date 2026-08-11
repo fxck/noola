@@ -1336,3 +1336,30 @@ export async function cancelBroadcast(
   if (out?.changed) await emitBroadcastUpdated(tenantId, id, out.status);
   return out ? { status: out.status } : null;
 }
+
+/** Thrown by deleteBroadcast when the send is still in flight — the caller maps it to 409. */
+export class BroadcastInFlightError extends Error {
+  constructor(public status: string) {
+    super(`broadcast is ${status}, stop it before deleting`);
+  }
+}
+
+/** Hard-delete a broadcast and all its delivery rows (events + recipients + the row itself). Blocked
+ *  while the send is in flight — 'sending' (the immediate-send window) or 'active' (a continuous
+ *  broadcast the scheduler is still ticking); cancel/stop it first. email_suppressions rows are left
+ *  intact on purpose: a bounce/complaint is durable deliverability data that outlives the broadcast
+ *  (its broadcast_id is nullable provenance, no FK). Returns false when no such broadcast exists. */
+export async function deleteBroadcast(tenantId: string, id: string): Promise<boolean> {
+  const deleted = await withTenant(tenantId, async (c) => {
+    const cur = await c.query("SELECT status FROM broadcasts WHERE id = $1", [id]);
+    if (!cur.rowCount) return false;
+    const status = cur.rows[0].status as string;
+    if (status === "sending" || status === "active") throw new BroadcastInFlightError(status);
+    await c.query("DELETE FROM broadcast_events WHERE broadcast_id = $1", [id]);
+    await c.query("DELETE FROM broadcast_recipients WHERE broadcast_id = $1", [id]);
+    await c.query("DELETE FROM broadcasts WHERE id = $1", [id]);
+    return true;
+  });
+  if (deleted) await emitBroadcastUpdated(tenantId, id, "deleted");
+  return deleted;
+}

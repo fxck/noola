@@ -10,6 +10,9 @@ export interface TicketRow {
   channel_type: string;
   external_channel_id: string | null;
   whose_turn: string | null;
+  /** Per-ticket AI on/off (migration 0075). false = the assistant is muted — on a widget ticket that
+   *  means the customer escalated to a human ("talk to a human"); true/absent = the AI answers. */
+  assistant_enabled: boolean | null;
   assignee_id: string | null;
   assignee_name: string | null;
   assignee_avatar_url: string | null;
@@ -67,7 +70,7 @@ const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_chann
               (SELECT tt.color FROM ticket_types tt
                  WHERE tt.tenant_id = t.tenant_id AND tt.id = t.type_id) AS type_color,
               t.merged_into, t.snoozed_until, t.sentiment,
-              t.support_mode, t.external_thread_id, t.external_guild_id,
+              t.support_mode, t.assistant_enabled, t.external_thread_id, t.external_guild_id,
               t.team_id,
               (SELECT tem.name FROM teams tem
                  WHERE tem.tenant_id = t.tenant_id AND tem.id = t.team_id) AS team_name,

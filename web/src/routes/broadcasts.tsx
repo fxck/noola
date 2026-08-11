@@ -26,6 +26,7 @@ import {
   Activity,
   Target,
   Copy,
+  Trash2,
 } from "lucide-react";
 import {
   useReactTable,
@@ -66,6 +67,7 @@ import {
   sendBroadcastTest,
   createBroadcast,
   updateBroadcast,
+  deleteBroadcast,
   isBroadcastsUnavailable,
   fetchSuppressions,
   addSuppression,
@@ -106,6 +108,7 @@ import { EmailPreview } from "@/components/email-preview";
 import type { ApiError } from "@/lib/api";
 import { relativeTime } from "@/lib/tickets";
 import { toast } from "@/components/ui/toaster";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { ArticleBody } from "@/components/editor/article-body";
 import { FormDialog } from "@/components/ui/form-dialog";
@@ -367,7 +370,9 @@ const STATUS_TONE: Record<BroadcastStatus, PillTone> = {
 
 const bcolHelp = createColumnHelper<Broadcast>();
 
-function BroadcastRowActions({ b, onEdit, onDuplicate }: { b: Broadcast; onEdit: (b: Broadcast) => void; onDuplicate: (b: Broadcast) => void }) {
+function BroadcastRowActions({ b, onEdit, onDuplicate, onDelete }: { b: Broadcast; onEdit: (b: Broadcast) => void; onDuplicate: (b: Broadcast) => void; onDelete: (b: Broadcast) => void }) {
+  // In-flight sends can't be deleted (the backend 409s); hide the action rather than surface an error.
+  const deletable = b.status !== "sending" && b.status !== "active";
   return (
     <div className="flex items-center justify-end gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
       <Button type="button" variant="ghost" size="icon" className="size-7 text-muted-foreground" title="Duplicate" aria-label="Duplicate broadcast" onClick={(e) => { e.stopPropagation(); onDuplicate(b); }}>
@@ -378,11 +383,16 @@ function BroadcastRowActions({ b, onEdit, onDuplicate }: { b: Broadcast; onEdit:
           <Pencil className="size-3.5" />
         </Button>
       )}
+      {deletable && (
+        <Button type="button" variant="ghost" size="icon" className="size-7 text-muted-foreground hover:text-destructive" title="Delete" aria-label="Delete broadcast" onClick={(e) => { e.stopPropagation(); onDelete(b); }}>
+          <Trash2 className="size-3.5" />
+        </Button>
+      )}
     </div>
   );
 }
 
-function buildBroadcastColumns(onEdit: (b: Broadcast) => void, onDuplicate: (b: Broadcast) => void): ColumnDef<Broadcast, any>[] {
+function buildBroadcastColumns(onEdit: (b: Broadcast) => void, onDuplicate: (b: Broadcast) => void, onDelete: (b: Broadcast) => void): ColumnDef<Broadcast, any>[] {
   const rate = (n: number | undefined, sent: number) => (sent > 0 ? `${Math.round((100 * (n ?? 0)) / sent)}%` : "—");
   return [
     bcolHelp.accessor("subject", {
@@ -473,7 +483,7 @@ function buildBroadcastColumns(onEdit: (b: Broadcast) => void, onDuplicate: (b: 
       id: "actions",
       header: "",
       enableHiding: false,
-      cell: ({ row }) => <BroadcastRowActions b={row.original} onEdit={onEdit} onDuplicate={onDuplicate} />,
+      cell: ({ row }) => <BroadcastRowActions b={row.original} onEdit={onEdit} onDuplicate={onDuplicate} onDelete={onDelete} />,
     }),
   ];
 }
@@ -490,19 +500,21 @@ function BroadcastsTable({
   onOpen,
   onEdit,
   onDuplicate,
+  onDelete,
   onCompose,
 }: {
   broadcasts: Broadcast[];
   onOpen: (b: Broadcast) => void;
   onEdit: (b: Broadcast) => void;
   onDuplicate: (b: Broadcast) => void;
+  onDelete: (b: Broadcast) => void;
   onCompose: () => void;
 }) {
   const [sorting, setSorting] = useState<SortingState>([{ id: "when", desc: true }]);
   const [globalFilter, setGlobalFilter] = useState("");
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [columnVisibility, setColumnVisibility] = useState({});
-  const columns = useMemo(() => buildBroadcastColumns(onEdit, onDuplicate), [onEdit, onDuplicate]);
+  const columns = useMemo(() => buildBroadcastColumns(onEdit, onDuplicate, onDelete), [onEdit, onDuplicate, onDelete]);
   const table = useReactTable({
     data: broadcasts,
     columns,
@@ -591,6 +603,9 @@ export function BroadcastsPage() {
   const [editing, setEditing] = useState<Broadcast | null>(null);
   const [showSuppressions, setShowSuppressions] = useState(false);
   const [showTopics, setShowTopics] = useState(false);
+  // The broadcast pending a delete confirmation (null = no dialog open).
+  const [pendingDelete, setPendingDelete] = useState<Broadcast | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const load = useRef(async () => {
     try {
@@ -667,6 +682,22 @@ export function BroadcastsPage() {
     }
   }
 
+  // Delete → hard-remove the broadcast and its delivery rows (confirmed via dialog). In-flight
+  // sends 409 (the row action hides delete for those, but guard the message too).
+  async function remove(b: Broadcast) {
+    setDeleting(true);
+    try {
+      await deleteBroadcast(b.id);
+      toast.success("Broadcast deleted.");
+      setPendingDelete(null);
+      await load();
+    } catch (e) {
+      toast.error((e as ApiError)?.detail ?? "Couldn't delete broadcast.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   // The ?edit=<id> click-through (detail header → composer): once the list is
   // in, open the composer on that draft and drop the param from the URL. A
   // non-draft (raced into another status) just explains itself.
@@ -738,6 +769,21 @@ export function BroadcastsPage() {
         </header>
         <SuppressionsDialog open={showSuppressions} onClose={() => setShowSuppressions(false)} />
         <TopicsDialog open={showTopics} onClose={() => setShowTopics(false)} />
+        <ConfirmDialog
+          open={pendingDelete !== null}
+          title="Delete broadcast?"
+          message={
+            <>
+              <span className="font-medium text-foreground">{pendingDelete?.subject || "(no subject)"}</span> and its
+              delivery history will be permanently removed. This can't be undone.
+            </>
+          }
+          confirmLabel="Delete"
+          destructive
+          busy={deleting}
+          onConfirm={() => pendingDelete && void remove(pendingDelete)}
+          onCancel={() => setPendingDelete(null)}
+        />
 
         {state === "unavailable" ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
@@ -756,6 +802,7 @@ export function BroadcastsPage() {
               onOpen={(b) => void navigate({ to: "/broadcasts/$broadcastId", params: { broadcastId: b.id } })}
               onEdit={openEdit}
               onDuplicate={(b) => void duplicate(b)}
+              onDelete={setPendingDelete}
               onCompose={openCompose}
             />
           )}
@@ -2388,20 +2435,18 @@ export function BroadcastDetail({
                     value={stats.clicked}
                     share={pctOfDelivered(stats.clicked, engagementBase)}
                   />
-                  {(stats.bounced > 0 || hasProviderData) && (
-                    <EngagementStat
-                      label="Bounced"
-                      value={stats.bounced}
-                      share={pctOfDelivered(stats.bounced, stats.sent)}
-                      tone="bad"
-                    />
-                  )}
+                  {/* Bounced + Unsubscribed always render (even at 0) so the delivery health of a
+                      send is legible at a glance rather than silently absent. */}
+                  <EngagementStat
+                    label="Bounced"
+                    value={stats.bounced}
+                    share={pctOfDelivered(stats.bounced, stats.sent)}
+                    tone="bad"
+                  />
                   {stats.complained > 0 && (
                     <EngagementStat label="Complained" value={stats.complained} tone="bad" />
                   )}
-                  {stats.unsubscribed > 0 && (
-                    <EngagementStat label="Unsubscribed" value={stats.unsubscribed} tone="warn" />
-                  )}
+                  <EngagementStat label="Unsubscribed" value={stats.unsubscribed} tone="warn" />
                   {stats.goal && (
                     <EngagementStat
                       label="Goal met"

@@ -238,6 +238,11 @@ export async function suggestForQuery(
   }
 
   const prep = await prepareDraft(tenantId, query, opts, started);
+  // Public groundedness guard: never let a customer-facing answer free-form when retrieval found
+  // nothing in scope (empty KB + Documents off = the firewall/nftables hallucination). Deflect + record.
+  if (opts.audience === "public" && prep.groundingCount === 0) {
+    return prep.finalize({ text: PUBLIC_NO_GROUNDING_DEFLECTION, confidence: 0 }, "grounding-guard", 0);
+  }
   const draftStarted = Date.now();
   let result: DraftResult;
   let model: string;
@@ -270,6 +275,11 @@ export async function* suggestForQueryStream(
   }
 
   const prep = await prepareDraft(tenantId, query, opts, started);
+  // Public groundedness guard (streaming sibling): deflect whole rather than stream an ungrounded answer.
+  if (opts.audience === "public" && prep.groundingCount === 0) {
+    yield { delta: PUBLIC_NO_GROUNDING_DEFLECTION };
+    return prep.finalize({ text: PUBLIC_NO_GROUNDING_DEFLECTION, confidence: 0 }, "grounding-guard", 0);
+  }
   const draftStarted = Date.now();
   let text = "";
   let dr: DraftResult | null = null;
@@ -348,6 +358,9 @@ async function prepareDraft(
   draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[] };
   citations: Citation[];
   retrieval: RetrievalSummary;
+  /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model would
+   *  have to free-form — the entry points deflect instead of letting it hallucinate. */
+  groundingCount: number;
   finalize: (result: DraftResult, model: string, latencyMs: number) => Promise<Suggestion>;
 }> {
   const source = opts.source ?? "live";
@@ -472,8 +485,16 @@ async function prepareDraft(
     };
   };
 
-  return { driver, draftInput, citations, retrieval, finalize };
+  return { driver, draftInput, citations, retrieval, groundingCount: grounding.length, finalize };
 }
+
+/** Shown to a PUBLIC asker (widget / autoreply) when retrieval returned NOTHING in scope. The draft
+ *  system prompt already says to answer "grounded ONLY in the provided sources" — with zero sources a
+ *  hosted model still free-forms (the observed nftables/firewall hallucination), so we short-circuit
+ *  before the model call with an honest deflection that routes to a human, rather than invent an
+ *  answer. Agent-assist drafts are exempt (an agent can write from an empty draft). */
+const PUBLIC_NO_GROUNDING_DEFLECTION =
+  "I don't have anything in our documentation about that yet, so I don't want to guess and risk giving you the wrong answer. I've flagged it for the team — if you'd like, ask to talk to a human and a teammate will help you out.";
 
 /** The ticket-scoped entry point for the /suggest endpoint: find the latest customer
  *  message, then run the shared core. */

@@ -14,6 +14,8 @@ import {
   broadcastTimeseries,
   sendBroadcast,
   cancelBroadcast,
+  deleteBroadcast,
+  BroadcastInFlightError,
   InvalidChannelError,
   InvalidTemplateError,
   InvalidScheduleError,
@@ -213,6 +215,20 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
     const out = await getBroadcast(tenantId, (req.params as { id: string }).id);
     if (!out) return reply.code(404).send({ error: "not found" });
     return { broadcast: out.broadcast, recipients: out.recipients, stats: out.stats };
+  }));
+
+  // Hard-delete a broadcast + its delivery rows. 409 while the send is in flight (stop it first).
+  app.delete("/broadcasts/:id", tenanted(async (tenantId, req, reply) => {
+    try {
+      const ok = await deleteBroadcast(tenantId, (req.params as { id: string }).id);
+      if (!ok) return reply.code(404).send({ error: "not found" });
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof BroadcastInFlightError) {
+        return reply.code(409).send({ error: `broadcast is '${e.status}' — stop it before deleting`, status: e.status });
+      }
+      throw e;
+    }
   }));
 
   // Delivery/engagement over time — the broadcast detail's "graphs over time" (sends, opens,

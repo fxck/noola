@@ -1,4 +1,5 @@
 import { withTenant } from "@repo/db";
+import { recordContactUnsubscribe } from "./broadcast-events.js";
 
 // Subscription topics — the multi-level layer over the global marketing opt-out (unsubscribe.ts).
 // A topic is a named list a broadcast can be tagged with; a contact opts out per-topic
@@ -119,6 +120,13 @@ export async function setTopicOptout(tenantId: string, contactId: string, topicI
         "INSERT INTO contact_topic_optouts (contact_id, topic_id) VALUES ($1, $2) ON CONFLICT (tenant_id, contact_id, topic_id) DO NOTHING",
         [contactId, topicId],
       );
+      // Move the per-broadcast Unsubscribed count on a topic broadcast the contact received
+      // (best-effort — never fail the opt-out over analytics).
+      try {
+        await recordContactUnsubscribe(c, contactId, { topicId });
+      } catch {
+        /* swallow: the topic opt-out row above is the authoritative effect */
+      }
     } else {
       await c.query("DELETE FROM contact_topic_optouts WHERE contact_id = $1 AND topic_id = $2", [contactId, topicId]);
     }

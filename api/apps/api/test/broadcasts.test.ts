@@ -1,6 +1,7 @@
 import pg from "pg";
 import { appPool, relayPool } from "@repo/db";
 import { createContact } from "../src/contacts.js";
+import { setSubscription } from "../src/unsubscribe.js";
 import {
   previewSegment,
   previewRecipients,
@@ -9,6 +10,8 @@ import {
   broadcastTimeseries,
   listBroadcasts,
   sendBroadcast,
+  deleteBroadcast,
+  BroadcastInFlightError,
   InvalidChannelError,
   MissingTargetError,
   type BroadcastSendFn,
@@ -673,6 +676,46 @@ async function main() {
     });
     check("AND inside a group, OR across groups", pOrAnd.total === 2);
     await superPool.query("DELETE FROM contact_events WHERE name = 'btest_login'");
+  }
+
+  // ---- footer-link unsubscribe stamps the per-broadcast Unsubscribed count ----
+  {
+    // A global opt-out must move the Unsubscribed tally of the broadcast the recipient most recently
+    // received (the token only knows tenant+contact, so we attribute to the newest recipient row).
+    // Use a fresh contact + a freshly-sent broadcast so that newest row is deterministically THIS one.
+    const uz = await createContact(A, { email: "btest-uz@x.test", name: "Uz", company: "BcastTestCo" });
+    const ubc = await createBroadcast(A, { subject: "BTEST Unsub", body: "hi", segment: { company: "BcastTestCo", conditionGroups: [[{ field: "name", op: "is", value: "Uz" }]] } });
+    await sendBroadcast(A, ubc.id, { send: stub().send });
+    const before = await getBroadcast(A, ubc.id);
+    check("fresh broadcast starts with 0 unsubscribed", before?.stats.unsubscribed === 0);
+    await setSubscription(A, uz.id, true);
+    const after = await getBroadcast(A, ubc.id);
+    check("unsubscribe stamps broadcast_recipients → per-broadcast Unsubscribed climbs", after?.stats.unsubscribed === 1);
+    // Idempotent: re-clicking the same link doesn't double-count.
+    await setSubscription(A, uz.id, true);
+    const again = await getBroadcast(A, ubc.id);
+    check("re-unsubscribe is idempotent (no double count)", again?.stats.unsubscribed === 1);
+    const ev = await superPool.query(
+      "SELECT count(*)::int AS n FROM broadcast_events WHERE broadcast_id = $1 AND type = 'unsubscribed'", [ubc.id]);
+    check("an 'unsubscribed' broadcast_event was appended once", ev.rows[0].n === 1);
+  }
+
+  // ---- deleteBroadcast ----
+  {
+    const draft = await createBroadcast(A, { subject: "BTEST Delete Me", body: "bye", segment: SEG });
+    check("deleteBroadcast removes a draft", (await deleteBroadcast(A, draft.id)) === true);
+    check("deleted broadcast is gone", (await getBroadcast(A, draft.id)) === null);
+    check("deleteBroadcast on a missing id → false", (await deleteBroadcast(A, draft.id)) === false);
+
+    // In-flight guard: a 'sending'/'active' broadcast can't be deleted.
+    const live = await createBroadcast(A, { subject: "BTEST InFlight", body: "wait", segment: SEG });
+    await superPool.query("UPDATE broadcasts SET status = 'sending' WHERE id = $1", [live.id]);
+    let guard: unknown = null;
+    try { await deleteBroadcast(A, live.id); } catch (e) { guard = e; }
+    check("deleteBroadcast on a sending broadcast → BroadcastInFlightError", guard instanceof BroadcastInFlightError);
+    check("the in-flight broadcast still exists", (await getBroadcast(A, live.id)) !== null);
+    await superPool.query("UPDATE broadcasts SET status = 'draft' WHERE id = $1", [live.id]);
+    check("deletable once no longer in flight", (await deleteBroadcast(A, live.id)) === true);
   }
 
   // ---- tenant isolation ----

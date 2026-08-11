@@ -12,6 +12,7 @@ import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
+import { mdToDiscord } from "./channels/format.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
 // (email/widget/…) can be selectively mirrored as ONE forum post in a Discord forum channel; the
@@ -511,7 +512,7 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   // Mirror the message's attachments (customer screenshots, agent-attached files) into the thread as
   // real Discord uploads, not just text — closing the inbound-only asymmetry.
   const { files, dropped } = await loadMirrorFiles(tenantId, messageId);
-  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}${droppedNote(dropped)}`, files)
+  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${mdToDiscord(row.body).slice(0, 1800)}${droppedNote(dropped)}`, files)
     .catch((e) => { console.warn(`[discord-mirror] relay postToThread threw (ticket ${ticketId}, thread ${mirror.post_thread_id}): ${(e as Error)?.message ?? String(e)}`); return false; });
   if (!posted) console.warn(`[discord-mirror] relay could not reach thread ${mirror.post_thread_id} (ticket ${ticketId}) — thread deleted or the bot lacks access/permission`);
   await syncMirrorState(tenantId, ticketId).catch(() => {});
@@ -535,7 +536,7 @@ export async function relayNoteToMirror(
   const name = note.authorName?.trim() || "Agent";
   const label = `📝 **${name}** _(internal note)_:`;
   await tp
-    .postToThread(mirror.post_thread_id, `${label}\n${note.body.slice(0, 1800)}`)
+    .postToThread(mirror.post_thread_id, `${label}\n${mdToDiscord(note.body).slice(0, 1800)}`)
     .catch((e) => console.warn(`[discord-mirror] note relay threw (ticket ${ticketId}): ${(e as Error)?.message ?? String(e)}`));
 }
 

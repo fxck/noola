@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { withTenant } from "@repo/db";
 import { publicApiBase } from "./env.js";
+import { recordContactUnsubscribe } from "./broadcast-events.js";
 
 // Marketing opt-out — the compliance seam for broadcasts (CAN-SPAM/GDPR). Every broadcast
 // email carries a per-recipient signed unsubscribe URL (footer link + RFC 8058
@@ -110,6 +111,16 @@ export async function setSubscription(
         : "UPDATE contacts SET unsubscribed_at = NULL WHERE id = $1 RETURNING email, name",
       [contactId],
     );
-    return r.rowCount ? (r.rows[0] as { email: string | null; name: string }) : null;
+    if (!r.rowCount) return null;
+    // Reflect the opt-out onto the broadcast that most likely prompted it, so the per-broadcast
+    // Unsubscribed count moves (best-effort — analytics must never fail the compliance opt-out).
+    if (unsubscribed) {
+      try {
+        await recordContactUnsubscribe(c, contactId);
+      } catch {
+        /* swallow: the contact-level opt-out above is the authoritative effect */
+      }
+    }
+    return r.rows[0] as { email: string | null; name: string };
   });
 }

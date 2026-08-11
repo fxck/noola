@@ -102,9 +102,14 @@ export function MessageBubble({
   // Customer identity: the ticket's OWN contact renders with the CANONICAL name + avatar (the same the
   // ticket row and contact page use), so a Discord-MERGED contact looks identical everywhere — not
   // "PA" on green here and "PB" on purple there (initials + color are hashed off the name string, so a
-  // divergent name = a different-looking person). A DISTINCT community participant keeps its own
-  // per-message author, so a multi-poster thread still shows different people.
-  const useCanonicalContact = !isCommunity && !!contactName;
+  // divergent name = a different-looking person). But a message from a DIFFERENT person — a community
+  // member who joined a Discord/forum thread — carries its own per-message `author_name`; those must
+  // keep their own identity. They aren't always tagged `author_kind==="community"` (non-OP forum
+  // repliers arrive as plain customers), so canonicalizing on `!isCommunity` alone collapsed every
+  // thread reply onto the OP. Gate on the per-message author actually MATCHING the ticket contact:
+  // only then is it safe to swap in the canonical identity.
+  const distinctAuthor = !!message.author_name && message.author_name !== contactName;
+  const useCanonicalContact = !isCommunity && !!contactName && !distinctAuthor;
   const authorName = useCanonicalContact ? contactName : message.author_name || contactName;
   const customerAvatarUrl = useCanonicalContact ? contactAvatarUrl : message.author_avatar_url;
 

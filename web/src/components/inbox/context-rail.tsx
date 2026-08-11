@@ -259,6 +259,24 @@ export function ContextRail({
             {t.status === "closed" ? "Closed" : "Open"}
           </span>
         </FactRow>
+        {t.channel_type === "widget" && (
+          // Widget escalation state made visible: a customer who tapped "talk to a human" mutes the AI
+          // (assistant_enabled=false). Without this an agent has no signal the AI is paused / they're
+          // expected to answer. Resuming ("Ask Noola") flips it back and clears the assignee (backend).
+          <FactRow label="AI">
+            {t.assistant_enabled === false ? (
+              <span className="inline-flex items-center gap-1.5 font-medium text-warning">
+                <span className="size-1.5 rounded-full bg-warning" />
+                Paused — customer asked for a human
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                <span className="size-1.5 rounded-full bg-success" />
+                Active
+              </span>
+            )}
+          </FactRow>
+        )}
         <FactRow label="Waiting on">
           {t.whose_turn === "us" ? (
             <span className="inline-flex items-center gap-1 font-medium text-warning">

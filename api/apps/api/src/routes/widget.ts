@@ -37,7 +37,12 @@ import { PIXEL_GIF } from "../tracking.js";
 async function setWidgetAssistantMode(tenantId: string, conversationId: string, enabled: boolean): Promise<void> {
   await withTenant(tenantId, (c) =>
     c.query(
-      `UPDATE tickets SET assistant_enabled = $2 WHERE channel_type = 'widget' AND external_channel_id = $1`,
+      // Resuming AI (enabled=true) hands the conversation back to the bot, so it must also release the
+      // human assignee the escalation put on it — otherwise the ticket stays "owned" by an agent who is
+      // no longer handling it. Escalation (enabled=false) leaves assignee untouched (routing sets it).
+      `UPDATE tickets SET assistant_enabled = $2,
+              assignee_id = CASE WHEN $2 THEN NULL ELSE assignee_id END
+         WHERE channel_type = 'widget' AND external_channel_id = $1`,
       [conversationId, enabled],
     ),
   );
