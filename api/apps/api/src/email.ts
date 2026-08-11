@@ -67,6 +67,24 @@ export async function tenantSupportAddress(tenantId: string): Promise<string | n
   return r.rowCount ? (r.rows[0].address as string) : null;
 }
 
+/** Drop our OWN inbound/support addresses from a reply-all Cc seed, case-insensitively (and de-dupe).
+ *  The customer emails TO support@, so it rides in on the parsed cc list; CC-ing it back onto the reply
+ *  forwards the outbound into Inbound Parse — a self-loop that spawns a duplicate ticket. `own` is the
+ *  tenant's support + reply addresses (either may be null). */
+export function stripOwnCcAddresses(cc: readonly unknown[], ...own: (string | null | undefined)[]): string[] {
+  const skip = new Set(own.filter((a): a is string => !!a).map((a) => a.toLowerCase()));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const a of cc) {
+    if (typeof a !== "string") continue;
+    const lc = a.trim().toLowerCase();
+    if (!lc || skip.has(lc) || seen.has(lc)) continue;
+    seen.add(lc);
+    out.push(a);
+  }
+  return out;
+}
+
 // ---- per-conversation reply addressing (P4) ------------------------------
 // Outbound replies set a SIGNED plus-address reply-to (support+t.<ticketid>.<sig>@domain) so a
 // customer's reply routes to the EXACT ticket — not merged by sender (a contact with two open
