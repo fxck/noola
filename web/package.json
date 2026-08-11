@@ -40,6 +40,7 @@
     "lexical": "^0.21.0",
     "lib0": "^0.2.117",
     "lucide-react": "^0.469.0",
+    "maplibre-gl": "^4.7.1",
     "phoenix": "^1.7.14",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",

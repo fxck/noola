@@ -124,6 +124,13 @@ export async function deriveContactContext(req: FastifyRequest, ctx: WidgetConte
     if (geo && !geoConflictsWithTimezone(geo.continentCode, ctx.timezone)) {
       if (geo.country) out["Country"] = geo.country;
       if (geo.city) out["City"] = geo.city;
+      // Approximate city-level coordinates (Intercom's map signal) — kept only on the trusted-IP
+      // branch, since the timezone-city fallback below has no coordinate to stand on. Stored as
+      // strings like every other attribute; the map reads them back with a numeric cast.
+      if (geo.latitude !== undefined && geo.longitude !== undefined) {
+        out["Latitude"] = String(geo.latitude);
+        out["Longitude"] = String(geo.longitude);
+      }
     } else {
       const tzCity = timezoneCity(ctx.timezone);
       if (tzCity) out["City"] = tzCity;

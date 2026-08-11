@@ -69,6 +69,44 @@ const COMPANIES: Co[] = [
   { name: "Ironwood Construction", domain: "ironwood.build", plan: "Business", industry: "Construction", size: 410, location: "Calgary, CA", mrr: 2000, ageMonths: 13 },
 ];
 
+// City → { display country, city-centre lat/lng } gazetteer covering every COMPANIES.location above.
+// Lets the seed stamp the SAME enrichment shape live IP-geo produces (City / Country / Latitude /
+// Longitude attributes), so the customers Map view has realistic, globally-spread pins in a demo
+// workspace that never saw a real widget visit. Country names match DB-IP's `country.names.en`.
+const COUNTRY_NAMES: Record<string, string> = {
+  US: "United States", UK: "United Kingdom", DE: "Germany", KE: "Kenya", IN: "India",
+  CA: "Canada", NL: "Netherlands", AU: "Australia", IE: "Ireland", JP: "Japan",
+  PT: "Portugal", ES: "Spain", BR: "Brazil", DK: "Denmark",
+};
+const CITY_LATLNG: Record<string, [number, number]> = {
+  "Chicago, US": [41.8781, -87.6298], "Boston, US": [42.3601, -71.0589], "Austin, US": [30.2672, -97.7431],
+  "London, UK": [51.5074, -0.1278], "Portland, US": [45.5152, -122.6784], "Berlin, DE": [52.52, 13.405],
+  "Nairobi, KE": [-1.2921, 36.8219], "Mumbai, IN": [19.076, 72.8777], "Toronto, CA": [43.6532, -79.3832],
+  "Rotterdam, NL": [51.9244, 4.4777], "Sydney, AU": [-33.8688, 151.2093], "Denver, US": [39.7392, -104.9903],
+  "New York, US": [40.7128, -74.006], "Vancouver, CA": [49.2827, -123.1207], "Dublin, IE": [53.3498, -6.2603],
+  "Munich, DE": [48.1351, 11.582], "Tokyo, JP": [35.6762, 139.6503], "Los Angeles, US": [34.0522, -118.2437],
+  "Hartford, US": [41.7658, -72.6734], "Lisbon, PT": [38.7223, -9.1393], "Amsterdam, NL": [52.3676, 4.9041],
+  "Madrid, ES": [40.4168, -3.7038], "Montreal, CA": [45.5017, -73.5673], "São Paulo, BR": [-23.5505, -46.6333],
+  "Edinburgh, UK": [55.9533, -3.1883], "Seattle, US": [47.6062, -122.3321], "Copenhagen, DK": [55.6761, 12.5683],
+  "Calgary, CA": [51.0447, -114.0719],
+};
+/** Turn a "City, CC" location into the four enrichment attributes, with a small deterministic jitter
+ *  (~±5km) so contacts in one city don't stack on a single pixel — exactly how city-centroid IP-geo
+ *  spreads real visitors. Returns {} for a location outside the gazetteer (contact stays unpinned). */
+function geoAttrsForLocation(location: string | undefined): Record<string, string> {
+  if (!location) return {};
+  const base = CITY_LATLNG[location];
+  if (!base) return {};
+  const [city, cc] = location.split(",").map((s) => s.trim());
+  const jitter = () => (rnd() - 0.5) * 0.09;
+  return {
+    City: city,
+    Country: COUNTRY_NAMES[cc] ?? cc,
+    Latitude: (base[0] + jitter()).toFixed(4),
+    Longitude: (base[1] + jitter()).toFixed(4),
+  };
+}
+
 const FIRST = ["Aisha", "Wei", "Diego", "Priya", "Marcus", "Yuki", "Fatima", "Liam", "Ananya", "Omar", "Sofia", "Kwame", "Elena", "Rahul", "Chloe", "Hiroshi", "Nadia", "Tomás", "Mei", "Samuel", "Ingrid", "Arjun", "Lucia", "Kenji", "Zara", "Noah", "Amara", "Viktor", "Leila", "Daniel", "Sana", "Mateo", "Hana", "Bjorn", "Rania", "Felix", "Camila", "Ravi", "Astrid", "Jamal", "Yara", "Oscar", "Divya", "Thomas", "Keiko", "Nathan", "Amina", "Pablo", "Freya", "Sanjay", "Grace", "Emil", "Layla", "Hugo", "Mira", "André"];
 const LAST = ["Okafor", "Chen", "Ramirez", "Sharma", "Delgado", "Tanaka", "Haddad", "O'Brien", "Iyer", "Farah", "Rossi", "Mensah", "Petrov", "Kapoor", "Dubois", "Yamamoto", "Novak", "Silva", "Wu", "Andersen", "Larsson", "Nair", "Costa", "Sato", "Khan", "Schmidt", "Adeyemi", "Volkov", "Haidari", "Murphy", "Malik", "Fernandez", "Kim", "Eriksson", "Aziz", "Weber", "Torres", "Reddy", "Berg", "Osei", "Saleh", "Lindqvist", "Menon", "Fischer", "Nakamura", "Walsh", "Bello", "Morales", "Nyman", "Gupta", "Bauer", "Hassan", "Moreau", "Patel", "Johansson", "Diallo"];
 const TITLES = ["Operations Manager", "Head of Finance", "Software Engineer", "IT Administrator", "Product Manager", "Data Analyst", "Marketing Lead", "Customer Success Manager", "CTO", "Founder", "Office Manager", "Billing Coordinator", "DevOps Engineer", "Support Lead", "Procurement Manager", "People Ops Manager", "Sales Director", "Solutions Architect"];
@@ -166,6 +204,11 @@ export async function seedRichDemo(c: Q): Promise<void> {
     const title = pick(TITLES);
     const attrs: Record<string, unknown> = { title, seed: "1" };
     if (co) { attrs.location = co.location; attrs.plan = co.plan; }
+    // Stamp the map-plottable geo enrichment (City / Country / Latitude / Longitude): a company
+    // contact sits in their account's city; a personal-email individual gets a random gazetteer city
+    // so the map isn't all-corporate. A handful stay unpinned (chance) — real directories are patchy.
+    const geoLoc = co ? co.location : chance(0.85) ? pick(Object.keys(CITY_LATLNG)) : undefined;
+    Object.assign(attrs, geoAttrsForLocation(geoLoc));
     const joinDays = co ? rint(3, Math.max(6, co.ageDays - 10)) : rint(3, 240);
     const avatar = `https://i.pravatar.cc/120?u=${encodeURIComponent(email)}`;
     const r = await c(

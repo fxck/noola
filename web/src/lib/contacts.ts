@@ -125,6 +125,25 @@ export async function fetchContacts(params: ContactListParams = {}): Promise<Con
   return api<ContactList>(`/contacts${query ? `?${query}` : ""}`);
 }
 
+/** One plottable contact for the Map view — identity plus the IP-derived city-level coordinate
+ *  enrichment. Only contacts that carry Latitude/Longitude attributes come back from the endpoint. */
+export interface ContactGeoPoint {
+  id: string;
+  name: string;
+  company: string;
+  city: string | null;
+  country: string | null;
+  avatar_url: string | null;
+  lat: number;
+  lng: number;
+}
+
+/** Every contact with plottable coordinates — the Map view's data source. A slim payload (no
+ *  attributes bag / rollups) so the whole set loads in one request for client-side clustering. */
+export async function fetchContactGeoPoints(): Promise<ContactGeoPoint[]> {
+  return (await api<{ points: ContactGeoPoint[] }>("/contacts/geo")).points;
+}
+
 export async function fetchContact(id: string): Promise<Contact> {
   // The API wraps the row in a { contact } envelope (same as create/update) — unwrap it,
   // else callers get the envelope and every field reads back undefined ("Unnamed contact").

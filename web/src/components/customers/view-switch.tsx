@@ -3,11 +3,11 @@ import { TAB_BASE, TAB_ON, TAB_OFF } from "@/components/ui/segmented";
 import { cn } from "@/lib/utils";
 
 /**
- * People | Companies — the Customers surface's view switch (§3: a view switch
- * is a pane-header control, always the same slot). One nav entity, two views
- * of the same customer base; routes stay /contacts and /companies.
+ * People | Companies | Map — the Customers surface's view switch (§3: a view switch
+ * is a pane-header control, always the same slot). One nav entity, three views
+ * of the same customer base; routes stay /contacts, /companies, /contacts/map.
  */
-export function CustomersViewSwitch({ current }: { current: "people" | "companies" }) {
+export function CustomersViewSwitch({ current }: { current: "people" | "companies" | "map" }) {
   return (
     <div
       role="tablist"
@@ -29,6 +29,14 @@ export function CustomersViewSwitch({ current }: { current: "people" | "companie
         className={cn(TAB_BASE, current === "companies" ? TAB_ON : TAB_OFF)}
       >
         Companies
+      </Link>
+      <Link
+        to="/contacts/map"
+        role="tab"
+        aria-selected={current === "map"}
+        className={cn(TAB_BASE, current === "map" ? TAB_ON : TAB_OFF)}
+      >
+        Map
       </Link>
     </div>
   );
