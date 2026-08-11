@@ -6,6 +6,7 @@ import {
   previewRecipients,
   createBroadcast,
   getBroadcast,
+  broadcastTimeseries,
   listBroadcasts,
   sendBroadcast,
   InvalidChannelError,
@@ -618,6 +619,27 @@ async function main() {
       got1?.stats.sent === 3 && got1?.stats.delivered === 0 && got1?.stats.opened === 2 && got1?.stats.clicked === 1);
     check("goal conversions count only in-window events",
       got1?.stats.goal?.event === "btest_signup" && got1?.stats.goal?.conversions === 1);
+
+    // ---- over-time timeseries (the detail's "graphs over time") ----
+    // The send + the two tracked touches all land in this hour, so the series has ≥1 bucket
+    // and its totals must match the aggregate stats exactly.
+    const ts = await broadcastTimeseries(A, gb.id);
+    check("timeseries returns a series for a real broadcast", ts !== null && Array.isArray(ts.buckets));
+    check("timeseries totals match send + tracked engagement (sent 3, opened 2, clicked 1)",
+      ts?.totals.sent === 3 && ts?.totals.opened === 2 && ts?.totals.clicked === 1);
+    check("timeseries records no bounces/unsubs (none happened)",
+      ts?.totals.bounced === 0 && ts?.totals.unsubscribed === 0 && ts?.totals.complained === 0);
+    check("timeseries per-bucket counts sum to the totals",
+      ts != null &&
+        ts.buckets.reduce((n, b) => n + b.sent, 0) === ts.totals.sent &&
+        ts.buckets.reduce((n, b) => n + b.opened, 0) === ts.totals.opened &&
+        ts.buckets.reduce((n, b) => n + b.clicked, 0) === ts.totals.clicked);
+    check("a burst send buckets hourly", ts?.granularity === "hour");
+    check("timeseries of an unknown broadcast id → null",
+      (await broadcastTimeseries(A, "00000000-0000-0000-0000-000000000000")) === null);
+    check("timeseries is tenant-isolated (B can't read A's broadcast)",
+      (await broadcastTimeseries(B, gb.id)) === null);
+
     await superPool.query("DELETE FROM contact_events WHERE name = 'btest_signup'");
 
     // Filter-grammar tail: event conditions + OR groups.

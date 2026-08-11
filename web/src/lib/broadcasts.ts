@@ -157,6 +157,31 @@ export interface BroadcastStats {
   goal: { event: string; days: number; conversions: number } | null;
 }
 
+/** One time bucket of the delivery/engagement timeline — counts of each event that OCCURRED
+ *  in that bucket (a recipient sent then opened later lands in two buckets). Powers the
+ *  broadcast detail's over-time chart. */
+export interface BroadcastTimeseriesBucket {
+  t: string; // ISO start of the bucket
+  sent: number;
+  delivered: number;
+  opened: number;
+  clicked: number;
+  bounced: number;
+  complained: number;
+  unsubscribed: number;
+}
+
+export interface BroadcastTimeseries {
+  granularity: "hour" | "day";
+  buckets: BroadcastTimeseriesBucket[];
+  totals: Omit<BroadcastTimeseriesBucket, "t">;
+}
+
+/** The delivery/engagement timeline for one broadcast (server auto-selects hour vs day buckets). */
+export async function fetchBroadcastTimeseries(id: string): Promise<BroadcastTimeseries> {
+  return api<BroadcastTimeseries>(`/broadcasts/${id}/timeseries`);
+}
+
 /** One parked address on the suppression list — a hard bounce / spam complaint (auto) or a
  *  manual add. A suppressed address is never re-sent (enforced server-side). */
 export interface Suppression {
