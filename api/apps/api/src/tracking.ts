@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { withTenant } from "@repo/db";
+import { publicApiBase } from "./env.js";
 
 // Broadcast engagement tracking — the open pixel and click redirect behind /t/*. Same
 // signed-token discipline as unsubscribe.ts: the token names one (tenant, recipient-row)
@@ -101,11 +102,7 @@ export async function trackClick(tenantId: string, recipientId: string): Promise
   });
 }
 
-const trackingBase = (): string => {
-  const sub = process.env.zeropsSubdomain;
-  const base = sub ? (/^https?:\/\//.test(sub) ? sub : `https://${sub}`) : `http://localhost:${process.env.PORT ?? 3000}`;
-  return base.replace(/\/+$/, "");
-};
+const trackingBase = (): string => publicApiBase();
 
 /** Append the auto-UTM triplet to an http(s) destination. A destination that already
  *  carries any utm_* param is left alone — the author's campaign tagging wins. */

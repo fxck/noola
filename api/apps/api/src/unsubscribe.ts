@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { withTenant } from "@repo/db";
+import { publicApiBase } from "./env.js";
 
 // Marketing opt-out — the compliance seam for broadcasts (CAN-SPAM/GDPR). Every broadcast
 // email carries a per-recipient signed unsubscribe URL (footer link + RFC 8058
@@ -82,19 +83,12 @@ export function verifyUnsubscribeToken(token: string): { tenantId: string; conta
   return { tenantId: bytesUuid(payload.subarray(0, 16)), contactId: bytesUuid(payload.subarray(16)) };
 }
 
-/** Absolute public URL for one contact's opt-out page, or null when unsignable. Points at
- *  THIS api's subdomain (zeropsSubdomain — same source betterauth's baseURL uses), so dev
- *  links land on apidev and stage links on apistage. */
+/** Absolute public URL for one contact's opt-out page, or null when unsignable. Points at THIS api's
+ *  public origin (API_BASE_URL in prod, else the Zerops subdomain). */
 export function unsubscribeUrl(tenantId: string, contactId: string): string | null {
   const token = mintUnsubscribeToken(tenantId, contactId);
   if (!token) return null;
-  const sub = process.env.zeropsSubdomain;
-  const base = sub
-    ? /^https?:\/\//.test(sub)
-      ? sub
-      : `https://${sub}`
-    : `http://localhost:${process.env.PORT ?? 3000}`;
-  return `${base.replace(/\/+$/, "")}/u/${token}`;
+  return `${publicApiBase()}/u/${token}`;
 }
 
 /** Flip one contact's marketing subscription. Returns the contact's email-ish display handle

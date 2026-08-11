@@ -33,6 +33,7 @@ import {
 } from "../email-provider.js";
 import { ingestSendgridInbound, type SendgridPart } from "../sendgrid-inbound.js";
 import { getSenderSettingsView, setSenderMode } from "../email-sender.js";
+import { publicApiBase } from "../env.js";
 import { mdToSlack } from "../channels/format.js";
 import {
   handleSlackAskCommand, handleSlackDraftCommand, slackPostDraft,
@@ -504,17 +505,11 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
   // rotate. Secrets are write-only (GET returns only hasApiKey / hasWebhookSecret + the inbound webhook
   // URL to paste into the provider). Absent → the shared env account.
 
-  // Absolute base of THIS api's public origin (zeropsSubdomain → dev on apidev, prod on the prod api),
-  // so the inbound webhook URL we hand the tenant lands on the right instance. Mirrors seenPixelUrl.
-  const publicBase = (): string => {
-    const sub = process.env.zeropsSubdomain;
-    const base = sub ? (/^https?:\/\//.test(sub) ? sub : `https://${sub}`) : `http://localhost:${process.env.PORT ?? 3000}`;
-    return base.replace(/\/+$/, "");
-  };
-  // The inbound endpoint path differs per provider (Resend Svix vs SendGrid Inbound Parse).
+  // The inbound endpoint path differs per provider (Resend Svix vs SendGrid Inbound Parse). The base is
+  // this api's public origin — API_BASE_URL (branded custom domain) in prod, else the Zerops subdomain.
   const providerView = (status: Awaited<ReturnType<typeof getTenantEmailProvider>>) =>
     status
-      ? { ...status, inboundWebhookUrl: `${publicBase()}/email/inbound/${status.provider}/${status.inboundHandle}` }
+      ? { ...status, inboundWebhookUrl: `${publicApiBase()}/email/inbound/${status.provider}/${status.inboundHandle}` }
       : null;
 
   app.get("/email/provider", tenanted(async (tenantId) => ({ provider: providerView(await getTenantEmailProvider(tenantId)) })));
