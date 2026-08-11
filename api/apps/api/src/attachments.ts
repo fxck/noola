@@ -210,6 +210,27 @@ export async function attachmentsForNotes(
   });
 }
 
+export interface AttachmentStorage {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  storage_key: string;
+}
+
+/** Storage rows for one message's attachments — for mirroring the actual bytes elsewhere (e.g.
+ *  uploading them to a Discord thread). RLS scopes to the caller's tenant. Oldest first. */
+export async function attachmentStorageForMessage(tenantId: string, messageId: string): Promise<AttachmentStorage[]> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, filename, content_type, size_bytes, storage_key
+         FROM message_attachments WHERE message_id = $1 ORDER BY created_at ASC`,
+      [messageId],
+    );
+    return r.rows as AttachmentStorage[];
+  });
+}
+
 /** Storage info for serving one attachment (RLS scopes it to the caller's tenant). null if absent. */
 export async function getAttachmentForServe(tenantId: string, id: string): Promise<AttachmentServe | null> {
   return withTenant(tenantId, async (c) => {

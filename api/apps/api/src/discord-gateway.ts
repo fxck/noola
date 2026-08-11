@@ -40,6 +40,12 @@ export function getDiscordSender(botId = "shared"): Sender | null {
 // ── Forum ops-mirror transport (discord-mirror.ts) ─────────────────────────────
 // The mirror engine's Discord surface: forum-post CRUD, tag sync, archive, reactions, role reads.
 // Same registry shape as senders; tests inject a mock via setMirrorTransportForTests.
+/** A file to upload alongside a Discord message (customer/agent attachment mirrored into the thread). */
+export interface MirrorFile {
+  name: string;
+  data: Buffer;
+}
+
 export interface MirrorTransport {
   /** Forum channels the bot can see in a guild (Settings picker). */
   listForums(guildId: string): Promise<{ id: string; name: string }[]>;
@@ -47,11 +53,13 @@ export interface MirrorTransport {
   listRoles(guildId: string): Promise<{ id: string; name: string }[]>;
   /** Text channels in a guild (VIP customer-channel picker). */
   listTextChannels(guildId: string): Promise<{ id: string; name: string }[]>;
-  /** Create one forum post; ensures the tag names exist on the forum (best-effort) and applies them. */
-  createForumPost(forumChannelId: string, name: string, content: string, tagNames: string[]): Promise<{ threadId: string } | null>;
+  /** Create one forum post; ensures the tag names exist on the forum (best-effort) and applies them.
+   *  Optional `files` upload as Discord attachments on the initial post message. */
+  createForumPost(forumChannelId: string, name: string, content: string, tagNames: string[], files?: MirrorFile[]): Promise<{ threadId: string } | null>;
   /** Anchor a thread on an existing channel message (VIP thread-per-message bindings, D5). */
   createMessageThread(channelId: string, messageId: string, name: string): Promise<{ threadId: string } | null>;
-  postToThread(threadId: string, content: string): Promise<boolean>;
+  /** Post into a thread; optional `files` upload as Discord attachments (on the first content chunk). */
+  postToThread(threadId: string, content: string, files?: MirrorFile[]): Promise<boolean>;
   setArchived(threadId: string, archived: boolean): Promise<boolean>;
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
   /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
@@ -67,6 +75,11 @@ export interface MirrorTransport {
   react(threadId: string, messageId: string, emoji: string): Promise<boolean>;
   memberRoleIds(guildId: string, userId: string): Promise<string[]>;
 }
+/** Map our provider-agnostic MirrorFile[] to discord.js's message `files` shape. */
+function toDiscordFiles(files?: MirrorFile[]): { attachment: Buffer; name: string }[] {
+  return (files ?? []).map((f) => ({ attachment: f.data, name: f.name }));
+}
+
 const mirrorTransports = new Map<string, MirrorTransport>();
 
 // Test seam shared by every consumer (mirror engine + the VIP thread-per-message path): tests
@@ -133,14 +146,15 @@ function buildMirrorTransport(client: Client): MirrorTransport {
         .filter((c) => c?.type === ChannelType.GuildText)
         .map((c) => ({ id: c!.id, name: c!.name }));
     },
-    async createForumPost(forumChannelId, name, content, tagNames) {
+    async createForumPost(forumChannelId, name, content, tagNames, files) {
       const f = await forum(forumChannelId);
       if (!f) return null;
       const appliedTags = await resolveForumTagIds(f, tagNames).catch(() => []);
       const chunks = splitForDiscord(content, 2000);
+      const df = toDiscordFiles(files);
       const created = await f.threads.create({
         name: name.slice(0, 100) || "Support ticket",
-        message: { content: chunks[0], allowedMentions: { parse: [] } },
+        message: { content: chunks[0], allowedMentions: { parse: [] }, ...(df.length ? { files: df } : {}) },
         appliedTags,
       }).catch(() => null);
       if (!created) return null;
@@ -158,12 +172,15 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       const t = await msg.startThread({ name: name.slice(0, 100) || "Conversation" }).catch(() => null);
       return t ? { threadId: t.id } : null;
     },
-    async postToThread(threadId, content) {
+    async postToThread(threadId, content, files) {
       const t = await thread(threadId);
       if (!t) return false;
       if (t.archived) await t.setArchived(false).catch(() => {});
-      for (const chunk of splitForDiscord(content, 2000)) {
-        await t.send({ content: chunk, allowedMentions: { parse: [] } });
+      const chunks = splitForDiscord(content, 2000);
+      const df = toDiscordFiles(files);
+      for (let i = 0; i < chunks.length; i++) {
+        // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads.
+        await t.send({ content: chunks[i], allowedMentions: { parse: [] }, ...(i === 0 && df.length ? { files: df } : {}) });
       }
       return true;
     },

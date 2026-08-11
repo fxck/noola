@@ -8,6 +8,7 @@ import {
 } from "../src/discord-mirror.js";
 import type { MirrorTransport } from "../src/discord-gateway.js";
 import { ingestInbound } from "../src/ingest.js";
+import { persistBufferAttachments } from "../src/attachments.js";
 
 // Discord forum ops-mirror gate (PILOT-AND-DISCORD-PLAN D1-D4): binding filter → forum post,
 // manual push, timeline relay into the post, note-by-default responder messages, 📤 promote-to-
@@ -36,14 +37,14 @@ const mock: MirrorTransport = {
   async listRoles() { return [{ id: ROLE, name: "Noola Responder" }]; },
   async listTextChannels() { return []; },
   async createMessageThread() { return null; },
-  async createForumPost(forumChannelId, name, content, tagNames) {
-    calls.push({ fn: "createForumPost", args: [forumChannelId, name, content, tagNames] });
+  async createForumPost(forumChannelId, name, content, tagNames, files) {
+    calls.push({ fn: "createForumPost", args: [forumChannelId, name, content, tagNames, files] });
     const threadId = `mirtest-thread-${++threadSeq}`;
     appliedTags.set(threadId, tagNames);
     return { threadId };
   },
-  async postToThread(threadId, content) {
-    calls.push({ fn: "postToThread", args: [threadId, content] });
+  async postToThread(threadId, content, files) {
+    calls.push({ fn: "postToThread", args: [threadId, content, files] });
     return true;
   },
   async setArchived(threadId, a) {
@@ -186,6 +187,28 @@ async function main() {
   });
   await relayTicketMessage(A, t1, agentMsg.messageId);
   check("console agent reply relayed as sent-to-customer", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("reply sent to customer") && String(c.args[1]).includes("MIRTEST console agent reply")));
+
+  // ── D2b: a message's attachments are uploaded into the thread, not dropped ───
+  // deferMirror mimics the real callers (widget/email): the mirror relay waits until attachments are
+  // persisted, so it forwards the file instead of racing ahead of it (the in-ingest auto-relay would
+  // otherwise fire before persistBufferAttachments below).
+  calls.length = 0;
+  const withFile = await ingestInbound({
+    tenantId: A, body: "MIRTEST message with a screenshot", authorType: "customer",
+    channelType: "widget", externalChannelId: "mirtest-w-auto",
+    identity: { externalId: "mirtest-c-auto", name: "Mir Tester auto" },
+    idempotencyKey: "mirtest:auto:file", ticketId: t1, skipAutoreply: true, deferMirror: true,
+  });
+  const stored = await persistBufferAttachments(A, t1, withFile.messageId, [
+    { filename: "shot.png", contentType: "image/png", data: Buffer.from("MIRTEST-fake-png-bytes") },
+  ]);
+  check("attachment persisted for the message", stored === 1);
+  await relayTicketMessage(A, t1, withFile.messageId);
+  const fileCall = calls.find((c) => c.fn === "postToThread" && String(c.args[1]).includes("MIRTEST message with a screenshot"));
+  const relayedFiles = fileCall?.args[2] as { name: string; data: Buffer }[] | undefined;
+  check("deferMirror suppresses the in-ingest auto-relay (single post)", calls.filter((c) => c.fn === "postToThread").length === 1);
+  check("attachment forwarded to Discord as a file", !!relayedFiles && relayedFiles.length === 1);
+  check("forwarded file keeps its name + bytes", relayedFiles?.[0]?.name === "shot.png" && relayedFiles?.[0]?.data?.byteLength === Buffer.from("MIRTEST-fake-png-bytes").byteLength);
 
   // ── D3: responder message → internal note ──────────────────────────────────
   const thread1 = m1!.post_thread_id;

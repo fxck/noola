@@ -1,11 +1,12 @@
 import { relayPool, withTenant } from "@repo/db";
 import { addNote } from "./notes.js";
-import { persistInboundNoteAttachments } from "./attachments.js";
+import { persistInboundNoteAttachments, attachmentStorageForMessage } from "./attachments.js";
+import { getObject } from "./storage.js";
 import { ingestInbound } from "./ingest.js";
 import { notifyContactByEmailIfAway } from "./email.js";
 import { getChannelDriver } from "./channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "./translate.js";
-import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport } from "./discord-gateway.js";
+import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
 import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate } from "./discord-classify.js";
@@ -313,15 +314,22 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
   // Latest customer message seeds the post body (best-effort).
   const latest = await withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT body FROM messages WHERE ticket_id = $1 AND author_type = 'customer' AND deleted_at IS NULL
+      `SELECT id, body FROM messages WHERE ticket_id = $1 AND author_type = 'customer' AND deleted_at IS NULL
         ORDER BY created_at DESC LIMIT 1`,
       [ticketId],
     );
-    return r.rowCount ? (r.rows[0].body as string) : null;
+    return r.rowCount ? (r.rows[0] as { id: string; body: string }) : null;
   });
 
+  // Attach that seeding message's files to the initial forum post, so a ticket opened with a
+  // screenshot shows it on Discord from the start (not just in later replies).
+  const seed = latest ? await loadMirrorFiles(tenantId, latest.id) : { files: [], dropped: 0 };
   const created = await tp
-    .createForumPost(binding.forum_channel_id, postTitle(t), postHeader(t, latest, binding.quick_links), mirrorTagNames(t))
+    .createForumPost(
+      binding.forum_channel_id, postTitle(t),
+      postHeader(t, latest?.body ?? null, binding.quick_links) + droppedNote(seed.dropped),
+      mirrorTagNames(t), seed.files,
+    )
     .catch(() => null);
   if (!created) {
     await relayPool.query("DELETE FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 AND post_thread_id LIKE 'pending:%'", [tenantId, ticketId]);
@@ -438,6 +446,32 @@ export function mirrorUrl(m: MirrorRef): string {
  * promotion-minted messages (origin 'discord_mirror') never reach here. Re-reads the message row
  * for the author name so the hook stays a fire-and-forget (tenantId, ids) call.
  */
+// Discord free-tier upload ceiling is 25 MB, but we stay conservative (8 MB/file, ≤10 files) so a
+// mirror never fails the whole post on one oversized file. Oversized/too-many are dropped with a note.
+const MIRROR_ATTACH_MAX_BYTES = 8 * 1024 * 1024;
+const MIRROR_ATTACH_MAX_FILES = 10;
+
+/** Load a message's stored attachments as Discord-uploadable files (bytes streamed from object
+ *  storage), applying the size/count caps. `dropped` counts anything skipped so the caller can note
+ *  it in the mirrored text rather than silently losing it. */
+async function loadMirrorFiles(tenantId: string, messageId: string): Promise<{ files: MirrorFile[]; dropped: number }> {
+  const rows = await attachmentStorageForMessage(tenantId, messageId).catch(() => []);
+  const files: MirrorFile[] = [];
+  let dropped = 0;
+  for (const a of rows) {
+    if (files.length >= MIRROR_ATTACH_MAX_FILES || (a.size_bytes ?? 0) > MIRROR_ATTACH_MAX_BYTES) { dropped++; continue; }
+    const obj = await getObject(a.storage_key).catch(() => null);
+    if (!obj || obj.body.byteLength > MIRROR_ATTACH_MAX_BYTES) { dropped++; continue; }
+    files.push({ name: a.filename || "file", data: obj.body });
+  }
+  return { files, dropped };
+}
+
+/** " _(N attachments too large to mirror)_" suffix, or "" when nothing was dropped. */
+function droppedNote(dropped: number): string {
+  return dropped ? `\n_(${dropped} attachment${dropped > 1 ? "s" : ""} too large to mirror)_` : "";
+}
+
 export async function relayTicketMessage(tenantId: string, ticketId: string, messageId: string): Promise<void> {
   const mirror = await getTicketMirror(tenantId, ticketId);
   if (!mirror) return;
@@ -458,7 +492,10 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   const isCustomer = row.author_type === "customer";
   const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
-  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}`)
+  // Mirror the message's attachments (customer screenshots, agent-attached files) into the thread as
+  // real Discord uploads, not just text — closing the inbound-only asymmetry.
+  const { files, dropped } = await loadMirrorFiles(tenantId, messageId);
+  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${row.body.slice(0, 1800)}${droppedNote(dropped)}`, files)
     .catch((e) => { console.warn(`[discord-mirror] relay postToThread threw (ticket ${ticketId}, thread ${mirror.post_thread_id}): ${(e as Error)?.message ?? String(e)}`); return false; });
   if (!posted) console.warn(`[discord-mirror] relay could not reach thread ${mirror.post_thread_id} (ticket ${ticketId}) — thread deleted or the bot lacks access/permission`);
   await syncMirrorState(tenantId, ticketId).catch(() => {});
