@@ -83,6 +83,16 @@ export async function addNote(
        RETURNING id`,
       [ticketId, input.authorId ?? null, input.authorName ?? null, input.body, mentioned],
     );
+    // Looping someone in on a note IS adding them to the conversation — mirror every @mention into
+    // the participant roster (same txn, idempotent) so "Looped in: @X" and the Participants panel agree.
+    if (mentioned.length) {
+      await c.query(
+        `INSERT INTO ticket_participants (tenant_id, ticket_id, user_id)
+           SELECT current_tenant(), $1, unnest($2::uuid[])
+         ON CONFLICT (tenant_id, ticket_id, user_id) DO NOTHING`,
+        [ticketId, mentioned],
+      );
+    }
     // Realtime: publish note.added to the transactional outbox in the SAME txn (message.created's
     // sibling) so the inbox notes panel updates live for every agent. The edge relays it on
     // noola.events.<tenant>; the web refetches the ticket's notes on the event.

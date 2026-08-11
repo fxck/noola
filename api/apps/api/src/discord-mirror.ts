@@ -8,6 +8,7 @@ import { getChannelDriver } from "./channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "./translate.js";
 import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
 import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
+import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
@@ -516,6 +517,28 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   await syncMirrorState(tenantId, ticketId).catch(() => {});
 }
 
+/**
+ * Relay an internal note authored IN NOOLA into the ticket's mirror thread, so the team collaborating
+ * in Discord sees the note the same way they see one typed in the thread. Best-effort + echo-safe: it
+ * posts as the bot, and handleMirrorPostMessage swallows bot/webhook messages, so a note that ORIGINATED
+ * from Discord (already in the thread) is never posted back. Call only from the Noola-side note path.
+ */
+export async function relayNoteToMirror(
+  tenantId: string,
+  ticketId: string,
+  note: { authorName?: string | null; body: string },
+): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const name = note.authorName?.trim() || "Agent";
+  const label = `📝 **${name}** _(internal note)_:`;
+  await tp
+    .postToThread(mirror.post_thread_id, `${label}\n${note.body.slice(0, 1800)}`)
+    .catch((e) => console.warn(`[discord-mirror] note relay threw (ticket ${ticketId}): ${(e as Error)?.message ?? String(e)}`));
+}
+
 /** Re-apply forum tags from the ticket's current status/priority; archive on closed, unarchive
  *  otherwise (D4 lifecycle). Cheap + idempotent, so callers can fire it after any change. */
 export async function syncMirrorState(tenantId: string, ticketId: string): Promise<void> {
@@ -958,7 +981,20 @@ async function applyMirrorTriage(
           .catch(() => {});
         return { promoted: false, action, reason: "no_seat" };
       }
-      await assignTicket(tenantId, ticketId, agentId);
+      // First 👀 claims the ticket (assignee); anyone reacting AFTER it's already assigned to someone
+      // else is looped in as a PARTICIPANT instead of silently stealing the assignment. Re-reacting as
+      // the current assignee is a no-op. There's one assignee_id — this is not multi-assignee.
+      {
+        const current = await withTenant(tenantId, async (c) => {
+          const r = await c.query("SELECT assignee_id FROM tickets WHERE id = $1", [ticketId]);
+          return r.rowCount ? ((r.rows[0].assignee_id as string | null) ?? null) : null;
+        });
+        if (!current) {
+          await assignTicket(tenantId, ticketId, agentId);
+        } else if (current !== agentId) {
+          await addParticipant(tenantId, ticketId, agentId).catch(() => null);
+        }
+      }
       break;
     case "unassign":
       await assignTicket(tenantId, ticketId, null);

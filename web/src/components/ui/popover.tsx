@@ -102,9 +102,17 @@ export function Popover({
               ...(flip
                 ? { bottom: window.innerHeight - rect.top + GAP }
                 : { top: rect.bottom + GAP }),
-              ...(align === "end"
-                ? { right: Math.max(8, window.innerWidth - rect.right) }
-                : { left: Math.max(8, rect.left) }),
+              // Horizontal clamp: keep the panel fully on-screen on the anchored edge. A start-aligned
+              // trigger near the right edge (e.g. the detail rail) would otherwise push the panel off
+              // the right; an end-aligned one near the left would push off the left. `eff` is the
+              // panel's known width (explicit `width`, else the trigger width as a lower bound).
+              ...(() => {
+                const eff = width ?? rect.width;
+                const maxInset = Math.max(8, window.innerWidth - eff - 8);
+                return align === "end"
+                  ? { right: Math.min(Math.max(8, window.innerWidth - rect.right), maxInset) }
+                  : { left: Math.min(Math.max(8, rect.left), maxInset) };
+              })(),
               // A provided `width` is a HARD width so panel content (e.g. an AI summary) WRAPS
               // instead of stretching the popover toward the viewport edge; without one, the panel
               // grows from the trigger's width to fit its content. Both stay capped to the viewport.

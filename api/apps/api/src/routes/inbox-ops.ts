@@ -7,6 +7,7 @@ import { tenanted } from "../http/tenant.js";
 import { roleAtLeast } from "../rbac.js";
 import { listMacros, createMacro, updateMacro, deleteMacro } from "../macros.js";
 import { listNotes, addNote, deleteNote } from "../notes.js";
+import { relayNoteToMirror } from "../discord-mirror.js";
 import { getTicketCsat } from "../csat.js";
 import { listFieldDefs, createFieldDef, updateFieldDef, deleteFieldDef, getTicketValues, setTicketValue } from "../customfields.js";
 import { listTicketTypes, createTicketType, updateTicketType, deleteTicketType } from "../tickettypes.js";
@@ -62,6 +63,9 @@ export default async function inboxOpsRoutes(app: FastifyInstance): Promise<void
     if (!note) return reply.code(404).send({ error: "ticket not found" });
     // Domain event (L0-F3): an internal note was added — automatable (e.g. @mention → notify).
     emitDomainEvent(tenantId, "note.added", { ticketId, mentionIds: parsed.data.mentionIds });
+    // Mirror the note into the ticket's Discord thread (best-effort). Only Noola-authored notes reach
+    // this route; Discord-origin notes come in via the gateway seam, so there's no echo.
+    void relayNoteToMirror(tenantId, ticketId, { authorName: req.session?.name ?? null, body: parsed.data.body });
     return reply.code(201).send({ note });
   }));
 

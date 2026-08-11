@@ -28,10 +28,11 @@ class MentionOption extends MenuOption {
   }
 }
 
-/** Keeps the portaled typeahead menu inside the viewport. Lexical anchors the menu at the caret
- *  and only flips it vertically, so a fixed-width menu overflows the right edge near a container /
- *  screen boundary (the "@-menu goes out of bounds" case). Measure after layout and shift
- *  horizontally so both edges stay in view; runs each render so it tracks the caret as you type. */
+/** Keeps the portaled typeahead menu inside the viewport. Lexical anchors the menu at the caret and
+ *  does NOT reposition it, so a fixed-size menu overflows the right edge near a container boundary
+ *  AND — since the reply/note composer sits at the very bottom of the screen — runs off the BOTTOM.
+ *  Measure after layout and shift both axes so every edge stays in view (flips up off the bottom,
+ *  in off the right); runs each render so it tracks the caret as you type. */
 function ClampedMenu({ children }: { children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -43,7 +44,10 @@ function ClampedMenu({ children }: { children: ReactNode }) {
     let dx = 0;
     if (r.right > window.innerWidth - gutter) dx = window.innerWidth - gutter - r.right;
     if (r.left + dx < gutter) dx = gutter - r.left;
-    if (dx) el.style.transform = `translateX(${Math.round(dx)}px)`;
+    let dy = 0;
+    if (r.bottom > window.innerHeight - gutter) dy = window.innerHeight - gutter - r.bottom;
+    if (r.top + dy < gutter) dy = gutter - r.top; // never push the top off the top edge
+    if (dx || dy) el.style.transform = `translate(${Math.round(dx)}px, ${Math.round(dy)}px)`;
   });
   return (
     <div

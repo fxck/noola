@@ -13,6 +13,7 @@ import {
 import { type Note } from "@/lib/notes";
 import { ChannelIcon } from "@/components/inbox/badges";
 import { ArticleBody } from "@/components/editor/article-body";
+import { NoolaMark } from "@/components/noola-mark";
 import { Avatar } from "@/components/ui/avatar";
 import { avatarSrc } from "@/lib/avatar-upload";
 import { localeName } from "@/lib/settings";
@@ -129,7 +130,16 @@ export function MessageBubble({
   return (
     <li className={cn("flex gap-3", isAgent && "flex-row-reverse")}>
       {isAgent ? (
-        message.author_avatar_url ? (
+        isAi ? (
+          // AI answers wear the Noola mark — the same brand avatar the widget shows for the
+          // assistant — not agent initials ("AG").
+          <span
+            className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-muted"
+            aria-hidden
+          >
+            <NoolaMark className="size-5" />
+          </span>
+        ) : message.author_avatar_url ? (
           <Avatar
             name={message.author_name || "Agent"}
             image={avatarSrc(message.author_avatar_url)}
