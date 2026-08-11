@@ -30,6 +30,8 @@ import {
 } from "../email-templates.js";
 import { renderBroadcastEmail } from "../emails/broadcast-email.js";
 import { listSuppressions, addSuppression, removeSuppression } from "../broadcast-events.js";
+import { listTopics, createTopic, updateTopic, deleteTopic } from "../subscription-topics.js";
+import { publicApiBase } from "../env.js";
 
 // Outbound messaging: subscriber webhooks (HMAC-signed event delivery + attempt log),
 // broadcasts (mass-send a filtered contact segment over ONE channel — email via the
@@ -99,18 +101,46 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
     return { ok: true };
   }));
 
+  // ---- Subscription topics (multi-level unsubscribe, 0110) ------------------
+  // Named lists a broadcast can be tagged with; a contact opts out per-topic (or globally) via the
+  // preference center. Archived topics stay assignable-off but keep history.
+  app.get("/subscription-topics", tenanted(async (tenantId, req) => {
+    const includeArchived = (req.query as { archived?: string } | undefined)?.archived === "1";
+    return { topics: await listTopics(tenantId, includeArchived) };
+  }));
+
+  app.post("/subscription-topics", tenanted(async (tenantId, req, reply) => {
+    const b = (req.body ?? {}) as { name?: string; description?: string };
+    if (!b.name || typeof b.name !== "string" || !b.name.trim()) return reply.code(400).send({ error: "name is required" });
+    const topic = await createTopic(tenantId, { name: b.name.trim(), description: typeof b.description === "string" ? b.description : "" });
+    return reply.code(201).send({ topic });
+  }));
+
+  app.patch("/subscription-topics/:id", tenanted(async (tenantId, req, reply) => {
+    const b = (req.body ?? {}) as { name?: string; description?: string; archived?: boolean };
+    const topic = await updateTopic(tenantId, (req.params as { id: string }).id, b);
+    if (!topic) return reply.code(404).send({ error: "not found" });
+    return { topic };
+  }));
+
+  app.delete("/subscription-topics/:id", tenanted(async (tenantId, req, reply) => {
+    const gone = await deleteTopic(tenantId, (req.params as { id: string }).id);
+    if (!gone) return reply.code(404).send({ error: "not found" });
+    return { ok: true };
+  }));
+
   // Preview a segment before composing: how many contacts match + per-channel reachable
   // handle counts → { total, reachable: { email: n, discord: n, … } }.
   app.post("/broadcasts/preview", tenanted(async (tenantId, req) => {
-    const segment = ((req.body as { segment?: Record<string, unknown> } | undefined)?.segment) ?? {};
-    return previewSegment(tenantId, segment);
+    const b = (req.body ?? {}) as { segment?: Record<string, unknown>; topicId?: string | null };
+    return previewSegment(tenantId, b.segment ?? {}, typeof b.topicId === "string" ? b.topicId : null);
   }));
 
-  // List WHO a segment resolves to for a channel (deliverable set, suppression applied) — the
-  // "view recipients" drill-in behind the reach count, capped for the UI. Read-only.
+  // List WHO a segment resolves to for a channel (deliverable set, suppression + topic applied) —
+  // the "view recipients" drill-in behind the reach count, capped for the UI. Read-only.
   app.post("/broadcasts/preview-recipients", tenanted(async (tenantId, req) => {
-    const b = (req.body ?? {}) as { segment?: Record<string, unknown>; channel?: string; limit?: number };
-    return previewRecipients(tenantId, b.segment ?? {}, typeof b.channel === "string" ? b.channel : "email", typeof b.limit === "number" ? b.limit : 200);
+    const b = (req.body ?? {}) as { segment?: Record<string, unknown>; channel?: string; limit?: number; topicId?: string | null };
+    return previewRecipients(tenantId, b.segment ?? {}, typeof b.channel === "string" ? b.channel : "email", typeof b.limit === "number" ? b.limit : 200, typeof b.topicId === "string" ? b.topicId : null);
   }));
 
   app.post("/broadcasts", tenanted(async (tenantId, req, reply) => {
@@ -201,7 +231,9 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
     const { html, text } = await renderBroadcastEmail(subject, body, {
       tokens,
       ...(blocks ? { blocks } : {}),
-      unsubscribeHref: "https://example.com/unsubscribe-preview",
+      // Real emails carry a working per-recipient link; the preview points at an honest stand-in
+      // page (not the old dead example.com placeholder that read as a "fake link").
+      unsubscribeHref: `${publicApiBase()}/u/preview`,
     });
     // Per-channel chat previews (0072): the DERIVED markdown body (blocks flatten to md) run
     // through the real driver-seam transforms, so the composer can show exactly what each

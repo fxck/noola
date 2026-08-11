@@ -79,6 +79,9 @@ export interface Broadcast {
   /** Email template id (built-in "branded"/"personal" or a custom uuid) — the
    *  stationery an email broadcast renders in. Absent on pre-template rows. */
   template_id?: string;
+  /** Subscription topic (0110) this broadcast belongs to — its footer + List-Unsubscribe opt
+   *  out of THIS topic. Null/absent = untopiced (footer opts out globally). */
+  topic_id?: string | null;
   /** Block-composed content (email broadcasts) — null/absent when the broadcast
    *  was written as plain markdown `body`. */
   blocks?: BroadcastBlock[] | null;
@@ -187,6 +190,8 @@ export interface BroadcastInput {
   templateId?: string;
   /** Optional saved-segment source (segments.ts) — recorded as provenance; its filter is snapshotted. */
   segmentId?: string | null;
+  /** Subscription topic id (0110) — a live topic, or null for an untopiced (global-footer) send. */
+  topicId?: string | null;
   /** Delivery mode — the server defaults to "oneshot". */
   mode?: BroadcastMode;
   /** Oneshot only: fire at this ISO datetime instead of immediately on send.
@@ -277,23 +282,24 @@ export async function fetchBroadcast(
   );
 }
 
-export async function previewSegment(segment: Segment): Promise<SegmentPreview> {
+export async function previewSegment(segment: Segment, topicId?: string | null): Promise<SegmentPreview> {
   return api<SegmentPreview>("/broadcasts/preview", {
     method: "POST",
-    body: JSON.stringify({ segment: cleanSegment(segment) }),
+    body: JSON.stringify({ segment: cleanSegment(segment), topicId: topicId ?? null }),
   });
 }
 
-/** List WHO a segment resolves to for a channel — the deliverable set (suppression applied),
- *  capped server-side. Powers the "view recipients" drill-in behind the reach count. */
+/** List WHO a segment resolves to for a channel — the deliverable set (suppression + topic
+ *  applied), capped server-side. Powers the "view recipients" drill-in behind the reach count. */
 export async function previewRecipients(
   segment: Segment,
   channel: BroadcastChannel,
   limit = 200,
+  topicId?: string | null,
 ): Promise<RecipientsPreview> {
   return api<RecipientsPreview>("/broadcasts/preview-recipients", {
     method: "POST",
-    body: JSON.stringify({ segment: cleanSegment(segment), channel, limit }),
+    body: JSON.stringify({ segment: cleanSegment(segment), channel, limit, topicId: topicId ?? null }),
   });
 }
 
@@ -303,6 +309,7 @@ export async function createBroadcast(input: BroadcastInput): Promise<Broadcast>
   if (input.channel) body.channel = input.channel;
   if (input.templateId) body.templateId = input.templateId;
   if (input.segmentId) body.segmentId = input.segmentId;
+  if (input.topicId !== undefined) body.topicId = input.topicId;
   if (input.mode) body.mode = input.mode;
   if (input.sendAt) body.sendAt = input.sendAt;
   if (input.stopAt) body.stopAt = input.stopAt;
@@ -422,4 +429,31 @@ export async function addSuppression(address: string): Promise<void> {
 /** Un-suppress an address (a fixed mailbox, a mistaken complaint). */
 export async function removeSuppression(address: string): Promise<void> {
   await api(`/broadcasts/suppressions/${encodeURIComponent(address)}`, { method: "DELETE" });
+}
+
+// ---- Subscription topics (multi-level unsubscribe) ------------------------
+
+/** A named list a broadcast can be tagged with; contacts opt out per-topic in the preference center. */
+export interface SubscriptionTopic {
+  id: string;
+  name: string;
+  description: string;
+  archived: boolean;
+  created_at: string;
+}
+
+export async function fetchTopics(includeArchived = false): Promise<SubscriptionTopic[]> {
+  return (await api<{ topics: SubscriptionTopic[] }>(`/subscription-topics${includeArchived ? "?archived=1" : ""}`)).topics;
+}
+
+export async function createTopic(input: { name: string; description?: string }): Promise<SubscriptionTopic> {
+  return (await api<{ topic: SubscriptionTopic }>("/subscription-topics", { method: "POST", body: JSON.stringify(input) })).topic;
+}
+
+export async function updateTopic(id: string, patch: { name?: string; description?: string; archived?: boolean }): Promise<SubscriptionTopic> {
+  return (await api<{ topic: SubscriptionTopic }>(`/subscription-topics/${id}`, { method: "PATCH", body: JSON.stringify(patch) })).topic;
+}
+
+export async function deleteTopic(id: string): Promise<void> {
+  await api(`/subscription-topics/${id}`, { method: "DELETE" });
 }

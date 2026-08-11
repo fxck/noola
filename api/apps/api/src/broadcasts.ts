@@ -15,6 +15,7 @@ import { instrumentHtml, trackingAvailable } from "./tracking.js";
 import { sendOutboundEmail } from "./email.js";
 import { renderBroadcastEmail } from "./emails/broadcast-email.js";
 import { getSegment } from "./segments.js";
+import { isUuid, topicExists } from "./subscription-topics.js";
 import {
   CHANNEL_DRIVERS,
   getChannelDriver,
@@ -48,6 +49,7 @@ export interface BroadcastRow {
   mention_role_id: string | null; // channel-post: optional role to ping (allowedMentions-gated)
   as_embed: boolean; // channel-post: render the post as an embed
   template_id: string; // email design template: built-in slug or email_templates row id
+  topic_id: string | null; // subscription topic (0110); null = untopiced → global-footer unsubscribe
   blocks: BroadcastBlock[] | null; // block-composer body (0067); null = legacy markdown `body`
   segment: Record<string, unknown>;
   segment_id: string | null;
@@ -110,7 +112,7 @@ export interface BroadcastStats {
 }
 
 const B_COLS =
-  "id, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, blocks, segment, segment_id, mode, send_at, stop_at, goal_event, goal_days, window_days, window_start_min, window_end_min, window_tz_offset_min, status, recipient_count, sent_count, failed_count, created_at, sent_at";
+  "id, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, topic_id, blocks, segment, segment_id, mode, send_at, stop_at, goal_event, goal_days, window_days, window_start_min, window_end_min, window_tz_offset_min, status, recipient_count, sent_count, failed_count, created_at, sent_at";
 const R_COLS = "id, broadcast_id, contact_id, handle, status, error, opened_at, clicked_at, delivered_at, bounced_at, bounce_kind, complained_at, unsubscribed_at, message_id, created_at";
 
 // Cap the recipient set a single broadcast resolves (keeps the send bounded) and the
@@ -280,6 +282,17 @@ function suppressedWhere(clauses: string[]): string {
 // Email path only (chat handles aren't email addresses). RLS scopes the subquery to the tenant.
 const NOT_EMAIL_SUPPRESSED = "NOT EXISTS (SELECT 1 FROM email_suppressions es WHERE es.address = lower(contacts.email))";
 
+// Multi-level unsubscribe (0110): when a broadcast is tagged with a topic, a contact opted out of
+// THAT topic is excluded (on top of the global opt-out + address suppression). Channel-agnostic —
+// a topic opt-out silences that topic everywhere. Returns a bare " AND NOT EXISTS(...)" fragment or
+// "" when untopiced. topicId is inlined as a validated-UUID literal (isUuid) so it never perturbs
+// the callers' positional-param arrays; a non-UUID degrades to no filter (never an injection).
+function topicExclusion(topicId: string | null | undefined): string {
+  return isUuid(topicId ?? null)
+    ? ` AND NOT EXISTS (SELECT 1 FROM contact_topic_optouts o WHERE o.contact_id = contacts.id AND o.topic_id = '${topicId}'::uuid)`
+    : "";
+}
+
 /**
  * Preview a segment: how many contacts match, and — per sendable channel — how many
  * distinct deliverable handles it holds (only those can actually receive). Email counts
@@ -290,17 +303,19 @@ const NOT_EMAIL_SUPPRESSED = "NOT EXISTS (SELECT 1 FROM email_suppressions es WH
 export async function previewSegment(
   tenantId: string,
   segment: Record<string, unknown> | null | undefined,
+  topicId?: string | null,
 ): Promise<{ total: number; reachable: Record<string, number> }> {
   const { clauses, params } = buildContactWhere(segmentFilters(segment));
   const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const topicSql = topicExclusion(topicId);
   return withTenant(tenantId, async (c) => {
     // `total` counts the raw segment match; the reachable counts additionally require a
-    // deliverable handle AND an active subscription (suppressedWhere), so the composer's
+    // deliverable handle AND an active subscription (global + topic + address), so the composer's
     // per-channel numbers are the true send-time audience.
     const r = await c.query(
       `SELECT count(*)::int AS total,
               count(DISTINCT lower(email)) FILTER (
-                WHERE email IS NOT NULL AND email <> '' AND unsubscribed_at IS NULL AND ${NOT_EMAIL_SUPPRESSED}
+                WHERE email IS NOT NULL AND email <> '' AND unsubscribed_at IS NULL AND ${NOT_EMAIL_SUPPRESSED}${topicSql}
               )::int AS with_email
          FROM contacts ${whereSql}`,
       params,
@@ -309,7 +324,7 @@ export async function previewSegment(
     // columns (no alias ambiguity against contact_identities' created_at etc.).
     const byChannel = await c.query(
       `SELECT ci.channel_type, count(DISTINCT lower(ci.external_id))::int AS n
-         FROM (SELECT id FROM contacts ${suppressedWhere(clauses)}) mc
+         FROM (SELECT id FROM contacts ${suppressedWhere(clauses)}${topicSql}) mc
          JOIN contact_identities ci ON ci.contact_id = mc.id
         GROUP BY ci.channel_type`,
       params,
@@ -344,10 +359,12 @@ async function resolveRecipients(
   c: PoolClient,
   channel: string,
   segment: Record<string, unknown> | null | undefined,
+  topicId?: string | null,
 ): Promise<ResolvedRecipient[]> {
   const { clauses, params } = buildContactWhere(segmentFilters(segment));
+  const topicSql = topicExclusion(topicId);
   if (channel === "email") {
-    const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> '' AND ${NOT_EMAIL_SUPPRESSED}`;
+    const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> '' AND ${NOT_EMAIL_SUPPRESSED}${topicSql}`;
     const r = await c.query(
       `SELECT DISTINCT ON (lower(email)) id, email AS handle, name, email, company, attributes
          FROM contacts ${whereSql}
@@ -362,7 +379,7 @@ async function resolveRecipients(
     `SELECT DISTINCT ON (lower(ci.external_id)) mc.id, ci.external_id AS handle,
             mc.name, mc.email, mc.company, mc.attributes
        FROM (SELECT id, updated_at, name, email, company, attributes
-               FROM contacts ${suppressedWhere(clauses)}) mc
+               FROM contacts ${suppressedWhere(clauses)}${topicSql}) mc
        JOIN contact_identities ci ON ci.contact_id = mc.id AND ci.channel_type = $${params.length + 1}
       ORDER BY lower(ci.external_id), mc.updated_at DESC
       LIMIT $${params.length + 2}`,
@@ -389,13 +406,15 @@ export async function previewRecipients(
   segment: Record<string, unknown> | null | undefined,
   channel: string,
   limit = 200,
+  topicId?: string | null,
 ): Promise<{ total: number; reachable: number; recipients: RecipientPreviewRow[]; truncated: boolean }> {
   const cap = Math.min(Math.max(1, Math.floor(limit) || 200), 1000);
-  const counts = await previewSegment(tenantId, segment); // true total + per-channel reachable
+  const counts = await previewSegment(tenantId, segment, topicId); // true total + per-channel reachable
   const { clauses, params } = buildContactWhere(segmentFilters(segment));
+  const topicSql = topicExclusion(topicId);
   const rows = await withTenant(tenantId, async (c) => {
     if (channel === "email") {
-      const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> '' AND ${NOT_EMAIL_SUPPRESSED}`;
+      const whereSql = `${suppressedWhere(clauses)} AND email IS NOT NULL AND email <> '' AND ${NOT_EMAIL_SUPPRESSED}${topicSql}`;
       const r = await c.query(
         `SELECT DISTINCT ON (lower(email)) name, email AS handle, company
            FROM contacts ${whereSql}
@@ -407,7 +426,7 @@ export async function previewRecipients(
     }
     const r = await c.query(
       `SELECT DISTINCT ON (lower(ci.external_id)) mc.name, ci.external_id AS handle, mc.company
-         FROM (SELECT id, updated_at, name, company FROM contacts ${suppressedWhere(clauses)}) mc
+         FROM (SELECT id, updated_at, name, company FROM contacts ${suppressedWhere(clauses)}${topicSql}) mc
          JOIN contact_identities ci ON ci.contact_id = mc.id AND ci.channel_type = $${params.length + 1}
         ORDER BY lower(ci.external_id), mc.updated_at DESC
         LIMIT $${params.length + 2}`,
@@ -441,6 +460,7 @@ export async function createBroadcast(
     segment?: Record<string, unknown>;
     segmentId?: string | null;
     templateId?: string;
+    topicId?: string | null;
     blocks?: BroadcastBlock[];
     mode?: "oneshot" | "continuous";
     sendAt?: string;
@@ -506,12 +526,15 @@ export async function createBroadcast(
     }
   }
   const win = parseWindow(input);
-  // A channel-post is one post → estimate 1; a segment estimate needs the reachable-handle count.
-  const recipientCount = audienceKind === "discord_channel" ? 1 : ((await previewSegment(tenantId, segment)).reachable[channel] ?? 0);
+  // Subscription topic (0110): store only a live topic; a stale/unknown id degrades to untopiced.
+  const topicId = input.topicId && (await topicExists(tenantId, input.topicId)) ? input.topicId : null;
+  // A channel-post is one post → estimate 1; a segment estimate needs the reachable-handle count
+  // (topic-aware so the estimate matches who actually resolves).
+  const recipientCount = audienceKind === "discord_channel" ? 1 : ((await previewSegment(tenantId, segment, topicId)).reachable[channel] ?? 0);
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `INSERT INTO broadcasts (tenant_id, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, blocks, segment, segment_id, mode, send_at, stop_at, goal_event, goal_days, window_days, window_start_min, window_end_min, window_tz_offset_min, recipient_count)
-       VALUES (current_tenant(), $1, COALESCE($2,''), $3, $4, $5, $6, $7, $8, $9::jsonb, COALESCE($10,'{}'::jsonb), $11, $12, $13, $14, $15, $16, $17::int[], $18, $19, $20, $21)
+      `INSERT INTO broadcasts (tenant_id, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, topic_id, blocks, segment, segment_id, mode, send_at, stop_at, goal_event, goal_days, window_days, window_start_min, window_end_min, window_tz_offset_min, recipient_count)
+       VALUES (current_tenant(), $1, COALESCE($2,''), $3, $4, $5, $6, $7, $8, $9, $10::jsonb, COALESCE($11,'{}'::jsonb), $12, $13, $14, $15, $16, $17, $18::int[], $19, $20, $21, $22)
        RETURNING ${B_COLS}`,
       [
         input.subject,
@@ -522,6 +545,7 @@ export async function createBroadcast(
         mentionRoleId,
         asEmbed,
         templateId,
+        topicId,
         blocks ? JSON.stringify(blocks) : null,
         JSON.stringify(segment),
         segmentId,
@@ -598,7 +622,12 @@ export async function updateBroadcast(
   const win = input.windowDays !== undefined || input.windowStartMin !== undefined || input.windowEndMin !== undefined || input.windowTzOffsetMin !== undefined
     ? parseWindow(input)
     : { days: existing.window_days, start: existing.window_start_min, end: existing.window_end_min, tz: existing.window_tz_offset_min };
-  const recipientCount = audienceKind === "discord_channel" ? 1 : ((await previewSegment(tenantId, segment)).reachable[channel] ?? 0);
+  // Subscription topic (0110): undefined keeps the stored topic; an explicit value must name a
+  // live topic (else it clears to untopiced — a stale/deleted id never sticks).
+  const topicId = input.topicId === undefined
+    ? existing.topic_id
+    : (input.topicId && (await topicExists(tenantId, input.topicId)) ? input.topicId : null);
+  const recipientCount = audienceKind === "discord_channel" ? 1 : ((await previewSegment(tenantId, segment, topicId)).reachable[channel] ?? 0);
 
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
@@ -607,7 +636,7 @@ export async function updateBroadcast(
          mention_role_id = $20, as_embed = $21, template_id = $5, blocks = $6::jsonb,
          segment = $7::jsonb, mode = $8, send_at = $9, stop_at = $10, goal_event = $11, goal_days = $12,
          window_days = $13::int[], window_start_min = $14, window_end_min = $15, window_tz_offset_min = $16,
-         recipient_count = $17
+         recipient_count = $17, topic_id = $22
        WHERE id = $1 AND status = 'draft'
        RETURNING ${B_COLS}`,
       [
@@ -632,6 +661,7 @@ export async function updateBroadcast(
         targetRef,
         mentionRoleId,
         asEmbed,
+        topicId,
       ],
     );
     return r.rowCount ? (r.rows[0] as BroadcastRow) : null;
@@ -759,7 +789,7 @@ export async function sendBroadcast(
 
   const prep = await withTenant(tenantId, async (c) => {
     const cur = await c.query(
-      "SELECT status, mode, send_at, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, blocks, segment FROM broadcasts WHERE id = $1",
+      "SELECT status, mode, send_at, subject, body, channel, audience_kind, target_ref, mention_role_id, as_embed, template_id, topic_id, blocks, segment FROM broadcasts WHERE id = $1",
       [id],
     );
     if (!cur.rowCount) return { kind: "not-found" as const };
@@ -810,7 +840,8 @@ export async function sendBroadcast(
     const parsedBlocks = BroadcastBlocks.safeParse(cur.rows[0].blocks);
     const blocks = parsedBlocks.success ? parsedBlocks.data : null;
     const segment = cur.rows[0].segment as Record<string, unknown>;
-    const recipients = await resolveRecipients(c, channel, segment);
+    const topicId = (cur.rows[0].topic_id as string | null) ?? null;
+    const recipients = await resolveRecipients(c, channel, segment, topicId);
     await c.query("UPDATE broadcasts SET status = 'sending', recipient_count = $2 WHERE id = $1", [
       id,
       recipients.length,
@@ -831,7 +862,7 @@ export async function sendBroadcast(
         merge: { name: rc.name, email: rc.email, company: rc.company, attributes: rc.attributes },
       });
     }
-    return { kind: "ready" as const, subject, body, channel, templateId, blocks, recipients: inserted };
+    return { kind: "ready" as const, subject, body, channel, templateId, topicId, blocks, recipients: inserted };
   });
 
   if (prep.kind === "not-found") return null;
@@ -863,6 +894,8 @@ export async function sendBroadcast(
     prep.recipients,
     send,
     opts.dispatch,
+    false,
+    prep.topicId,
   ).catch(() => {});
   return { status: "sending", done };
 }
@@ -893,6 +926,9 @@ async function runSend(
   // Continuous ticks send incrementally: counters accumulate but the broadcast must stay
   // 'active' (no terminal status, no sent_at stamp).
   keepActive = false,
+  // Subscription topic (0110) — folded into the per-recipient unsubscribe link so the footer +
+  // List-Unsubscribe opt out of THIS topic (null = the legacy global opt-out).
+  topicId: string | null = null,
 ): Promise<void> {
   // Email: render the template-styled HTML + plaintext ONCE (subject/body/blocks/tokens are
   // constant across recipients) via React Email. If rendering fails (e.g. air-gapped), fall
@@ -932,7 +968,7 @@ async function runSend(
     let errMsg: string | null = null;
     let messageId: string | null = null;
     try {
-      const unsub = withUnsub ? unsubscribeUrl(tenantId, rc.contactId) : null;
+      const unsub = withUnsub ? unsubscribeUrl(tenantId, rc.contactId, topicId) : null;
       let sendText = rendered
         ? unsub
           ? rendered.text.split(UNSUB_PLACEHOLDER).join(unsub)
@@ -1074,7 +1110,7 @@ export async function runContinuousTick(
 
   const prep = await withTenant(tenantId, async (c) => {
     const cur = await c.query(
-      "SELECT status, stop_at, subject, body, channel, template_id, blocks, segment FROM broadcasts WHERE id = $1",
+      "SELECT status, stop_at, subject, body, channel, template_id, topic_id, blocks, segment FROM broadcasts WHERE id = $1",
       [id],
     );
     if (!cur.rowCount) return { kind: "not-found" as const };
@@ -1086,12 +1122,13 @@ export async function runContinuousTick(
     }
     const channel = cur.rows[0].channel as string;
     const segment = cur.rows[0].segment as Record<string, unknown>;
+    const topicId = (cur.rows[0].topic_id as string | null) ?? null;
     const already = await c.query(
       "SELECT contact_id FROM broadcast_recipients WHERE broadcast_id = $1 AND contact_id IS NOT NULL",
       [id],
     );
     const seen = new Set((already.rows as { contact_id: string }[]).map((r) => r.contact_id));
-    const fresh = (await resolveRecipients(c, channel, segment)).filter((rc) => !seen.has(rc.id));
+    const fresh = (await resolveRecipients(c, channel, segment, topicId)).filter((rc) => !seen.has(rc.id));
     if (!fresh.length) return { kind: "idle" as const };
     const inserted: SendRecipient[] = [];
     for (const rc of fresh) {
@@ -1118,6 +1155,7 @@ export async function runContinuousTick(
       body: (cur.rows[0].body as string) ?? "",
       channel,
       templateId: cur.rows[0].template_id as string,
+      topicId,
       blocks: parsedBlocks.success ? parsedBlocks.data : null,
       recipients: inserted,
     };
@@ -1143,6 +1181,7 @@ export async function runContinuousTick(
     send,
     opts.dispatch,
     true, // keepActive
+    prep.topicId,
   ).catch(() => {});
   return { status: "active", sent: prep.recipients.length, done };
 }
