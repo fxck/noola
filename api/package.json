@@ -40,6 +40,7 @@
     "test:broadcasts": "tsx apps/api/test/broadcasts.test.ts",
     "test:reply-email": "tsx apps/api/test/reply-email.test.ts",
     "test:resend-inbound": "tsx apps/api/test/resend-inbound.test.ts",
+    "test:sendgrid-inbound": "tsx apps/api/test/sendgrid-inbound.test.ts",
     "test:email-provider": "tsx apps/api/test/email-provider.test.ts",
     "test:email-sender": "tsx apps/api/test/email-sender.test.ts",
     "test:email-domains": "tsx apps/api/test/email-domains.test.ts",

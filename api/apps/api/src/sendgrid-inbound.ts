@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import {
   handleInboundEmail,
-  resolveTenantByAddress,
   parseInboundAddress,
   ORIGIN_HEADER,
   type InboundEmail,
@@ -34,6 +33,11 @@ export interface SendgridInboundResult {
   ingested: boolean;
   ticketId?: string | null;
   reason?: string;
+  // diagnostics for the route's structured log — so a future drop is a one-line read, not a debug loop
+  from?: string;
+  recipient?: string | null;
+  candidates?: string[];
+  rawMime?: boolean;
 }
 
 /** Read a single-line header value out of SendGrid's raw `headers` blob (case-insensitive). */
@@ -63,13 +67,20 @@ function htmlToText(html: string): string {
 
 /**
  * Normalize a SendGrid Inbound Parse payload (already parsed into fields + files by the multipart
- * route) and ingest via the shared inbound spine. Resolves the tenant from the recipient — the SMTP
- * envelope `to` (direct-MX puts the +t token address there), then the To header, then forwarding
- * fallbacks (Delivered-To / X-Original-To). No tenant route → accepted-but-ignored (202).
+ * route) and ingest via the shared inbound spine.
+ *
+ * The tenant is NOT derived from the recipient — the caller already resolved it from the per-tenant
+ * inbound :handle in the URL (the handle IS the routing key, like Intercom's connected inbox), and
+ * passes it in `opts.tenantId`. So a first-time sender to a workspace's address always lands as a new
+ * lead + ticket, even if that exact recipient address was never pre-registered as a route. The
+ * recipient is used only to (a) carry a +ticket reply token for exact-ticket threading and (b) fill
+ * the stored `to` — we prefer a candidate matching the workspace's support address, else any
+ * candidate, else the support address itself.
  */
 export async function ingestSendgridInbound(
   fields: Record<string, string>,
   files: SendgridPart[],
+  opts: { tenantId: string; supportAddress: string | null },
 ): Promise<SendgridInboundResult> {
   const headers = fields.headers;
   // Echo guard: our own outbound carries X-Noola-Origin — never re-ingest it if it ever loops back.
@@ -89,13 +100,25 @@ export async function ingestSendgridInbound(
     headerFromBlob(headers, "x-original-to") ?? "",
   ].map((a) => parseAddress(a).address).filter(Boolean);
 
-  let toAddr: string | null = null;
-  for (const cand of candidates) {
-    if (await resolveTenantByAddress(parseInboundAddress(cand).base)) { toAddr = cand; break; }
-  }
-  if (!toAddr) return { status: 202, ingested: false, reason: "no tenant route" };
-
   const from = parseAddress(fields.from);
+
+  // Raw-MIME guard: if "POST the raw, full MIME message" is ticked in Inbound Parse, SendGrid sends a
+  // single `email` field of raw RFC822 instead of parsed fields — so there's no from/to/text to work
+  // with. Detect it explicitly and surface an actionable reason rather than a silent empty ingest.
+  const rawMime = !fields.envelope && !fields.to && !fields.from && !fields.text && !fields.html && !!fields.email;
+  if (rawMime || !from.address) {
+    return { status: 202, ingested: false, reason: rawMime ? "raw-mime-unsupported" : "empty-sender", from: from.address, candidates, rawMime };
+  }
+
+  // Pick the recipient to store / thread on. The tenant is already fixed by the handle, so this only
+  // steers reply-token threading and the displayed `to` — never whether we ingest.
+  const supportBase = opts.supportAddress ? parseInboundAddress(opts.supportAddress).base.toLowerCase() : null;
+  const toAddr =
+    candidates.find((c) => supportBase && parseInboundAddress(c).base.toLowerCase() === supportBase) ??
+    candidates.find((c) => parseInboundAddress(c).ticketId) ??
+    candidates[0] ??
+    opts.supportAddress ??
+    from.address; // last resort: something non-empty so parseInboundAddress downstream is safe
   const body = fields.text && fields.text.trim() ? fields.text : fields.html ? htmlToText(fields.html) : "";
   const cc = [...parseAddressList(fields.cc), ...parseAddressList(fields.to)]
     .map((a) => a.address)
@@ -117,15 +140,26 @@ export async function ingestSendgridInbound(
       data: f.data,
     }));
 
-  const result: IngestResult | null = await handleInboundEmail({
-    messageId,
+  const result: IngestResult | null = await handleInboundEmail(
+    {
+      messageId,
+      from: from.address,
+      fromName: from.name,
+      to: toAddr,
+      subject: fields.subject ?? "",
+      body,
+      ...(cc.length ? { cc: [...new Set(cc)] } : {}),
+      ...(attachments.length ? { attachments } : {}),
+    },
+    { tenantId: opts.tenantId },
+  );
+  return {
+    status: result ? 201 : 202,
+    ingested: !!result,
+    ticketId: result?.ticketId ?? null,
     from: from.address,
-    fromName: from.name,
-    to: toAddr,
-    subject: fields.subject ?? "",
-    body,
-    ...(cc.length ? { cc: [...new Set(cc)] } : {}),
-    ...(attachments.length ? { attachments } : {}),
-  });
-  return { status: result ? 201 : 202, ingested: !!result, ticketId: result?.ticketId ?? null };
+    recipient: toAddr,
+    candidates,
+    ...(result ? {} : { reason: "ingest-null" }),
+  };
 }

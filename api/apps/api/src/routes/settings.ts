@@ -570,7 +570,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     if (!ok) return reply.code(401).send({ error: "bad signature" });
     const r = await ingestResendInbound(
       (req.body ?? {}) as Parameters<typeof ingestResendInbound>[0],
-      { apiKey: resolved.apiKey },
+      { apiKey: resolved.apiKey, tenantId: resolved.tenantId, supportAddress: await tenantSupportAddress(resolved.tenantId) },
     );
     return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
   });
@@ -607,7 +607,17 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
       app.log.warn({ err: e }, "sendgrid inbound multipart parse failed");
       return reply.code(400).send({ error: "malformed multipart payload" });
     }
-    const r = await ingestSendgridInbound(fields, files);
+    const support = await tenantSupportAddress(resolved.tenantId);
+    const r = await ingestSendgridInbound(fields, files, { tenantId: resolved.tenantId, supportAddress: support });
+    // One structured line per inbound so a drop is a one-look diagnosis, not a log-hunt. info on
+    // success, warn on any non-ingest so it stands out.
+    const logCtx = {
+      handle, tenantId: resolved.tenantId, status: r.status, ingested: r.ingested,
+      ticketId: r.ticketId ?? null, reason: r.reason, from: r.from, recipient: r.recipient,
+      candidates: r.candidates, rawMime: r.rawMime,
+    };
+    if (r.ingested) app.log.info(logCtx, "sendgrid inbound ingested");
+    else app.log.warn(logCtx, "sendgrid inbound not ingested");
     return reply.code(r.status).send({ ok: true, ingested: r.ingested, ticketId: r.ticketId ?? null, ...(r.reason ? { reason: r.reason } : {}) });
   });
 
