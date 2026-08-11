@@ -83,7 +83,7 @@ function ReplyEmail({ body, agentName, pixelUrl, t }: { body: string; agentName?
           </Section>
           <Hr style={{ borderColor: t.borderColor, margin: "24px 0 0" }} />
           <Text style={{ fontSize: `${t.smallSize}px`, color: t.mutedColor, lineHeight: 1.6, margin: "16px 0 0" }}>
-            {t.footerText || "Sent with Noola · Reply to this email to continue the conversation."}
+            {t.footerText || "Reply to this email to continue the conversation."}
           </Text>
           {/* Read-receipt pixel — its first load stamps the message seen. Best-effort: many clients
               block remote images, so a missing open never implies "unread", only a fired one is a

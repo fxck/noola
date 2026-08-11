@@ -16,11 +16,14 @@ import {
   type EmailTemplate,
   type EmailTemplateTokens,
   type SocialLink,
+  type EmailBranding,
   fetchEmailTemplates,
   createEmailTemplate,
   updateEmailTemplate,
   deleteEmailTemplate,
   previewEmailTemplate,
+  fetchEmailBranding,
+  saveEmailBranding,
 } from "@/lib/email-templates";
 import type { ApiError } from "@/lib/api";
 import { relativeTime } from "@/lib/tickets";
@@ -72,7 +75,7 @@ const BRANDED_FALLBACK: ResolvedTokens = {
   smallSize: 12,
   subjectSize: 22,
   showSubject: true,
-  wordmark: "Noola",
+  wordmark: "",
   logoUrl: "",
   footerText: "You received this because you're a contact of this workspace.",
   socialLinks: [],
@@ -123,6 +126,25 @@ export function SettingsEmailTemplatesPage() {
   const [deleting, setDeleting] = useState<EmailTemplate | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
 
+  // Email branding — the wordmark/sender name; its own tiny fetch+save, kept
+  // out of the templates list's load path so a branding failure never blocks
+  // (or crashes) the list. null until the fetch resolves; stays null if it fails.
+  const [branding, setBranding] = useState<EmailBranding | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    void fetchEmailBranding()
+      .then((b) => {
+        if (live) setBranding(b);
+      })
+      .catch(() => {
+        // Non-fatal — just skip the field; never crash the page.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
   const load = useRef(async () => {
     setStatus("loading");
     try {
@@ -147,6 +169,21 @@ export function SettingsEmailTemplatesPage() {
       // Non-fatal — the save itself succeeded; the list catches up next load.
     }
   }).current;
+
+  // Persist the brand-name override on blur, only when it actually changed.
+  // On success, refetch the templates list so the Branded preview picks up the
+  // new server-resolved wordmark.
+  async function saveBranding(next: string) {
+    if (!branding || next === branding.brandName) return;
+    try {
+      const saved = await saveEmailBranding(next);
+      setBranding(saved);
+      await refresh();
+      toast.success("Brand name saved.");
+    } catch {
+      toast.error("Couldn't save the brand name.");
+    }
+  }
 
   const open = (id: string | null) =>
     void navigate({ to: "/settings/email-templates", search: id ? { template: id } : {} });
@@ -279,6 +316,18 @@ export function SettingsEmailTemplatesPage() {
               and one custom template can frame ticket replies; built-ins are read-only — duplicate
               one to make it yours.
             </p>
+            {branding && (
+              <div className="max-w-3xl px-6 pt-4">
+                <div className="space-y-1.5 rounded-xl border bg-card p-4 shadow-sm">
+                  <Label htmlFor="email-brand-name">Brand name</Label>
+                  <BrandNameField branding={branding} onSave={saveBranding} />
+                  <p className="text-xs text-muted-foreground">
+                    Shown as the wordmark on Branded emails and the sender name on automated replies.
+                    Defaults to your workspace name.
+                  </p>
+                </div>
+              </div>
+            )}
             <div className="max-w-3xl px-6 pb-10 pt-4">
               {status === "loading" ? (
                 <RowsSkeleton rows={4} />
@@ -343,6 +392,30 @@ export function SettingsEmailTemplatesPage() {
         onCancel={() => setDeleting(null)}
       />
     </>
+  );
+}
+
+/** Brand-name override input. Controlled with local text state so typing is
+ *  smooth; persists on blur (only when changed). The placeholder is the
+ *  workspace name — the effective default when the override is empty. */
+function BrandNameField({
+  branding,
+  onSave,
+}: {
+  branding: EmailBranding;
+  onSave: (next: string) => void | Promise<void>;
+}) {
+  const [text, setText] = useState(branding.brandName);
+  useEffect(() => setText(branding.brandName), [branding.brandName]);
+  return (
+    <Input
+      id="email-brand-name"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={() => void onSave(text)}
+      placeholder={branding.workspace}
+      maxLength={60}
+    />
   );
 }
 

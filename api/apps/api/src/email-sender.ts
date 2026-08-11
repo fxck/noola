@@ -16,6 +16,7 @@ export type EmailSenderMode = "shared" | "teammate";
 interface SenderConfig {
   mode: EmailSenderMode;
   workspace: string; // tenant display name, e.g. "Zerops"
+  brandName: string; // explicit email brand override; "" = fall back to workspace
   verifiedDomains: Set<string>; // lowercased domains with a verified sending domain
 }
 
@@ -30,13 +31,14 @@ export function bustSenderCache(tenantId?: string): void {
 async function loadSenderConfig(tenantId: string): Promise<SenderConfig> {
   return withTenant(tenantId, async (c) => {
     // One connection — queries must be sequential (pg forbids concurrent queries on a single client).
-    const m = await c.query("SELECT mode FROM email_sender_settings WHERE tenant_id = current_tenant()");
+    const m = await c.query("SELECT mode, brand_name FROM email_sender_settings WHERE tenant_id = current_tenant()");
     const w = await c.query("SELECT name FROM tenants WHERE id = current_tenant()");
     const d = await c.query("SELECT domain FROM email_sending_domains WHERE status = 'verified'");
     const mode: EmailSenderMode = m.rowCount && m.rows[0].mode === "teammate" ? "teammate" : "shared";
     const workspace = (w.rowCount ? ((w.rows[0].name as string) ?? "") : "").trim() || "Support";
+    const brandName = (m.rowCount ? ((m.rows[0].brand_name as string | null) ?? "") : "").trim();
     const verifiedDomains = new Set((d.rows as { domain: string }[]).map((x) => x.domain.toLowerCase()));
-    return { mode, workspace, verifiedDomains };
+    return { mode, workspace, brandName, verifiedDomains };
   });
 }
 
@@ -82,12 +84,20 @@ export async function getSenderMode(tenantId: string): Promise<EmailSenderMode> 
   return (await senderConfig(tenantId)).mode;
 }
 
-/** UI view: current mode + whether teammate mode is actually usable (needs a verified sending domain). */
+/** The brand shown on outbound email chrome (the Branded frame's wordmark, the From display name for
+ *  AI/automated replies): the tenant's explicit brand_name, else the workspace name. Never "Noola". */
+export async function resolveBrandName(tenantId: string): Promise<string> {
+  const cfg = await senderConfig(tenantId);
+  return cfg.brandName || cfg.workspace;
+}
+
+/** UI view: mode + whether teammate mode is usable (needs a verified sending domain) + the brand name
+ *  (raw override, "" when unset) and the workspace name (the placeholder/fallback the UI shows). */
 export async function getSenderSettingsView(
   tenantId: string,
-): Promise<{ mode: EmailSenderMode; hasVerifiedDomain: boolean; workspace: string }> {
+): Promise<{ mode: EmailSenderMode; hasVerifiedDomain: boolean; workspace: string; brandName: string }> {
   const cfg = await senderConfig(tenantId);
-  return { mode: cfg.mode, hasVerifiedDomain: cfg.verifiedDomains.size > 0, workspace: cfg.workspace };
+  return { mode: cfg.mode, hasVerifiedDomain: cfg.verifiedDomains.size > 0, workspace: cfg.workspace, brandName: cfg.brandName };
 }
 
 export async function setSenderMode(tenantId: string, mode: EmailSenderMode): Promise<void> {
@@ -96,6 +106,20 @@ export async function setSenderMode(tenantId: string, mode: EmailSenderMode): Pr
       `INSERT INTO email_sender_settings (tenant_id, mode) VALUES (current_tenant(), $1)
        ON CONFLICT (tenant_id) DO UPDATE SET mode = $1, updated_at = now()`,
       [mode],
+    );
+  });
+  bustSenderCache(tenantId);
+}
+
+/** Set (or clear, with "") the explicit email brand name. Empty string stores NULL so the read path
+ *  falls back to the workspace name. */
+export async function setBrandName(tenantId: string, brandName: string): Promise<void> {
+  const value = brandName.trim().slice(0, 80) || null;
+  await withTenant(tenantId, async (c) => {
+    await c.query(
+      `INSERT INTO email_sender_settings (tenant_id, brand_name) VALUES (current_tenant(), $1)
+       ON CONFLICT (tenant_id) DO UPDATE SET brand_name = $1, updated_at = now()`,
+      [value],
     );
   });
   bustSenderCache(tenantId);

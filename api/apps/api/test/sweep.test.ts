@@ -104,7 +104,7 @@ async function main() {
   const rendered = await renderReplyEmail("Hi **there**, see [docs](https://example.com)", { agentName: "Aleš", tokens });
   check("reply frame renders flagged tokens", rendered.html.includes("#00ff00") && rendered.html.includes("— Aleš"));
   const stock = await renderReplyEmail("plain", {});
-  check("stock frame unchanged without tokens", stock.html.includes("Sent with Noola"));
+  check("stock frame unchanged without tokens", stock.html.includes("Reply to this email to continue the conversation.") && !stock.html.includes("Noola"));
   await deleteTemplate(A, t1.id);
   await deleteTemplate(A, t2.id);
   check("deleting the flagged row degrades to stock", (await getReplyTemplateTokens(A)) === null);

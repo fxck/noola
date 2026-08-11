@@ -32,7 +32,7 @@ import {
   resolveTenantByInboundHandle, EmailProviderSecretsUnavailableError, isEmailProvider,
 } from "../email-provider.js";
 import { ingestSendgridInbound, type SendgridPart } from "../sendgrid-inbound.js";
-import { getSenderSettingsView, setSenderMode } from "../email-sender.js";
+import { getSenderSettingsView, setSenderMode, setBrandName } from "../email-sender.js";
 import { publicApiBase } from "../env.js";
 import { mdToSlack } from "../channels/format.js";
 import {
@@ -637,6 +637,23 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     if (mode !== "shared" && mode !== "teammate") return reply.code(400).send({ error: "mode must be 'shared' or 'teammate'" });
     await setSenderMode(tenantId, mode);
     return getSenderSettingsView(tenantId);
+  }));
+
+  // Email brand name — the wordmark on the Branded/broadcast frame + the From display name for
+  // automated replies. Empty = fall back to the workspace name (never "Noola"). GET is readable by any
+  // agent; PUT is admin-only (it changes what customers see on every outbound email).
+  app.get("/email/branding", tenanted(async (tenantId) => {
+    const v = await getSenderSettingsView(tenantId);
+    return { brandName: v.brandName, workspace: v.workspace };
+  }));
+
+  app.put("/email/branding", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    const raw = (req.body as { brandName?: unknown } | undefined)?.brandName;
+    if (raw !== undefined && typeof raw !== "string") return reply.code(400).send({ error: "brandName must be a string" });
+    await setBrandName(tenantId, typeof raw === "string" ? raw : "");
+    const v = await getSenderSettingsView(tenantId);
+    return { brandName: v.brandName, workspace: v.workspace };
   }));
 
   // ---- Model-B: branded sending domains (Intercom "custom email domain") ----

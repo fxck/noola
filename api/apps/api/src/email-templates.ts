@@ -1,5 +1,6 @@
 import { withTenant } from "@repo/db";
 import { EmailTemplateTokens } from "@repo/contracts";
+import { resolveBrandName } from "./email-sender.js";
 
 // Email template designer — per-tenant DESIGN TOKENS that parameterize the react.email
 // frame (emails/broadcast-email.tsx). Two built-ins live in code: 'branded' (the card
@@ -48,7 +49,10 @@ export const BRANDED_TOKENS: Required<EmailTemplateTokens> = {
   smallSize: 12,
   subjectSize: 22,
   showSubject: true,
-  wordmark: "Noola",
+  // No baked brand: the branded built-in's effective wordmark is the tenant's brand name, injected
+  // per-tenant by the read paths below (listTemplates / resolveTemplateTokens). An empty wordmark on a
+  // custom row still means "hide the header" — that semantic is unchanged.
+  wordmark: "",
   logoUrl: "",
   footerText: "You received this because you're a contact of this workspace.",
   socialLinks: [],
@@ -78,16 +82,27 @@ export function mergeTokens(partial: EmailTemplateTokens | null | undefined): Re
   return { ...BRANDED_TOKENS, ...(parsed.success ? parsed.data : {}) };
 }
 
-/** All templates the tenant can pick: the two built-ins, then custom rows (newest first). */
+/** All templates the tenant can pick: the two built-ins, then custom rows (newest first). The branded
+ *  built-in's wordmark is filled with the tenant's brand name so the designer shows the real brand
+ *  (and a duplicate seeds from it), never a hardcoded "Noola". */
 export async function listTemplates(tenantId: string): Promise<EmailTemplateView[]> {
-  const custom = await withTenant(tenantId, async (c) => {
-    const r = await c.query(`SELECT ${COLS} FROM email_templates ORDER BY created_at DESC LIMIT 100`);
-    return r.rows as EmailTemplateRow[];
-  });
+  const [custom, brand] = await Promise.all([
+    withTenant(tenantId, async (c) => {
+      const r = await c.query(`SELECT ${COLS} FROM email_templates ORDER BY created_at DESC LIMIT 100`);
+      return r.rows as EmailTemplateRow[];
+    }),
+    resolveBrandName(tenantId),
+  ]);
   return [
-    ...BUILTINS.map((b) => ({ id: b.id, name: b.name, builtin: true, tokens: b.tokens })),
+    ...BUILTINS.map((b) => ({ id: b.id, name: b.name, builtin: true, tokens: brandedWordmark(b, brand) })),
     ...custom.map((t) => ({ id: t.id, name: t.name, builtin: false, tokens: t.tokens, useForReplies: t.use_for_replies, updated_at: t.updated_at })),
   ];
+}
+
+/** A built-in's tokens with the tenant brand filled into the 'branded' frame's wordmark (only there —
+ *  'personal' stays headerless). */
+function brandedWordmark(b: { id: string; tokens: Required<EmailTemplateTokens> }, brand: string): Required<EmailTemplateTokens> {
+  return b.id === "branded" ? { ...b.tokens, wordmark: brand } : b.tokens;
 }
 
 export async function createTemplate(
@@ -168,7 +183,7 @@ export async function resolveTemplateTokens(
   templateId: string | null | undefined,
 ): Promise<Required<EmailTemplateTokens>> {
   const builtin = BUILTINS.find((b) => b.id === (templateId ?? "branded"));
-  if (builtin) return builtin.tokens;
+  if (builtin) return brandedWordmark(builtin, await resolveBrandName(tenantId));
   if (!templateId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(templateId)) {
     return BRANDED_TOKENS;
   }

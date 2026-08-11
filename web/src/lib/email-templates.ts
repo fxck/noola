@@ -112,3 +112,24 @@ export async function previewEmailTemplate(input: {
     body: JSON.stringify(input),
   });
 }
+
+// Email branding — the wordmark shown on Branded emails and the sender name on
+// automated replies. `brandName` is the raw override ("" when unset);
+// `workspace` is the tenant/workspace name used as the fallback/placeholder.
+export interface EmailBranding {
+  brandName: string;
+  workspace: string;
+}
+
+export async function fetchEmailBranding(): Promise<EmailBranding> {
+  return api<EmailBranding>("/email/branding");
+}
+
+/** Save the brand-name override — an empty string clears it so the wordmark
+ *  falls back to the workspace name. Admin-only server-side. */
+export async function saveEmailBranding(brandName: string): Promise<EmailBranding> {
+  return api<EmailBranding>("/email/branding", {
+    method: "PUT",
+    body: JSON.stringify({ brandName }),
+  });
+}
