@@ -1254,8 +1254,8 @@ function SendingDomainsSection({ isAdmin }: { isAdmin: boolean }) {
 
       {!providerEnabled && (
         <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
-          Self-serve provisioning is off (no provider API key on this server). You can still track a domain here and set it up
-          manually in your email provider's dashboard.
+          Self-serve provisioning is off — connect your Resend or SendGrid account in “Bring your own email provider” above to
+          auto-create the DNS records here. You can still track a domain and authenticate it by hand in your provider's dashboard.
         </p>
       )}
 

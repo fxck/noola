@@ -152,6 +152,15 @@ export async function resendApiKeyForTenant(tenantId: string): Promise<string | 
   return process.env.RESEND_API_KEY ?? null;
 }
 
+/** The provider + key the DOMAIN WIZARD should talk to for a tenant: their BYO provider+key when
+ *  present (Resend or SendGrid — domains live in THEIR account), else the shared Resend env key as the
+ *  platform fallback. Null → no self-serve provider (the wizard degrades to local tracking). */
+export async function emailDomainCredsForTenant(tenantId: string): Promise<TenantProviderCreds | null> {
+  const creds = await tenantEmailProviderCreds(tenantId);
+  if (creds) return creds;
+  return process.env.RESEND_API_KEY ? { provider: "resend", apiKey: process.env.RESEND_API_KEY } : null;
+}
+
 // ---- pre-tenant inbound resolution (webhook handle → tenant) --------------
 
 export interface InboundHandleResolution {

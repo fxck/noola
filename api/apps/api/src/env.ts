@@ -15,3 +15,20 @@ export function requireEnv(key: string): string {
   }
   return v;
 }
+
+/**
+ * Absolute public origin of THIS api, for URLs we hand out (inbound webhook URLs, email read-receipt
+ * pixels, unsubscribe + tracking links). Prefers an explicit `API_BASE_URL` (set this to the branded
+ * custom domain in prod, e.g. https://api.noola.cc) and falls back to the Zerops auto subdomain
+ * (`zeropsSubdomain`) so dev/stage keep working with zero config. No trailing slash.
+ */
+export function publicApiBase(): string {
+  const explicit = process.env.API_BASE_URL?.trim();
+  const sub = process.env.zeropsSubdomain;
+  const base = explicit
+    ? explicit
+    : sub
+      ? /^https?:\/\//.test(sub) ? sub : `https://${sub}`
+      : `http://localhost:${process.env.PORT ?? 3000}`;
+  return base.replace(/\/+$/, "");
+}

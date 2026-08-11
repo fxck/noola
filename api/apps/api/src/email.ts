@@ -7,6 +7,7 @@ import { renderReplyEmail } from "./emails/reply-email.js";
 import { prodSecret } from "./prod-secret.js";
 import { tenantEmailProviderCreds, type EmailProviderName } from "./email-provider.js";
 import { resolveFromIdentity } from "./email-sender.js";
+import { publicApiBase } from "./env.js";
 
 // The email channel — the second real channel after Discord, riding the same
 // ingestInbound() spine. Dev/stage use Mailpit (SMTP catch + HTTP API); a real
@@ -371,18 +372,12 @@ export async function sendAuthEmail(
  * with no HTML (a render hiccup never blocks the send). No-ops (with a reason)
  * when the channel is disabled or there's no recipient.
  */
-/** Absolute URL of the read-receipt pixel for one agent message. Mirrors unsubscribeUrl's public
- *  base derivation (zeropsSubdomain → this api's own origin) so dev links land on apidev and stage
- *  links on apistage. Email "Seen" is best-effort: it only fires in clients that load remote images
- *  (Gmail/Outlook block by default), so a missing open never means "unread". */
+/** Absolute URL of the read-receipt pixel for one agent message. Uses this api's public origin
+ *  (API_BASE_URL in prod, else the Zerops subdomain). Email "Seen" is best-effort: it only fires in
+ *  clients that load remote images (Gmail/Outlook block by default), so a missing open never means
+ *  "unread". */
 function seenPixelUrl(messageId: string): string {
-  const sub = process.env.zeropsSubdomain;
-  const base = sub
-    ? /^https?:\/\//.test(sub)
-      ? sub
-      : `https://${sub}`
-    : `http://localhost:${process.env.PORT ?? 3000}`;
-  return `${base.replace(/\/+$/, "")}/public/seen/${messageId}`;
+  return `${publicApiBase()}/public/seen/${messageId}`;
 }
 
 export async function routeEmailOutbound(

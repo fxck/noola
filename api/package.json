@@ -42,6 +42,7 @@
     "test:resend-inbound": "tsx apps/api/test/resend-inbound.test.ts",
     "test:email-provider": "tsx apps/api/test/email-provider.test.ts",
     "test:email-sender": "tsx apps/api/test/email-sender.test.ts",
+    "test:email-domains": "tsx apps/api/test/email-domains.test.ts",
     "test:integrations": "tsx apps/api/test/integrations.test.ts",
     "test:automations": "tsx apps/api/test/automations.test.ts",
     "test:tagrules": "tsx apps/api/test/tagrules.test.ts",
@@ -55,7 +56,7 @@
     "test:translation": "tsx apps/api/test/translation.test.ts",
     "test:channels": "tsx apps/api/test/channels.test.ts",
     "test:tails": "tsx apps/api/test/tails.test.ts",
-  "test:flow-guards": "tsx apps/api/test/flow-guards.test.ts",
+    "test:flow-guards": "tsx apps/api/test/flow-guards.test.ts",
     "test:wave5": "tsx apps/api/test/wave5.test.ts",
     "test:teams": "tsx apps/api/test/teams.test.ts",
     "test:routing-v2": "tsx apps/api/test/routing-v2.test.ts",
@@ -63,7 +64,8 @@
     "test:reports": "tsx apps/api/test/reports.test.ts",
     "test:ai-wave5": "tsx apps/api/test/ai-wave5.test.ts",
     "eval": "tsx apps/api/eval/run.ts",
-    "dev": "tsx watch apps/api/src/server.ts"
+    "dev": "tsx watch apps/api/src/server.ts",
+    "test:env": "tsx apps/api/test/env.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
