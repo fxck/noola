@@ -7,8 +7,9 @@ process.env.MODEL_KEY_SECRET = process.env.MODEL_KEY_SECRET || "test-model-key-s
 
 const {
   saveTenantEmailProvider, getTenantEmailProvider, deleteTenantEmailProvider,
-  tenantEmailProviderCreds, resolveTenantByInboundHandle, rotateInboundHandle,
+  tenantEmailProviderCreds, resolveTenantByInboundHandle, rotateInboundHandle, tenantReplyAddress,
 } = await import("../src/email-provider.js");
+const { ticketReplyAddress } = await import("../src/email.js");
 
 // BYO Resend provider store: encrypted round-trip, write-only masking, partial update, and the
 // pre-tenant inbound-handle resolution the per-tenant webhook route relies on.
@@ -81,6 +82,19 @@ async function main() {
     await saveTenantEmailProvider(A, { apiKey: "" });
     check("empty string clears the api key", (await tenantEmailProviderCreds(A)) === null);
     check("clearing the key keeps the row", (await getTenantEmailProvider(A))?.hasApiKey === false);
+
+    // Reply address (inbound routing domain): set → returned + drives the per-ticket Reply-To onto the
+    // inbound domain, independent of the branded From/support address. Empty clears back to null.
+    const ticket = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    await saveTenantEmailProvider(A, { replyAddress: "Support@Inbound.Zerops.io" });
+    check("reply address stored, lowercased", (await getTenantEmailProvider(A))?.replyAddress === "support@inbound.zerops.io");
+    check("tenantReplyAddress returns it", (await tenantReplyAddress(A)) === "support@inbound.zerops.io");
+    check(
+      "Reply-To token lands on the inbound domain",
+      ticketReplyAddress((await tenantReplyAddress(A))!, ticket).endsWith("@inbound.zerops.io"),
+    );
+    await saveTenantEmailProvider(A, { replyAddress: "" });
+    check("empty string clears the reply address", (await tenantReplyAddress(A)) === null);
 
     // Delete removes the row entirely (revert to shared env).
     check("delete removes the row", (await deleteTenantEmailProvider(A)) === true);

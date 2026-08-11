@@ -5,7 +5,7 @@ import { ingestInbound, type IngestResult } from "./ingest.js";
 import { persistBufferAttachments } from "./attachments.js";
 import { renderReplyEmail } from "./emails/reply-email.js";
 import { prodSecret } from "./prod-secret.js";
-import { tenantEmailProviderCreds, type EmailProviderName } from "./email-provider.js";
+import { tenantEmailProviderCreds, tenantReplyAddress, type EmailProviderName } from "./email-provider.js";
 import { resolveFromIdentity } from "./email-sender.js";
 import { publicApiBase } from "./env.js";
 
@@ -307,9 +307,13 @@ export async function sendOutboundEmail(
   const smtpHost = process.env.SMTP_HOST;
   if (!creds && !smtpHost) return { delivered: false, reason: "email-disabled" };
   const support = (await tenantSupportAddress(tenantId)) ?? "support@noola.local";
-  const supportDomain = support.split("@")[1] ?? "noola.local";
+  // Reply-To routes on the INBOUND receiving domain when the tenant set one (forwarded support@ → their
+  // Inbound Parse domain, e.g. support@inbound.zerops.io); otherwise it stays on the support domain (the
+  // simple case where From and inbound share a domain). The From identity is independent — branded.
+  const replyBase = (await tenantReplyAddress(tenantId)) || support;
+  const replyDomain = replyBase.split("@")[1] ?? support.split("@")[1] ?? "noola.local";
   // From = teammate identity (name always; address = teammate's own in teammate mode + verified domain,
-  // else the support address). Reply-To/Message-ID below stay pinned to the support address so inbound
+  // else the support address). Reply-To/Message-ID below stay pinned to the reply address so inbound
   // routing + threading are unaffected by who the reply is From.
   const fromIdentity = await resolveFromIdentity(tenantId, support, { agentName: opts?.agentName, agentEmail: opts?.agentEmail });
   const tx = creds ? providerSmtpTransport(creds.provider, creds.apiKey) : smtpTransport(smtpHost!, Number(process.env.SMTP_PORT ?? 1025));
@@ -321,8 +325,8 @@ export async function sendOutboundEmail(
     text: body,
     ...(opts?.replyToTicketId
       ? {
-          replyTo: ticketReplyAddress(support, opts.replyToTicketId),
-          messageId: `<t.${ticketEmailToken(opts.replyToTicketId)}.${Date.now().toString(36)}@${supportDomain}>`,
+          replyTo: ticketReplyAddress(replyBase, opts.replyToTicketId),
+          messageId: `<t.${ticketEmailToken(opts.replyToTicketId)}.${Date.now().toString(36)}@${replyDomain}>`,
         }
       : {}),
     ...(opts?.inReplyTo ? { inReplyTo: angled(opts.inReplyTo), references: angled(opts.inReplyTo) } : {}),

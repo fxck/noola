@@ -1,0 +1,11 @@
+-- BYO inbound reply routing: the address customers' replies must be sent to, which can differ from
+-- the branded support/From address. When a workspace forwards its public support@ mail into SendGrid
+-- Inbound Parse (or Resend inbound) on a dedicated receiving domain, replies have to be addressed to
+-- THAT domain to route back — e.g. From is support@zerops.io (branded), but replies must go to
+-- support+t.<ticket>@inbound.zerops.io so they hit Inbound Parse and thread to the exact ticket.
+--
+-- reply_address = the base address on the receiving domain (e.g. support@inbound.zerops.io). Outbound
+-- derives the per-ticket Reply-To token from it; the From stays the branded/teammate identity. NULL =
+-- reply routing lives on the support address's own domain (the simple case where From and inbound share
+-- a domain), preserving existing behavior.
+ALTER TABLE email_provider_settings ADD COLUMN IF NOT EXISTS reply_address text;

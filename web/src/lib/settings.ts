@@ -425,6 +425,9 @@ export interface EmailProvider {
   inboundWebhookUrl: string;
   active: boolean;
   updatedAt: string | null;
+  /** Where customer replies route (on the inbound receiving domain), when it differs from the branded
+   *  From/support address; null = replies stay on the support domain. */
+  replyAddress: string | null;
 }
 
 export async function fetchEmailProvider(): Promise<EmailProvider | null> {
@@ -432,7 +435,7 @@ export async function fetchEmailProvider(): Promise<EmailProvider | null> {
 }
 
 /** Partial: omit a field to leave it as-is, pass "" to clear it. */
-export async function saveEmailProvider(patch: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean }): Promise<EmailProvider> {
+export async function saveEmailProvider(patch: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean; replyAddress?: string }): Promise<EmailProvider> {
   return (await api<{ provider: EmailProvider }>("/email/provider", { method: "PUT", body: JSON.stringify(patch) })).provider;
 }
 

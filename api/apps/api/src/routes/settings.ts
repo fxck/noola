@@ -516,18 +516,23 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
 
   app.put("/email/provider", tenanted(async (tenantId, req, reply) => {
     if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
-    const b = (req.body ?? {}) as Partial<{ provider: string; apiKey: string; webhookSecret: string; active: boolean }>;
+    const b = (req.body ?? {}) as Partial<{ provider: string; apiKey: string; webhookSecret: string; active: boolean; replyAddress: string }>;
     if (b.provider !== undefined && !isEmailProvider(b.provider)) {
       return reply.code(400).send({ error: "provider must be 'resend' or 'sendgrid'" });
     }
-    const patch: { provider?: "resend" | "sendgrid"; apiKey?: string; webhookSecret?: string; active?: boolean } = {};
+    // reply address: "" clears; a non-empty value must look like an email (basic shape only).
+    if (typeof b.replyAddress === "string" && b.replyAddress.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.replyAddress.trim())) {
+      return reply.code(400).send({ error: "replyAddress must be a valid email address" });
+    }
+    const patch: { provider?: "resend" | "sendgrid"; apiKey?: string; webhookSecret?: string; active?: boolean; replyAddress?: string } = {};
     if (isEmailProvider(b.provider)) patch.provider = b.provider;
     // Only carry through fields the client actually sent — omit = leave as-is, "" = clear.
     if (typeof b.apiKey === "string") patch.apiKey = b.apiKey;
     if (typeof b.webhookSecret === "string") patch.webhookSecret = b.webhookSecret;
     if (typeof b.active === "boolean") patch.active = b.active;
-    if (patch.provider === undefined && patch.apiKey === undefined && patch.webhookSecret === undefined && patch.active === undefined) {
-      return reply.code(400).send({ error: "provide provider, apiKey and/or webhookSecret (or active)" });
+    if (typeof b.replyAddress === "string") patch.replyAddress = b.replyAddress;
+    if (patch.provider === undefined && patch.apiKey === undefined && patch.webhookSecret === undefined && patch.active === undefined && patch.replyAddress === undefined) {
+      return reply.code(400).send({ error: "provide provider, apiKey and/or webhookSecret (or active/replyAddress)" });
     }
     try {
       return { provider: providerView(await saveTenantEmailProvider(tenantId, patch)) };

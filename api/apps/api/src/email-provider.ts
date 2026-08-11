@@ -36,6 +36,9 @@ export interface EmailProviderStatus {
   inboundHandle: string;
   active: boolean;
   updatedAt: string | null;
+  /** The address customer replies route to (on the inbound receiving domain), when it differs from
+   *  the branded support/From address. null = replies route on the support address's own domain. */
+  replyAddress: string | null;
 }
 
 function newInboundHandle(): string {
@@ -49,7 +52,7 @@ export async function getTenantEmailProvider(tenantId: string): Promise<EmailPro
     const r = await c.query(
       `SELECT provider, (api_key_enc IS NOT NULL) AS has_api_key,
               (webhook_secret_enc IS NOT NULL) AS has_webhook_secret,
-              inbound_handle, active, updated_at
+              inbound_handle, active, updated_at, reply_address
          FROM email_provider_settings WHERE tenant_id = current_tenant()`,
     );
     if (!r.rowCount) return null;
@@ -61,6 +64,7 @@ export async function getTenantEmailProvider(tenantId: string): Promise<EmailPro
       inboundHandle: row.inbound_handle as string,
       active: Boolean(row.active),
       updatedAt: row.updated_at ? new Date(row.updated_at as string).toISOString() : null,
+      replyAddress: (row.reply_address as string | null) ?? null,
     };
   });
 }
@@ -73,28 +77,32 @@ export async function getTenantEmailProvider(tenantId: string): Promise<EmailPro
  */
 export async function saveTenantEmailProvider(
   tenantId: string,
-  input: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean },
+  input: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean; replyAddress?: string },
 ): Promise<EmailProviderStatus> {
   if (!encryptionAvailable()) {
     throw new EmailProviderSecretsUnavailableError("MODEL_KEY_SECRET is not set — cannot store email provider credentials");
   }
   const setApiKey = input.apiKey !== undefined;
   const setWebhook = input.webhookSecret !== undefined;
+  const setReply = input.replyAddress !== undefined;
   // Empty string clears; a non-empty value encrypts; undefined leaves the column as-is.
   const apiKeyEnc = setApiKey ? (input.apiKey ? encryptSecret(input.apiKey.trim()) : null) : null;
   const webhookEnc = setWebhook ? (input.webhookSecret ? encryptSecret(input.webhookSecret.trim()) : null) : null;
+  // reply_address is not a secret — stored plain. Empty string clears; undefined leaves as-is.
+  const replyAddr = setReply ? (input.replyAddress && input.replyAddress.trim() ? input.replyAddress.trim().toLowerCase() : null) : null;
   const provider = input.provider ?? null; // null = keep existing (insert defaults to 'resend')
   await withTenant(tenantId, async (c) => {
     await c.query(
-      `INSERT INTO email_provider_settings (tenant_id, provider, inbound_handle, api_key_enc, webhook_secret_enc, active)
-       VALUES (current_tenant(), COALESCE($7, 'resend'), $1, $2, $3, COALESCE($4, true))
+      `INSERT INTO email_provider_settings (tenant_id, provider, inbound_handle, api_key_enc, webhook_secret_enc, active, reply_address)
+       VALUES (current_tenant(), COALESCE($7, 'resend'), $1, $2, $3, COALESCE($4, true), $9)
        ON CONFLICT (tenant_id) DO UPDATE SET
          provider           = COALESCE($7, email_provider_settings.provider),
          api_key_enc        = CASE WHEN $5 THEN $2 ELSE email_provider_settings.api_key_enc END,
          webhook_secret_enc = CASE WHEN $6 THEN $3 ELSE email_provider_settings.webhook_secret_enc END,
          active             = COALESCE($4, email_provider_settings.active),
+         reply_address      = CASE WHEN $8 THEN $9 ELSE email_provider_settings.reply_address END,
          updated_at         = now()`,
-      [newInboundHandle(), apiKeyEnc, webhookEnc, input.active ?? null, setApiKey, setWebhook, provider],
+      [newInboundHandle(), apiKeyEnc, webhookEnc, input.active ?? null, setApiKey, setWebhook, provider, setReply, replyAddr],
     );
   });
   const status = await getTenantEmailProvider(tenantId);
@@ -141,6 +149,18 @@ export async function tenantEmailProviderCreds(tenantId: string): Promise<Tenant
   const apiKey = decryptSecret(row.api_key_enc);
   if (!apiKey) return null;
   return { provider: isEmailProvider(row.provider) ? row.provider : "resend", apiKey };
+}
+
+/** The address customer replies should route to (on the inbound receiving domain), or null when
+ *  replies live on the support address's own domain. Outbound derives the per-ticket Reply-To token
+ *  from this so a forwarded support@ still threads back through Inbound Parse. */
+export async function tenantReplyAddress(tenantId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      "SELECT reply_address FROM email_provider_settings WHERE tenant_id = current_tenant()",
+    );
+    return r.rowCount ? ((r.rows[0].reply_address as string | null) ?? null) : null;
+  });
 }
 
 /** The Resend key to use for a tenant's OUTBOUND provider calls (the DOMAIN WIZARD, Resend-only): the
