@@ -1,5 +1,6 @@
 import pg from "pg";
-import { resolveFromIdentity, setSenderMode, getSenderSettingsView, bustSenderCache } from "../src/email-sender.js";
+import { resolveFromIdentity, setSenderMode, getSenderSettingsView, bustSenderCache, setBrandName, resolveBrandName } from "../src/email-sender.js";
+import { resolveTemplateTokens, listTemplates } from "../src/email-templates.js";
 
 // Teammate sending identity: shared mode → support address + "<name> from <workspace>"; teammate mode
 // → the teammate's OWN address when its domain is verified, else fall back to support.
@@ -59,6 +60,25 @@ async function main() {
     const view = await getSenderSettingsView(A);
     check("view reports current mode", view.mode === "teammate");
     check("view reports a verified domain is available", view.hasVerifiedDomain === true);
+
+    // --- brand name (email chrome) ---
+    // Unset brand → falls back to the workspace name, never a hardcoded "Noola".
+    await setBrandName(A, "");
+    const wsBrand = await resolveBrandName(A);
+    check("unset brand falls back to the workspace name", wsBrand === view.workspace && wsBrand !== "Noola");
+    check("unset brand: the Branded built-in's wordmark IS the workspace name",
+      (await resolveTemplateTokens(A, "branded")).wordmark === view.workspace);
+    const emptyView = await getSenderSettingsView(A);
+    check("view exposes the raw brand override (empty when unset)", emptyView.brandName === "");
+
+    // Explicit brand override wins everywhere the chrome is resolved.
+    await setBrandName(A, "Acme Support");
+    check("resolveBrandName returns the explicit override", (await resolveBrandName(A)) === "Acme Support");
+    check("Branded built-in wordmark picks up the override", (await resolveTemplateTokens(A, "branded")).wordmark === "Acme Support");
+    const listed = await listTemplates(A);
+    check("listTemplates shows the brand on the Branded built-in", listed.find((t) => t.id === "branded")?.tokens.wordmark === "Acme Support");
+    check("the Personal built-in stays headerless (no brand injected)", listed.find((t) => t.id === "personal")?.tokens.wordmark === "");
+    check("getSenderSettingsView returns the raw override", (await getSenderSettingsView(A)).brandName === "Acme Support");
   } finally {
     await clean();
     await superPool.end();

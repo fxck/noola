@@ -177,10 +177,10 @@ function BroadcastEmail({
           ) : null}
           <Hr style={{ borderColor: t.borderColor, margin: "24px 0 0" }} />
           <Text style={footerStyle}>
-            {`Sent with Noola · ${t.footerText}`}
+            {t.footerText}
             {unsubscribeHref ? (
               <>
-                {" · "}
+                {t.footerText ? " · " : null}
                 <Link href={unsubscribeHref} style={{ color: t.mutedColor, textDecoration: "underline" }}>
                   Unsubscribe
                 </Link>

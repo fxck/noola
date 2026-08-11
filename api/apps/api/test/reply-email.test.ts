@@ -14,7 +14,7 @@ function check(name: string, cond: boolean) {
   }
 }
 
-const FOOTER = "Sent with Noola · Reply to this email to continue the conversation.";
+const FOOTER = "Reply to this email to continue the conversation.";
 
 async function main() {
   const md = "Hi there, **thanks** for reaching out.\n\n- restart the app\n- clear the cache";
