@@ -22,7 +22,8 @@ import { translateOutboundReply, stampOutboundTranslation } from "../translate.j
 import { claimAttachments, attachmentsForTicket } from "../attachments.js";
 import { getTicketMirror, pushTicketToDiscord, mirrorUrl, syncMirrorState, mirrorEligibility } from "../discord-mirror.js";
 import { getObject } from "../storage.js";
-import { notifyContactByEmailIfAway, type MailAttachment } from "../email.js";
+import { notifyContactByEmailIfAway, tenantSupportAddress, stripOwnCcAddresses, type MailAttachment } from "../email.js";
+import { tenantReplyAddress } from "../email-provider.js";
 
 // Attach computed SLA state to ticket rows (policy loaded once; null when disabled).
 async function withSla<T extends TicketRow>(tenantId: string, rows: T[]): Promise<(T & { sla: TicketSla | null })[]> {
@@ -267,7 +268,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
 
   app.get("/tickets/:id/messages", tenanted(async (tenantId, req) => {
     const { id } = req.params as { id: string };
-    const [messages, byMsg, replyChannels] = await Promise.all([
+    const [messages, byMsg, replyChannels, supportAddr, replyAddr] = await Promise.all([
       withTenant(tenantId, async (c) => {
         const r = await c.query(
           `SELECT m.id, m.ticket_id, m.author_type, m.author_kind, m.body, COALESCE(m.auto, false) AS auto,
@@ -283,6 +284,8 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       }),
       attachmentsForTicket(tenantId, id),
       getReplyChannels(tenantId, id),
+      tenantSupportAddress(tenantId),
+      tenantReplyAddress(tenantId),
     ]);
     // Hydrate each message with its claimed attachments (thread render + download links). `channels`
     // powers the composer's channel picker (the contact's reachable channels; `current` = default).
@@ -290,10 +293,15 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     const lastEmailMeta = [...messages].reverse()
       .find((m) => (m as { author_type?: string; channel_type?: string }).author_type === "customer"
         && (m as { channel_type?: string }).channel_type === "email") as { meta?: { cc?: string[] } } | undefined;
+    // Strip our OWN inbound/support addresses from the reply-all seed — the customer emailed TO
+    // support@, so it rides in on the cc list, and CC-ing it back forwards the reply into Inbound
+    // Parse (a self-loop / duplicate ticket). Filter here, at the read chokepoint, so it covers every
+    // inbound provider AND already-landed tickets — not just newly parsed mail.
+    const rawCc = Array.isArray(lastEmailMeta?.meta?.cc) ? lastEmailMeta.meta.cc : [];
     return {
       messages: messages.map((m) => ({ ...m, attachments: byMsg.get(m.id) ?? [] })),
       channels: replyChannels,
-      emailCc: Array.isArray(lastEmailMeta?.meta?.cc) ? lastEmailMeta.meta.cc : [],
+      emailCc: stripOwnCcAddresses(rawCc, supportAddr, replyAddr),
     };
   }));
 
