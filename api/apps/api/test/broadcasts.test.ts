@@ -605,8 +605,23 @@ async function main() {
     const boRow = got0?.recipients.find((r) => r.handle === "btest-b@x.test");
     check("recipient rows expose opened_at/clicked_at (null before touches)",
       annRow?.opened_at === null && annRow?.clicked_at === null);
+    const cntBUpd = async (id: string): Promise<number> =>
+      (await superPool.query(
+        "SELECT count(*)::int AS n FROM outbox WHERE event_type = 'noola.broadcast.updated' AND payload->'data'->>'broadcastId' = $1",
+        [id],
+      )).rows[0].n as number;
+    const bUpdBefore = await cntBUpd(gb.id);
     await trackOpen(A, annRow!.id);
     await trackClick(A, boRow!.id); // click implies open
+    // Engagement now nudges the detail live via the transactional-outbox broadcast-updated event, so a
+    // terminal "Sent" broadcast's Opened/Clicked climb without a poll. First-touch only — a re-loaded
+    // pixel must stay silent.
+    check("first open + first click each emit a live broadcast-updated event",
+      (await cntBUpd(gb.id)) - bUpdBefore === 2);
+    const bUpdAfterTouch = await cntBUpd(gb.id);
+    await trackOpen(A, annRow!.id); // re-open (pixel reload)
+    check("a re-open does not emit a second event (no realtime spam)",
+      (await cntBUpd(gb.id)) === bUpdAfterTouch);
     await superPool.query(
       "INSERT INTO contact_events (tenant_id, contact_id, name) VALUES ($1, $2, 'btest_signup')",
       [A, bo.id],
