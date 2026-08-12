@@ -17,6 +17,7 @@ import { createAttachment, claimAttachments, attachmentsForTicket, type Attachme
 import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
 import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
+import { suggestionMeta } from "../autoreply.js";
 import { wantsHuman } from "../model.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen } from "../contacts.js";
@@ -228,6 +229,16 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
         channelType: "widget",
         origin: "automation",
       });
+      // The widget assistant IS the AI answering autonomously — mark the message auto=true + attach
+      // generation stats, same as the ambient autoreply path. Without this the AI's own answer looks
+      // like a human agent everywhere: "AG" (not the Noola mark) in the console, "Agent" (not "AI
+      // assistant") in the Discord mirror, no AiReceipt, and it's uncounted in AI analytics.
+      await withTenant(wk.tenantId, async (c) => {
+        await c.query("UPDATE messages SET auto = true, meta = $2::jsonb WHERE id = $1", [
+          answerMsg.messageId,
+          JSON.stringify(suggestionMeta(s, "widget")),
+        ]);
+      }).catch(() => {});
       return {
         answer: s.draft,
         citations: s.citations.map((c) => ({ title: c.title, snippet: c.snippet })),
@@ -346,6 +357,14 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
         channelType: "widget",
         origin: "automation",
       });
+      // Mark the streamed AI answer auto=true + attach stats, same as /public/ask and the ambient
+      // autoreply path — otherwise the widget assistant's own reply reads as a human agent.
+      await withTenant(wk.tenantId, async (c) => {
+        await c.query("UPDATE messages SET auto = true, meta = $2::jsonb WHERE id = $1", [
+          answerMsg.messageId,
+          JSON.stringify(suggestionMeta(suggestion, "widget")),
+        ]);
+      }).catch(() => {});
       send("done", {
         messageId: answerMsg.messageId,
         conversationId: inbound.ticketId,

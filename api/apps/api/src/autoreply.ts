@@ -611,7 +611,7 @@ async function evaluateForMessage(
 
 /** The generation stats blob attached to a drafted reply (same shape as messages.meta).
  *  Under the rule baseline model is "rule" and tokensIn/out are null (extractive). */
-function suggestionMeta(s: Suggestion, kind: string): Record<string, unknown> {
+export function suggestionMeta(s: Suggestion, kind: string): Record<string, unknown> {
   return {
     kind,
     model: s.model,
