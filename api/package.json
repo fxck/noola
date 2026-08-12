@@ -72,7 +72,8 @@
     "test:ai-wave5": "tsx apps/api/test/ai-wave5.test.ts",
     "eval": "tsx apps/api/eval/run.ts",
     "dev": "tsx watch apps/api/src/server.ts",
-    "test:env": "tsx apps/api/test/env.test.ts"
+    "test:env": "tsx apps/api/test/env.test.ts",
+    "test:discord-guild-cache": "tsx apps/api/test/discord-guild-cache.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

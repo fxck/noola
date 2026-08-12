@@ -46,7 +46,19 @@ export interface MirrorFile {
   data: Buffer;
 }
 
+/** A guild's Settings-picker lists, read straight from the gateway in-memory cache. */
+export interface GuildSnapshot {
+  forums: { id: string; name: string }[];
+  textChannels: { id: string; name: string }[];
+  roles: { id: string; name: string }[];
+}
+
 export interface MirrorTransport {
+  /** Synchronous snapshot of a guild's pickers from the gateway IN-MEMORY cache (no REST fetch, so it
+   *  can never hang). null when the guild isn't cached (bot not in it, or not ready yet). Feeds
+   *  discord_guild_cache so Settings render from our DB instead of a live Discord call. Optional so
+   *  test fakes needn't implement it; the live transport always does. */
+  snapshotGuild?(guildId: string): GuildSnapshot | null;
   /** Forum channels the bot can see in a guild (Settings picker). */
   listForums(guildId: string): Promise<{ id: string; name: string }[]>;
   /** Roles in a guild (responder-role picker). */
@@ -138,6 +150,18 @@ function buildMirrorTransport(client: Client): MirrorTransport {
     return ch && "isThread" in ch && (ch as ThreadChannel).isThread() ? (ch as ThreadChannel) : null;
   };
   return {
+    snapshotGuild(guildId) {
+      // Pure in-memory cache read — the gateway keeps channels/roles live via events, so this is
+      // instant and CANNOT hang (unlike the *.fetch() paths below). null = guild not cached.
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) return null;
+      const channels = [...guild.channels.cache.values()];
+      return {
+        forums: channels.filter((c) => c?.type === ChannelType.GuildForum).map((c) => ({ id: c!.id, name: c!.name })),
+        textChannels: channels.filter((c) => c?.type === ChannelType.GuildText).map((c) => ({ id: c!.id, name: c!.name })),
+        roles: [...guild.roles.cache.values()].filter((r) => r.name !== "@everyone").map((r) => ({ id: r.id, name: r.name })),
+      };
+    },
     async listForums(guildId) {
       const guild = await withTimeout(client.guilds.fetch(guildId)).catch(() => null);
       if (!guild) return [];
