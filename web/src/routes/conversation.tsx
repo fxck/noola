@@ -18,7 +18,7 @@ const routeApi = getRouteApi("/tickets/$ticketId");
 export function ConversationPage() {
   const { ticketId } = routeApi.useParams();
   const navigate = useNavigate();
-  const { subscribe } = useRealtime();
+  const { subscribe, resyncEpoch } = useRealtime();
 
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [users, setUsers] = useState<AgentUser[]>([]);
@@ -66,6 +66,16 @@ export function ConversationPage() {
     return unsubscribe;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subscribe]);
+
+  // Reconnect catch-up: events that touched this ticket while the socket was down never reached the
+  // subscription above, so refetch the thread when the socket recovers (resyncEpoch bumps).
+  useEffect(() => {
+    if (resyncEpoch > 0) {
+      setRtSignal((n) => n + 1);
+      reload();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resyncEpoch]);
 
   if (loading) {
     return (
