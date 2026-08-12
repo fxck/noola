@@ -339,6 +339,20 @@ async function main() {
     await removeAgentChannelIdentity(A, seatId, "discord");
     if (prevMark.rowCount) await upsertAgentChannelIdentity(A, seatId, prevMark.rows[0].external_id as string);
     await sleep(300); // let close-event automations settle before cleanup
+
+    // 🚫 spam triage — the reaction path must reach markConversationSpam. Regression guard for the
+    // 0112 backfill of no_entry_sign->spam onto tenants seeded before it was a built-in default:
+    // without the mapping the reaction resolved to `unmapped_emoji` and was silently dropped.
+    check("tenant reaction map carries the spam default (0112 backfill)", liveMap["no_entry_sign"] === "spam");
+    if (liveMap["no_entry_sign"] === "spam") {
+      calls.length = 0;
+      const spamRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "🚫", reactorRoleIds: [ROLE] });
+      check("🚫 triages spam", spamRes.action === "spam" && !spamRes.reason);
+      const spammed = await withTenant(A, (c) => c.query("SELECT spam_at FROM tickets WHERE id = $1", [t1]));
+      check("🚫 marked the ticket spam", spammed.rows[0].spam_at !== null);
+      check("🆗 confirmation react on spam", calls.some((c) => c.fn === "react" && c.args[2] === "🆗"));
+      await unmarkConversationSpam(A, t1); // restore so the downstream direct-hook spam checks start clean
+    }
   }
 
   // ── spam → Discord: a spammed conversation gets a notice + archive; restore reopens ────────
