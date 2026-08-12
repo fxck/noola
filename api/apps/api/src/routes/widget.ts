@@ -189,6 +189,8 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
       // Attachments are stored just below (post-ingest); defer the Discord mirror so it waits for them.
       deferMirror: files.length > 0,
+      // Idempotency: a retried turn (same token) is collapsed to one visitor message, not duplicated.
+      idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
     });
 
     // Store + claim any inline files onto the persisted message (first-class attachments the agent
@@ -291,6 +293,9 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       externalChannelId: conversationId ?? null,
       subject: text.slice(0, 80),
       identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
+      // Idempotency: persist-before-stream means a mid-stream failure + retry could double the ask;
+      // the same token collapses it to one message.
+      idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
     });
     if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
 

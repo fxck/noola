@@ -95,6 +95,9 @@ export function Composer({
   const { removeItem, refetch: refetchQueue } = useQueue();
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
+  // Synchronous in-flight latch. `sending` is React state — set async — so two fast ⌘↵ presses both
+  // read it as false and fire two sends. This ref flips before any await, closing that window.
+  const sendingRef = useRef(false);
   const [note, setNote] = useState<{ kind: "ok" | "warn"; text: string } | null>(null);
   // Reply vs internal note. In "note" mode, Send saves an agent-only note (no dispatch).
   const [mode, setMode] = useState<"reply" | "note">("reply");
@@ -347,60 +350,68 @@ export function Composer({
 
   async function send() {
     const text = body.trim();
-    if (!text || sending || queueBusy) return;
-    // Internal note mode: save an agent-only note (never dispatched to a channel).
-    if (mode === "note") {
+    if (!text || sending || queueBusy || sendingRef.current) return;
+    sendingRef.current = true;
+    try {
+      // Internal note mode: save an agent-only note (never dispatched to a channel).
+      if (mode === "note") {
+        setSending(true);
+        setNote(null);
+        try {
+          await addNote(ticket.id, text, mentionIds);
+          setBody("");
+          setMentionIds([]);
+          setNoteReset((n) => n + 1);
+          if (typingTimer.current) clearTimeout(typingTimer.current);
+          markTyping(false);
+          onNoteAdded();
+        } catch {
+          setNote({ kind: "warn", text: "Couldn't save the note — please try again." });
+        } finally {
+          setSending(false);
+        }
+        return;
+      }
+      // If we're editing a pending queue draft, deliver it through the queue so the
+      // approval item resolves (rather than posting a duplicate reply).
+      if (editingPending && pending && pending.id === editingPending) {
+        await sendPending(pending, text);
+        return;
+      }
       setSending(true);
       setNote(null);
+      // One idempotency token per accepted send. A transport-level retry of this request reuses it, so
+      // the server stores the message — and dispatches the external channel send — exactly once.
+      const clientMessageId = crypto.randomUUID();
       try {
-        await addNote(ticket.id, text, mentionIds);
+        const emailCc = activeChannel === "email" ? cc : undefined;
+        const { delivered } = await sendReply(ticket.id, text, attachments.map((a) => a.id), activeChannel, emailCc, clientMessageId);
         setBody("");
-        setMentionIds([]);
-        setNoteReset((n) => n + 1);
+        setReplyReset((n) => n + 1);
+        setAttachments([]);
+        clearPreviews();
+        setCitations(null);
+        setCopilotNote(null);
+        setSug(null);
         if (typingTimer.current) clearTimeout(typingTimer.current);
         markTyping(false);
-        onNoteAdded();
+        onSent();
+        onMutated();
+        if (isDiscord) {
+          setNote(
+            delivered
+              ? { kind: "ok", text: "Sent — delivered to Discord." }
+              : { kind: "warn", text: "Saved, but Discord delivery failed." },
+          );
+        }
+        replyRef.current?.focus();
       } catch {
-        setNote({ kind: "warn", text: "Couldn't save the note — please try again." });
+        setNote({ kind: "warn", text: "Couldn't send — please try again." });
       } finally {
         setSending(false);
       }
-      return;
-    }
-    // If we're editing a pending queue draft, deliver it through the queue so the
-    // approval item resolves (rather than posting a duplicate reply).
-    if (editingPending && pending && pending.id === editingPending) {
-      await sendPending(pending, text);
-      return;
-    }
-    setSending(true);
-    setNote(null);
-    try {
-      const emailCc = activeChannel === "email" ? cc : undefined;
-      const { delivered } = await sendReply(ticket.id, text, attachments.map((a) => a.id), activeChannel, emailCc);
-      setBody("");
-      setReplyReset((n) => n + 1);
-      setAttachments([]);
-      clearPreviews();
-      setCitations(null);
-      setCopilotNote(null);
-      setSug(null);
-      if (typingTimer.current) clearTimeout(typingTimer.current);
-      markTyping(false);
-      onSent();
-      onMutated();
-      if (isDiscord) {
-        setNote(
-          delivered
-            ? { kind: "ok", text: "Sent — delivered to Discord." }
-            : { kind: "warn", text: "Saved, but Discord delivery failed." },
-        );
-      }
-      replyRef.current?.focus();
-    } catch {
-      setNote({ kind: "warn", text: "Couldn't send — please try again." });
     } finally {
-      setSending(false);
+      sendingRef.current = false;
     }
   }
 

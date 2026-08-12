@@ -407,7 +407,17 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       ticketId: id,
       authorId: req.session?.userId ?? null,
       channelOverride: parsed.data.channel ?? null,
+      // Idempotency: a client-supplied token collapses a double-submit / transport retry to one message.
+      idempotencyKey: parsed.data.clientMessageId ? `reply:${parsed.data.clientMessageId}` : null,
     });
+
+    // Replay: this exact send already landed on a prior request (double ⌘↵, retry). The message exists
+    // and was fully handled the first time — return it WITHOUT muting the assistant, claiming
+    // attachments, or dispatching to the channel again. Re-dispatching is the duplicate external send
+    // this guard exists to prevent.
+    if (result.replay) {
+      return reply.code(200).send({ ticketId: result.ticketId, messageId: result.messageId, delivered: true, replay: true });
+    }
 
     // A human agent stepped in — stand the assistant down on this ticket so ambient autoreply doesn't
     // talk over the human on the customer's next message (the human owns the thread until the AI is

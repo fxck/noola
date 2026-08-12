@@ -284,6 +284,7 @@ export async function sendReply(
   attachmentIds?: string[],
   channel?: string,
   cc?: string[],
+  clientMessageId?: string,
 ): Promise<{ delivered: boolean }> {
   return api<{ ticketId: string; messageId: string; delivered: boolean }>(
     `/tickets/${ticketId}/reply`,
@@ -294,6 +295,7 @@ export async function sendReply(
         ...(attachmentIds?.length ? { attachmentIds } : {}),
         ...(channel ? { channel } : {}),
         ...(cc?.length ? { cc } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
       }),
     },
   );

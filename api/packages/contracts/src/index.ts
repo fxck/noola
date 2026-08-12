@@ -92,6 +92,10 @@ export const ReplyInput = z.object({
   channel: z.string().min(1).max(40).optional(),
   /** Email replies only: carbon-copy these addresses (reply-all). Other channels ignore it. */
   cc: z.array(z.email()).max(10).optional(),
+  /** Client-generated idempotency token for THIS send attempt. The client reuses the same token when
+   *  it retries the same send (double-submit, transport retry) so the server collapses the duplicate
+   *  instead of storing + dispatching the reply — and the external channel send — twice. */
+  clientMessageId: z.string().min(1).max(128).optional(),
 });
 export type ReplyInput = z.infer<typeof ReplyInput>;
 
@@ -836,6 +840,10 @@ export const PublicAskInput = z.object({
   // is linked to the real contact (when verifyIdentity is on).
   userHash: z.string().trim().min(1).max(128).optional(),
   userJwt: z.string().trim().min(1).max(8192).optional(),
+  /** Client-generated idempotency token for this send. Reused across a transport retry of the same
+   *  turn so the visitor's message is persisted once, not duplicated (the widget persists BEFORE it
+   *  streams, so a mid-stream failure + retry could otherwise double the message). */
+  clientMessageId: z.string().min(1).max(128).optional(),
 });
 export type PublicAskInput = z.infer<typeof PublicAskInput>;
 
