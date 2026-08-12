@@ -489,6 +489,21 @@ function droppedNote(dropped: number): string {
   return dropped ? `\n_(${dropped} attachment${dropped > 1 ? "s" : ""} too large to mirror)_` : "";
 }
 
+/** A thin rule prepended to each relayed message so consecutive posts don't merge into one wall. */
+const MIRROR_DIVIDER = "──────────";
+
+/** Render a relayed message body as a Discord blockquote: every line (blanks included, to preserve
+ *  paragraph spacing inside the quote) gets a "> " prefix, so the body reads as one visually-bracketed
+ *  block under its author header instead of flowing straight into the next message. Kept under a tight
+ *  budget because the "> " prefixes + header + divider must all fit Discord's 2000-char message cap. */
+function quoteBlock(body: string): string {
+  return body
+    .slice(0, 1700)
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
 export async function relayTicketMessage(tenantId: string, ticketId: string, messageId: string): Promise<void> {
   const mirror = await getTicketMirror(tenantId, ticketId);
   if (!mirror) return;
@@ -512,7 +527,7 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
   // Mirror the message's attachments (customer screenshots, agent-attached files) into the thread as
   // real Discord uploads, not just text — closing the inbound-only asymmetry.
   const { files, dropped } = await loadMirrorFiles(tenantId, messageId);
-  const posted = await tp.postToThread(mirror.post_thread_id, `${label}\n${mdToDiscord(row.body).slice(0, 1800)}${droppedNote(dropped)}`, files)
+  const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(row.body))}${droppedNote(dropped)}`, files)
     .catch((e) => { console.warn(`[discord-mirror] relay postToThread threw (ticket ${ticketId}, thread ${mirror.post_thread_id}): ${(e as Error)?.message ?? String(e)}`); return false; });
   if (!posted) console.warn(`[discord-mirror] relay could not reach thread ${mirror.post_thread_id} (ticket ${ticketId}) — thread deleted or the bot lacks access/permission`);
   await syncMirrorState(tenantId, ticketId).catch(() => {});
@@ -536,7 +551,7 @@ export async function relayNoteToMirror(
   const name = note.authorName?.trim() || "Agent";
   const label = `📝 **${name}** _(internal note)_:`;
   await tp
-    .postToThread(mirror.post_thread_id, `${label}\n${mdToDiscord(note.body).slice(0, 1800)}`)
+    .postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(note.body))}`)
     .catch((e) => console.warn(`[discord-mirror] note relay threw (ticket ${ticketId}): ${(e as Error)?.message ?? String(e)}`));
 }
 
