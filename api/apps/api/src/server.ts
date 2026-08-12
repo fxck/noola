@@ -13,6 +13,7 @@ import { ensureTicketsCollection, reindexAllTickets, ensureKbCollection, reindex
 import { ensureThreadsCollection, reindexAllThreads } from "./threads.js";
 import { ensureVectorCollections, reindexAllVectors } from "./vector.js";
 import { startDiscord } from "./discord-gateway.js";
+import { syncDiscordGuildSnapshots } from "./discord-guild-cache.js";
 import { backfillSeedFlows } from "./seedflows.js";
 import { runScheduledAutomations } from "./automations.js";
 import { detectSlaBreaches } from "./sla.js";
@@ -452,6 +453,11 @@ setInterval(() => void detectSlaBreaches(app.log), 60_000);
 // elapsed (across all tenants), so a docs URL / repo stays live in the KB. Overlap-guarded; a
 // per-source failure never stops the sweep; no-op when no source has a refresh interval set.
 setInterval(() => void runScheduledSourceRefresh(app.log), 60_000);
+// Project the bot's gateway cache of each guild's forums/roles/channels into discord_guild_cache, so
+// the Discord Settings pages render from our DB (instant, outage-proof) instead of a live fetch. One
+// warm-up pass after the gateway settles, then a steady refresh.
+setTimeout(() => void syncDiscordGuildSnapshots(app.log), 20_000);
+setInterval(() => void syncDiscordGuildSnapshots(app.log), 60_000);
 // Snooze wake: every minute, resurface snoozed tickets whose wake time has passed (clear the flag,
 // flip whose_turn to 'us'). Cross-tenant; overlap-guarded; no-op when nothing is due.
 setInterval(() => void wakeSnoozedTickets(app.log), 60_000);

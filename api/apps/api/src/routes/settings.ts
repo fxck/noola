@@ -51,6 +51,7 @@ import { getTagConfig, replaceTagConfig } from "../tagrules.js";
 import { getClassificationConfig, replaceClassificationConfig } from "../classification.js";
 import { listMirrorBindings, replaceMirrorBindings, backfillMirrors } from "../discord-mirror.js";
 import { getMirrorTransport } from "../discord-gateway.js";
+import { resolveGuildSnapshots } from "../discord-guild-cache.js";
 import { relayPool } from "@repo/db";
 import { BUILTIN_RISK_TAGS } from "../model.js";
 import { channelCatalog } from "../channels/registry.js";
@@ -129,16 +130,15 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
       relayPool.query("SELECT guild_id FROM discord_links WHERE tenant_id = $1", [tenantId]),
     ]);
     const tp = getMirrorTransport();
-    const guilds = await Promise.all(
-      (links.rows as { guild_id: string }[]).map(async ({ guild_id }) => {
-        // Concurrent, and each transport call is timeout-bounded (discord-gateway) — a degraded bot
-        // degrades to empty lists fast instead of hanging the request into a 504.
-        const [forums, roles] = tp
-          ? await Promise.all([tp.listForums(guild_id).catch(() => []), tp.listRoles(guild_id).catch(() => [])])
-          : [[], []];
-        return { id: guild_id, forums, roles };
-      }),
-    );
+    // Pickers come from OUR cache (discord_guild_cache), never a live Discord fetch — so this endpoint
+    // can't 504 and it renders last-known lists even if the bot is down. Tier 1 fills a cold miss from
+    // the gateway in-memory cache (sync, no hang); the background sync keeps it fresh.
+    const guildIds = (links.rows as { guild_id: string }[]).map((r) => r.guild_id);
+    const snaps = await resolveGuildSnapshots(guildIds, tp);
+    const guilds = guildIds.map((id) => {
+      const s = snaps.get(id);
+      return { id, forums: s?.forums ?? [], roles: s?.roles ?? [] };
+    });
     return { bindings, guilds, botOnline: !!tp };
   }));
 
@@ -162,36 +162,27 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
       relayPool.query("SELECT guild_id, team_role_ids FROM discord_links WHERE tenant_id = $1", [tenantId]),
     ]);
     const tp = getMirrorTransport();
-    const guilds = await Promise.all(
-      (links.rows as { guild_id: string; team_role_ids: unknown }[]).map(async ({ guild_id, team_role_ids }) => {
-        // All transport calls concurrent + timeout-bounded (discord-gateway) so a degraded bot
-        // degrades to empty lists fast instead of hanging the request into a 504.
-        let roles: { id: string; name: string }[] = [];
-        let channels: Array<{ id: string; name: string; kind: "text" | "forum" }> = [];
-        if (tp) {
-          [roles, channels] = await Promise.all([
-            tp.listRoles(guild_id).catch(() => []),
-            // Text channels AND forums — a forum binding = community-forum intake (each post is
-            // its own ticket via the thread=ticket path; the post author is the customer).
-            Promise.all([
-              tp.listTextChannels(guild_id).catch(() => []),
-              tp.listForums(guild_id).catch(() => []),
-            ]).then(([text, forums]) => [
-              ...text.map((c) => ({ ...c, kind: "text" as const })),
-              ...forums.map((c) => ({ ...c, kind: "forum" as const })),
-            ]),
-          ]);
-        }
-        return {
-          id: guild_id,
-          // Identity classification: members with these roles are the tenant's own team — their
-          // messages never mint tickets / never count as customers (the §9 seam, now UI-editable).
-          teamRoleIds: Array.isArray(team_role_ids) ? (team_role_ids as string[]) : [],
-          roles,
-          channels,
-        };
-      }),
-    );
+    // Pickers from OUR cache (discord_guild_cache), never a live fetch — can't 504, survives a bot
+    // outage. Tier 1 fills a cold miss from the gateway cache (sync); the background sync keeps fresh.
+    const links2 = links.rows as { guild_id: string; team_role_ids: unknown }[];
+    const snaps = await resolveGuildSnapshots(links2.map((r) => r.guild_id), tp);
+    const guilds = links2.map(({ guild_id, team_role_ids }) => {
+      const s = snaps.get(guild_id);
+      // Text channels AND forums — a forum binding = community-forum intake (each post is its own
+      // ticket via the thread=ticket path; the post author is the customer).
+      const channels = [
+        ...(s?.textChannels ?? []).map((c) => ({ ...c, kind: "text" as const })),
+        ...(s?.forums ?? []).map((c) => ({ ...c, kind: "forum" as const })),
+      ];
+      return {
+        id: guild_id,
+        // Identity classification: members with these roles are the tenant's own team — their
+        // messages never mint tickets / never count as customers (the §9 seam, now UI-editable).
+        teamRoleIds: Array.isArray(team_role_ids) ? (team_role_ids as string[]) : [],
+        roles: s?.roles ?? [],
+        channels,
+      };
+    });
     const byChannel = new Map(accounts.map((a) => [`${a.guild_id}:${a.channel_id}`, a]));
     return {
       bindings: bindings.map((b) => ({
