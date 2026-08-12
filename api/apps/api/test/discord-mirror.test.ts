@@ -189,6 +189,9 @@ async function main() {
   });
   await relayTicketMessage(A, t1, agentMsg.messageId);
   check("console agent reply relayed as sent-to-customer", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("reply sent to customer") && String(c.args[1]).includes("MIRTEST console agent reply")));
+  // Readability: the relayed body is blockquoted (each line "> "-prefixed) and preceded by a divider,
+  // so consecutive mirrored messages read as distinct blocks instead of one wall of text.
+  check("relayed body is blockquoted + divided", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("──────────") && String(c.args[1]).includes("> MIRTEST console agent reply")));
 
   // ── D2b: a message's attachments are uploaded into the thread, not dropped ───
   // deferMirror mimics the real callers (widget/email): the mirror relay waits until attachments are
