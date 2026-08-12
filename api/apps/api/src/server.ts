@@ -335,25 +335,39 @@ async function initNats(): Promise<void> {
   }
 }
 
-/** Single-writer outbox drainer: publish committed events, mark published. */
+/** Single-writer outbox drainer: publish committed events, mark published.
+ *
+ * Single-flight: the 500ms interval must NOT start a new drain while the previous one is still
+ * running. A drain holds one of relayPool's (few) connections across a per-row `js.publish` to NATS
+ * inside the transaction — so if NATS slows or a backlog builds, an unguarded interval stacks
+ * overlapping drains that each grab a connection until the pool is EXHAUSTED, and then every other
+ * relayPool.query() in the app (discord settings, api keys, email routing, …) blocks forever waiting
+ * for a connection. `SKIP LOCKED` prevents double-publish but not connection exhaustion — this flag is
+ * what bounds concurrency to one. */
+let draining = false;
 async function drainOutbox(): Promise<void> {
-  if (!js) return;
-  const c = await relayPool.connect();
+  if (!js || draining) return;
+  draining = true;
   try {
-    await c.query("BEGIN");
-    const rows = await c.query(
-      "SELECT id, subject, payload FROM outbox WHERE published_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 100",
-    );
-    for (const row of rows.rows) {
-      await js.publish(row.subject, sc.encode(JSON.stringify(row.payload)));
-      await c.query("UPDATE outbox SET published_at = now() WHERE id = $1", [row.id]);
+    const c = await relayPool.connect();
+    try {
+      await c.query("BEGIN");
+      const rows = await c.query(
+        "SELECT id, subject, payload FROM outbox WHERE published_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 100",
+      );
+      for (const row of rows.rows) {
+        await js.publish(row.subject, sc.encode(JSON.stringify(row.payload)));
+        await c.query("UPDATE outbox SET published_at = now() WHERE id = $1", [row.id]);
+      }
+      await c.query("COMMIT");
+    } catch (err) {
+      await c.query("ROLLBACK").catch(() => {});
+      app.log.error({ err }, "outbox drain failed");
+    } finally {
+      c.release();
     }
-    await c.query("COMMIT");
-  } catch (err) {
-    await c.query("ROLLBACK").catch(() => {});
-    app.log.error({ err }, "outbox drain failed");
   } finally {
-    c.release();
+    draining = false;
   }
 }
 
