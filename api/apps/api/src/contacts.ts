@@ -31,6 +31,17 @@ export interface ContactRow {
   last_seen_at?: string | null;
   /** Derived (list/get only): last_seen_at within the online window (3 min). */
   online?: boolean;
+  /** Derived (list/get only): the contact's company memberships (0111 junction), primary first.
+   *  The primary mirrors the legacy company_id/company columns; the rest are extra accounts. */
+  companies?: ContactCompany[];
+}
+
+/** One company a contact belongs to (0111 many-to-many). `is_primary` marks the account that
+ *  keeps the denormalized contacts.company_id / contacts.company columns in sync. */
+export interface ContactCompany {
+  id: string;
+  name: string;
+  is_primary: boolean;
 }
 
 /** A partial patch for a contact — the fields a caller may set. Undefined = leave alone;
@@ -41,6 +52,10 @@ export interface ContactInputShape {
   name?: string;
   company?: string;
   company_id?: string | null;
+  /** Many-to-many company membership (0111). ORDERED — first = primary. When defined it REPLACES
+   *  the contact's full company set (overriding company/company_id, which are derived from the
+   *  primary); [] clears all. Left undefined = leave memberships untouched. */
+  company_ids?: string[];
   attributes?: Record<string, unknown>;
   /** Semantic fields the CSV importer maps onto real columns (Intercom parity). All optional;
    *  written by upsertOne only, and only when provided (COALESCE keeps the stored value otherwise). */
@@ -77,7 +92,14 @@ const DERIVED_COLS = `${COLS}, last_seen_at,
   (coalesce(name,'') <> '' OR coalesce(email,'') <> '') AS identified,
   (SELECT ci.channel_type FROM contact_identities ci WHERE ci.contact_id = contacts.id
     ORDER BY ci.created_at ASC LIMIT 1) AS primary_channel,
-  (last_seen_at IS NOT NULL AND last_seen_at > now() - interval '3 minutes') AS online`;
+  (last_seen_at IS NOT NULL AND last_seen_at > now() - interval '3 minutes') AS online,
+  COALESCE((
+    SELECT json_agg(json_build_object('id', co.id, 'name', co.name, 'is_primary', cc.is_primary)
+             ORDER BY cc.is_primary DESC, co.name ASC)
+      FROM contact_companies cc
+      JOIN companies co ON co.tenant_id = cc.tenant_id AND co.id = cc.company_id
+     WHERE cc.contact_id = contacts.id
+  ), '[]'::json) AS companies`;
 
 // Whitelisted sortable/filterable core columns → safe SQL identifiers. Field names can't be
 // parameterized, so ONLY these literal identifiers ever reach the query; anything else is an
@@ -372,6 +394,70 @@ export async function bumpContactSeen(tenantId: string, contactId: string): Prom
   }).catch(() => {}); // presence is best-effort — never fail the request over it
 }
 
+// ── Company membership (0111 many-to-many) ───────────────────────────────────
+// The contact_companies junction is the source of truth for "which companies a contact belongs
+// to"; contacts.company_id / contacts.company stay pinned to the PRIMARY membership so the
+// account rollups, directory filters, and company-detail contact lists keep reading them
+// unchanged. Both writers below run on a withTenant client (RLS-scoped, current_tenant()).
+
+/**
+ * Authoritatively rewrite a contact's full company set. `companyIds` is ORDERED — the first is
+ * the primary. Unknown / cross-tenant ids are dropped (RLS scopes the lookup). Passing [] clears
+ * every membership. Returns the primary id + its name so the caller can pin the denormalized
+ * contacts.company_id / contacts.company columns.
+ *
+ * The one-primary-per-contact partial unique index (contact_companies_primary_uq) forbids two
+ * live primaries even transiently, so we upsert every row as NON-primary first (clearing any
+ * stale primary), then promote exactly one — never two rows carry is_primary=true at once.
+ */
+async function setContactCompanies(
+  c: PoolClient,
+  contactId: string,
+  companyIds: string[],
+): Promise<{ primaryId: string | null; primaryName: string }> {
+  const ids = [...new Set(companyIds.filter((x): x is string => typeof x === "string" && x.length > 0))];
+  const found = ids.length
+    ? ((await c.query(`SELECT id, name FROM companies WHERE id = ANY($1::uuid[])`, [ids])).rows as { id: string; name: string }[])
+    : [];
+  const nameById = new Map(found.map((r) => [r.id, r.name]));
+  const validIds = ids.filter((id) => nameById.has(id)); // preserve order, drop unknown/cross-tenant
+
+  // Drop memberships no longer present.
+  if (validIds.length) {
+    await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND NOT (company_id = ANY($2::uuid[]))`, [contactId, validIds]);
+  } else {
+    await c.query(`DELETE FROM contact_companies WHERE contact_id = $1`, [contactId]);
+  }
+  // Upsert every membership as non-primary (also demotes a previously-primary row that's staying).
+  for (const id of validIds) {
+    await c.query(
+      `INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary)
+       VALUES (current_tenant(), $1, $2, false)
+       ON CONFLICT (tenant_id, contact_id, company_id) DO UPDATE SET is_primary = false`,
+      [contactId, id],
+    );
+  }
+  const primaryId = validIds[0] ?? null;
+  if (primaryId) {
+    await c.query(`UPDATE contact_companies SET is_primary = true WHERE contact_id = $1 AND company_id = $2`, [contactId, primaryId]);
+  }
+  return { primaryId, primaryName: primaryId ? (nameById.get(primaryId) ?? "") : "" };
+}
+
+/** Mirror a legacy single-company change (import / upsert / merge set contacts.company_id
+ *  directly) into the junction so the membership set never drifts from the denormalized column:
+ *  demote any current primary, then upsert this company as the primary. Additive — other
+ *  memberships are left in place. */
+async function ensurePrimaryCompany(c: PoolClient, contactId: string, companyId: string): Promise<void> {
+  await c.query(`UPDATE contact_companies SET is_primary = false WHERE contact_id = $1 AND is_primary`, [contactId]);
+  await c.query(
+    `INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary)
+     VALUES (current_tenant(), $1, $2, true)
+     ON CONFLICT (tenant_id, contact_id, company_id) DO UPDATE SET is_primary = true`,
+    [contactId, companyId],
+  );
+}
+
 /** Plain insert (no conflict handling — use upsertContact for idempotent sync). Throws
  *  a pg 23505 if external_id / email already exists for the tenant. */
 export async function createContact(tenantId: string, input: ContactInputShape): Promise<ContactRow> {
@@ -379,10 +465,20 @@ export async function createContact(tenantId: string, input: ContactInputShape):
     const r = await c.query(
       `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes)
        VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb))
-       RETURNING ${COLS}`,
+       RETURNING id`,
       [input.external_id ?? null, input.email ?? null, input.name ?? null, input.company ?? null, input.company_id ?? null, jsonOrNull(input.attributes)],
     );
-    return r.rows[0] as ContactRow;
+    const id = r.rows[0].id as string;
+    if (input.company_ids !== undefined) {
+      // The membership set is authoritative — pin the denormalized columns to the primary.
+      const { primaryId, primaryName } = await setContactCompanies(c, id, input.company_ids);
+      await c.query(`UPDATE contacts SET company_id = $2, company = $3 WHERE id = $1`, [id, primaryId, primaryName]);
+    } else if (input.company_id) {
+      // Legacy single-company create → keep the junction consistent.
+      await ensurePrimaryCompany(c, id, input.company_id);
+    }
+    const sel = await c.query(`SELECT ${DERIVED_COLS} FROM contacts WHERE id = $1`, [id]);
+    return sel.rows[0] as ContactRow;
   });
   fireWebhook(tenantId, "contact.created", contact);
   return contact;
@@ -396,6 +492,9 @@ export async function updateContact(
   id: string,
   input: ContactInputShape,
 ): Promise<ContactRow | null> {
+  // company_ids (the many-to-many set) is authoritative when present: it drives the primary and
+  // the denormalized company/company_id columns, so the legacy scalar path is skipped for those.
+  const manageSet = input.company_ids !== undefined;
   const sets: string[] = [];
   const params: unknown[] = [id];
   const set = (col: string, val: unknown): void => {
@@ -405,20 +504,33 @@ export async function updateContact(
   if (input.external_id !== undefined) set("external_id", input.external_id);
   if (input.email !== undefined) set("email", input.email);
   if (input.name !== undefined) set("name", input.name);
-  if (input.company !== undefined) set("company", input.company);
-  if (input.company_id !== undefined) set("company_id", input.company_id);
+  if (!manageSet && input.company !== undefined) set("company", input.company);
+  if (!manageSet && input.company_id !== undefined) set("company_id", input.company_id);
   if (input.attributes !== undefined) {
     params.push(JSON.stringify(input.attributes));
     sets.push(`attributes = $${params.length}::jsonb`);
   }
-  if (!sets.length) return getContact(tenantId, id); // nothing to change
-  sets.push("updated_at = now()");
+
   const contact = await withTenant(tenantId, async (c) => {
-    const r = await c.query(
-      `UPDATE contacts SET ${sets.join(", ")} WHERE id = $1 RETURNING ${COLS}`,
-      params,
-    );
-    return r.rowCount ? (r.rows[0] as ContactRow) : null;
+    const exists = await c.query(`SELECT 1 FROM contacts WHERE id = $1`, [id]);
+    if (!exists.rowCount) return null;
+
+    if (sets.length) {
+      sets.push("updated_at = now()");
+      await c.query(`UPDATE contacts SET ${sets.join(", ")} WHERE id = $1`, params);
+    }
+
+    if (manageSet) {
+      const { primaryId, primaryName } = await setContactCompanies(c, id, input.company_ids ?? []);
+      await c.query(`UPDATE contacts SET company_id = $2, company = $3, updated_at = now() WHERE id = $1`, [id, primaryId, primaryName]);
+    } else if (input.company_id !== undefined) {
+      // Legacy single-company change → keep the junction primary in step with the column.
+      if (input.company_id) await ensurePrimaryCompany(c, id, input.company_id);
+      else await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [id]);
+    }
+
+    const sel = await c.query(`SELECT ${DERIVED_COLS} FROM contacts WHERE id = $1`, [id]);
+    return sel.rows[0] as ContactRow;
   });
   if (contact) fireWebhook(tenantId, "contact.updated", contact);
   return contact;
@@ -554,6 +666,7 @@ async function upsertOne(
        WHERE id = $1`,
       [id, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, email, ext, created],
     );
+    await syncUpsertCompanies(c, id, input, cid);
     return { id, created: false };
   }
 
@@ -563,7 +676,26 @@ async function upsertOne(
      RETURNING id`,
     [ext, email, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, created],
   );
-  return { id: ins.rows[0].id as string, created: true };
+  const newId = ins.rows[0].id as string;
+  await syncUpsertCompanies(c, newId, input, cid);
+  return { id: newId, created: true };
+}
+
+/** Keep the junction consistent on the back-office upsert path: an explicit company_ids set is
+ *  authoritative (and re-pins the primary column); otherwise a single company_id COALESCE'd above
+ *  is mirrored as the primary membership. */
+async function syncUpsertCompanies(
+  c: PoolClient,
+  contactId: string,
+  input: ContactInputShape,
+  cid: string | null,
+): Promise<void> {
+  if (input.company_ids !== undefined) {
+    const { primaryId, primaryName } = await setContactCompanies(c, contactId, input.company_ids);
+    await c.query(`UPDATE contacts SET company_id = $2, company = $3 WHERE id = $1`, [contactId, primaryId, primaryName]);
+  } else if (cid) {
+    await ensurePrimaryCompany(c, contactId, cid);
+  }
 }
 
 // ── Cross-channel identity resolution (omnichannel) ──────────────────────────
@@ -832,19 +964,33 @@ export async function mergeContacts(
                AND lower(k.external_id) = lower(ci.external_id))`,
       [keepId, dropId],
     );
-    // Delete the duplicate (cascading its leftover identities) so a unique email/external_id it holds
-    // can't collide with the kept contact's fill-in (both live under the same tenant partial indexes).
+    // Re-home the dropped contact's company memberships (0111) onto the kept contact — union of both
+    // accounts. Move as NON-primary (the kept contact's primary wins; ensurePrimaryCompany reconciles
+    // below); rows that already exist on the kept side cascade-delete with the dropped contact.
+    await c.query(
+      `UPDATE contact_companies cc SET contact_id = $1, is_primary = false
+        WHERE cc.contact_id = $2
+          AND NOT EXISTS (
+            SELECT 1 FROM contact_companies k
+             WHERE k.tenant_id = cc.tenant_id AND k.contact_id = $1 AND k.company_id = cc.company_id)`,
+      [keepId, dropId],
+    );
+    // Delete the duplicate (cascading its leftover identities + company memberships) so a unique
+    // email/external_id it holds can't collide with the kept contact's fill-in.
     await c.query("DELETE FROM contacts WHERE id = $1", [dropId]);
-    const r = await c.query(
+    await c.query(
       `UPDATE contacts
           SET name = $2, company = $3, company_id = $4, email = $5, external_id = $6,
               attributes = $7::jsonb, unsubscribed_at = $8::timestamptz, avatar_url = $9,
               last_seen_at = $10::timestamptz, updated_at = now()
-        WHERE id = $1
-        RETURNING ${COLS}`,
+        WHERE id = $1`,
       [keepId, mergedName, mergedCompany, mergedCompanyId, mergedEmail, mergedExternal,
        JSON.stringify(mergedAttrs), mergedUnsub, mergedAvatar, mergedSeen],
     );
-    return r.rowCount ? (r.rows[0] as ContactRow) : null;
+    // Pin the junction primary to the merged company (or clear it when neither side had one).
+    if (mergedCompanyId) await ensurePrimaryCompany(c, keepId, mergedCompanyId);
+    else await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [keepId]);
+    const sel = await c.query(`SELECT ${DERIVED_COLS} FROM contacts WHERE id = $1`, [keepId]);
+    return sel.rowCount ? (sel.rows[0] as ContactRow) : null;
   });
 }

@@ -171,9 +171,27 @@ const COLUMNS: ColumnDef<Contact>[] = [
     accessorKey: "company",
     header: "Company",
     meta: { label: "Company" },
-    cell: ({ getValue }) => {
-      const v = getValue() as string;
-      return v ? <span className="block max-w-[14rem] truncate" title={v}>{v}</span> : null;
+    // Multi-company (0111): show the primary account, with a "+N" affordance for extra memberships.
+    // Falls back to the denormalized `company` string for anonymous rows with no membership set.
+    cell: ({ row }) => {
+      const cos = row.original.companies ?? [];
+      const primary = cos.find((c) => c.is_primary) ?? cos[0];
+      const label = primary?.name || row.original.company;
+      if (!label) return null;
+      const extra = cos.length > 1 ? cos.length - 1 : 0;
+      return (
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="block max-w-[12rem] truncate" title={label}>{label}</span>
+          {extra > 0 && (
+            <span
+              className="shrink-0 rounded bg-muted px-1 text-micro text-muted-foreground"
+              title={cos.map((c) => c.name).join(", ")}
+            >
+              +{extra}
+            </span>
+          )}
+        </div>
+      );
     },
   },
   {

@@ -12,7 +12,11 @@ export interface Contact {
   external_id: string | null;
   email: string | null;
   name: string;
+  /** The PRIMARY company name (denormalized). For the full set use `companies`. */
   company: string;
+  /** The contact's company memberships (0111 many-to-many), primary first. The primary mirrors
+   *  `company`/`company_id`; the rest are additional accounts. Always present from list/detail. */
+  companies?: ContactCompany[];
   /** Free-form enrichment — plan, region, seat count… Always an object (may be empty). */
   attributes: Record<string, string>;
   /** API-relative avatar path (e.g. "/avatar/<uuid>.jpg"), or null when none set. */
@@ -64,11 +68,22 @@ export interface ContactList {
   total: number;
 }
 
+/** One company a contact belongs to (0111). `is_primary` marks the account mirrored into the
+ *  denormalized `company`/`company_id` columns. */
+export interface ContactCompany {
+  id: string;
+  name: string;
+  is_primary: boolean;
+}
+
 /** Create/update payload. All optional — the server fills gaps and owns the id. */
 export interface ContactInput {
   name?: string;
   email?: string | null;
   company?: string;
+  /** Ordered company membership set (0111) — first is primary. When sent it REPLACES the full
+   *  set (and drives company/company_id); [] clears all memberships. */
+  company_ids?: string[];
   external_id?: string | null;
   attributes?: Record<string, string>;
 }

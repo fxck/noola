@@ -316,6 +316,25 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
     }
   }));
 
+  // Resolve company names → ids (get-or-create), preserving input order — the contact editor's
+  // "add a company that doesn't exist yet" primitive so a new membership doesn't need a separate
+  // create round-trip. Idempotent (keyed on lower(name) via companies_name_uq).
+  app.post("/companies/ensure", tenanted(async (tenantId, req, reply) => {
+    const names = (req.body as { names?: unknown } | undefined)?.names;
+    if (!Array.isArray(names) || names.some((n) => typeof n !== "string")) {
+      return reply.code(400).send({ error: "body must be { names: string[] }" });
+    }
+    const map = await ensureCompaniesByName(tenantId, names as string[]);
+    const seen = new Set<string>();
+    const companies: { id: string; name: string }[] = [];
+    for (const raw of names as string[]) {
+      const n = raw.trim();
+      const id = n ? map.get(n.toLowerCase()) : undefined;
+      if (id && !seen.has(id)) { seen.add(id); companies.push({ id, name: n }); }
+    }
+    return { companies };
+  }));
+
   // CSV import (Intercom migration): header-mapped company rows, keyed idempotently on lower(name).
   // Body is the raw CSV text (the SPA reads the file client-side); returns per-outcome counts. Run
   // this BEFORE the contacts import so people link to already-provisioned accounts (though the
