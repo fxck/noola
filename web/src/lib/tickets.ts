@@ -46,9 +46,12 @@ export interface Ticket {
   /** Derived server-side: the contact was seen within the 3-min online window — drives the inbox
    *  presence dot (matches the contacts list/detail). */
   contact_online?: boolean | null;
-  /** The contact's company (account) — row/rail context. Optional (older api). */
+  /** The contact's PRIMARY company (account) — row/rail context. Optional (older api). */
   company_id?: string | null;
   company_name?: string | null;
+  /** The contact's full company membership set (0111), primary first. The rail shows all; the compact
+   *  list scan-line still uses company_name (primary). Optional (older api). */
+  companies?: { id: string; name: string; is_primary: boolean }[];
   /** The team lane this ticket sits in (Teams, Wave 2), or null. Optional (older api). */
   team_id?: string | null;
   team_name?: string | null;
