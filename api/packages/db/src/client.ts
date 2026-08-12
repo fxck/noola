@@ -16,12 +16,16 @@ export const appPool = new Pool({
   max: 10,
 });
 
-/** Outbox-drainer pool — BYPASSRLS role, sees across tenants. */
+/** Cross-tenant pool — BYPASSRLS role. Started life as just the outbox drainer, but it's now the
+ *  shared pre-tenant / cross-tenant READ pool too: lookups keyed by something other than a tenant
+ *  (guild_id, email route address, api key, sla policies, …) run here before the tenant is known.
+ *  max:2 was sized for the lone drainer and is far too tight for that fan-in — a couple of concurrent
+ *  relay reads (or a slow drain) exhausted it and blocked every other relay query. Give it headroom. */
 export const relayPool = new Pool({
   ...base,
   user: process.env.RELAY_DB_USER ?? "event_relay",
   password: process.env.RELAY_DB_PASSWORD,
-  max: 2,
+  max: 8,
 });
 
 /** Identity-surface pool — the least-privilege `auth_user` role (better-auth's DB
