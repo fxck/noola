@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
+import type { PoolClient } from "pg";
 import { withTenant } from "@repo/db";
+import { EVENT_TYPES } from "@repo/contracts";
 import { publicApiBase } from "./env.js";
 
 // Broadcast engagement tracking — the open pixel and click redirect behind /t/*. Same
@@ -66,12 +68,34 @@ export function verifyTrackToken(
   return { tenantId: bytesUuid(payload.subarray(0, 16)), recipientId: bytesUuid(payload.subarray(16)) };
 }
 
-/** First-touch open. Idempotent; a click also implies an open (mail client fetched it). */
+/** Emit a broadcast-updated event on the transactional outbox so the edge relays a live UI nudge — the
+ *  broadcast detail refetches its engagement tallies. Runs INSIDE the caller's txn (atomic with the
+ *  open/click stamp), reusing the existing broadcast-updated channel the detail already listens on. */
+async function emitBroadcastEngagement(c: PoolClient, tenantId: string, broadcastId: string, status: string): Promise<void> {
+  const envelope = {
+    id: broadcastId,
+    type: EVENT_TYPES.broadcastUpdated,
+    tenantId,
+    occurredAt: new Date().toISOString(),
+    data: { broadcastId, status },
+  };
+  await c.query(
+    "INSERT INTO outbox (tenant_id, event_type, subject, payload) VALUES (current_tenant(), $1, 'noola.events.' || current_tenant(), $2::jsonb)",
+    [EVENT_TYPES.broadcastUpdated, JSON.stringify(envelope)],
+  );
+}
+
+/** First-touch open. Idempotent; a click also implies an open (mail client fetched it). Emits a live
+ *  broadcast-updated nudge ONLY on the first open — a re-loaded pixel must not spam realtime — so the
+ *  detail page's Opened tally climbs live even for a terminal (Sent) broadcast that no longer polls. */
 export async function trackOpen(tenantId: string, recipientId: string): Promise<void> {
   await withTenant(tenantId, async (c) => {
-    await c.query("UPDATE broadcast_recipients SET opened_at = COALESCE(opened_at, now()) WHERE id = $1", [
-      recipientId,
-    ]);
+    // `(opened_at = now())` is true only when THIS statement just set it (transaction_timestamp is
+    // stable in-txn) → reliable first-touch detection while keeping the idempotent COALESCE stamp.
+    const r = await c.query(
+      "UPDATE broadcast_recipients SET opened_at = COALESCE(opened_at, now()) WHERE id = $1 RETURNING broadcast_id, (opened_at = now()) AS first_open",
+      [recipientId],
+    );
     // Intercom-parity "Last opened email" on the recipient's contact (RLS scopes the join).
     await c.query(
       `UPDATE contacts
@@ -80,14 +104,19 @@ export async function trackOpen(tenantId: string, recipientId: string): Promise<
         WHERE br.id = $1 AND contacts.id = br.contact_id`,
       [recipientId],
     );
+    if (r.rowCount && r.rows[0].first_open) {
+      const b = await c.query("SELECT status FROM broadcasts WHERE id = $1", [r.rows[0].broadcast_id]);
+      if (b.rowCount) await emitBroadcastEngagement(c, tenantId, r.rows[0].broadcast_id, b.rows[0].status);
+    }
   });
 }
 
-/** First-touch click (implies open — the recipient definitely saw the mail). */
+/** First-touch click (implies open — the recipient definitely saw the mail). Emits a live nudge on the
+ *  first click, same as trackOpen. */
 export async function trackClick(tenantId: string, recipientId: string): Promise<void> {
   await withTenant(tenantId, async (c) => {
-    await c.query(
-      "UPDATE broadcast_recipients SET clicked_at = COALESCE(clicked_at, now()), opened_at = COALESCE(opened_at, now()) WHERE id = $1",
+    const r = await c.query(
+      "UPDATE broadcast_recipients SET clicked_at = COALESCE(clicked_at, now()), opened_at = COALESCE(opened_at, now()) WHERE id = $1 RETURNING broadcast_id, (clicked_at = now()) AS first_click",
       [recipientId],
     );
     // Intercom-parity "Last clicked on link in email" (+ implied open) on the contact.
@@ -99,6 +128,10 @@ export async function trackClick(tenantId: string, recipientId: string): Promise
         WHERE br.id = $1 AND contacts.id = br.contact_id`,
       [recipientId],
     );
+    if (r.rowCount && r.rows[0].first_click) {
+      const b = await c.query("SELECT status FROM broadcasts WHERE id = $1", [r.rows[0].broadcast_id]);
+      if (b.rowCount) await emitBroadcastEngagement(c, tenantId, r.rows[0].broadcast_id, b.rows[0].status);
+    }
   });
 }
 
