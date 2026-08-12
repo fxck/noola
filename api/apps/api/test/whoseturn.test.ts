@@ -99,6 +99,24 @@ async function main() {
     check("agent resolution → whose_turn = customer", t.rows[0].whose_turn === "customer");
   });
 
+  // Idempotent agent reply: two identical sends (same client token) collapse to ONE message. This is
+  // the dedup /tickets/:id/reply now relies on — a double-⌘↵ or transport retry replays instead of
+  // storing + dispatching the reply (and its external channel send) twice.
+  const idemA = await ingestInbound({
+    tenantId: A, body: "WTTEST duplicate send", authorType: "agent",
+    idempotencyKey: "reply:wttest-idem", ticketId: r.ticketId,
+  });
+  const idemB = await ingestInbound({
+    tenantId: A, body: "WTTEST duplicate send", authorType: "agent",
+    idempotencyKey: "reply:wttest-idem", ticketId: r.ticketId,
+  });
+  check("duplicate agent reply (same key) → second is a replay", idemA.replay === false && idemB.replay === true);
+  check("duplicate agent reply → same messageId (no second message)", idemB.messageId === idemA.messageId);
+  await withTenant(A, async (c) => {
+    const n = await c.query("SELECT count(*)::int AS n FROM messages WHERE idempotency_key = $1", ["reply:wttest-idem"]);
+    check("duplicate agent reply → exactly one stored message", n.rows[0].n === 1);
+  });
+
   await clean();
   await superPool.end();
   await appPool.end();

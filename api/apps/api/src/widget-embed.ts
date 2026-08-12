@@ -1180,7 +1180,12 @@ export const WIDGET_JS = String.raw`(function () {
     // The server decides who answers from the conversation's authoritative AI mode: in AI mode it
     // replies; in human mode (or an attachment-only turn) it just persists the message for the team.
     // We never pass an escalate flag here — a plain message in human mode is simply queued to the agent.
-    var body = { key: KEY, question: text, conversationId: convId };
+    // One idempotency token per send attempt, carried on BOTH the stream and plain lanes below. A
+    // transport retry of the same turn reuses it so the server persists the visitor message once.
+    var clientMessageId = (self.crypto && self.crypto.randomUUID)
+      ? self.crypto.randomUUID()
+      : 'w-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    var body = { key: KEY, question: text, conversationId: convId, clientMessageId: clientMessageId };
     if (files.length) body.attachments = files.map(function (f) { return { dataUrl: f.dataUrl, filename: f.filename }; });
     if (identity.email) body.email = identity.email;
     if (identity.name) body.name = identity.name;
