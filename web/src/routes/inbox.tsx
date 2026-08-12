@@ -105,7 +105,7 @@ export function InboxPage() {
   const { user } = useAuth();
   const { ticket: selectedId, view: viewParam } = inboxRouteApi.useSearch();
   const navigate = inboxRouteApi.useNavigate();
-  const { subscribe } = useRealtime();
+  const { subscribe, resyncEpoch } = useRealtime();
   const { nerd } = useNerdMode();
   const [open, setOpen] = useState<Ticket[] | null>(null);
   const [closed, setClosed] = useState<Ticket[]>([]);
@@ -229,6 +229,16 @@ export function InboxPage() {
       unsubscribe();
     };
   }, [subscribe]);
+
+  // Reconnect catch-up: the subscription above never saw events that fired while the socket was
+  // down, so reload the lists (and bump the open thread) when the socket recovers.
+  useEffect(() => {
+    if (resyncEpoch > 0) {
+      void loadRef.current();
+      if (selectedRef.current) setRtSignal((n) => n + 1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resyncEpoch]);
 
   // Full-text search: debounce the box, then hit the server (subject + body,
   // tenant-scoped, across open+closed). Empty query drops back to the view list.

@@ -44,6 +44,13 @@ export interface RealtimeApi {
   subscribe: (fn: (e: EdgeEvent) => void) => () => void;
   /** Force a fresh socket connection (tear down + reconnect) — a manual retry affordance. */
   reconnect: () => void;
+  /**
+   * Bumps every time the socket RE-opens after a drop (not the first connect). Phoenix channels
+   * don't replay broadcasts missed while disconnected, so a live subscription silently loses every
+   * event during the gap. Watch this to refetch the current view on reconnect — an HTTP reload pulls
+   * the authoritative state regardless of which events were missed, so the thread catches up.
+   */
+  resyncEpoch: number;
 }
 
 const RealtimeContext = createContext<RealtimeApi | null>(null);
@@ -62,7 +69,7 @@ export function useRealtime(): RealtimeApi {
  * re-subscribing every render. One line to make any list/detail surface live.
  */
 export function useLiveRefresh(prefixes: string[], refetch: () => void) {
-  const { subscribe } = useRealtime();
+  const { subscribe, resyncEpoch } = useRealtime();
   const ref = useRef({ prefixes, refetch });
   ref.current = { prefixes, refetch };
   useEffect(() => {
@@ -77,6 +84,11 @@ export function useLiveRefresh(prefixes: string[], refetch: () => void) {
       unsub();
     };
   }, [subscribe]);
+  // After a reconnect (resyncEpoch bumps, never on the initial 0), refetch once to catch up on any
+  // events that fired while the socket was down — the live subscription above can't see those.
+  useEffect(() => {
+    if (resyncEpoch > 0) ref.current.refetch();
+  }, [resyncEpoch]);
 }
 
 // When no provider is mounted (e.g. the login screen), consumers still render.
@@ -90,6 +102,7 @@ const NULL_API: RealtimeApi = {
   setPresence: () => {},
   subscribe: () => () => {},
   reconnect: () => {},
+  resyncEpoch: 0,
 };
 
 function flattenPresence(presence: Presence): PresenceUser[] {
@@ -116,6 +129,9 @@ export function RealtimeProvider({ children }: { children: ReactNode }) {
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [presence, setPresence] = useState<PresenceUser[]>([]);
   const [eventsPerMin, setEventsPerMin] = useState(0);
+  // Bumps on every socket RE-open after a drop — consumers watch it to refetch (Phoenix doesn't
+  // replay events missed while disconnected, so the live bus alone can't catch a gap up).
+  const [resyncEpoch, setResyncEpoch] = useState(0);
   // Bumping this nonce tears down and recreates the socket — a manual reconnect.
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const reconnect = useRef(() => setReconnectNonce((n) => n + 1)).current;
@@ -151,9 +167,23 @@ export function RealtimeProvider({ children }: { children: ReactNode }) {
     }
     setStatus("connecting");
 
+    // token as a FUNCTION, not a captured value: Phoenix calls params() on every (re)connect, so a
+    // reconnect re-reads the CURRENT session token. A static object froze the token at socket
+    // creation — after a token refresh/expiry the auto-reconnect kept re-authenticating with the
+    // dead token and realtime stayed down until a full page reload.
     const socket = new Socket(`${EDGE_URL}/socket`, {
-      params: { token: getToken() ?? "" },
+      params: () => ({ token: getToken() ?? "" }),
       reconnectAfterMs: (tries) => [500, 1000, 2000, 5000][tries - 1] ?? 5000,
+    });
+    // Recover status to "live" whenever the transport (re)opens — the one-shot join receive below
+    // only fires on the FIRST join, so without this the badge stuck on "down" after an auto-reconnect
+    // even though events were flowing again. Every re-open after the first is a recovered gap →
+    // bump resyncEpoch so consumers refetch what they missed while disconnected.
+    let openedOnce = false;
+    socket.onOpen(() => {
+      setStatus("live");
+      if (openedOnce) setResyncEpoch((n) => n + 1);
+      openedOnce = true;
     });
     socket.onError(() => setStatus("down"));
     socket.onClose(() => setStatus("down"));
@@ -233,8 +263,9 @@ export function RealtimeProvider({ children }: { children: ReactNode }) {
       setPresence: setPresencePatch,
       subscribe,
       reconnect,
+      resyncEpoch,
     }),
-    [status, latencyMs, eventsPerMin, presence, others, myId, setPresencePatch, subscribe, reconnect],
+    [status, latencyMs, eventsPerMin, presence, others, myId, setPresencePatch, subscribe, reconnect, resyncEpoch],
   );
 
   return <RealtimeContext.Provider value={value}>{children}</RealtimeContext.Provider>;
