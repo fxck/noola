@@ -130,11 +130,14 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     ]);
     const tp = getMirrorTransport();
     const guilds = await Promise.all(
-      (links.rows as { guild_id: string }[]).map(async ({ guild_id }) => ({
-        id: guild_id,
-        forums: tp ? await tp.listForums(guild_id).catch(() => []) : [],
-        roles: tp ? await tp.listRoles(guild_id).catch(() => []) : [],
-      })),
+      (links.rows as { guild_id: string }[]).map(async ({ guild_id }) => {
+        // Concurrent, and each transport call is timeout-bounded (discord-gateway) — a degraded bot
+        // degrades to empty lists fast instead of hanging the request into a 504.
+        const [forums, roles] = tp
+          ? await Promise.all([tp.listForums(guild_id).catch(() => []), tp.listRoles(guild_id).catch(() => [])])
+          : [[], []];
+        return { id: guild_id, forums, roles };
+      }),
     );
     return { bindings, guilds, botOnline: !!tp };
   }));
@@ -160,24 +163,34 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     ]);
     const tp = getMirrorTransport();
     const guilds = await Promise.all(
-      (links.rows as { guild_id: string; team_role_ids: unknown }[]).map(async ({ guild_id, team_role_ids }) => ({
-        id: guild_id,
-        // Identity classification: members with these roles are the tenant's own team — their
-        // messages never mint tickets / never count as customers (the §9 seam, now UI-editable).
-        teamRoleIds: Array.isArray(team_role_ids) ? (team_role_ids as string[]) : [],
-        roles: tp ? await tp.listRoles(guild_id).catch(() => []) : [],
-        // Text channels AND forums — a forum binding = community-forum intake (each post is
-        // its own ticket via the thread=ticket path; the post author is the customer).
-        channels: tp
-          ? await Promise.all([
+      (links.rows as { guild_id: string; team_role_ids: unknown }[]).map(async ({ guild_id, team_role_ids }) => {
+        // All transport calls concurrent + timeout-bounded (discord-gateway) so a degraded bot
+        // degrades to empty lists fast instead of hanging the request into a 504.
+        let roles: { id: string; name: string }[] = [];
+        let channels: Array<{ id: string; name: string; kind: "text" | "forum" }> = [];
+        if (tp) {
+          [roles, channels] = await Promise.all([
+            tp.listRoles(guild_id).catch(() => []),
+            // Text channels AND forums — a forum binding = community-forum intake (each post is
+            // its own ticket via the thread=ticket path; the post author is the customer).
+            Promise.all([
               tp.listTextChannels(guild_id).catch(() => []),
               tp.listForums(guild_id).catch(() => []),
             ]).then(([text, forums]) => [
               ...text.map((c) => ({ ...c, kind: "text" as const })),
               ...forums.map((c) => ({ ...c, kind: "forum" as const })),
-            ])
-          : [],
-      })),
+            ]),
+          ]);
+        }
+        return {
+          id: guild_id,
+          // Identity classification: members with these roles are the tenant's own team — their
+          // messages never mint tickets / never count as customers (the §9 seam, now UI-editable).
+          teamRoleIds: Array.isArray(team_role_ids) ? (team_role_ids as string[]) : [],
+          roles,
+          channels,
+        };
+      }),
     );
     const byChannel = new Map(accounts.map((a) => [`${a.guild_id}:${a.channel_id}`, a]));
     return {

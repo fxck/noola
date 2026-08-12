@@ -111,6 +111,23 @@ async function resolveForumTagIds(forum: ForumChannel, tagNames: string[]): Prom
   return want.map((n) => have.get(n)).filter((id): id is string => !!id).slice(0, 5);
 }
 
+/** Discord (discord.js) fetches await the gateway/REST queue and can HANG indefinitely when the bot's
+ *  connection is degraded — `.catch()` only handles rejection, not a never-settling promise. The
+ *  settings endpoints await these inline, so a stalled fetch hangs the HTTP request until the gateway
+ *  kills it with a 504. Bound every fetch: on timeout REJECT so the caller's existing `.catch(() => …)`
+ *  degrades to the same empty result it uses for "bot offline". */
+const DISCORD_FETCH_TIMEOUT_MS = 5000;
+function withTimeout<T>(p: Promise<T>, ms = DISCORD_FETCH_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("discord fetch timeout")), ms);
+    if (typeof t.unref === "function") t.unref();
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 function buildMirrorTransport(client: Client): MirrorTransport {
   const forum = async (id: string): Promise<ForumChannel | null> => {
     const ch = await client.channels.fetch(id).catch(() => null);
@@ -122,25 +139,25 @@ function buildMirrorTransport(client: Client): MirrorTransport {
   };
   return {
     async listForums(guildId) {
-      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      const guild = await withTimeout(client.guilds.fetch(guildId)).catch(() => null);
       if (!guild) return [];
-      const channels = await guild.channels.fetch().catch(() => null);
+      const channels = await withTimeout(guild.channels.fetch()).catch(() => null);
       if (!channels) return [];
       return [...channels.values()]
         .filter((c) => c?.type === ChannelType.GuildForum)
         .map((c) => ({ id: c!.id, name: c!.name }));
     },
     async listRoles(guildId) {
-      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      const guild = await withTimeout(client.guilds.fetch(guildId)).catch(() => null);
       if (!guild) return [];
-      const roles = await guild.roles.fetch().catch(() => null);
+      const roles = await withTimeout(guild.roles.fetch()).catch(() => null);
       if (!roles) return [];
       return [...roles.values()].filter((r) => r.name !== "@everyone").map((r) => ({ id: r.id, name: r.name }));
     },
     async listTextChannels(guildId) {
-      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      const guild = await withTimeout(client.guilds.fetch(guildId)).catch(() => null);
       if (!guild) return [];
-      const channels = await guild.channels.fetch().catch(() => null);
+      const channels = await withTimeout(guild.channels.fetch()).catch(() => null);
       if (!channels) return [];
       return [...channels.values()]
         .filter((c) => c?.type === ChannelType.GuildText)
