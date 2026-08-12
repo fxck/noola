@@ -526,7 +526,31 @@ function ContactFacts({
               </a>
             </FactRow>
           )}
-          {c.company && (
+          {/* Company memberships (0111): every company the contact belongs to, primary first,
+              each linking to its account page. Falls back to the denormalized name (resolved to
+              an id best-effort) for older payloads without a `companies` array. */}
+          {(c.companies?.length ?? 0) > 0 ? (
+            <FactRow label={c.companies!.length > 1 ? "Companies" : "Company"}>
+              <span className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1">
+                {c.companies!.map((co, i) => (
+                  <span key={co.id} className="inline-flex min-w-0 items-center gap-1">
+                    <Link
+                      to="/companies/$companyId"
+                      params={{ companyId: co.id }}
+                      className="min-w-0 truncate underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      title={co.is_primary ? "Primary company" : "Open company"}
+                    >
+                      {co.name}
+                    </Link>
+                    {co.is_primary && c.companies!.length > 1 && (
+                      <span className="rounded bg-muted px-1 text-micro text-muted-foreground">primary</span>
+                    )}
+                    {i < c.companies!.length - 1 && <span className="text-muted-foreground">,</span>}
+                  </span>
+                ))}
+              </span>
+            </FactRow>
+          ) : c.company ? (
             <FactRow label="Company">
               {companyId ? (
                 <Link
@@ -541,7 +565,7 @@ function ContactFacts({
                 <span className="min-w-0 truncate">{c.company}</span>
               )}
             </FactRow>
-          )}
+          ) : null}
           {planEntry && (
             <FactRow label="Plan">
               <span className="min-w-0 truncate">{planEntry[1]}</span>

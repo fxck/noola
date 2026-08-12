@@ -9,6 +9,7 @@ import {
   upsertContact,
   bulkUpsertContacts,
   contactHistory,
+  mergeContacts,
 } from "../src/contacts.js";
 
 // Contacts directory + sync seam: CRUD, filtered listing, idempotent upsert on
@@ -32,6 +33,8 @@ async function main() {
   const clean = async () => {
     await superPool.query("DELETE FROM contacts WHERE external_id LIKE 'ctest%' OR email LIKE 'ctest%'");
     await superPool.query("DELETE FROM tickets WHERE external_channel_id LIKE 'ctest%'");
+    // Company membership fixtures (0111) — contacts above cascade-delete their junction rows first.
+    await superPool.query("DELETE FROM companies WHERE name LIKE 'CTestCo%'");
   };
   await clean();
 
@@ -152,6 +155,62 @@ async function main() {
     // A ticket never resolved to this contact → no linkage.
     const unlinked = await createContact(A, { external_id: "ctest-noemail", name: "No Email" });
     check("history for an unlinked contact is empty", (await contactHistory(A, unlinked.id)).tickets.length === 0);
+  }
+
+  // ---- company membership (0111 many-to-many) ----
+  {
+    const coR = await superPool.query(
+      `INSERT INTO companies (tenant_id, name) VALUES ($1,'CTestCo Alpha'),($1,'CTestCo Beta') RETURNING id, name`,
+      [A],
+    );
+    const rows = coR.rows as { id: string; name: string }[];
+    const alpha = rows.find((r) => r.name === "CTestCo Alpha")!.id;
+    const beta = rows.find((r) => r.name === "CTestCo Beta")!.id;
+    const primaryOf = (c?: { companies?: { id: string; is_primary: boolean }[] } | null) =>
+      c?.companies?.find((x) => x.is_primary)?.id;
+    const primaryCount = (c?: { companies?: { is_primary: boolean }[] } | null) =>
+      c?.companies?.filter((x) => x.is_primary).length ?? 0;
+
+    // Create with an ORDERED set → first is primary and pins the denormalized columns.
+    const mc = await createContact(A, { external_id: "ctest-mc-1", name: "Multi Co", company_ids: [alpha, beta] });
+    check("create with company_ids returns both memberships", (mc.companies?.length ?? 0) === 2);
+    check("first company_id is primary", primaryOf(mc) === alpha && primaryCount(mc) === 1);
+    check("primary pins denormalized company_id/company", mc.company_id === alpha && mc.company === "CTestCo Alpha");
+
+    // Reorder → beta becomes primary (never two live primaries).
+    const re = await updateContact(A, mc.id, { company_ids: [beta, alpha] });
+    check("reorder promotes the new first to primary", primaryOf(re) === beta && re?.company_id === beta && re?.company === "CTestCo Beta");
+    check("exactly one primary after reorder", primaryCount(re) === 1);
+
+    // Shrink to one, then clear all.
+    const one = await updateContact(A, mc.id, { company_ids: [beta] });
+    check("shrink membership set to one", one?.companies?.length === 1 && one?.companies?.[0].id === beta);
+    const none = await updateContact(A, mc.id, { company_ids: [] });
+    check("empty company_ids clears memberships + columns", (none?.companies?.length ?? -1) === 0 && none?.company_id === null && none?.company === "");
+
+    // Unknown id in the set is dropped (RLS-scoped lookup).
+    const filtered = await updateContact(A, mc.id, { company_ids: [alpha, "00000000-0000-0000-0000-000000000000"] });
+    check("unknown company id is dropped from the set", filtered?.companies?.length === 1 && filtered?.companies?.[0].id === alpha);
+
+    // Legacy single company_id write still mirrors the primary into the junction.
+    const legacy = await updateContact(A, mc.id, { company_id: beta });
+    check("legacy company_id change mirrors primary into junction", primaryOf(legacy) === beta && primaryCount(legacy) === 1);
+
+    // List rows also carry companies[].
+    const listed = await listContacts(A, { q: "Multi Co" });
+    check("list rows include companies[]", (listed.contacts[0]?.companies?.length ?? 0) >= 1);
+
+    // Merge unions memberships and keeps the KEPT contact's primary.
+    const keep = await createContact(A, { external_id: "ctest-mc-keep", name: "Keep", company_ids: [alpha] });
+    const drop = await createContact(A, { external_id: "ctest-mc-drop", name: "Drop", company_ids: [beta] });
+    const merged = await mergeContacts(A, keep.id, drop.id);
+    const mids = new Set(merged?.companies?.map((x) => x.id));
+    check("merge unions company memberships", mids.has(alpha) && mids.has(beta));
+    check("merge keeps kept contact's primary", primaryOf(merged) === alpha && primaryCount(merged) === 1);
+
+    // Cross-tenant: A's company id can't be attached from tenant B.
+    const bContact = await createContact(B, { external_id: "ctest-mc-b", name: "B User", company_ids: [alpha] });
+    check("cross-tenant company id is not attached", (bContact.companies?.length ?? 0) === 0 && bContact.company_id === null);
   }
 
   // ---- tenant isolation ----

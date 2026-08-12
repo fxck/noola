@@ -517,11 +517,20 @@ export const ContactInput = z
     name: z.string().max(300).optional(),
     company: z.string().max(300).optional(),
     company_id: z.guid().nullable().optional(),
+    /** Many-to-many company membership (0111). An ORDERED set of company ids — the FIRST is the
+     *  primary account (it keeps the legacy contacts.company_id / contacts.company columns pinned,
+     *  so account rollups keep working). When present it REPLACES the contact's full membership set;
+     *  [] clears all companies. Overrides the single company/company_id when both are sent. */
+    company_ids: z.array(z.guid()).max(50).optional(),
     attributes: z.record(z.string(), z.unknown()).optional(),
   })
-  .refine((v) => Boolean(v.external_id || v.email || v.name || v.company) || v.company_id !== undefined, {
-    message: "at least one of external_id, email, name, company is required",
-  });
+  .refine(
+    (v) =>
+      Boolean(v.external_id || v.email || v.name || v.company) ||
+      v.company_id !== undefined ||
+      v.company_ids !== undefined,
+    { message: "at least one of external_id, email, name, company is required" },
+  );
 
 /** Create/update a company (account record). Create requires a name; update is partial. */
 export const CompanyInput = z.object({

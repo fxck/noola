@@ -57,6 +57,18 @@ export interface CompanyQuery {
   dir?: "asc" | "desc";
 }
 
+/** Resolve company names → ids (get-or-create), preserving order — the contact editor's
+ *  "add a company that doesn't exist yet" primitive. De-duped by id server-side. */
+export async function ensureCompanies(names: string[]): Promise<{ id: string; name: string }[]> {
+  const clean = names.map((n) => n.trim()).filter(Boolean);
+  if (!clean.length) return [];
+  const res = await api<{ companies: { id: string; name: string }[] }>("/companies/ensure", {
+    method: "POST",
+    body: JSON.stringify({ names: clean }),
+  });
+  return res.companies;
+}
+
 /** One page of companies + the total match count (server-side pagination/sort/filter). */
 export async function fetchCompanies(opts: CompanyQuery = {}): Promise<{ companies: Company[]; total: number }> {
   const p = new URLSearchParams();
