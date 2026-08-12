@@ -614,17 +614,20 @@ export function ContactsPage() {
   function exportSelected() {
     const rows = selectedRows.map((r) => r.original);
     if (!rows.length) return;
+    // `company` stays the primary (back-compat); `companies` carries the full 0111 membership set as
+    // a "; "-joined list so a multi-account contact doesn't silently export only one of its accounts.
     const cols = ["name", "email", "company", "external_id", "created_at", "updated_at"] as const;
     const attrCols = [...new Set(rows.flatMap((r) => Object.keys(r.attributes ?? {})))].sort();
     const esc = (v: unknown) => {
       const s = v == null ? "" : String(v);
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const lines = [[...cols, ...attrCols].join(",")];
+    const lines = [[...cols, "companies", ...attrCols].join(",")];
     for (const r of rows) {
       const base = cols.map((k) => esc((r as unknown as Record<string, unknown>)[k]));
+      const companies = esc((r.companies ?? []).map((c) => c.name).join("; "));
       const attrs = attrCols.map((k) => esc(r.attributes?.[k]));
-      lines.push([...base, ...attrs].join(","));
+      lines.push([...base, companies, ...attrs].join(","));
     }
     const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);

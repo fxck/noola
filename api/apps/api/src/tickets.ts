@@ -47,9 +47,12 @@ export interface TicketRow {
   /** Derived (list/detail): the contact's last_seen_at is within the 3-min online window. Drives the
    *  inbox presence dot so it matches the contacts list/detail. */
   contact_online: boolean;
-  /** The contact's company (account), hydrated via contacts.company_id — row/rail context. */
+  /** The contact's PRIMARY company (account), hydrated via contacts.company_id — row/rail context. */
   company_id: string | null;
   company_name: string | null;
+  /** The contact's full company membership set (0111 many-to-many), primary first. The rail shows
+   *  all of them; company_id/company_name remain the primary for the compact list scan-line. */
+  companies: { id: string; name: string; is_primary: boolean }[];
   /** One-line snippet of the LATEST message (whitespace-collapsed, capped) — the list row's
    *  scan line, so the inbox reads what the conversation is at without opening it. */
   preview: string | null;
@@ -79,6 +82,13 @@ const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_chann
               co.company_id,
               (SELECT cp.name FROM companies cp
                  WHERE cp.tenant_id = t.tenant_id AND cp.id = co.company_id) AS company_name,
+              COALESCE((
+                SELECT json_agg(json_build_object('id', ccp.id, 'name', ccp.name, 'is_primary', cc.is_primary)
+                         ORDER BY cc.is_primary DESC, ccp.name ASC)
+                  FROM contact_companies cc
+                  JOIN companies ccp ON ccp.tenant_id = cc.tenant_id AND ccp.id = cc.company_id
+                 WHERE cc.tenant_id = t.tenant_id AND cc.contact_id = t.contact_id
+              ), '[]'::json) AS companies,
               (SELECT left(regexp_replace(m.body, '\\s+', ' ', 'g'), 140) FROM messages m
                  WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id
                  ORDER BY m.created_at DESC LIMIT 1) AS preview`;

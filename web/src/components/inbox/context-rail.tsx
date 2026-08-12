@@ -232,7 +232,31 @@ export function ContextRail({
             )}
           </FactRow>
         )}
-        {t.company_name && (
+        {/* Full company membership set (0111): a contact can belong to several accounts — list them
+            all, each linking to its account page, primary tagged when there's more than one. Falls
+            back to the denormalized primary name for older payloads without a `companies` array. */}
+        {(t.companies?.length ?? 0) > 0 ? (
+          <FactRow label={t.companies!.length > 1 ? "Companies" : "Company"}>
+            <span className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1">
+              {t.companies!.map((co, i) => (
+                <span key={co.id} className="inline-flex min-w-0 items-center gap-1">
+                  <Link
+                    to="/companies/$companyId"
+                    params={{ companyId: co.id }}
+                    className="min-w-0 truncate underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    title={co.is_primary ? "Primary company" : "Open company"}
+                  >
+                    {co.name}
+                  </Link>
+                  {co.is_primary && t.companies!.length > 1 && (
+                    <span className="rounded bg-muted px-1 text-micro text-muted-foreground">primary</span>
+                  )}
+                  {i < t.companies!.length - 1 && <span className="text-muted-foreground">,</span>}
+                </span>
+              ))}
+            </span>
+          </FactRow>
+        ) : t.company_name ? (
           <FactRow label="Company">
             {t.company_id ? (
               <Link
@@ -247,7 +271,7 @@ export function ContextRail({
               <span className="min-w-0 truncate">{t.company_name}</span>
             )}
           </FactRow>
-        )}
+        ) : null}
         <FactRow label="Status">
           <span className="inline-flex items-center gap-1.5">
             <span
