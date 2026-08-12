@@ -1161,7 +1161,25 @@ export const WIDGET_JS = String.raw`(function () {
       c.unread = (c.unread || 0) + 1; saveConvs(); renderBadge();
     }
   }
-  function markRead(convId) { var c = getConv(convId); if (c && c.unread) { c.unread = 0; saveConvs(); renderBadge(); } }
+  // Clear the SERVER-side unseen watermark (agent replies with seen_at IS NULL) for a thread the
+  // visitor is now viewing. markRead alone only clears the LOCAL badge; the server-side unseen flag is
+  // what bootSyncPop reads, and its only other stamp — startLive's viewing:true poll — never runs for
+  // NON-escalated threads (render() gates startLive on c.escalated). Without this, an agent/AI reply on
+  // a non-escalated thread re-pops the messenger on every reload even after the visitor has seen it.
+  // Fire-and-forget, no render: opening the thread IS viewing it, so viewing:true is honest; the server
+  // no-ops when already stamped (the seen_at IS NULL guard).
+  function stampSeen(convId) {
+    if (!convId) return;
+    try {
+      fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: KEY, conversationId: convId, viewing: true }) }).catch(function () {});
+    } catch (e) {}
+  }
+  function markRead(convId) {
+    var c = getConv(convId);
+    if (c && c.unread) { c.unread = 0; saveConvs(); renderBadge(); }
+    stampSeen(convId);   // also clear the server-side unseen watermark, so the boot-pop doesn't repeat
+  }
 
   function sendMsg(convId) {
     var c = getConv(convId); if (!c) return;
