@@ -1344,7 +1344,12 @@ export const WIDGET_JS = String.raw`(function () {
   // surfaces the thread in the agents' "needs reply" queue — the full AI transcript stays on the
   // same ticket. UI reflects the new mode once the server has confirmed it (no optimistic race).
   function escalate(convId) {
-    var c = getConv(convId); if (!c || c.escalated || busy) return;
+    var c = getConv(convId); if (!c || c.escalated || c.escalating || busy) return;
+    // Synchronous in-flight latch: c.escalated is only set once the server confirms (below), so
+    // without this a rapid double-tap / re-click fires TWO handoff requests before the first resolves
+    // — the "talk to a human" message got posted twice. escalating guards the window; it's cleared on
+    // completion (success flips to escalated; failure reopens the affordance for a retry).
+    c.escalating = true;
     var b = { key: KEY, question: 'I’d like to talk to a human, please.', conversationId: convId, escalate: true };
     if (identity.email) b.email = identity.email;
     if (identity.name) b.name = identity.name;
@@ -1354,11 +1359,11 @@ export const WIDGET_JS = String.raw`(function () {
     trackActivity('requested_human', { conversationId: convId });
     fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) })
       .then(function () {
-        c.escalated = true; saveConvs();
+        c.escalating = false; c.escalated = true; saveConvs();
         if (view === 'thread' && threadId === convId) { pendingDir = 'none'; render(); }
         startLive(convId);
       })
-      .catch(function () {});
+      .catch(function () { c.escalating = false; });
   }
 
   // Bring the AI back ("Ask the assistant"): un-mute the assistant server-side, then reflect it. The

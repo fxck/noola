@@ -41,9 +41,18 @@ async function setWidgetAssistantMode(tenantId: string, conversationId: string, 
       // Resuming AI (enabled=true) hands the conversation back to the bot, so it must also release the
       // human assignee the escalation put on it — otherwise the ticket stays "owned" by an agent who is
       // no longer handling it. Escalation (enabled=false) leaves assignee untouched (routing sets it).
+      //
+      // Match on the ticket id OR external_channel_id. The widget's `conversationId` is the ticket id
+      // the server handed back (responses return conversationId: ticketId), while `external_channel_id`
+      // is NULL for the common case — an identified visitor threads onto their existing ticket by
+      // contact identity, so nothing ever wrote the conversationId there. Keying ONLY on
+      // external_channel_id meant this UPDATE matched ZERO rows for those conversations, so "talk to a
+      // human" never actually muted the assistant and the bot kept answering past the handoff. The
+      // id::text branch fixes that; the external_channel_id branch keeps legacy client-uuid conversations
+      // (where the widget sent its own id and it WAS stored) working.
       `UPDATE tickets SET assistant_enabled = $2,
               assignee_id = CASE WHEN $2 THEN NULL ELSE assignee_id END
-         WHERE channel_type = 'widget' AND external_channel_id = $1`,
+         WHERE channel_type = 'widget' AND (id::text = $1 OR external_channel_id = $1)`,
       [conversationId, enabled],
     ),
   );
