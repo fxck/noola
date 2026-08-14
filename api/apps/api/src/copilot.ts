@@ -1,5 +1,5 @@
 import { withTenant } from "@repo/db";
-import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type ModelServingDriver } from "./model.js";
+import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { personaFragment } from "./persona.js";
 import { searchArticles, hydrateArticles } from "./kb.js";
@@ -201,6 +201,11 @@ export interface SuggestOpts {
    *  on-demand public /ask passes ['kb'] to re-assert KB-only at the command layer regardless of
    *  how the tenant widened its public source_scopes (§5.3 #2). */
   forceScope?: string[];
+  /** Images the customer attached to the message being answered (widget screenshots, error shots).
+   *  Passed straight to the vision-capable hosted model as image content-blocks so the draft accounts
+   *  for what they showed. Retrieval is unaffected — grounding still comes from the text query — and
+   *  the rule baseline ignores them. */
+  images?: DraftImage[];
 }
 
 const EMPTY_RETRIEVAL: RetrievalSummary = { topScore: 0, citedKinds: [], agreement: 0, perCitation: [] };
@@ -358,7 +363,7 @@ async function prepareDraft(
   started: number,
 ): Promise<{
   driver: ModelServingDriver;
-  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[] };
+  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[] };
   citations: Citation[];
   retrieval: RetrievalSummary;
   /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model would
@@ -467,7 +472,9 @@ async function prepareDraft(
   // Conversation history (best-effort) so the draft is context-aware — a follow-up must see the
   // prior turns, not answer blind. Ticket-scoped; a bare query (raw /suggest, eval) → no history.
   const history = ticketId ? await loadHistory(tenantId, ticketId, messageId).catch(() => []) : [];
-  const draftInput = { customerMessage: query, sources: grounding, persona, history };
+  // Current-turn images (widget screenshots) ride along to a vision model as image content-blocks —
+  // extra context on TOP of the text-driven retrieval, never a substitute for grounding.
+  const draftInput = { customerMessage: query, sources: grounding, persona, history, images: opts.images };
 
   // Trace + content-gap + Suggestion assembly, invoked once a DraftResult exists (one-shot
   // or streamed). `latencyMs` is the draft-generation time the caller measured.

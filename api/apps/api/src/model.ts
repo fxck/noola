@@ -35,6 +35,15 @@ export interface DraftTurn {
   role: "customer" | "agent";
   text: string;
 }
+/** An image the customer attached to the message being answered — a screenshot, an error, a photo.
+ *  Passed to a VISION-capable hosted model as an image content-block alongside the text so the model
+ *  can actually SEE what was sent (a build log, a broken UI) instead of answering blind to it. The
+ *  extractive rule baseline can't look at pixels, so it ignores these entirely. `dataBase64` is the
+ *  raw base64 payload (no `data:` prefix); `mediaType` is an image/* type the provider accepts. */
+export interface DraftImage {
+  mediaType: string;
+  dataBase64: string;
+}
 export interface DraftReplyInput {
   customerMessage: string;
   sources: DraftSource[];
@@ -42,6 +51,10 @@ export interface DraftReplyInput {
    *  transcript ahead of the latest message so a follow-up ("you didn't finish your reply") is answered
    *  WITH context, not blind. The extractive rule baseline ignores it (it only quotes sources). */
   history?: DraftTurn[];
+  /** Images attached to the CURRENT customer message. Sent to a vision-capable hosted model as image
+   *  content-blocks on the user turn so the answer accounts for what the customer showed. Ignored by
+   *  the rule baseline (it can't see pixels) and harmlessly by a non-vision hosted model. */
+  images?: DraftImage[];
   // Optional per-tenant voice fragment (persona.ts). Prepended to the draft system prompt so the
   // hosted model answers in the team's configured tone/signature. The extractive rule baseline
   // ignores it — it can't paraphrase, so it stays honest regardless of persona.
@@ -303,6 +316,31 @@ function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   return { system, user };
 }
 
+/** Build the Anthropic user-turn `content`: a plain string when there are no images, or a
+ *  [text, image…] content-block array when the customer attached images to this turn — so a
+ *  vision-capable model answers WITH the screenshot in front of it, not blind to it. */
+function anthropicUserContent(user: string, images?: DraftImage[]): unknown {
+  if (!images || images.length === 0) return user;
+  return [
+    { type: "text", text: user },
+    ...images.map((im) => ({
+      type: "image",
+      source: { type: "base64", media_type: im.mediaType, data: im.dataBase64 },
+    })),
+  ];
+}
+/** OpenAI-compatible sibling: images ride as `image_url` parts carrying a data: URL. */
+function openaiUserContent(user: string, images?: DraftImage[]): unknown {
+  if (!images || images.length === 0) return user;
+  return [
+    { type: "text", text: user },
+    ...images.map((im) => ({
+      type: "image_url",
+      image_url: { url: `data:${im.mediaType};base64,${im.dataBase64}` },
+    })),
+  ];
+}
+
 export class HttpChatModelDriver implements ModelServingDriver {
   readonly name: string;
   private readonly rule = new RuleModelDriver();
@@ -322,8 +360,8 @@ export class HttpChatModelDriver implements ModelServingDriver {
     try {
       const r =
         this.opts.provider === "anthropic"
-          ? await this.anthropic(system, user, ctrl.signal)
-          : await this.openaiCompatible(system, user, ctrl.signal);
+          ? await this.anthropic(system, user, input.images, ctrl.signal)
+          : await this.openaiCompatible(system, user, input.images, ctrl.signal);
       const text = r.text.trim();
       if (!text) throw new Error("empty completion");
       // A hosted model is more trustworthy than the extractive baseline, but not
@@ -345,8 +383,8 @@ export class HttpChatModelDriver implements ModelServingDriver {
     try {
       const gen =
         this.opts.provider === "anthropic"
-          ? this.anthropicStream(system, user, ctrl.signal)
-          : this.openaiStream(system, user, ctrl.signal);
+          ? this.anthropicStream(system, user, input.images, ctrl.signal)
+          : this.openaiStream(system, user, input.images, ctrl.signal);
       let text = "";
       let tokensIn: number | undefined;
       let tokensOut: number | undefined;
@@ -374,8 +412,8 @@ export class HttpChatModelDriver implements ModelServingDriver {
     try {
       const r =
         this.opts.provider === "anthropic"
-          ? await this.anthropic(system, user, ctrl.signal)
-          : await this.openaiCompatible(system, user, ctrl.signal);
+          ? await this.anthropic(system, user, undefined, ctrl.signal)
+          : await this.openaiCompatible(system, user, undefined, ctrl.signal);
       return r.text.trim();
     } finally {
       clearTimeout(timer);
@@ -390,6 +428,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
   private async openaiCompatible(
     system: string,
     user: string,
+    images: DraftImage[] | undefined,
     signal: AbortSignal,
   ): Promise<{ text: string; tokensIn?: number; tokensOut?: number }> {
     const res = await fetch(`${this.base()}/chat/completions`, {
@@ -402,7 +441,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         temperature: 0.3,
         messages: [
           { role: "system", content: system },
-          { role: "user", content: user },
+          { role: "user", content: openaiUserContent(user, images) },
         ],
       }),
     });
@@ -421,6 +460,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
   private async anthropic(
     system: string,
     user: string,
+    images: DraftImage[] | undefined,
     signal: AbortSignal,
   ): Promise<{ text: string; tokensIn?: number; tokensOut?: number }> {
     const res = await fetch(`${this.base()}/messages`, {
@@ -435,7 +475,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         model: this.opts.model,
         max_tokens: DRAFT_MAX_TOKENS,
         system,
-        messages: [{ role: "user", content: user }],
+        messages: [{ role: "user", content: anthropicUserContent(user, images) }],
       }),
     });
     if (!res.ok) throw new Error(`anthropic ${res.status}: ${clip(await res.text(), 200)}`);
@@ -473,6 +513,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
   private async *anthropicStream(
     system: string,
     user: string,
+    images: DraftImage[] | undefined,
     signal: AbortSignal,
   ): AsyncIterable<{ delta?: string; tokensIn?: number; tokensOut?: number }> {
     const res = await fetch(`${this.base()}/messages`, {
@@ -488,7 +529,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         max_tokens: DRAFT_MAX_TOKENS,
         system,
         stream: true,
-        messages: [{ role: "user", content: user }],
+        messages: [{ role: "user", content: anthropicUserContent(user, images) }],
       }),
     });
     for await (const data of this.sseData(res, "anthropic")) {
@@ -517,6 +558,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
   private async *openaiStream(
     system: string,
     user: string,
+    images: DraftImage[] | undefined,
     signal: AbortSignal,
   ): AsyncIterable<{ delta?: string; tokensIn?: number; tokensOut?: number }> {
     const res = await fetch(`${this.base()}/chat/completions`, {
@@ -531,7 +573,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         stream_options: { include_usage: true },
         messages: [
           { role: "system", content: system },
-          { role: "user", content: user },
+          { role: "user", content: openaiUserContent(user, images) },
         ],
       }),
     });
