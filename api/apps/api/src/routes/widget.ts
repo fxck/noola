@@ -18,7 +18,7 @@ import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
 import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
 import { suggestionMeta } from "../autoreply.js";
-import { wantsHuman } from "../model.js";
+import { wantsHuman, type DraftImage } from "../model.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
@@ -66,6 +66,32 @@ async function widgetAssistantEnabled(tenantId: string, ticketId: string): Promi
 
 const WIDGET_ATTACH_DATA_URL = /^data:([\w.+-]+\/[\w.+-]+);base64,(.+)$/i;
 const WIDGET_ATTACH_MAX_BYTES = 15 * 1024 * 1024; // 15MB raw, mirrors the agent upload cap
+
+// Image types every mainstream vision model (Anthropic + OpenAI) accepts. SVG is deliberately absent:
+// it's markup, not a raster the model gains anything from, and an XSS vector we don't want to forward.
+const WIDGET_VISION_MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const WIDGET_VISION_MAX_IMAGES = 4; // per turn — bounds the token/latency cost of a multi-image ask
+const WIDGET_VISION_MAX_BYTES = 5 * 1024 * 1024; // per image, comfortably under provider inline caps
+
+// Turn the visitor's inline attachments into model-ready image blocks so a vision-capable model can
+// SEE what they sent (a screenshot, an error) instead of answering blind to it. Non-image files
+// (PDFs, logs) are for a human to open, not the model; oversized or exotic types are skipped. The
+// base64 the widget already posted IS the payload — no storage round-trip. Never throws.
+function imagesForModel(files: Array<{ dataUrl: string; filename: string }>): DraftImage[] {
+  const out: DraftImage[] = [];
+  for (const f of files) {
+    if (out.length >= WIDGET_VISION_MAX_IMAGES) break;
+    const m = WIDGET_ATTACH_DATA_URL.exec(f.dataUrl ?? "");
+    if (!m) continue;
+    const mediaType = m[1].toLowerCase();
+    if (!WIDGET_VISION_MEDIA_TYPES.has(mediaType)) continue;
+    // Estimate decoded size from base64 length (4 chars → 3 bytes) without allocating the buffer.
+    const approxBytes = Math.floor((m[2].length * 3) / 4);
+    if (approxBytes === 0 || approxBytes > WIDGET_VISION_MAX_BYTES) continue;
+    out.push({ mediaType, dataBase64: m[2] });
+  }
+  return out;
+}
 
 // Store the visitor's inline files in object-storage and claim them onto the just-persisted widget
 // message — the same first-class message_attachments rows an agent reply produces, so the agent
@@ -227,7 +253,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     }
 
     try {
-      const s = await suggestForQuery(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId });
+      const s = await suggestForQuery(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files) });
       // Persist the AI answer as an agent message on the SAME ticket → threads + fans out over the
       // widget WS. origin:'automation' suppresses re-triggering the rules engine off the AI's reply.
       const answerMsg = await ingestInbound({
@@ -279,6 +305,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const parsed = PublicAskInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     const { key, question, conversationId, name, userId, userHash, userJwt } = parsed.data;
+    const files = parsed.data.attachments ?? [];
     const text = question.trim();
     if (!text) return reply.code(400).send({ error: "message is empty" });
 
@@ -313,11 +340,23 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       externalChannelId: conversationId ?? null,
       subject: text.slice(0, 80),
       identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
+      // Attachments are stored just below (post-ingest); defer the Discord mirror so it waits for them.
+      deferMirror: files.length > 0,
       // Idempotency: persist-before-stream means a mid-stream failure + retry could double the ask;
       // the same token collapses it to one message.
       idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
     });
     if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
+
+    // Store + claim any inline files onto the persisted message — the same first-class attachments the
+    // agent console renders and the visitor re-fetches. This lane carries text+image turns (the widget
+    // streams whenever there's text), so without this the screenshot would be dropped, not just unseen.
+    if (files.length) {
+      await persistWidgetAttachments(wk.tenantId, inbound.ticketId, inbound.messageId, files);
+      void import("../discord-mirror.js")
+        .then((mm) => mm.relayTicketMessage(wk.tenantId, inbound.ticketId, inbound.messageId))
+        .catch(() => {});
+    }
 
     // Not in AI mode, or the visitor just asked for a human → nothing to stream; the widget falls back
     // to its human-queue rendering (hydrateThread flips to human mode on assistantEnabled=false).
@@ -344,7 +383,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const hb = setInterval(() => raw.write(": ping\n\n"), 15_000);
 
     try {
-      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId });
+      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files) });
       // Manual iteration so we capture the generator's RETURN value (the final Suggestion).
       let suggestion: Awaited<ReturnType<typeof suggestForQuery>>;
       for (;;) {

@@ -25,6 +25,7 @@
     "test:kb": "tsx apps/api/test/kb.test.ts",
     "test:documents": "tsx apps/api/test/documents.test.ts",
     "test:copilot": "tsx apps/api/test/copilot.test.ts",
+    "test:vision": "tsx apps/api/test/vision.test.ts",
     "test:threads": "tsx apps/api/test/threads.test.ts",
     "test:vector": "tsx apps/api/test/vector.test.ts",
     "test:autoreply": "tsx apps/api/test/autoreply.test.ts",
