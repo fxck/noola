@@ -13,6 +13,7 @@ import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
 import { mdToDiscord } from "./channels/format.js";
+import { enqueueRelay, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
 // (email/widget/…) can be selectively mirrored as ONE forum post in a Discord forum channel; the
@@ -504,11 +505,79 @@ function quoteBlock(body: string): string {
     .join("\n");
 }
 
+/** True if the ticket has ANY ticket_mirror row — including a still-`pending:` one mid-creation. The
+ *  relay enqueue gates on this so (a) the vast majority of tickets (no binding / discord-origin) never
+ *  enqueue a relay, and (b) a message that arrives while the forum post is still being created IS
+ *  enqueued (getTicketMirror would have excluded the pending row) — the deliverer then waits for the
+ *  post to finish, closing the relay-before-mirror-exists race. */
+async function ticketHasMirrorRow(tenantId: string, ticketId: string): Promise<boolean> {
+  const r = await relayPool
+    .query("SELECT 1 FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 LIMIT 1", [tenantId, ticketId])
+    .catch(() => null);
+  return (r?.rowCount ?? 0) > 0;
+}
+
+/** Relay a fresh ticket message into its mirror post (ingest post-commit hook). Now DURABLE: it enqueues
+ *  onto the relay outbox instead of posting inline, so a degraded Discord connection or a process restart
+ *  can't lose the mirror copy — the drainer delivers it (and retries) via deliverMessageRelay below.
+ *  Idempotent by message id. No-ops instantly when the ticket isn't mirrored. */
 export async function relayTicketMessage(tenantId: string, ticketId: string, messageId: string): Promise<void> {
-  const mirror = await getTicketMirror(tenantId, ticketId);
-  if (!mirror) return;
+  if (!(await ticketHasMirrorRow(tenantId, ticketId))) return;
+  await enqueueRelay("message", tenantId, ticketId, `message:${messageId}`, { messageId });
+}
+
+/**
+ * Relay an internal note authored IN NOOLA into the ticket's mirror thread, so the team collaborating
+ * in Discord sees the note the same way they see one typed in the thread. Durable via the relay outbox
+ * (deliverNoteRelay below). Echo-safe: it posts as the bot, and handleMirrorPostMessage swallows
+ * bot/webhook messages, so a note that ORIGINATED from Discord is never posted back. `dedupeKey` should
+ * be a stable id (the note id) so a retried enqueue doesn't double-post; call only from the Noola-side
+ * note path.
+ */
+export async function relayNoteToMirror(
+  tenantId: string,
+  ticketId: string,
+  note: { authorName?: string | null; body: string; dedupeKey: string },
+): Promise<void> {
+  if (!(await ticketHasMirrorRow(tenantId, ticketId))) return;
+  await enqueueRelay("note", tenantId, ticketId, `note:${note.dedupeKey}`, {
+    authorName: note.authorName ?? null,
+    body: note.body,
+  });
+}
+
+// ── relay outbox delivery (called by the drainer in discord-relay-outbox.ts) ─────────────────────────
+
+/** Dispatch one leased relay-outbox row to the right Discord write. Returns a DeliverResult the drainer
+ *  uses to mark delivered / back off / dead-letter. A missing transport or a not-yet-ready mirror is
+ *  RETRIABLE (bot reconnects, forum post finishes creating); a vanished source row is a terminal skip. */
+export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
   const tp = transport();
-  if (!tp) { console.warn(`[discord-mirror] relay skipped: no live Discord transport (ticket ${ticketId})`); return; }
+  if (!tp) return { ok: false, retriable: true, error: "no live discord transport" };
+  const mirror = await getTicketMirror(row.tenant_id, row.ticket_id);
+  if (!mirror) return { ok: false, retriable: true, error: "mirror post not ready" };
+
+  if (row.kind === "message") {
+    const messageId = String(row.payload.messageId ?? "");
+    if (!messageId) return { ok: false, retriable: false, error: "missing messageId" };
+    return deliverMessageRelay(tp, mirror, row.tenant_id, row.ticket_id, messageId);
+  }
+  if (row.kind === "note") {
+    return deliverNoteRelay(tp, mirror, (row.payload.authorName as string | null) ?? null, String(row.payload.body ?? ""));
+  }
+  if (row.kind === "react") {
+    return deliverReactRelay(tp, String(row.payload.threadId ?? ""), String(row.payload.discordMessageId ?? ""), String(row.payload.emoji ?? ""));
+  }
+  return { ok: false, retriable: false, error: `unknown relay kind ${(row as RelayRow).kind}` };
+}
+
+async function deliverMessageRelay(
+  tp: MirrorTransport,
+  mirror: MirrorRef,
+  tenantId: string,
+  ticketId: string,
+  messageId: string,
+): Promise<DeliverResult> {
   const row = await withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT m.body, m.author_type, COALESCE(m.auto, false) AS auto,
@@ -519,40 +588,43 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
       [messageId, ticketId],
     );
     return r.rowCount ? r.rows[0] as { body: string; author_type: string; auto: boolean; author_name: string | null } : null;
-  });
-  if (!row) return;
+  }).catch(() => null);
+  // Message deleted before we could relay it → nothing to deliver; terminal, not an error.
+  if (!row) return { ok: true, retriable: false, error: "source message gone" };
   const isCustomer = row.author_type === "customer";
   const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
-  // Mirror the message's attachments (customer screenshots, agent-attached files) into the thread as
-  // real Discord uploads, not just text — closing the inbound-only asymmetry.
   const { files, dropped } = await loadMirrorFiles(tenantId, messageId);
-  const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(row.body))}${droppedNote(dropped)}`, files)
-    .catch((e) => { console.warn(`[discord-mirror] relay postToThread threw (ticket ${ticketId}, thread ${mirror.post_thread_id}): ${(e as Error)?.message ?? String(e)}`); return false; });
-  if (!posted) console.warn(`[discord-mirror] relay could not reach thread ${mirror.post_thread_id} (ticket ${ticketId}) — thread deleted or the bot lacks access/permission`);
+  try {
+    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(row.body))}${droppedNote(dropped)}`, files);
+    if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
   await syncMirrorState(tenantId, ticketId).catch(() => {});
+  return { ok: true, retriable: false };
 }
 
-/**
- * Relay an internal note authored IN NOOLA into the ticket's mirror thread, so the team collaborating
- * in Discord sees the note the same way they see one typed in the thread. Best-effort + echo-safe: it
- * posts as the bot, and handleMirrorPostMessage swallows bot/webhook messages, so a note that ORIGINATED
- * from Discord (already in the thread) is never posted back. Call only from the Noola-side note path.
- */
-export async function relayNoteToMirror(
-  tenantId: string,
-  ticketId: string,
-  note: { authorName?: string | null; body: string },
-): Promise<void> {
-  const mirror = await getTicketMirror(tenantId, ticketId);
-  if (!mirror) return;
-  const tp = transport();
-  if (!tp) return;
-  const name = note.authorName?.trim() || "Agent";
+async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorName: string | null, body: string): Promise<DeliverResult> {
+  const name = authorName?.trim() || "Agent";
   const label = `📝 **${name}** _(internal note)_:`;
-  await tp
-    .postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(note.body))}`)
-    .catch((e) => console.warn(`[discord-mirror] note relay threw (ticket ${ticketId}): ${(e as Error)?.message ?? String(e)}`));
+  try {
+    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(body))}`);
+    if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
+  return { ok: true, retriable: false };
+}
+
+async function deliverReactRelay(tp: MirrorTransport, threadId: string, discordMessageId: string, emoji: string): Promise<DeliverResult> {
+  if (!threadId || !discordMessageId || !emoji) return { ok: false, retriable: false, error: "missing react args" };
+  try {
+    const ok = await tp.react(threadId, discordMessageId, emoji);
+    return ok ? { ok: true, retriable: false } : { ok: false, retriable: true, error: "react not applied" };
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
 }
 
 /** Re-apply forum tags from the ticket's current status/priority; archive on closed, unarchive
@@ -947,7 +1019,14 @@ export async function handleMirrorReaction(
     "UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1",
     [r.discordMessageId, result.messageId],
   );
-  await transport()?.react(r.threadId, r.discordMessageId, PROMOTED_EMOJI).catch(() => {});
+  // Durable ✅ confirmation: enqueue instead of a fire-and-forget react. The old inline react hung in
+  // discord.js's queue on a degraded connection (observed: ✅ landing ~30 min late, or never), so the
+  // "sent" confirmation could silently never appear. The drainer retries until it lands.
+  await enqueueRelay("react", row.tenant_id, result.ticketId, `react:${r.discordMessageId}:${PROMOTED_EMOJI}`, {
+    threadId: r.threadId,
+    discordMessageId: r.discordMessageId,
+    emoji: PROMOTED_EMOJI,
+  });
   return { promoted: true, reason: out.delivered ? undefined : out.reason };
 }
 

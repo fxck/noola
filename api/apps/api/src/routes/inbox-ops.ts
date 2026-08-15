@@ -65,7 +65,7 @@ export default async function inboxOpsRoutes(app: FastifyInstance): Promise<void
     emitDomainEvent(tenantId, "note.added", { ticketId, mentionIds: parsed.data.mentionIds });
     // Mirror the note into the ticket's Discord thread (best-effort). Only Noola-authored notes reach
     // this route; Discord-origin notes come in via the gateway seam, so there's no echo.
-    void relayNoteToMirror(tenantId, ticketId, { authorName: req.session?.name ?? null, body: parsed.data.body });
+    void relayNoteToMirror(tenantId, ticketId, { authorName: req.session?.name ?? null, body: parsed.data.body, dedupeKey: note.id });
     return reply.code(201).send({ note });
   }));
 

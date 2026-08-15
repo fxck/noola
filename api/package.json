@@ -13,6 +13,7 @@
     "seed:demo": "tsx apps/api/src/seed-demo.ts",
     "test:isolation": "tsx packages/db/test/isolation.test.ts",
     "test:discord": "tsx apps/api/test/discord.test.ts",
+    "test:discord-relay-outbox": "tsx apps/api/test/discord-relay-outbox.test.ts",
     "test:discord-ondemand": "tsx apps/api/test/discord-ondemand.test.ts",
     "test:slack-ondemand": "tsx apps/api/test/slack-ondemand.test.ts",
     "test:discord-bots": "tsx apps/api/test/discord-bots.test.ts",

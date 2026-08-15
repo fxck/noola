@@ -13,6 +13,7 @@ import { ensureTicketsCollection, reindexAllTickets, ensureKbCollection, reindex
 import { ensureThreadsCollection, reindexAllThreads } from "./threads.js";
 import { ensureVectorCollections, reindexAllVectors } from "./vector.js";
 import { startDiscord } from "./discord-gateway.js";
+import { drainDiscordRelay } from "./discord-relay-outbox.js";
 import { backfillSeedFlows } from "./seedflows.js";
 import { runScheduledAutomations } from "./automations.js";
 import { detectSlaBreaches } from "./sla.js";
@@ -428,6 +429,9 @@ void ensureVectorCollections()
   .then(() => reindexAllVectors(app.log))
   .catch((err) => app.log.warn({ err }, "qdrant ensure/backfill failed"));
 setInterval(() => void drainOutbox(), 500);
+// Discord ops-mirror relay outbox (0113): deliver mirror messages/notes + promote ✅ reacts durably,
+// surviving degraded Discord connections and process restarts. Single-flight internally; 1s cadence.
+setInterval(() => void drainDiscordRelay(), 1000);
 // Prune stale answer_claims (§6) — the claim only needs to serialize concurrent answerers within one
 // customer turn, so anything older than a couple of days is dead weight. Runs on relayPool as role
 // event_relay (BYPASSRLS janitor); the 0076 `GRANT ... DELETE ... TO event_relay` is what lets this
