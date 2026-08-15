@@ -61,6 +61,7 @@ export function ContextRail({
   messageCount,
   onMutated,
   focused,
+  refreshKey,
 }: {
   ticket: Ticket;
   users: AgentUser[];
@@ -70,6 +71,9 @@ export function ContextRail({
   messageCount: number | null;
   onMutated: () => void;
   focused: boolean;
+  /** Realtime bump — increments on any event touching this ticket; drives the live
+   *  Participants roster refetch. */
+  refreshKey: number;
 }) {
   const [t, setT] = useState(ticket);
   useEffect(() => setT(ticket), [ticket]);
@@ -230,6 +234,17 @@ export function ContextRail({
                 <span className="truncate">{t.contact_name}</span>
               </span>
             )}
+          </FactRow>
+        )}
+        {t.contact_email && (
+          <FactRow label="Email">
+            <a
+              href={`mailto:${t.contact_email}`}
+              className="min-w-0 truncate underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              title={t.contact_email}
+            >
+              {t.contact_email}
+            </a>
           </FactRow>
         )}
         {/* Full company membership set (0111): a contact can belong to several accounts — list them
@@ -416,7 +431,7 @@ export function ContextRail({
         </RailSection>
 
         <RailSection id="participants" icon={Users} title="Participants">
-          <ParticipantsPanel ticketId={ticket.id} users={users} />
+          <ParticipantsPanel ticketId={ticket.id} users={users} refreshKey={refreshKey} />
         </RailSection>
 
         <AgentRunsSection ticketId={ticket.id} />
@@ -670,7 +685,15 @@ function TagEditor({
  *  Lists current participants (avatar + name, remove-× on hover) and an Add
  *  control that reuses the assignee dropdown's teammate list (the `users` the
  *  rail already holds). Fetches on ticket change; add/remove are optimistic. */
-function ParticipantsPanel({ ticketId, users }: { ticketId: string; users: AgentUser[] }) {
+function ParticipantsPanel({
+  ticketId,
+  users,
+  refreshKey,
+}: {
+  ticketId: string;
+  users: AgentUser[];
+  refreshKey: number;
+}) {
   const [participants, setParticipants] = useState<Participant[] | null>(null);
 
   useEffect(() => {
@@ -683,6 +706,21 @@ function ParticipantsPanel({ ticketId, users }: { ticketId: string; users: Agent
       live = false;
     };
   }, [ticketId]);
+
+  // Realtime bump: a participant.changed (loop-in / remove) or note-mention event for this ticket
+  // refetches the roster IN PLACE (no loading flash) so a teammate looped in by another agent shows
+  // up live, not only after a manual refresh. Skips the initial render (refreshKey===0).
+  useEffect(() => {
+    if (refreshKey === 0) return;
+    let live = true;
+    fetchParticipants(ticketId)
+      .then((p) => live && setParticipants(p))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   async function add(userId: string) {
     const user = users.find((u) => u.id === userId);

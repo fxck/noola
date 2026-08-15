@@ -21,6 +21,7 @@ export const EVENT_TYPES = {
   autoreplyJob: "noola.autoreply.job",
   sourceSynced: "noola.source.synced",
   broadcastUpdated: "noola.broadcast.updated",
+  participantChanged: "participant.changed",
 } as const;
 
 // NATS / JetStream addressing. One subject token per tenant so the edge can

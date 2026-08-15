@@ -681,9 +681,41 @@ async function upsertOne(
   return { id: newId, created: true };
 }
 
-/** Keep the junction consistent on the back-office upsert path: an explicit company_ids set is
- *  authoritative (and re-pins the primary column); otherwise a single company_id COALESCE'd above
- *  is mirrored as the primary membership. */
+/** Identify/upsert with only a free-text company NAME (no id): resolve-or-create that company and
+ *  MERGE it additively into the junction, on the caller's txn connection. This is the omnichannel
+ *  "client/account" case — a person logging in under one client sends {user, company-name}; logging
+ *  in under a DIFFERENT client sends a different name. We accumulate every one as a membership instead
+ *  of clobbering (the old path wrote only the scalar contacts.company, last-write-wins, so the
+ *  Companies/clients list on the person detail rendered empty). The FIRST company observed stays
+ *  primary — we only set is_primary when the contact has none yet, so re-logins never flip it and the
+ *  one-primary partial-unique index is never violated. Returns the resolved company id. */
+async function mergeCompanyByName(c: PoolClient, contactId: string, rawName: string): Promise<string | null> {
+  const name = (rawName ?? "").trim();
+  if (!name) return null;
+  const cr = await c.query(
+    `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
+     ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET name = companies.name
+     RETURNING id`,
+    [name],
+  );
+  const companyId = cr.rows[0].id as string;
+  const hasPrimary = ((await c.query(
+    `SELECT 1 FROM contact_companies WHERE contact_id = $1 AND is_primary LIMIT 1`,
+    [contactId],
+  )).rowCount ?? 0) > 0;
+  await c.query(
+    `INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary)
+     VALUES (current_tenant(), $1, $2, $3)
+     ON CONFLICT (tenant_id, contact_id, company_id) DO NOTHING`,
+    [contactId, companyId, !hasPrimary],
+  );
+  return companyId;
+}
+
+/** Keep the junction consistent on the upsert path: an explicit company_ids set is authoritative
+ *  (and re-pins the primary column); a single company_id is mirrored as the primary membership;
+ *  otherwise a free-text company NAME (the widget/identify case) is merged additively into the
+ *  junction so cross-client memberships accumulate instead of overwriting. */
 async function syncUpsertCompanies(
   c: PoolClient,
   contactId: string,
@@ -695,6 +727,13 @@ async function syncUpsertCompanies(
     await c.query(`UPDATE contacts SET company_id = $2, company = $3 WHERE id = $1`, [contactId, primaryId, primaryName]);
   } else if (cid) {
     await ensurePrimaryCompany(c, contactId, cid);
+  } else if ((input.company ?? "").trim()) {
+    const primaryId = await mergeCompanyByName(c, contactId, input.company!);
+    // Pin the denormalized primary pointer only when it's still empty — keeps company_id referencing
+    // a real account without disturbing an already-chosen primary.
+    if (primaryId) {
+      await c.query(`UPDATE contacts SET company_id = COALESCE(company_id, $2) WHERE id = $1`, [contactId, primaryId]);
+    }
   }
 }
 
