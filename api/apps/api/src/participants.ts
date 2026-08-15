@@ -1,9 +1,38 @@
 import { withTenant } from "@repo/db";
+import { EVENT_TYPES } from "@repo/contracts";
+import { randomUUID } from "node:crypto";
+import type { PoolClient } from "pg";
 
 // Ticket participants — named teammates on a single conversation ("attendees"), alongside the one
 // assignee and the team lane. Add drags a teammate into THIS issue; they surface in the context rail
 // and (when their Discord id is mapped) get an @ping in the ops mirror. See discord-mirror
 // pingSeatInMirror for the notification side.
+
+/** Publish a participant.changed event to the transactional outbox on the SAME connection/txn as the
+ *  roster write (message.created's sibling — see ingest.ts / notes.ts). The edge relays it on
+ *  noola.events.<tenant>; the web's Participants panel refetches for this ticket. Without this, a
+ *  loop-in only surfaced to OTHER agents after a manual refresh. */
+async function emitParticipantChanged(
+  c: PoolClient,
+  tenantId: string,
+  ticketId: string,
+  userId: string,
+  action: "added" | "removed",
+): Promise<void> {
+  const id = randomUUID();
+  const envelope = {
+    id,
+    type: EVENT_TYPES.participantChanged,
+    tenantId,
+    ticketId,
+    occurredAt: new Date().toISOString(),
+    data: { ticketId, userId, action },
+  };
+  await c.query(
+    "INSERT INTO outbox (tenant_id, event_type, subject, payload) VALUES (current_tenant(), $1, 'noola.events.' || current_tenant(), $2::jsonb)",
+    [EVENT_TYPES.participantChanged, JSON.stringify(envelope)],
+  );
+}
 
 export interface Participant {
   userId: string;
@@ -55,6 +84,7 @@ export async function addParticipant(
       [userId],
     );
     if (!r.rowCount) return null;
+    if (added) await emitParticipantChanged(c, tenantId, ticketId, userId, "added");
     return { participant: rowToParticipant(r.rows[0]), added };
   });
 }
@@ -66,6 +96,8 @@ export async function removeParticipant(tenantId: string, ticketId: string, user
       "DELETE FROM ticket_participants WHERE ticket_id = $1 AND user_id = $2",
       [ticketId, userId],
     );
-    return (r.rowCount ?? 0) > 0;
+    const removed = (r.rowCount ?? 0) > 0;
+    if (removed) await emitParticipantChanged(c, tenantId, ticketId, userId, "removed");
+    return removed;
   });
 }

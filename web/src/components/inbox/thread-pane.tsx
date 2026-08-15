@@ -395,6 +395,7 @@ export function ThreadPane({
           messageCount={messages?.length ?? null}
           onMutated={onMutated}
           focused={focused}
+          refreshKey={refreshKey}
         />
       )}
     </div>

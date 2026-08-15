@@ -254,7 +254,9 @@ async function main() {
   check("non-mirror thread falls through", nonMirror.handled === false);
 
   // ── D3: 📤 promotion — role gate + exactly-once ────────────────────────────
-  const wrongEmoji = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "👍", reactorRoleIds: [ROLE] });
+  // Unmapped emoji on the OP starter message (discordMessageId === thread id) reaches the triage map
+  // and is ignored as unmapped (a non-OP reaction would be short-circuited earlier by the OP gate).
+  const wrongEmoji = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "👍", reactorRoleIds: [ROLE] });
   check("non-📤, unmapped emoji ignored", !wrongEmoji.promoted && wrongEmoji.reason === "unmapped_emoji");
   const noRole = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-eve", emoji: PROMOTE_EMOJI, reactorRoleIds: [] });
   check("role gate blocks a non-responder reactor", !noRole.promoted && noRole.reason === "not_responder");
@@ -305,30 +307,39 @@ async function main() {
 
   if (triageReady) {
     calls.length = 0;
-    const closeRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "✅", reactorRoleIds: [ROLE] });
+    // OP-only triage gate: a ✅ on a mid-thread reply (discordMessageId != the post's starter id, which
+    // in a Discord forum post equals the thread id) must NOT triage — only the OP starter message does.
+    // Regression guard: reacting on ANY message used to close the ticket, in a half-attributed state.
+    const nonOpClose = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "✅", reactorRoleIds: [ROLE] });
+    check("✅ on a non-OP message is refused", nonOpClose.reason === "not_starter_message" && !nonOpClose.action);
+    const stillOpen = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
+    check("✅ on a non-OP message did NOT close", stillOpen.rows[0].status === "open");
+
+    // The OP starter message (discordMessageId === post_thread_id) DOES triage.
+    const closeRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "✅", reactorRoleIds: [ROLE] });
     check("✅ triages close", closeRes.action === "close" && !closeRes.reason);
     const closedRow = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
     check("✅ closed the ticket", closedRow.rows[0].status === "closed");
     check("✅ archived the post", archived.get(thread1) === true);
     check("🆗 confirmation react", calls.some((c) => c.fn === "react" && c.args[2] === "🆗"));
 
-    const gateRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-eve", emoji: "🔄", reactorRoleIds: [] });
+    const gateRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-eve", emoji: "🔄", reactorRoleIds: [] });
     check("triage role gate blocks outsiders", gateRes.reason === "not_responder");
 
-    const reopenRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "🔄", reactorRoleIds: [ROLE] });
+    const reopenRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "🔄", reactorRoleIds: [ROLE] });
     check("🔄 triages reopen", reopenRes.action === "reopen" && !reopenRes.reason);
     const reopened = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
     check("🔄 reopened the ticket", reopened.rows[0].status === "open");
     check("🔄 unarchived the post", archived.get(thread1) === false);
 
-    const snoozeRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "💤", reactorRoleIds: [ROLE] });
+    const snoozeRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "💤", reactorRoleIds: [ROLE] });
     check("💤 triages snooze", snoozeRes.action === "snooze" && !snoozeRes.reason);
     const snoozed = await withTenant(A, (c) => c.query("SELECT snoozed_until FROM tickets WHERE id = $1", [t1]));
     check("💤 set a future snooze", snoozed.rows[0].snoozed_until !== null && new Date(snoozed.rows[0].snoozed_until as string).getTime() > Date.now());
 
     // 👀 assign-to-me: unmarked reactor → helpful in-thread hint, no assignment.
     calls.length = 0;
-    const noSeat = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "👀", reactorRoleIds: [ROLE] });
+    const noSeat = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "👀", reactorRoleIds: [ROLE] });
     check("👀 without a linked seat refuses", noSeat.action === "assign_me" && noSeat.reason === "no_seat");
     check("👀 refusal hints at Settings → Members", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("Settings → Members")));
 
@@ -341,7 +352,7 @@ async function main() {
     await upsertAgentChannelIdentity(A, seatId, "mirtest-user-bob");
     check("teammate mark resolves the seat", (await resolveTeammate(A, "mirtest-user-bob")) === seatId);
     // No role passed — the explicit mark alone must clear the responder gate.
-    const assignRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "👀", reactorRoleIds: [] });
+    const assignRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "👀", reactorRoleIds: [] });
     check("👀 assigns to the linked seat (mark bypasses role gate)", assignRes.action === "assign_me" && !assignRes.reason);
     const asg = await withTenant(A, (c) => c.query("SELECT assignee_id FROM tickets WHERE id = $1", [t1]));
     check("assignee persisted", asg.rows[0].assignee_id === seatId);
@@ -355,7 +366,7 @@ async function main() {
     check("tenant reaction map carries the spam default (0112 backfill)", liveMap["no_entry_sign"] === "spam");
     if (liveMap["no_entry_sign"] === "spam") {
       calls.length = 0;
-      const spamRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: "🚫", reactorRoleIds: [ROLE] });
+      const spamRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "🚫", reactorRoleIds: [ROLE] });
       check("🚫 triages spam", spamRes.action === "spam" && !spamRes.reason);
       const spammed = await withTenant(A, (c) => c.query("SELECT spam_at FROM tickets WHERE id = $1", [t1]));
       check("🚫 marked the ticket spam", spammed.rows[0].spam_at !== null);

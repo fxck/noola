@@ -927,6 +927,14 @@ export async function handleMirrorReaction(
   }
 
   if (canonicalEmojiName(r.emoji) !== "outbox_tray") {
+    // Triage (close/reopen/snooze/assign/spam) acts on the WHOLE ticket, so only honor it on the post's
+    // STARTER message (the OP) — in a Discord forum post the starter message id equals the thread id
+    // (post_thread_id). Reacting ✅/👀/… on a mid-thread reply used to triage the ticket all the same,
+    // so a checkmark on ANY message closed it; require the OP. (📤 promote is deliberately the opposite —
+    // it targets a RESPONDER's message — so it lives past this gate, below.)
+    if (r.discordMessageId !== mirror.post_thread_id) {
+      return { promoted: false, reason: "not_starter_message" };
+    }
     return applyMirrorTriage(mirror, r, agentId);
   }
 
@@ -1053,13 +1061,23 @@ async function applyMirrorTriage(
   const { tenant_id: tenantId, ticket_id: ticketId } = mirror;
 
   switch (action) {
-    case "close":
-      await setTicketStatus(tenantId, ticketId, "closed");
-      // CSAT-on-close stays unified through the seeded `ticket.closed → survey` flow (same as Slack).
-      void import("./automations.js")
-        .then((m) => m.emitDomainEvent(tenantId, "ticket.closed", { ticketId }))
-        .catch(() => {});
+    case "close": {
+      const closed = await setTicketStatus(tenantId, ticketId, "closed");
+      if (closed) {
+        // Mirror the web /tickets/:id/close route EXACTLY so a reaction-close isn't a half-close:
+        //  - index the resolved thread as a knowledge source (the old reaction path skipped this), and
+        //  - emit ticket.closed WITH the reactor's name so onTicketClosed posts "✅ Resolved by X"
+        //    (attribution was lost before → a bare, unattributed close) and CSAT/seeded automations fire.
+        const actorName = agentId ? await teammateName(tenantId, agentId) : null;
+        void import("./threads.js")
+          .then((m) => m.indexResolvedThread(tenantId, ticketId))
+          .catch(() => {});
+        void import("./automations.js")
+          .then((m) => m.emitDomainEvent(tenantId, "ticket.closed", { ticketId, actorName }))
+          .catch(() => {});
+      }
       break;
+    }
     case "reopen":
       await setTicketStatus(tenantId, ticketId, "open");
       break;

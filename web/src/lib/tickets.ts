@@ -42,6 +42,8 @@ export interface Ticket {
   /** The contact this conversation belongs to (omnichannel unification), or null. */
   contact_id?: string | null;
   contact_name?: string | null;
+  /** The contact's email (leads/known contacts). Optional (older api). Rendered as a mailto row. */
+  contact_email?: string | null;
   contact_avatar_url?: string | null;
   /** Derived server-side: the contact was seen within the 3-min online window — drives the inbox
    *  presence dot (matches the contacts list/detail). */
