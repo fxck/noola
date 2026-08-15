@@ -330,6 +330,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
         const r = await c.query(
           `SELECT m.id, m.ticket_id, m.author_type, m.author_kind, m.body, COALESCE(m.auto, false) AS auto,
                   m.meta, m.channel_type, m.created_at, m.seen_at,
+                  m.delivery_status, m.delivered_at, m.bounced_at, m.bounce_kind, m.complained_at, m.opened_at,
                   COALESCE((SELECT u.name FROM users u WHERE u.tenant_id = m.tenant_id AND u.id = m.author_id),
                            m.author_external_name) AS author_name,
                   COALESCE((SELECT u.avatar_url FROM users u WHERE u.tenant_id = m.tenant_id AND u.id = m.author_id),
@@ -475,6 +476,19 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       : { delivered: false as boolean, reason: "no-driver" };
     if (driver?.dispatch && !out.delivered) {
       app.log.warn({ ticketId: id, channel: result.channelType, reason: out.reason }, "outbound not delivered");
+    }
+
+    // Email delivery tracking (0114): persist the provider Message-ID + an initial head so the thread
+    // shows send confidence immediately — 'sent' (SMTP handed off) or 'failed' (driver couldn't send).
+    // A provider delivery webhook later advances 'sent' → delivered / bounced / complained. Best-effort.
+    if (result.channelType === "email" && driver?.dispatch) {
+      await withTenant(tenantId, (c) =>
+        c.query("UPDATE messages SET provider_message_id = $2, delivery_status = $3 WHERE id = $1", [
+          result.messageId,
+          out.providerMessageId ?? null,
+          out.delivered ? "sent" : "failed",
+        ]),
+      ).catch((err) => app.log.warn({ err, ticketId: id }, "delivery status stamp failed"));
     }
 
     // Widget/away fallback: a widget reply has no outbound driver (the widget polls). If the customer

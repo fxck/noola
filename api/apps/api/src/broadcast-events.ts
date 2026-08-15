@@ -72,6 +72,25 @@ function recipientDelta(type: DeliveryEventType, bounceKind: "hard" | "soft" | n
   }
 }
 
+/** The per-message delivery-head mutation for a 1:1 reply email (0114) — the messages-table analog of
+ *  recipientDelta. Same first-touch COALESCE + never-regress-a-terminal-outcome discipline; an 'opened'
+ *  also stamps seen_at so it unifies with the existing open-pixel "Seen" signal. */
+function messageDelta(type: DeliveryEventType, bounceKind: "hard" | "soft" | null): { sql: string; params: unknown[] } | null {
+  switch (type) {
+    case "delivered":
+      return { sql: "delivery_status = CASE WHEN delivery_status IN ('bounced','complained') THEN delivery_status ELSE 'delivered' END, delivered_at = COALESCE(delivered_at, now())", params: [] };
+    case "bounced":
+      return { sql: "delivery_status = 'bounced', bounced_at = COALESCE(bounced_at, now()), bounce_kind = COALESCE(bounce_kind, $2)", params: [bounceKind ?? "hard"] };
+    case "complained":
+      return { sql: "delivery_status = 'complained', complained_at = COALESCE(complained_at, now())", params: [] };
+    case "opened":
+    case "clicked":
+      return { sql: "opened_at = COALESCE(opened_at, now()), seen_at = COALESCE(seen_at, now())", params: [] };
+    default:
+      return null; // 'sent' is stamped at send; deferred/unsubscribed/failed carry no message-head change
+  }
+}
+
 export async function recordDeliveryEvent(tenantId: string, ev: DeliveryEvent): Promise<RecordResult> {
   const address = ev.address?.trim().toLowerCase() || null;
   return withTenant(tenantId, async (c) => {
@@ -102,17 +121,33 @@ export async function recordDeliveryEvent(tenantId: string, ev: DeliveryEvent): 
       }
     }
 
+    // 1b. Reply-email fallback (0114): no broadcast recipient — try a 1:1 agent reply, matched by the
+    //     Message-ID we stamped at send. Advances the messages delivery head; the suppression step
+    //     below (address-keyed) still applies to a reply hard-bounce/complaint.
+    let msgId: string | null = null;
+    if (!rid && ev.messageId) {
+      const mm = await c.query("SELECT id FROM messages WHERE provider_message_id = $1 LIMIT 1", [ev.messageId]);
+      if (mm.rowCount) msgId = mm.rows[0].id as string;
+    }
+    if (msgId) {
+      const md = messageDelta(ev.type, ev.bounceKind ?? null);
+      if (md) await c.query(`UPDATE messages SET ${md.sql} WHERE id = $1`, [msgId, ...md.params]);
+    }
+
     // 2. Advance the recipient's derived status/timestamps.
     if (rid) {
       const delta = recipientDelta(ev.type, ev.bounceKind ?? null);
       if (delta) await c.query(`UPDATE broadcast_recipients SET ${delta.sql} WHERE id = $1`, [rid, ...delta.params]);
     }
 
-    // 3. Append the immutable event.
-    await c.query(
-      "INSERT INTO broadcast_events (broadcast_id, recipient_id, contact_id, type, address, meta, occurred_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb, COALESCE($7, now()))",
-      [bcastId, rid, contactId, ev.type, address, JSON.stringify(ev.meta ?? {}), ev.occurredAt ?? null],
-    );
+    // 3. Append the immutable broadcast event — broadcast context only. A reply-email match (msgId) is
+    //    not a broadcast, so it doesn't append here (its head lives on the messages row).
+    if (!msgId) {
+      await c.query(
+        "INSERT INTO broadcast_events (broadcast_id, recipient_id, contact_id, type, address, meta, occurred_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb, COALESCE($7, now()))",
+        [bcastId, rid, contactId, ev.type, address, JSON.stringify(ev.meta ?? {}), ev.occurredAt ?? null],
+      );
+    }
 
     // 4. Suppress permanent failures. A hard bounce or a spam complaint parks the address so no
     //    future send re-hits it; a complaint additionally opts the known contact out of marketing.
@@ -132,7 +167,7 @@ export async function recordDeliveryEvent(tenantId: string, ev: DeliveryEvent): 
       }
     }
 
-    return { matched: !!rid, recipientId: rid, suppressed };
+    return { matched: !!rid || !!msgId, recipientId: rid, suppressed };
   });
 }
 

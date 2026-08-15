@@ -23,7 +23,13 @@ export interface OutboundContext {
   ticketId?: string | null;
 }
 
-export type DispatchResult = { delivered: boolean; reason?: string };
+export type DispatchResult = {
+  delivered: boolean;
+  reason?: string;
+  /** Email only (0114): the unangled Message-ID the provider will echo, so the caller can persist it
+   *  on the message row for delivery-webhook matching. Absent for channels without provider events. */
+  providerMessageId?: string;
+};
 
 /** Extra outbound payload beyond the text body. Only channels that support it (email) act on it;
  *  others ignore the argument entirely. */
@@ -103,14 +109,23 @@ const email: ChannelDriver = {
     relayPool
       .query("SELECT count(*)::int AS n FROM email_routes WHERE tenant_id = $1", [tenantId])
       .then((r) => r.rows[0].n as number),
-  dispatch: (ctx, body, opts) =>
-    routeEmailOutbound(
+  dispatch: async (ctx, body, opts) => {
+    const r = await routeEmailOutbound(
       { tenantId: ctx.tenantId, externalChannelId: ctx.externalChannelId, ticketId: ctx.ticketId ?? null },
       ctx.subject,
       body,
       opts?.attachments,
-      { agentName: opts?.agentName ?? null, ...(opts?.agentEmail ? { agentEmail: opts.agentEmail } : {}), ...(opts?.cc?.length ? { cc: opts.cc } : {}), ...(opts?.seenMessageId ? { seenMessageId: opts.seenMessageId } : {}) },
-    ),
+      {
+        agentName: opts?.agentName ?? null,
+        ...(opts?.agentEmail ? { agentEmail: opts.agentEmail } : {}),
+        ...(opts?.cc?.length ? { cc: opts.cc } : {}),
+        ...(opts?.seenMessageId ? { seenMessageId: opts.seenMessageId } : {}),
+        // The agent message id doubles as the reply Message-ID key so delivery events match back (0114).
+        ...(opts?.seenMessageId ? { replyMessageId: opts.seenMessageId } : {}),
+      },
+    );
+    return { delivered: r.delivered, ...(r.reason ? { reason: r.reason } : {}), ...(r.messageId ? { providerMessageId: r.messageId } : {}) };
+  },
 };
 
 const slack: ChannelDriver = {

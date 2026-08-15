@@ -388,6 +388,11 @@ export async function sendOutboundEmail(
      *  the recipient row (0109). Mutually exclusive with replyToTicketId (a marketing send is not a
      *  ticket reply). The returned `messageId` is the unangled full id the provider will echo. */
     marketingId?: string | null;
+    /** Ticket-reply delivery tracking (0114): the internal messages.id, embedded into the reply's
+     *  Message-ID (`<t.<ticket-token>.m.<messageId>@domain>`) so a provider delivery event echoes it
+     *  and we can match it back to this exact reply row. The returned `messageId` is that unangled id.
+     *  Only meaningful alongside replyToTicketId. */
+    replyMessageId?: string | null;
   },
 ): Promise<{ delivered: boolean; reason?: string; messageId?: string }> {
   if (!to) return { delivered: false, reason: "no-recipient" };
@@ -408,6 +413,13 @@ export async function sendOutboundEmail(
   // routing + threading are unaffected by who the reply is From.
   const fromIdentity = await resolveFromIdentity(tenantId, support, { agentName: opts?.agentName, agentEmail: opts?.agentEmail });
   const tx = creds ? providerSmtpTransport(creds.provider, creds.apiKey) : smtpTransport(smtpHost!, Number(process.env.SMTP_PORT ?? 1025));
+  // Reply Message-ID (unangled). When the caller passes the internal messages.id we embed it
+  // (`t.<ticket-token>.m.<messageId>@domain`) so a provider delivery event, which echoes the
+  // Message-ID, matches straight back to this reply row (0114); otherwise fall back to the old
+  // timestamped form. Computed once so the stamped header and the returned id are identical.
+  const replyLocalId = opts?.replyToTicketId
+    ? `t.${ticketEmailToken(opts.replyToTicketId)}.${opts?.replyMessageId ? `m.${opts.replyMessageId}` : Date.now().toString(36)}@${replyDomain}`
+    : null;
   await tx.sendMail({
     from: fromIdentity,
     to,
@@ -417,7 +429,7 @@ export async function sendOutboundEmail(
     ...(opts?.replyToTicketId
       ? {
           replyTo: ticketReplyAddress(replyBase, opts.replyToTicketId),
-          messageId: `<t.${ticketEmailToken(opts.replyToTicketId)}.${Date.now().toString(36)}@${replyDomain}>`,
+          messageId: `<${replyLocalId}>`,
         }
       : {}),
     // Marketing send (0109): stamp a deterministic per-recipient Message-ID so a provider
@@ -441,8 +453,10 @@ export async function sendOutboundEmail(
         : {}),
     },
   });
-  const marketingMessageId = opts?.marketingId && !opts?.replyToTicketId ? `${opts.marketingId}@${replyDomain}` : undefined;
-  return { delivered: true, ...(marketingMessageId ? { messageId: marketingMessageId } : {}) };
+  // Return the unangled Message-ID the provider will echo: the reply id for a ticket reply (0114),
+  // else the marketing id for a broadcast send (0109). The caller persists it for webhook matching.
+  const echoedMessageId = replyLocalId ?? (opts?.marketingId ? `${opts.marketingId}@${replyDomain}` : undefined);
+  return { delivered: true, ...(echoedMessageId ? { messageId: echoedMessageId } : {}) };
 }
 
 /** A file attached to an outbound email (nodemailer's attachment shape, narrowed to what we send). */
@@ -502,8 +516,8 @@ export async function routeEmailOutbound(
   subject: string,
   body: string,
   attachments?: MailAttachment[],
-  opts?: { agentName?: string | null; agentEmail?: string | null; cc?: string[]; seenMessageId?: string | null },
-): Promise<{ delivered: boolean; reason?: string }> {
+  opts?: { agentName?: string | null; agentEmail?: string | null; cc?: string[]; seenMessageId?: string | null; replyMessageId?: string | null },
+): Promise<{ delivered: boolean; reason?: string; messageId?: string }> {
   const subj = /^re:/i.test(subject) ? subject : `Re: ${subject}`;
   // The tenant's flagged reply template (0072) restyles the frame; failures fall back to the
   // stock personal look — a designer hiccup never blocks the send.
@@ -534,6 +548,7 @@ export async function routeEmailOutbound(
     ...(opts?.cc?.length ? { cc: opts.cc } : {}),
     ...(opts?.agentName ? { agentName: opts.agentName } : {}),
     ...(opts?.agentEmail ? { agentEmail: opts.agentEmail } : {}),
+    ...(opts?.replyMessageId ? { replyMessageId: opts.replyMessageId } : {}),
     replyToTicketId: routing.ticketId ?? null,
     inReplyTo,
   });
@@ -561,14 +576,26 @@ export async function notifyContactByEmailIfAway(
     return r.rowCount ? (r.rows[0] as { email: string | null; online: boolean }) : null;
   });
   if (!info?.email || info.online) return;
-  await routeEmailOutbound(
+  const res = await routeEmailOutbound(
     { tenantId, externalChannelId: info.email, ticketId: args.ticketId },
     args.subject || "Support",
     args.body,
     undefined,
-    // best-effort read receipt on the away-fallback email too
-    { agentName: args.agentName ?? null, ...(args.messageId ? { seenMessageId: args.messageId } : {}) },
-  ).catch(() => {});
+    // best-effort read receipt + delivery tracking on the away-fallback email too (the message row is
+    // channel_type='widget', but once it goes out by email we track it like any reply email — 0114).
+    { agentName: args.agentName ?? null, ...(args.messageId ? { seenMessageId: args.messageId, replyMessageId: args.messageId } : {}) },
+  ).catch(() => null);
+  // Stamp the fallback reply's delivery head so the thread shows it actually went out by email (and
+  // later flips to delivered/bounced from the provider webhook), not just an unconfirmed widget reply.
+  if (args.messageId && res) {
+    await withTenant(tenantId, (c) =>
+      c.query("UPDATE messages SET provider_message_id = COALESCE($2, provider_message_id), delivery_status = $3 WHERE id = $1", [
+        args.messageId,
+        res.messageId ?? null,
+        res.delivered ? "sent" : "failed",
+      ]),
+    ).catch(() => {});
+  }
 }
 
 // ---- inbound poller (Mailpit; validated live) ---------------------------

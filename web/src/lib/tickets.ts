@@ -211,6 +211,16 @@ export interface Message {
   /** Read receipt: when the customer last saw this (agent) message — set by the widget foreground
    *  poll or an email tracking-pixel open. Null/absent = not yet seen. Drives the "Seen" line. */
   seen_at?: string | null;
+  /** Email delivery head for an agent reply (0114): sent | delivered | bounced | complained | failed.
+   *  Null/absent = not an email reply (or older row). Drives the per-message delivery badge. */
+  delivery_status?: string | null;
+  delivered_at?: string | null;
+  bounced_at?: string | null;
+  /** 'hard' | 'soft' — shown as the bounce badge's tooltip. */
+  bounce_kind?: string | null;
+  complained_at?: string | null;
+  /** Provider "opened" event (distinct from the seen pixel, though they unify server-side). */
+  opened_at?: string | null;
   /** The agent who authored this message (real name, from users) — null/absent for
    *  customer messages, auto-replies, and rows older than the author stamp. */
   author_name?: string | null;
