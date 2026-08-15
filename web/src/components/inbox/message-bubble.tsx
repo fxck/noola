@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound } from "lucide-react";
+import { StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound, Check, CheckCheck, Eye, TriangleAlert } from "lucide-react";
 import {
   type Message,
   type MessageMeta,
@@ -27,6 +27,62 @@ import { cn } from "@/lib/utils";
 // The thread's message-rendering family: customer/agent bubbles (with auto-translation display),
 // internal notes, and the AI-answer receipt + its nerd-mode instrument breakdown. Extracted from
 // thread-pane so the pane owns scroll/lifecycle and this file owns how a single entry renders.
+
+/** Email delivery badge for an agent reply (0114): send-confidence beyond the "Seen" pixel —
+ *  Sent → Delivered → Opened, or a Bounced / Marked-spam / Failed state. Renders only when a delivery
+ *  head exists (email replies, including a widget reply that fell back to email). */
+function DeliveryBadge({
+  status,
+  bounceKind,
+  openedAt,
+  viaEmailFallback,
+}: {
+  status: string;
+  bounceKind?: string | null;
+  openedAt?: string | null;
+  viaEmailFallback?: boolean;
+}) {
+  const via = viaEmailFallback ? " · by email" : "";
+  let icon: ReactNode;
+  let label: string;
+  let title: string;
+  let tone = "text-muted-foreground/80";
+  if (status === "complained") {
+    icon = <TriangleAlert className="size-3" />;
+    label = "Marked spam";
+    title = "The recipient marked this email as spam";
+    tone = "text-destructive";
+  } else if (status === "bounced") {
+    icon = <TriangleAlert className="size-3" />;
+    label = "Bounced";
+    title = `Email bounced${bounceKind ? ` (${bounceKind})` : ""} — it did not reach the recipient`;
+    tone = "text-destructive";
+  } else if (status === "failed") {
+    icon = <TriangleAlert className="size-3" />;
+    label = "Failed to send";
+    title = "The email could not be handed off to the provider";
+    tone = "text-destructive";
+  } else if (openedAt) {
+    icon = <Eye className="size-3" />;
+    label = "Opened";
+    title = `Recipient opened the email${via}`;
+  } else if (status === "delivered") {
+    icon = <CheckCheck className="size-3" />;
+    label = "Delivered";
+    title = `Delivered to the recipient's mail server${via}`;
+  } else if (status === "sent") {
+    icon = <Check className="size-3" />;
+    label = "Sent";
+    title = `Handed off to the email provider${via}`;
+  } else {
+    return null;
+  }
+  return (
+    <span className={cn("inline-flex items-center gap-0.5 font-medium", tone)} title={title}>
+      {icon} {label}
+    </span>
+  );
+}
 
 /** Internal note in the thread — agent-only, visually distinct from customer/agent
  *  messages (never dispatched to a channel). Full-width, warning-tinted card. */
@@ -206,6 +262,14 @@ export function MessageBubble({
             </span>
           )}
           {showChannel && message.channel_type && <ChannelIcon channel={message.channel_type} className="size-3" />}
+          {isAgent && message.delivery_status && (
+            <DeliveryBadge
+              status={message.delivery_status}
+              bounceKind={message.bounce_kind}
+              openedAt={message.opened_at}
+              viaEmailFallback={message.channel_type === "widget"}
+            />
+          )}
         </div>
         {tr && (
           <div className={cn("flex items-center gap-1.5 text-micro text-muted-foreground", isAgent && "flex-row-reverse")}>
