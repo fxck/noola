@@ -254,8 +254,9 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       if (!t) return false;
       const msg = await t.messages.fetch(messageId).catch(() => null);
       if (!msg) return false;
-      await msg.react(emoji).catch(() => false);
-      return true;
+      // Report the ACTUAL outcome — the old `.catch(() => false); return true` swallowed the failure and
+      // reported success regardless, so the relay drainer could never know the react didn't land.
+      return await msg.react(emoji).then(() => true).catch(() => false);
     },
     async memberRoleIds(guildId, userId) {
       const guild = await client.guilds.fetch(guildId).catch(() => null);

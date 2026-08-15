@@ -7,6 +7,7 @@ import {
   handleMirrorPostMessage, handleMirrorReaction, PROMOTE_EMOJI,
   onConversationSpam, onConversationUnspam,
 } from "../src/discord-mirror.js";
+import { drainDiscordRelay } from "../src/discord-relay-outbox.js";
 import { markConversationSpam, unmarkConversationSpam } from "../src/spam.js";
 import type { MirrorTransport } from "../src/discord-gateway.js";
 import { ingestInbound } from "../src/ingest.js";
@@ -97,6 +98,7 @@ async function main() {
 
   const clean = async () => {
     await superPool.query("DELETE FROM ticket_mirror_messages WHERE discord_message_id LIKE 'mirtest-%'");
+    await superPool.query(`DELETE FROM discord_relay_outbox WHERE ticket_id IN (SELECT id FROM tickets WHERE external_channel_id LIKE 'mirtest-%')`).catch(() => {});
     await superPool.query("DELETE FROM ticket_mirror WHERE guild_id = $1", [GUILD]);
     await superPool.query("DELETE FROM discord_mirror_bindings WHERE guild_id = $1", [GUILD]);
     const t = "SELECT id FROM tickets WHERE external_channel_id LIKE 'mirtest-%'";
@@ -179,6 +181,7 @@ async function main() {
     idempotencyKey: "mirtest:auto:2", ticketId: t1, skipAutoreply: true,
   });
   await relayTicketMessage(A, t1, follow.messageId);
+  await drainDiscordRelay(); // relays are durable now: enqueue → the drainer performs the Discord write
   const posts = calls.filter((c) => c.fn === "postToThread");
   check("customer follow-up relayed into the post", posts.some((c) => String(c.args[1]).includes("MIRTEST follow-up from customer")));
   check("relay labels the customer", posts.some((c) => String(c.args[1]).includes("Mir Tester auto")));
@@ -188,6 +191,7 @@ async function main() {
     ticketId: t1, idempotencyKey: "mirtest:auto:3",
   });
   await relayTicketMessage(A, t1, agentMsg.messageId);
+  await drainDiscordRelay();
   check("console agent reply relayed as sent-to-customer", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("reply sent to customer") && String(c.args[1]).includes("MIRTEST console agent reply")));
   // Readability: the relayed body is blockquoted (each line "> "-prefixed) and preceded by a divider,
   // so consecutive mirrored messages read as distinct blocks instead of one wall of text.
@@ -209,6 +213,7 @@ async function main() {
   ]);
   check("attachment persisted for the message", stored === 1);
   await relayTicketMessage(A, t1, withFile.messageId);
+  await drainDiscordRelay();
   const fileCall = calls.find((c) => c.fn === "postToThread" && String(c.args[1]).includes("MIRTEST message with a screenshot"));
   const relayedFiles = fileCall?.args[2] as { name: string; data: Buffer }[] | undefined;
   check("deferMirror suppresses the in-ingest auto-relay (single post)", calls.filter((c) => c.fn === "postToThread").length === 1);
@@ -258,6 +263,7 @@ async function main() {
 
   calls.length = 0;
   const promoted = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+  await drainDiscordRelay(); // the ✅ confirmation react is enqueued now — drain it to the transport
   check("responder 📤 promotes", promoted.promoted === true);
   const agentRow = await withTenant(A, (c) => c.query(
     "SELECT author_type, author_kind, author_external_name, body FROM messages WHERE ticket_id = $1 AND body = 'MIRTEST internal thought from Bob'", [t1]));
