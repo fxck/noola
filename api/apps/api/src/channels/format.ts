@@ -19,6 +19,40 @@ function protectCode(md: string): { text: string; restore: (s: string) => string
   return { text, restore: (s) => s.replace(/\u0000(\d+)\u0000/g, (_, i) => slots[Number(i)] ?? "") };
 }
 
+/**
+ * Normalize blockquote line boundaries so a quote and the text around it stay SEPARATE blocks.
+ *
+ * Discord (and people typing quickly) write per-line `>` quotes with no blank line before the answer
+ * that follows — the classic "quote the question, answer below" shape. But every CommonMark renderer
+ * we feed (email via `marked`) AND the agent SPA's Lexical importer fold a non-`>` line that directly
+ * follows a `>` line INTO the quote (lazy continuation / previous-sibling merge), and swallow a later
+ * `>` block into the same quote too — so the whole message renders as one big italic blockquote and
+ * `quote / text / quote / text` can't round-trip.
+ *
+ * Inserting a blank line at each quote↔non-quote boundary makes each run its own block, which every
+ * renderer then parses correctly. Meaning-preserving (blank lines are block separators); consecutive
+ * `>` lines stay one quote; fenced code is left untouched.
+ */
+export function normalizeBlockquotes(md: string): string {
+  if (!md || !md.includes(">")) return md;
+  const isFence = (l: string) => /^\s*(```|~~~)/.test(l);
+  const isQuote = (l: string) => /^\s*>/.test(l);
+  const isBlank = (l: string) => l.trim() === "";
+  const out: string[] = [];
+  let inFence = false;
+  for (const line of md.split("\n")) {
+    if (isFence(line)) inFence = !inFence;
+    if (!inFence) {
+      const prev = out.length ? out[out.length - 1] : null;
+      if (prev !== null && !isBlank(prev) && !isBlank(line) && isQuote(prev) !== isQuote(line)) {
+        out.push("");
+      }
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
 /** Inline rules shared by the transforms. Order is load-bearing: the SINGLE-marker italic
  *  rules run FIRST — they can't match a double marker (the char after `*` is `*`, rejected),
  *  but if bold ran first its OUTPUT (e.g. Slack `*bold*`) would be re-matched as italic. */

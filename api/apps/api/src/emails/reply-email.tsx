@@ -5,6 +5,7 @@ import * as React from "react";
 import { Body, Container, Head, Hr, Html, Img, Markdown, Section, Text } from "@react-email/components";
 import { render } from "@react-email/render";
 import type { EmailTemplateTokens } from "@repo/contracts";
+import { normalizeBlockquotes } from "../channels/format.js";
 
 // The conversation-reply email — deliberately quieter and more personal than the broadcast frame.
 // It should read like a person's email, not a marketing card: no in-body subject headline, just
@@ -73,7 +74,7 @@ function ReplyEmail({ body, agentName, pixelUrl, t }: { body: string; agentName?
                 codeInline: { backgroundColor: "#f4f4f5", borderRadius: "4px", padding: "1px 4px" },
               }}
             >
-              {body || "_(no content)_"}
+              {normalizeBlockquotes(body) || "_(no content)_"}
             </Markdown>
             {agentName ? (
               <Text style={{ fontSize: `${t.paragraphSize}px`, color: t.mutedColor, lineHeight: 1.6, margin: "16px 0 0" }}>

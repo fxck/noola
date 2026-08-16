@@ -3,6 +3,7 @@ import { ingestInbound, type IngestResult } from "./ingest.js";
 import { persistInboundAttachments } from "./attachments.js";
 import { getDiscordSender, getMirrorTransport } from "./discord-gateway.js";
 import { classifyDiscordAuthor } from "./discord-classify.js";
+import { normalizeBlockquotes } from "./channels/format.js";
 
 /** Options a channel-post carries beyond the body (Phase 4). A ticket reply passes none — it
  *  posts plain, pings nothing. A broadcast channel-post may ping ONE role (allowedMentions-gated
@@ -126,7 +127,9 @@ export interface InboundDiscordMessage {
  *  no longer silently dropped. Returns "" only when there is genuinely nothing. */
 function composeBody(m: InboundDiscordMessage): string {
   const text = (m.content ?? "").trim();
-  if (text) return m.content;
+  // Discord quotes are per-line `>` with no blank line before the answer text; normalize so the stored
+  // body renders as separate quote/text blocks everywhere instead of folding into one big blockquote.
+  if (text) return normalizeBlockquotes(m.content);
   if (m.threadKind === "forum_post" && m.threadName) return m.threadName;
   const embed = (m.embeds ?? []).find((e) => e.title || e.description || e.url);
   if (embed) return embed.title || embed.description || embed.url || "[embed]";

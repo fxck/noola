@@ -44,6 +44,7 @@
     "test:message-delivery": "tsx apps/api/test/message-delivery.test.ts",
     "test:subscription-topics": "tsx apps/api/test/subscription-topics.test.ts",
     "test:reply-email": "tsx apps/api/test/reply-email.test.ts",
+    "test:format": "tsx apps/api/test/format.test.ts",
     "test:email-quote": "tsx apps/api/test/email-quote.test.ts",
     "test:reply-all-cc": "tsx apps/api/test/reply-all-cc.test.ts",
     "test:blocklist": "tsx apps/api/test/blocklist.test.ts",
