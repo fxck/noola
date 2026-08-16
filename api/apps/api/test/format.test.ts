@@ -1,4 +1,4 @@
-import { mdToSlack, mdToTelegramHtml, mdToWhatsApp, mdToPlain } from "../src/channels/format.js";
+import { mdToSlack, mdToTelegramHtml, mdToWhatsApp, mdToPlain, normalizeBlockquotes } from "../src/channels/format.js";
 
 // Per-channel markdown adaptation (channels/format.ts) — pure transforms, no DB. Pins the
 // syntax each surface actually renders: Slack mrkdwn, Telegram HTML, WhatsApp single-marker,
@@ -62,6 +62,32 @@ function check(name: string, cond: boolean, got?: string) {
   check("broadcast shape (slack)", mdToSlack(md).startsWith("*What's new this month*"), mdToSlack(md));
   check("broadcast shape (telegram)", mdToTelegramHtml(md).startsWith("<b>What&#39;s new this month</b>") || mdToTelegramHtml(md).startsWith("<b>What's new this month</b>"), mdToTelegramHtml(md));
   check("broadcast shape (whatsapp)", mdToWhatsApp(md).startsWith("*What's new this month*"), mdToWhatsApp(md));
+}
+
+// ---- blockquote normalization (Discord/CommonMark-vs-Lexical fold) ----
+{
+  // Discord "quote the question, answer below": the answer must NOT fold into the quote.
+  const q = normalizeBlockquotes("> question\nanswer");
+  check("bq: blank line inserted after a quote before text", q === "> question\n\nanswer", q);
+
+  // Interspersed quote/text/quote/text becomes four distinct blocks.
+  const inter = normalizeBlockquotes("> q1\nt1\n> q2\nt2");
+  check("bq: quote/text/quote/text separated", inter === "> q1\n\nt1\n\n> q2\n\nt2", inter);
+
+  // Consecutive quote lines stay ONE quote (no blank inserted between them).
+  const multi = normalizeBlockquotes("> a\n> b\nc");
+  check("bq: consecutive quote lines stay grouped", multi === "> a\n> b\n\nc", multi);
+
+  // Idempotent — already-separated input is unchanged.
+  const already = "> q\n\ntext";
+  check("bq: idempotent on separated input", normalizeBlockquotes(already) === already, normalizeBlockquotes(already));
+
+  // No blockquote → untouched (fast path).
+  check("bq: plain text untouched", normalizeBlockquotes("just text\nmore text") === "just text\nmore text");
+
+  // A `>` inside a fenced code block is not treated as a quote boundary.
+  const fenced = "```\n> not a quote\ncode\n```\nafter";
+  check("bq: fenced code left alone", normalizeBlockquotes(fenced) === fenced, normalizeBlockquotes(fenced));
 }
 
 if (failures > 0) {
