@@ -5,6 +5,7 @@ import { ContentEditable } from "@lexical/react/LexicalContentEditable";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import { $convertFromMarkdownString } from "@lexical/markdown";
 import { EDITOR_NODES, MD_TRANSFORMERS, editorTheme, onEditorError } from "./config";
+import { normalizeBlockquotes } from "@/lib/markdown";
 import { cn } from "@/lib/utils";
 
 // Cheap stable key so the read-only tree re-initializes when the body changes
@@ -31,7 +32,7 @@ export function ArticleBody({ markdown, className }: { markdown: string; classNa
       theme: editorTheme,
       nodes: [...EDITOR_NODES],
       onError: onEditorError,
-      editorState: () => $convertFromMarkdownString(markdown, MD_TRANSFORMERS),
+      editorState: () => $convertFromMarkdownString(normalizeBlockquotes(markdown), MD_TRANSFORMERS),
     }),
     [markdown],
   );
