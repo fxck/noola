@@ -100,6 +100,20 @@ export const ReplyInput = z.object({
 });
 export type ReplyInput = z.infer<typeof ReplyInput>;
 
+/** Start a NEW outbound conversation with a single contact (Intercom "new message"). The agent's
+ *  opening message creates a real, inbox-visible ticket keyed to the contact + delivered over their
+ *  reachable channel; the contact's reply threads straight back into it (whose_turn moves to them). */
+export const OutboundConversationInput = z.object({
+  contactId: z.guid(),
+  subject: z.string().min(1).max(200),
+  body: z.string().min(1).max(10000),
+  /** Delivery channel. Omitted → the contact's default reachable channel (email today). */
+  channel: z.string().min(1).max(40).optional(),
+  /** Client-generated idempotency token — a retried submit collapses to one conversation + one send. */
+  clientMessageId: z.string().min(1).max(128).optional(),
+});
+export type OutboundConversationInput = z.infer<typeof OutboundConversationInput>;
+
 /** Ingest a document: filename, its MIME type, and the raw text content. */
 export const DocumentInput = z.object({
   filename: z.string().min(1).max(300),
