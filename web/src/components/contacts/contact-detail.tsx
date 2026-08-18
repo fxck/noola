@@ -310,8 +310,7 @@ export function ContactDetail({
             size="sm"
             className="h-8 gap-1.5 text-xs"
             onClick={() => setComposing(true)}
-            disabled={!c.email}
-            title={c.email ? "Start a new conversation" : "No email address to reach this contact"}
+            title="Start a new conversation"
           >
             <MessageSquarePlus className="size-3.5" /> Message
           </Button>

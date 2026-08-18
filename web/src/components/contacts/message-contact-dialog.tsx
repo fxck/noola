@@ -31,7 +31,9 @@ export function MessageContactDialog({
   const [body, setBody] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const canSend = !!subject.trim() && !!body.trim() && !!contactEmail;
+  // Reachability is resolved server-side (in-app if they're active in the widget, else email), so the
+  // compose only needs content — a truly unreachable contact comes back as a 422 we surface below.
+  const canSend = !!subject.trim() && !!body.trim();
 
   async function submit() {
     if (!canSend || busy) return;
@@ -42,7 +44,12 @@ export function MessageContactDialog({
         body: body.trim(),
         clientMessageId: crypto.randomUUID(),
       });
-      toast.success(res.delivered ? "Message sent — conversation opened." : "Conversation opened — delivery is pending.");
+      const where = res.channel === "widget" ? "in-app" : "by email";
+      toast.success(
+        res.delivered || res.channel === "widget"
+          ? `Message sent ${where} — conversation opened.`
+          : "Conversation opened — delivery is pending.",
+      );
       setSubject("");
       setBody("");
       onSent(res.ticketId);
@@ -50,7 +57,7 @@ export function MessageContactDialog({
       const status = (e as { status?: number }).status;
       toast.error(
         status === 422
-          ? "This contact has no email address to reach them on."
+          ? "There's no way to reach this contact yet — no email, and they haven't used the chat widget."
           : "Couldn't start that conversation. Please try again.",
       );
       setBusy(false);
@@ -65,8 +72,8 @@ export function MessageContactDialog({
       title={`Message ${contactName}`}
       description={
         contactEmail
-          ? `Emails ${contactEmail} and opens a conversation you can follow in the inbox.`
-          : "This contact has no email address on file, so there's no way to reach them yet."
+          ? `Delivered in-app if they're active in the chat widget, otherwise emailed to ${contactEmail}. Opens a conversation you can follow in the inbox.`
+          : "Delivered in-app if they're active in the chat widget. Opens a conversation you can follow in the inbox."
       }
       onClose={() => {
         if (busy) return;
