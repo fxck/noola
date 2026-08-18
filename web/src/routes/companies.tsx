@@ -789,6 +789,11 @@ function CompanyFacts({ company, onChanged }: { company: CompanyDetail; onChange
       <CompanyEditCard company={company} onChanged={onChanged} />
       <div className="px-4 py-3">
         <dl className="flex flex-col">
+          {company.external_id && (
+            <FactRow label="External ID">
+              <span className="min-w-0 truncate font-mono text-xs" title={company.external_id}>{company.external_id}</span>
+            </FactRow>
+          )}
           {company.domain && (
             <FactRow label="Domain">
               <span className="min-w-0 truncate">{company.domain}</span>
@@ -869,6 +874,7 @@ function Metric({ label, value, warn }: { label: string; value: number | string;
 function CompanyEditCard({ company, onChanged }: { company: CompanyDetail; onChanged?: () => void }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState(company.name);
+  const [externalId, setExternalId] = useState(company.external_id ?? "");
   const [domain, setDomain] = useState(company.domain ?? "");
   const [plan, setPlan] = useState(company.plan ?? "");
   const [defs, setDefs] = useState<CustomFieldDef[]>([]);
@@ -878,6 +884,7 @@ function CompanyEditCard({ company, onChanged }: { company: CompanyDetail; onCha
   useEffect(() => {
     if (!open) return;
     setName(company.name);
+    setExternalId(company.external_id ?? "");
     setDomain(company.domain ?? "");
     setPlan(company.plan ?? "");
     void Promise.all([
@@ -891,7 +898,7 @@ function CompanyEditCard({ company, onChanged }: { company: CompanyDetail; onCha
   async function save() {
     setSaving(true);
     try {
-      await updateCompany(company.id, { name: name.trim(), domain: domain.trim() || undefined, plan: plan.trim() || undefined });
+      await updateCompany(company.id, { name: name.trim(), external_id: externalId.trim(), domain: domain.trim() || undefined, plan: plan.trim() || undefined });
       if (defs.length) {
         await api(`/companies/${company.id}/custom-values`, { method: "PUT", body: JSON.stringify({ values }) });
       }
@@ -916,6 +923,10 @@ function CompanyEditCard({ company, onChanged }: { company: CompanyDetail; onCha
           <label className="block space-y-1">
             <span className="text-micro font-medium text-muted-foreground">Name</span>
             <Input value={name} onChange={(e) => setName(e.target.value)} className="h-8 text-sm" />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-micro font-medium text-muted-foreground">External ID</span>
+            <Input value={externalId} onChange={(e) => setExternalId(e.target.value)} placeholder="your-system's company id" className="h-8 font-mono text-xs" />
           </label>
           <label className="block space-y-1">
             <span className="text-micro font-medium text-muted-foreground">Domain</span>

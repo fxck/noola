@@ -8,6 +8,9 @@ import { withTenant } from "@repo/db";
 export interface Company {
   id: string;
   name: string;
+  /** Your own identifier for this account (Intercom's company `company_id`), distinct from Noola's
+   *  internal uuid. The dedup key for identify (external_id first, name fallback). Null when unset. */
+  external_id: string | null;
   domain: string;
   plan: string;
   attributes: Record<string, unknown>;
@@ -32,7 +35,7 @@ export interface CompanyRow extends Company {
   health: AccountHealth;
 }
 
-const COLS = "id, name, domain, plan, attributes, created_at, updated_at";
+const COLS = "id, name, external_id, domain, plan, attributes, created_at, updated_at";
 
 /**
  * Deterministic, explainable account health. Starts at 100 and deducts for the signals that predict
@@ -99,6 +102,7 @@ function rowToHealth(r: Record<string, unknown>): AccountHealth {
 const mapCompany = (r: Record<string, unknown>): Company => ({
   id: r.id as string,
   name: r.name as string,
+  external_id: (r.external_id as string | null) ?? null,
   domain: (r.domain as string) ?? "",
   plan: (r.plan as string) ?? "",
   attributes: (r.attributes as Record<string, unknown>) ?? {},
@@ -306,28 +310,31 @@ export async function getCompany(tenantId: string, id: string): Promise<CompanyD
   });
 }
 
-export async function createCompany(tenantId: string, input: { name: string; domain?: string; plan?: string; attributes?: Record<string, unknown> }): Promise<Company> {
+export async function createCompany(tenantId: string, input: { name: string; external_id?: string | null; domain?: string; plan?: string; attributes?: Record<string, unknown> }): Promise<Company> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `INSERT INTO companies (tenant_id, name, domain, plan, attributes)
-       VALUES (current_tenant(), $1, $2, $3, $4::jsonb) RETURNING ${COLS}`,
-      [input.name, input.domain ?? "", input.plan ?? "", JSON.stringify(input.attributes ?? {})],
+      `INSERT INTO companies (tenant_id, name, external_id, domain, plan, attributes)
+       VALUES (current_tenant(), $1, $2, $3, $4, $5::jsonb) RETURNING ${COLS}`,
+      [input.name, (input.external_id ?? "").trim() || null, input.domain ?? "", input.plan ?? "", JSON.stringify(input.attributes ?? {})],
     );
     return mapCompany(r.rows[0] as Record<string, unknown>);
   });
 }
 
-export async function updateCompany(tenantId: string, id: string, patch: { name?: string; domain?: string; plan?: string; attributes?: Record<string, unknown> }): Promise<Company | null> {
+export async function updateCompany(tenantId: string, id: string, patch: { name?: string; external_id?: string | null; domain?: string; plan?: string; attributes?: Record<string, unknown> }): Promise<Company | null> {
   return withTenant(tenantId, async (c) => {
+    // external_id: undefined = leave alone; "" (cleared in the editor) = null it out; a value sets it.
+    const extId = patch.external_id === undefined ? undefined : (patch.external_id ?? "").trim() || null;
     const r = await c.query(
       `UPDATE companies SET
           name = COALESCE($2, name),
+          external_id = CASE WHEN $6::boolean THEN $7 ELSE external_id END,
           domain = COALESCE($3, domain),
           plan = COALESCE($4, plan),
           attributes = COALESCE($5::jsonb, attributes),
           updated_at = now()
         WHERE id = $1 RETURNING ${COLS}`,
-      [id, patch.name ?? null, patch.domain ?? null, patch.plan ?? null, patch.attributes ? JSON.stringify(patch.attributes) : null],
+      [id, patch.name ?? null, patch.domain ?? null, patch.plan ?? null, patch.attributes ? JSON.stringify(patch.attributes) : null, extId !== undefined, extId ?? null],
     );
     if (!r.rowCount) return null;
     // Keep contacts' denormalized `company` text in sync on rename, so name-based segments /
@@ -351,6 +358,8 @@ export async function deleteCompany(tenantId: string, id: string): Promise<boole
 
 export interface CompanyImportRow {
   name: string;
+  /** Intercom "Company ID" — your external id for the account. */
+  external_id?: string;
   domain?: string;
   plan?: string;
   attributes?: Record<string, unknown>;
@@ -375,16 +384,18 @@ export async function bulkUpsertCompanies(
       const name = (r.name ?? "").trim();
       if (!name) continue;
       const res = await c.query(
-        `INSERT INTO companies (tenant_id, name, domain, plan, attributes, created_at)
-         VALUES (current_tenant(), $1, COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb), COALESCE($5::timestamptz, now()))
+        `INSERT INTO companies (tenant_id, name, external_id, domain, plan, attributes, created_at)
+         VALUES (current_tenant(), $1, NULLIF($6,''), COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb), COALESCE($5::timestamptz, now()))
          ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET
+           -- Keep an already-stored external_id (don't clobber); only fill it when currently empty.
+           external_id = COALESCE(companies.external_id, NULLIF($6,'')),
            domain = CASE WHEN COALESCE($2,'') = '' THEN companies.domain ELSE EXCLUDED.domain END,
            plan = CASE WHEN COALESCE($3,'') = '' THEN companies.plan ELSE EXCLUDED.plan END,
            attributes = companies.attributes || COALESCE($4::jsonb,'{}'::jsonb),
            created_at = COALESCE($5::timestamptz, companies.created_at),
            updated_at = now()
          RETURNING (xmax = 0) AS created`,
-        [name, r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null, r.created_at ?? null],
+        [name, r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null, r.created_at ?? null, r.external_id ?? ""],
       );
       if (res.rows[0].created) created++;
       else updated++;

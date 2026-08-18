@@ -1518,7 +1518,10 @@ export const WIDGET_JS = String.raw`(function () {
     if (uh != null) identity.user_hash = String(uh);
     var jwt = opts.intercom_user_jwt != null ? opts.intercom_user_jwt : (opts.user_jwt != null ? opts.user_jwt : opts.userJwt);
     if (jwt != null) identity.user_jwt = String(jwt);
+    // company: a plain name string OR an Intercom-style { company_id, name, plan, domain } object —
+    // forwarded as-is to /public/identify (the server dedups on company_id, external_id-first).
     if (typeof opts.company === 'string') identity.company = opts.company;
+    else if (opts.company && typeof opts.company === 'object') identity.company = opts.company;
     for (var k in opts) { if (opts.hasOwnProperty(k) && !KNOWN[k]) identity.attributes[k] = opts[k]; }
     saveIdentity();
   }

@@ -18,6 +18,9 @@ export interface AccountHealth {
 export interface Company {
   id: string;
   name: string;
+  /** Your own identifier for this account (Intercom company `company_id`), or null. The dedup key for
+   *  identify (external_id first, then name). */
+  external_id: string | null;
   domain: string;
   plan: string;
   attributes: Record<string, unknown>;
@@ -33,6 +36,8 @@ export interface CompanyDetail extends Company {
 
 export interface CompanyInput {
   name?: string;
+  /** External id (Intercom company_id). "" clears it; omitted leaves it unchanged. */
+  external_id?: string;
   domain?: string;
   plan?: string;
   attributes?: Record<string, unknown>;

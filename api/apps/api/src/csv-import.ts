@@ -140,6 +140,7 @@ export function parseCsvCompanies(
   let skipped = 0;
   for (const cells of grid.slice(1)) {
     let name = "";
+    let externalId: string | undefined;
     let domain: string | undefined;
     let plan: string | undefined;
     let createdAt: string | undefined;
@@ -150,6 +151,9 @@ export function parseCsvCompanies(
       const h = headers[c];
       if (h === "name" || h === "companyname" || h === "company") {
         if (!name) name = value.slice(0, 300);
+      } else if (h === "companyid" || h === "externalid" || h === "id") {
+        // Intercom's "Company ID" is your external id for the account (the dedup handle).
+        if (!externalId) externalId = value.slice(0, 200);
       } else if (h === "domain" || h === "website" || h === "companywebsite" || h === "url" || h === "companyurl") {
         if (!domain) domain = value.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").slice(0, 300);
       } else if (h === "plan" || h === "companyplan" || h === "planname") {
@@ -158,12 +162,13 @@ export function parseCsvCompanies(
         const at = parseMaybeDate(value);
         if (at) createdAt = at;
       } else {
-        // company id, size, seats, MRR, industry, last seen, … → attributes (nothing dropped).
+        // size, seats, MRR, industry, last seen, … → attributes (nothing dropped).
         attributes[grid[0][c].trim().slice(0, 60) || h] = value.slice(0, 500);
       }
     }
     if (!name) { skipped++; continue; } // a company with no name can't be keyed
     const row: CompanyImportRow = { name };
+    if (externalId) row.external_id = externalId;
     if (domain) row.domain = domain;
     if (plan) row.plan = plan;
     if (createdAt) row.created_at = createdAt;
