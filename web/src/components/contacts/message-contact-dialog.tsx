@@ -2,7 +2,7 @@ import { useState } from "react";
 import { FormDialog } from "@/components/ui/form-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
+import { RichTextEditor } from "@/components/editor/rich-text-editor";
 import { toast } from "@/components/ui/toaster";
 import { messageContact } from "@/lib/contacts";
 
@@ -85,6 +85,7 @@ export function MessageContactDialog({
       submitLabel="Send"
       submitDisabled={!canSend}
       busy={busy}
+      size="lg"
     >
       <div className="space-y-3">
         <div className="space-y-1">
@@ -100,16 +101,18 @@ export function MessageContactDialog({
           />
         </div>
         <div className="space-y-1">
-          <Label htmlFor="msg-body">Message</Label>
-          <Textarea
-            id="msg-body"
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            rows={6}
-            placeholder={`Hi ${firstName},`}
-            maxLength={10000}
-            disabled={busy}
-          />
+          <Label>Message</Label>
+          {/* The same Lexical composer the inbox reply box uses — markdown shortcuts, toolbar,
+              links — serialized to markdown via onChange (rendered identically on delivery). */}
+          <div className="overflow-hidden rounded-md border">
+            <RichTextEditor
+              initialMarkdown=""
+              onChange={setBody}
+              placeholder={`Hi ${firstName},`}
+              ariaLabel="Message"
+              minHeight={180}
+            />
+          </div>
         </div>
       </div>
     </FormDialog>

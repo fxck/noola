@@ -55,6 +55,7 @@ export const WIDGET_JS = String.raw`(function () {
   // live lanes (scoped to the active escalated conversation)
   var activeConvId = null;
   var pollTimer = null;
+  var discoverTimer = null;   // background poll of the server conversation list (proactive/outbound)
   var ws = null, wsHb = null, wsRef = 0;
   // While an AI answer streams token-by-token (SSE), the poll/WS/hydrate reconcilers must NOT
   // rebuild #log from the server — the answer isn't persisted until the stream's 'done', so a
@@ -469,6 +470,7 @@ export const WIDGET_JS = String.raw`(function () {
     renderBadge();
     resumeLive();
     bootSyncPop();
+    startDiscover();
   }
 
   function applyConfig() {
@@ -568,6 +570,28 @@ export const WIDGET_JS = String.raw`(function () {
       }
       if (best && !panelOpen) autoOpenThread(best.id);
     });
+  }
+
+  // Proactive/outbound delivery (a conversation WE started — broadcast recipient or a one-to-one
+  // "new message") can land while the visitor is already sitting on the page with the widget idle.
+  // bootSyncPop only fires once at load, and the live lane only watches conversations already cached
+  // locally, so without this a proactive message wouldn't surface until the next refresh. Poll the
+  // server conversation list on an interval and pop the newest unseen thread — exactly like
+  // bootSyncPop — so it surfaces LIVE. Identified visitors only; a backgrounded tab is skipped, and a
+  // fresh unseen conversation that syncServerConvs adds locally lights the Messages list too.
+  function startDiscover() {
+    if (discoverTimer || !isIdentified()) return;
+    discoverTimer = setInterval(function () {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      syncServerConvs(function (changed) {
+        if (panelOpen) { if (changed && view === 'messages') { pendingDir = 'none'; render(); } return; }
+        var best = null;
+        for (var i = 0; i < convs.length; i++) {
+          if (convs[i].unseen && (!best || (convs[i].updatedAt || 0) > (best.updatedAt || 0))) best = convs[i];
+        }
+        if (best) autoOpenThread(best.id);
+      });
+    }, 15000);
   }
 
   // Roots (tabbed) vs leaves (drilled-into) — decides the transition style.
@@ -1580,7 +1604,7 @@ export const WIDGET_JS = String.raw`(function () {
         hookActivity(); recordPageView();
         break;
       }
-      case 'update': { ingestIdentity(a || {}); sendIdentify(); break; }
+      case 'update': { ingestIdentity(a || {}); sendIdentify(); bootSyncPop(); startDiscover(); break; }
       case 'track': { if (typeof a === 'string' && a) trackActivity(a, b || {}); break; }
       case 'show': { launcherHidden = false; mount(); if (bubbleEl) bubbleEl.style.display = 'grid'; renderBadge(); break; }
       case 'hide': { launcherHidden = true; closePanel(); if (bubbleEl) bubbleEl.style.display = 'none'; if (badgeEl) badgeEl.style.display = 'none'; break; }
