@@ -286,13 +286,14 @@ export async function eraseContact(id: string): Promise<void> {
 
 /** Start a NEW outbound conversation with this contact (Intercom "new message"). Creates an
  *  inbox-visible ticket with the agent's opening message and delivers over the contact's reachable
- *  channel (email today); the reply threads back in. Returns the new ticket id so the caller can jump
- *  straight to the thread. `clientMessageId` makes a retried submit collapse to one conversation. */
+ *  channel — in-app via the widget when they're active in the messenger, otherwise email; the reply
+ *  threads back in. Returns the new ticket id (jump straight to the thread) and the channel it went out
+ *  on. `clientMessageId` makes a retried submit collapse to one conversation. */
 export async function messageContact(
   id: string,
-  input: { subject: string; body: string; clientMessageId?: string },
-): Promise<{ ticketId: string; delivered: boolean }> {
-  return api<{ ticketId: string; delivered: boolean }>(`/tickets/outbound`, {
+  input: { subject: string; body: string; channel?: "email" | "widget"; clientMessageId?: string },
+): Promise<{ ticketId: string; delivered: boolean; channel: "email" | "widget" }> {
+  return api<{ ticketId: string; delivered: boolean; channel: "email" | "widget" }>(`/tickets/outbound`, {
     method: "POST",
     body: JSON.stringify({ contactId: id, ...input }),
   });

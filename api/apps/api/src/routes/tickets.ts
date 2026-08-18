@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
 import { withTenant } from "@repo/db";
 import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput, OutboundConversationInput, SpamTicketInput, ParticipantInput } from "@repo/contracts";
 import { markConversationSpam, unmarkConversationSpam } from "../spam.js";
@@ -532,21 +533,44 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       if (dup.rowCount) return reply.code(200).send({ ticketId: dup.rows[0].ticket_id, replay: true });
     }
 
-    // Resolve the contact + their reachable channel. v1 delivers over email; a contact with no email is
-    // unreachable for now (widget/other channels land with the widget-as-target work).
-    const co = await withTenant(tenantId, (c) => c.query("SELECT email FROM contacts WHERE id = $1", [contactId]));
-    if (!co.rowCount) return reply.code(404).send({ error: "contact_not_found" });
-    const email = ((co.rows[0].email as string | null) ?? "").trim().toLowerCase();
-    if (!email) return reply.code(422).send({ error: "contact_unreachable", detail: "contact has no email address" });
+    // Resolve the contact + pick the delivery channel. In-app (widget) is preferred when the contact is
+    // reachable in the messenger — a proactive conversation lands right in their widget (Intercom
+    // parity), surfaced by the widget's own server-conversation sync on their next load; their reply
+    // threads straight back. Otherwise fall back to email. An explicit `channel` overrides the auto
+    // choice. A contact with neither an email nor a widget presence is unreachable.
+    const co = await withTenant(tenantId, async (c) => {
+      const r = await c.query("SELECT email FROM contacts WHERE id = $1", [contactId]);
+      if (!r.rowCount) return null;
+      const w = await c.query(
+        "SELECT 1 FROM tickets WHERE contact_id = $1 AND channel_type = 'widget' LIMIT 1",
+        [contactId],
+      );
+      return { email: ((r.rows[0].email as string | null) ?? "").trim().toLowerCase(), widgetReachable: (w.rowCount ?? 0) > 0 };
+    });
+    if (!co) return reply.code(404).send({ error: "contact_not_found" });
+    const { email, widgetReachable } = co;
+    const wanted = parsed.data.channel;
+    const channelType =
+      wanted === "widget" || wanted === "email"
+        ? wanted
+        : widgetReachable
+          ? "widget"
+          : "email";
+    if (channelType === "email" && !email) {
+      return reply.code(422).send({ error: "contact_unreachable", detail: "contact has no email address" });
+    }
 
-    // Create the conversation shell keyed to the contact's address (so their reply unifies back onto it)
-    // and typed to the delivery channel. whose_turn is set to the customer by the ingest automation
-    // below (an agent message moves the ball to them).
+    // A widget conversation is keyed by a generated conversation handle (external_channel_id); the
+    // widget discovers it via /public/conversations by contact and pops it on next load. It's a human
+    // (not AI) conversation, so the assistant is muted. Email is keyed to the address so a reply unifies
+    // back. whose_turn moves to the customer via the ingest automation below.
+    const isWidget = channelType === "widget";
+    const externalId = isWidget ? randomUUID() : email;
     const t = await withTenant(tenantId, (c) =>
       c.query(
-        `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id, support_mode)
-         VALUES (current_tenant(), $1, 'email', $2, $3, 'staffed') RETURNING id`,
-        [subject, email, contactId],
+        `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id, support_mode, assistant_enabled)
+         VALUES (current_tenant(), $1, $2, $3, $4, 'staffed', $5) RETURNING id`,
+        [subject, channelType, externalId, contactId, !isWidget],
       ),
     );
     const ticketId = t.rows[0].id as string;
@@ -558,37 +582,41 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       body,
       authorType: "agent",
       authorId: req.session?.userId ?? null,
-      channelType: "email",
-      externalChannelId: email,
+      channelType,
+      externalChannelId: externalId,
       subject,
       idempotencyKey: clientMessageId ? `outbound:${clientMessageId}` : null,
     });
 
-    // Deliver over the channel registry — same seam as a reply. Passing the ticket id stamps the `+t.`
-    // Reply-To so the contact's reply routes straight back into this conversation.
-    const driver = getChannelDriver("email");
-    const out = driver?.dispatch
-      ? await driver.dispatch(
-          { tenantId, channelType: "email", externalChannelId: email, subject, ticketId },
-          body,
-          { agentName: req.session?.name ?? null, agentEmail: req.session?.email ?? null, seenMessageId: result.messageId },
-        )
-      : { delivered: false as boolean, reason: "no-driver" };
-    if (!out.delivered) {
-      app.log.warn({ ticketId, reason: (out as { reason?: string }).reason }, "outbound conversation not delivered");
+    // The widget has no outbound driver — the message simply lands in the conversation and the visitor's
+    // widget surfaces it on its next server-sync (no dispatch, no delivery head). Email dispatches over
+    // the channel registry; passing the ticket id stamps the `+t.` Reply-To so the reply threads back.
+    let delivered = true;
+    if (!isWidget) {
+      const driver = getChannelDriver("email");
+      const out = driver?.dispatch
+        ? await driver.dispatch(
+            { tenantId, channelType: "email", externalChannelId: email, subject, ticketId },
+            body,
+            { agentName: req.session?.name ?? null, agentEmail: req.session?.email ?? null, seenMessageId: result.messageId },
+          )
+        : { delivered: false as boolean, reason: "no-driver" };
+      delivered = out.delivered;
+      if (!out.delivered) {
+        app.log.warn({ ticketId, reason: (out as { reason?: string }).reason }, "outbound conversation not delivered");
+      }
+      // Email delivery tracking (0114): stamp the provider Message-ID + initial head so the thread shows
+      // send confidence immediately; a provider webhook later advances sent → delivered / bounced.
+      await withTenant(tenantId, (c) =>
+        c.query("UPDATE messages SET provider_message_id = $2, delivery_status = $3 WHERE id = $1", [
+          result.messageId,
+          (out as { providerMessageId?: string }).providerMessageId ?? null,
+          out.delivered ? "sent" : "failed",
+        ]),
+      ).catch((err) => app.log.warn({ err, ticketId }, "delivery status stamp failed"));
     }
 
-    // Email delivery tracking (0114): stamp the provider Message-ID + initial head so the thread shows
-    // send confidence immediately; a provider webhook later advances sent → delivered / bounced.
-    await withTenant(tenantId, (c) =>
-      c.query("UPDATE messages SET provider_message_id = $2, delivery_status = $3 WHERE id = $1", [
-        result.messageId,
-        (out as { providerMessageId?: string }).providerMessageId ?? null,
-        out.delivered ? "sent" : "failed",
-      ]),
-    ).catch((err) => app.log.warn({ err, ticketId }, "delivery status stamp failed"));
-
-    return reply.code(201).send({ ticketId, messageId: result.messageId, delivered: out.delivered });
+    return reply.code(201).send({ ticketId, messageId: result.messageId, delivered, channel: channelType });
   }));
 
   // Copilot: a retrieval-augmented suggested reply for a ticket. Retrieves the tenant's KB +
