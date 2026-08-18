@@ -1,6 +1,7 @@
 import { withTenant } from "@repo/db";
 import type { PoolClient } from "pg";
 import type { ContactFilterCondition, ContactSortField } from "@repo/contracts";
+import { countryCentroid, jitterFromId } from "./country-centroids.js";
 
 // The contacts directory + back-office sync. A tenant-scoped people/company directory
 // with free-form attributes (RLS-isolated), an idempotent upsert (on the caller's stable
@@ -345,26 +346,45 @@ export interface ContactGeoPoint {
   avatar_url: string | null;
   lat: number;
   lng: number;
+  /** true = coordinates are an approximate country-centroid placement (imported contact with a
+   *  Country but no precise IP coordinates), not a precise pin. */
+  approx?: boolean;
 }
 
-/** Every contact that carries plottable coordinates (the Latitude/Longitude enrichment attributes),
- *  as a slim payload for the map. Spam-hidden contacts are excluded, mirroring the directory. The
- *  numeric guard keeps a malformed attribute value (imported junk) from failing the ::float8 cast —
- *  such a row is simply skipped rather than 500-ing the whole map. */
+/** Contacts to plot on the map. Precise coordinates (the Latitude/Longitude IP-enrichment attributes)
+ *  are used when present; otherwise, for an IMPORTED contact that carries only a Country name (no IP
+ *  coordinates — the common case after an Intercom/CSV migration), we fall back to an approximate
+ *  country-centroid placement (jittered per contact so a country's people spread into a cluster). A
+ *  contact with neither precise coords nor a recognized Country is not placeable and is skipped.
+ *  Spam-hidden contacts are excluded, mirroring the directory. The numeric guards keep a malformed
+ *  attribute value from failing the ::float8 cast — such a row degrades to the country fallback. */
 export async function listContactGeoPoints(tenantId: string): Promise<ContactGeoPoint[]> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT id, name, company, avatar_url,
               attributes->>'City'    AS city,
               attributes->>'Country' AS country,
-              (attributes->>'Latitude')::float8  AS lat,
-              (attributes->>'Longitude')::float8 AS lng
+              CASE WHEN attributes->>'Latitude'  ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (attributes->>'Latitude')::float8  END AS lat,
+              CASE WHEN attributes->>'Longitude' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (attributes->>'Longitude')::float8 END AS lng
          FROM contacts
         WHERE spam_at IS NULL
-          AND attributes->>'Latitude'  ~ '^-?[0-9]+(\\.[0-9]+)?$'
-          AND attributes->>'Longitude' ~ '^-?[0-9]+(\\.[0-9]+)?$'`,
+          AND ( (attributes->>'Latitude'  ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                 AND attributes->>'Longitude' ~ '^-?[0-9]+(\\.[0-9]+)?$')
+                OR nullif(btrim(attributes->>'Country'), '') IS NOT NULL )`,
     );
-    return r.rows as ContactGeoPoint[];
+    const out: ContactGeoPoint[] = [];
+    for (const row of r.rows as Array<Omit<ContactGeoPoint, "lat" | "lng" | "approx"> & { lat: number | null; lng: number | null }>) {
+      if (row.lat != null && row.lng != null) {
+        out.push({ ...row, lat: row.lat, lng: row.lng, approx: false });
+        continue;
+      }
+      // No precise coordinates — place at the country centroid if we recognize the country.
+      const base = countryCentroid(row.country);
+      if (!base) continue;
+      const j = jitterFromId(base, row.id);
+      out.push({ ...row, lat: j.lat, lng: j.lng, approx: true });
+    }
+    return out;
   });
 }
 
