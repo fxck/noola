@@ -154,7 +154,9 @@ export type BroadcastSendFn = (
   // delivery-event webhook can match the event back to this exact recipient row (0109). The seam
   // returns the FULL Message-ID it stamped (`<token@sending-domain>` unangled) so the caller stores
   // the same value the provider will echo.
-  opts?: { html?: string; unsubscribeUrl?: string; marketingId?: string },
+  // `broadcastReplyRecipientId` (the recipient row id) stamps a signed `+b.` Reply-To so a recipient's
+  // reply promotes to a ticket tagged with its broadcast origin (lazy-promotion — no ticket at send).
+  opts?: { html?: string; unsubscribeUrl?: string; marketingId?: string; broadcastReplyRecipientId?: string },
 ) => Promise<{ delivered: boolean; reason?: string; messageId?: string }>;
 
 const defaultSend: BroadcastSendFn = (tenantId, to, subject, body, opts) =>
@@ -1119,6 +1121,7 @@ async function runSend(
             ...(sendHtml ? { html: sendHtml } : {}),
             ...(unsub ? { unsubscribeUrl: unsub } : {}),
             marketingId: `b.${rc.id}`,
+            broadcastReplyRecipientId: rc.id,
           })
         : await dispatch(
             { tenantId, channelType: channel, externalChannelId: rc.handle, subject: sendSubject },

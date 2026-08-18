@@ -5,6 +5,7 @@ import {
   CornerUpLeft,
   Hash,
   Link2,
+  Megaphone,
   MessageSquareText,
   MessagesSquare,
   Plus,
@@ -298,6 +299,18 @@ export function ContextRail({
             {t.status === "closed" ? "Closed" : "Open"}
           </span>
         </FactRow>
+        {t.source_broadcast_id && (
+          // Lazy-promotion origin (0116): this conversation was born from the contact replying to a
+          // broadcast — surface which one so the agent knows the context they're answering into.
+          <FactRow label="Source">
+            <span className="inline-flex min-w-0 items-center gap-1.5 text-muted-foreground">
+              <Megaphone className="size-3.5 shrink-0" />
+              <span className="min-w-0 truncate" title={t.source_broadcast_subject ?? undefined}>
+                Broadcast{t.source_broadcast_subject ? ` · ${t.source_broadcast_subject}` : ""}
+              </span>
+            </span>
+          </FactRow>
+        )}
         {t.channel_type === "widget" && (
           // Widget escalation state made visible: a customer who tapped "talk to a human" mutes the AI
           // (assistant_enabled=false). Without this an agent has no signal the AI is paused / they're

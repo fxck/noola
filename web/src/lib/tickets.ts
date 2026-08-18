@@ -54,6 +54,11 @@ export interface Ticket {
   /** The contact's full company membership set (0111), primary first. The rail shows all; the compact
    *  list scan-line still uses company_name (primary). Optional (older api). */
   companies?: { id: string; name: string; is_primary: boolean }[];
+  /** Lazy-promotion origin (0116): when this conversation was born from a recipient replying to a
+   *  broadcast, the broadcast id + its subject. Drives the "Started from broadcast «…»" rail badge so
+   *  the agent has context for why this person is writing. Null for organically-started tickets. */
+  source_broadcast_id?: string | null;
+  source_broadcast_subject?: string | null;
   /** The team lane this ticket sits in (Teams, Wave 2), or null. Optional (older api). */
   team_id?: string | null;
   team_name?: string | null;
