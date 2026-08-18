@@ -283,3 +283,17 @@ export async function exportContactData(id: string): Promise<Blob> {
 export async function eraseContact(id: string): Promise<void> {
   await api(`/contacts/${id}/erase`, { method: "POST" });
 }
+
+/** Start a NEW outbound conversation with this contact (Intercom "new message"). Creates an
+ *  inbox-visible ticket with the agent's opening message and delivers over the contact's reachable
+ *  channel (email today); the reply threads back in. Returns the new ticket id so the caller can jump
+ *  straight to the thread. `clientMessageId` makes a retried submit collapse to one conversation. */
+export async function messageContact(
+  id: string,
+  input: { subject: string; body: string; clientMessageId?: string },
+): Promise<{ ticketId: string; delivered: boolean }> {
+  return api<{ ticketId: string; delivered: boolean }>(`/tickets/outbound`, {
+    method: "POST",
+    body: JSON.stringify({ contactId: id, ...input }),
+  });
+}

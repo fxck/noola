@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import {
   Search,
   Pencil,
+  MessageSquarePlus,
   Trash2,
   Download,
   ShieldX,
@@ -56,6 +57,7 @@ import { cn } from "@/lib/utils";
 import { contactDisplayName, systemAttributeGroup, isTechnicalAttribute, SYSTEM_GROUP_ORDER, channelLabel } from "@/lib/contact-display";
 import { contactIntel, type ContactIntel, type Tone } from "@/lib/contact-intel";
 import { ErrorState } from "@/components/ui/error-state";
+import { MessageContactDialog } from "@/components/contacts/message-contact-dialog";
 
 const abs = (s: string) => {
   const d = new Date(s);
@@ -112,8 +114,10 @@ export function ContactDetail({
   const [loadError, setLoadError] = useState(false);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [merging, setMerging] = useState(false);
+  const [composing, setComposing] = useState(false);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     let live = true;
@@ -301,6 +305,16 @@ export function ContactDetail({
           <span className="hidden min-w-0 truncate text-xs text-muted-foreground sm:block">{c.email}</span>
         )}
         <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1.5 text-xs"
+            onClick={() => setComposing(true)}
+            disabled={!c.email}
+            title={c.email ? "Start a new conversation" : "No email address to reach this contact"}
+          >
+            <MessageSquarePlus className="size-3.5" /> Message
+          </Button>
           <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs" onClick={() => onEdit(c)}>
             <Pencil className="size-3.5" /> Edit
           </Button>
@@ -416,6 +430,18 @@ export function ContactDetail({
         keepId={contactId}
         onCancel={() => setMerging(false)}
         onMerge={(dropId) => void doMerge(dropId)}
+      />
+
+      <MessageContactDialog
+        open={composing}
+        contactId={contactId}
+        contactName={contactDisplayName(c)}
+        contactEmail={c.email ?? null}
+        onClose={() => setComposing(false)}
+        onSent={(ticketId) => {
+          setComposing(false);
+          void navigate({ to: "/", search: { ticket: ticketId } });
+        }}
       />
     </div>
   );
