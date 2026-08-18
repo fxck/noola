@@ -154,7 +154,9 @@ export type BroadcastSendFn = (
   // delivery-event webhook can match the event back to this exact recipient row (0109). The seam
   // returns the FULL Message-ID it stamped (`<token@sending-domain>` unangled) so the caller stores
   // the same value the provider will echo.
-  opts?: { html?: string; unsubscribeUrl?: string; marketingId?: string },
+  // `broadcastReplyRecipientId` (the recipient row id) stamps a signed `+b.` Reply-To so a recipient's
+  // reply promotes to a ticket tagged with its broadcast origin (lazy-promotion — no ticket at send).
+  opts?: { html?: string; unsubscribeUrl?: string; marketingId?: string; broadcastReplyRecipientId?: string },
 ) => Promise<{ delivered: boolean; reason?: string; messageId?: string }>;
 
 const defaultSend: BroadcastSendFn = (tenantId, to, subject, body, opts) =>
@@ -1033,6 +1035,37 @@ interface SendRecipient {
   merge: MergeData;
 }
 
+/** Eager broadcast conversation (0117): open a real ticket for this recipient at send time, carrying
+ *  the agent's broadcast message, so the send is openable as a conversation immediately and a `+b.`
+ *  reply threads straight back onto it. Flagged `outbound_pending` (kept out of the active inbox until
+ *  the recipient replies) and stamped with its broadcast origin. contactId may be null (a handle with
+ *  no resolved contact). No outbox event is emitted — these are bulk and intentionally do NOT push
+ *  into the live inbox; the reply (normal ingest) is what surfaces the conversation. */
+async function createBroadcastConversation(
+  tenantId: string,
+  broadcastId: string,
+  contactId: string | null,
+  handle: string,
+  subject: string,
+  body: string,
+): Promise<{ ticketId: string; messageId: string }> {
+  return withTenant(tenantId, async (c) => {
+    const t = await c.query(
+      `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id,
+           whose_turn, outbound_pending, source_broadcast_id, support_mode)
+       VALUES (current_tenant(), $1, 'email', $2, $3, 'customer', true, $4, 'staffed') RETURNING id`,
+      [subject || "(no subject)", handle, contactId, broadcastId],
+    );
+    const ticketId = t.rows[0].id as string;
+    const m = await c.query(
+      `INSERT INTO messages (tenant_id, ticket_id, author_type, body, channel_type, external_channel_id, author_kind)
+       VALUES (current_tenant(), $1, 'agent', $2, 'email', $3, 'agent') RETURNING id`,
+      [ticketId, body, handle],
+    );
+    return { ticketId, messageId: m.rows[0].id as string };
+  });
+}
+
 /** The background per-recipient send loop: send each (channel 'email' via the email seam,
  *  everything else via the channel driver's dispatch), record sent/failed(+error), tick the
  *  parent counters as it goes, then finalize status = 'sent' (any delivered / nothing to do)
@@ -1092,8 +1125,23 @@ async function runSend(
     let ok = false;
     let errMsg: string | null = null;
     let messageId: string | null = null;
+    // Eager conversation (0117): for an email send, open a real (inbox-hidden) ticket carrying the
+    // agent's message BEFORE sending, so the broadcast is openable as a conversation right away and a
+    // `+b.` reply threads straight back onto it. Created best-effort — a failure here never blocks the
+    // actual send. The message body is the clean broadcast body (merge-applied, no unsub footer).
+    let convoTicketId: string | null = null;
+    let convoMessageId: string | null = null;
     try {
       const unsub = withUnsub ? unsubscribeUrl(tenantId, rc.contactId, topicId) : null;
+      if (isEmail) {
+        const convoBody = personalize ? applyMergeTags(body, rc.merge) : body;
+        const convoSubject = personalize ? applyMergeTags(subject, rc.merge) : subject;
+        const convo = await createBroadcastConversation(tenantId, broadcastId, rc.contactId, rc.handle, convoSubject, convoBody).catch(
+          () => null,
+        );
+        convoTicketId = convo?.ticketId ?? null;
+        convoMessageId = convo?.messageId ?? null;
+      }
       let sendText = rendered
         ? unsub
           ? rendered.text.split(UNSUB_PLACEHOLDER).join(unsub)
@@ -1119,6 +1167,7 @@ async function runSend(
             ...(sendHtml ? { html: sendHtml } : {}),
             ...(unsub ? { unsubscribeUrl: unsub } : {}),
             marketingId: `b.${rc.id}`,
+            broadcastReplyRecipientId: rc.id,
           })
         : await dispatch(
             { tenantId, channelType: channel, externalChannelId: rc.handle, subject: sendSubject },
@@ -1132,12 +1181,19 @@ async function runSend(
       errMsg = (e as Error)?.message ?? "send-error";
     }
     await withTenant(tenantId, async (c) => {
-      await c.query("UPDATE broadcast_recipients SET status = $2, error = $3, message_id = COALESCE($4, message_id) WHERE id = $1", [
-        rc.id,
-        ok ? "sent" : "failed",
-        ok ? null : errMsg,
-        messageId,
-      ]);
+      await c.query(
+        "UPDATE broadcast_recipients SET status = $2, error = $3, message_id = COALESCE($4, message_id), ticket_id = COALESCE($5, ticket_id) WHERE id = $1",
+        [rc.id, ok ? "sent" : "failed", ok ? null : errMsg, messageId, convoTicketId],
+      );
+      // Mirror the send result onto the conversation's message so the thread shows delivery confidence
+      // (sent / failed), matching a normal reply. A provider webhook later advances sent → delivered.
+      if (convoMessageId) {
+        await c.query("UPDATE messages SET delivery_status = $2, provider_message_id = COALESCE($3, provider_message_id) WHERE id = $1", [
+          convoMessageId,
+          ok ? "sent" : "failed",
+          messageId,
+        ]);
+      }
       await c.query(
         "UPDATE broadcasts SET sent_count = sent_count + $2, failed_count = failed_count + $3 WHERE id = $1",
         [broadcastId, ok ? 1 : 0, ok ? 0 : 1],

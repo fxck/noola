@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Inbox, CornerUpLeft, ListChecks, CircleDashed, UserCheck, CheckCircle2, ShieldBan, type LucideIcon } from "lucide-react";
+import { Inbox, CornerUpLeft, ListChecks, CircleDashed, UserCheck, CheckCircle2, ShieldBan, Megaphone, type LucideIcon } from "lucide-react";
 import { type ViewKey, avatarHue } from "@/lib/tickets";
 import type { Team } from "@/lib/teams";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ export const VIEWS: { key: ViewKey; label: string; icon: LucideIcon }[] = [
   { key: "approval", label: "Needs approval", icon: ListChecks },
   { key: "unassigned", label: "Unassigned", icon: CircleDashed },
   { key: "my", label: "Mine", icon: UserCheck },
+  { key: "outbound", label: "Outbound", icon: Megaphone },
   { key: "closed", label: "Closed", icon: CheckCircle2 },
   { key: "spam", label: "Spam", icon: ShieldBan },
 ];

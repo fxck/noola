@@ -293,9 +293,12 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
           SET updated_at = now(),
               whose_turn = $2,
               channel_type        = CASE WHEN $3::boolean THEN $4 ELSE channel_type END,
-              external_channel_id = CASE WHEN $3::boolean THEN $5 ELSE external_channel_id END
+              external_channel_id = CASE WHEN $3::boolean THEN $5 ELSE external_channel_id END,
+              -- A customer reply promotes an eager outbound conversation (broadcast/one-to-one, 0117)
+              -- out of the Outbound lane into the active inbox. No-op on a normal ticket.
+              outbound_pending    = CASE WHEN $6::boolean THEN false ELSE outbound_pending END
         WHERE id = $1`,
-      [ticketId, whoseTurn, retarget, msgChannelType, msgExternal],
+      [ticketId, whoseTurn, retarget, msgChannelType, msgExternal, isCustomerUpd],
     );
 
     // "Last contacted" (Intercom-parity): an outbound (non-customer) message stamps the ticket's

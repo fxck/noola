@@ -150,27 +150,54 @@ export function ticketReplyAddress(supportAddress: string, ticketId: string): st
   return `${local}+t.${ticketEmailToken(ticketId)}@${domain}`;
 }
 
+/** Signed per-broadcast-recipient reply token: `<uuid-without-dashes>.<sig10>`. Same construction as
+ *  the ticket token but a distinct `+b.` namespace — a broadcast has no ticket at send time, so the
+ *  token points at the recipient row; a reply carrying it promotes to a ticket lazily (see
+ *  handleInboundEmail). */
+export function broadcastEmailToken(recipientId: string): string {
+  const id = recipientId.replace(/-/g, "").toLowerCase();
+  return `${id}.${tokenSig(id)}`;
+}
+
+/** The per-recipient reply address stamped on a broadcast email. A reply here routes back to us
+ *  carrying the recipient row id, so the materialized ticket is tagged with its broadcast origin. */
+export function broadcastReplyAddress(supportAddress: string, recipientId: string): string {
+  const [local, domain] = supportAddress.split("@");
+  return `${local}+b.${broadcastEmailToken(recipientId)}@${domain}`;
+}
+
 /** Parse an inbound recipient. Returns the base (route) address plus the VERIFIED ticket id when
  *  the address carries a valid `+t.<id>.<sig>` token; a bad/forged signature yields ticketId null
  *  (and routes by the base address like any other mail). Foreign plus-tags are stripped for the
  *  base so `support+whatever@` still routes to the tenant. */
-export function parseInboundAddress(address: string): { base: string; ticketId: string | null } {
+export function parseInboundAddress(
+  address: string,
+): { base: string; ticketId: string | null; broadcastRecipientId: string | null } {
   const a = address.trim();
-  const m = /^([^+@]+)\+t\.([0-9a-f]{32})\.([0-9a-f]{10})@(.+)$/i.exec(a);
+  // Two signed plus-tag namespaces share the same `<32hex>.<10hex>` shape: `+t.` (a ticket reply) and
+  // `+b.` (a broadcast-recipient reply, promoted to a ticket on arrival). Verify the signature over the
+  // id and hand back whichever id kind the tag carried.
+  const m = /^([^+@]+)\+([tb])\.([0-9a-f]{32})\.([0-9a-f]{10})@(.+)$/i.exec(a);
   if (m) {
-    const [, local, idRaw, sig, domain] = m;
+    const [, local, kind, idRaw, sig, domain] = m;
     const id = idRaw.toLowerCase();
     const base = `${local}@${domain}`.toLowerCase();
     try {
       if (crypto.timingSafeEqual(Buffer.from(sig.toLowerCase()), Buffer.from(tokenSig(id)))) {
         const uuid = `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
-        return { base, ticketId: uuid };
+        return kind.toLowerCase() === "b"
+          ? { base, ticketId: null, broadcastRecipientId: uuid }
+          : { base, ticketId: uuid, broadcastRecipientId: null };
       }
     } catch { /* length mismatch — treat as unsigned */ }
-    return { base, ticketId: null };
+    return { base, ticketId: null, broadcastRecipientId: null };
   }
   const g = /^([^+@]+)(\+[^@]*)?@(.+)$/.exec(a);
-  return { base: g ? `${g[1]}@${g[3]}`.toLowerCase() : a.toLowerCase(), ticketId: null };
+  return {
+    base: g ? `${g[1]}@${g[3]}`.toLowerCase() : a.toLowerCase(),
+    ticketId: null,
+    broadcastRecipientId: null,
+  };
 }
 
 /** Angle-bracket-normalize an RFC 5322 Message-ID for In-Reply-To/References. */
@@ -307,21 +334,29 @@ export async function handleInboundEmail(
 
   // Exact-ticket routing (P4): a verified reply-to token beats From-address threading — the reply
   // lands on THAT ticket (reopening it if it closed meanwhile), so a contact with several open
-  // conversations can answer each one's email correctly. Token invalid / ticket gone → fall
-  // through to the normal contact threading below.
-  if (parsed.ticketId) {
+  // conversations can answer each one's email correctly. A `+b.` broadcast token resolves to the
+  // eager conversation opened for that recipient (0117), routed the same way. Token invalid / ticket
+  // gone → fall through to the normal contact threading below.
+  const broadcastTicketId = parsed.broadcastRecipientId
+    ? await resolveBroadcastReplyTicket(tenantId, parsed.broadcastRecipientId)
+    : null;
+  const routeTicketId = parsed.ticketId ?? broadcastTicketId;
+  if (routeTicketId) {
     const exists = await withTenant(tenantId, async (c) => {
-      const r = await c.query("SELECT status FROM tickets WHERE id = $1", [parsed.ticketId]);
+      const r = await c.query("SELECT status FROM tickets WHERE id = $1", [routeTicketId]);
       if (!r.rowCount) return false;
-      if ((r.rows[0].status as string) !== "open") {
-        await c.query("UPDATE tickets SET status = 'open', updated_at = now() WHERE id = $1", [parsed.ticketId]);
-      }
+      // Reopen if it closed meanwhile AND clear outbound_pending — the recipient's reply is exactly
+      // what promotes an eager broadcast conversation out of the Outbound lane into the active inbox.
+      await c.query(
+        "UPDATE tickets SET status = CASE WHEN status <> 'open' THEN 'open' ELSE status END, outbound_pending = false, updated_at = now() WHERE id = $1",
+        [routeTicketId],
+      );
       return true;
     }).catch(() => false);
     if (exists) {
       const result = await ingestInbound({
         tenantId,
-        ticketId: parsed.ticketId,
+        ticketId: routeTicketId,
         body,
         authorType: "customer",
         idempotencyKey: `email:${m.messageId}`,
@@ -350,7 +385,39 @@ export async function handleInboundEmail(
   });
   // A replayed (idempotency-deduped) message already carried its files/cc/quote the first time.
   if (!result.replay) await finishInboundEmail(result, m, quoted);
+  // Broadcast lazy-promotion FALLBACK: only for a `+b.` reply whose recipient had NO eager conversation
+  // (pre-0117 sends). The reply materialized a ticket via contact-threading above; tag it with the
+  // broadcast it answered. Post-0117 sends resolve to their eager ticket and returned earlier.
+  if (parsed.broadcastRecipientId && !broadcastTicketId && !result.replay) {
+    await linkBroadcastReply(tenantId, result.ticketId, parsed.broadcastRecipientId).catch(() => {});
+  }
   return result;
+}
+
+/** Resolve a `+b.` broadcast reply token to the eager conversation opened for that recipient at send
+ *  (0117), or null when the recipient predates eager conversations (pre-0117 send → lazy fallback). */
+async function resolveBroadcastReplyTicket(tenantId: string, recipientId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT ticket_id FROM broadcast_recipients WHERE id = $1", [recipientId]);
+    return (r.rows[0]?.ticket_id as string | null) ?? null;
+  }).catch(() => null);
+}
+
+/** Tag a freshly-threaded reply with the broadcast it answered. The reply already resolved/created a
+ *  ticket via normal contact-threading; here we only record which broadcast (and recipient row) it
+ *  came from. First origin wins — the stamp writes only when currently null, so a later reply to a
+ *  different broadcast never overwrites the first. The recipient row is read under the tenant, so a
+ *  forged or foreign id resolves to nothing and no stamp is written. */
+async function linkBroadcastReply(tenantId: string, ticketId: string, recipientId: string): Promise<void> {
+  await withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT broadcast_id FROM broadcast_recipients WHERE id = $1", [recipientId]);
+    if (!r.rowCount) return;
+    await c.query(
+      `UPDATE tickets SET source_broadcast_id = $2, source_broadcast_recipient_id = $3
+        WHERE id = $1 AND source_broadcast_id IS NULL`,
+      [ticketId, r.rows[0].broadcast_id, recipientId],
+    );
+  });
 }
 
 // ---- outbound seam ------------------------------------------------------
@@ -393,6 +460,11 @@ export async function sendOutboundEmail(
      *  and we can match it back to this exact reply row. The returned `messageId` is that unangled id.
      *  Only meaningful alongside replyToTicketId. */
     replyMessageId?: string | null;
+    /** Broadcast lazy-promotion: the broadcast_recipients row id. Stamps a signed `+b.` Reply-To so a
+     *  recipient's reply routes back carrying this id and promotes to a ticket tagged with its broadcast
+     *  origin (see handleInboundEmail). Independent of the marketing Message-ID (which tracks outbound
+     *  delivery events); a broadcast is not a ticket reply, so replyToTicketId stays null here. */
+    broadcastReplyRecipientId?: string | null;
   },
 ): Promise<{ delivered: boolean; reason?: string; messageId?: string }> {
   if (!to) return { delivered: false, reason: "no-recipient" };
@@ -436,6 +508,12 @@ export async function sendOutboundEmail(
     // delivery-event webhook can match the event back to the recipient row. Skipped when this is
     // a ticket reply (that path owns the Message-ID for threading).
     ...(opts?.marketingId && !opts?.replyToTicketId ? { messageId: `<${opts.marketingId}@${replyDomain}>` } : {}),
+    // Broadcast lazy-promotion: a signed `+b.` Reply-To so a recipient's reply routes back carrying
+    // the recipient row id and materializes a ticket tagged with its broadcast origin. A ticket reply
+    // (replyToTicketId) owns Reply-To already, so this only applies to a fire-and-forget broadcast.
+    ...(opts?.broadcastReplyRecipientId && !opts?.replyToTicketId
+      ? { replyTo: broadcastReplyAddress(replyBase, opts.broadcastReplyRecipientId) }
+      : {}),
     ...(opts?.inReplyTo ? { inReplyTo: angled(opts.inReplyTo), references: angled(opts.inReplyTo) } : {}),
     // A rich HTML alternative (React Email render) when the caller supplies one — mail clients that
     // can, show it; plaintext `text` stays the fallback. Attachments ride the same nodemailer send.
