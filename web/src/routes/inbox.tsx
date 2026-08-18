@@ -7,6 +7,7 @@ import {
   type ViewKey,
   type AgentUser,
   fetchOpenTickets,
+  fetchOutboundTickets,
   fetchClosedTickets,
   fetchSpamTickets,
   fetchUsers,
@@ -42,6 +43,7 @@ const EMPTY_COPY: Record<ViewKey, string> = {
   my: "Nothing is assigned to you right now.",
   closed: "No closed tickets yet.",
   spam: "No spam. Senders you mark as spam land here for review.",
+  outbound: "Nothing outbound is awaiting a reply. Broadcasts and messages you start land here until the contact replies.",
 };
 
 const SHORTCUTS: [string[], string][] = [
@@ -110,6 +112,7 @@ export function InboxPage() {
   const [open, setOpen] = useState<Ticket[] | null>(null);
   const [closed, setClosed] = useState<Ticket[]>([]);
   const [spam, setSpam] = useState<Ticket[]>([]);
+  const [outbound, setOutbound] = useState<Ticket[]>([]);
   const [users, setUsers] = useState<AgentUser[]>([]);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -157,15 +160,17 @@ export function InboxPage() {
     setLoading(true);
     setError(false);
     try {
-      const [o, c, s, u] = await Promise.all([
+      const [o, c, s, ob, u] = await Promise.all([
         fetchOpenTickets(),
         fetchClosedTickets(),
         fetchSpamTickets(),
+        fetchOutboundTickets(),
         fetchUsers(),
       ]);
       setOpen(o);
       setClosed(c);
       setSpam(s);
+      setOutbound(ob);
       setUsers(u);
       // Unread set is best-effort — never fail the inbox load over it.
       void fetchUnreadTicketIds()
@@ -276,8 +281,8 @@ export function InboxPage() {
   const { items: queueItems } = useQueue();
   const approvalIds = useMemo(() => new Set(queueItems.map((i) => i.ticket_id)), [queueItems]);
   const counts = useMemo(
-    () => viewCounts(open ?? [], closed, myId, approvalIds, spam),
-    [open, closed, spam, myId, approvalIds],
+    () => viewCounts(open ?? [], closed, myId, approvalIds, spam, outbound),
+    [open, closed, spam, outbound, myId, approvalIds],
   );
   const searchMode = query.trim().length > 0;
   const [sort, setSort] = useState<SortKey>("recent");
@@ -295,12 +300,12 @@ export function InboxPage() {
     if (searchMode) return searchResults ?? [];
     if (activeTeam)
       return sortTickets((open ?? []).filter((t) => t.team_id === activeTeam.id), sort);
-    return sortTickets(filterByView(view, open ?? [], closed, myId, approvalIds, spam), sort);
-  }, [searchMode, searchResults, activeTeam, view, open, closed, spam, myId, sort]);
+    return sortTickets(filterByView(view, open ?? [], closed, myId, approvalIds, spam, outbound), sort);
+  }, [searchMode, searchResults, activeTeam, view, open, closed, spam, outbound, myId, sort]);
 
   const selected = useMemo(
-    () => [...(open ?? []), ...closed, ...spam, ...(searchResults ?? [])].find((t) => t.id === selectedId) ?? null,
-    [open, closed, spam, searchResults, selectedId],
+    () => [...(open ?? []), ...closed, ...spam, ...outbound, ...(searchResults ?? [])].find((t) => t.id === selectedId) ?? null,
+    [open, closed, spam, outbound, searchResults, selectedId],
   );
   const activeView = VIEWS.find((v) => v.key === view)!;
 

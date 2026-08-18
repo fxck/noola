@@ -1,7 +1,7 @@
 import { withTenant, relayPool } from "@repo/db";
 import type { PoolClient } from "pg";
 
-export type View = "my" | "unassigned" | "needs_reply" | "closed" | "all" | "spam";
+export type View = "my" | "unassigned" | "needs_reply" | "closed" | "all" | "spam" | "outbound";
 
 export interface TicketRow {
   id: string;
@@ -123,9 +123,16 @@ export async function listTickets(
   } else if (view === "spam") {
     // The one view that SHOWS spam — everything hidden by "Mark as spam", for review/unspam.
     where = "WHERE t.spam_at IS NOT NULL";
+  } else if (view === "outbound") {
+    // The Outbound lane (0117): conversations WE opened (broadcast recipients / one-to-one) that the
+    // contact hasn't replied to yet — openable here without flooding the active queues.
+    where = "WHERE t.status = 'open' AND t.outbound_pending";
   }
   // Spam-hidden tickets drop out of every view except the dedicated Spam view.
   if (view !== "spam") where += " AND t.spam_at IS NULL";
+  // Outbound-pending conversations (awaiting the contact's first reply) drop out of every view except
+  // the dedicated Outbound view — that's what keeps a 5,000-recipient broadcast out of the inbox.
+  if (view !== "outbound") where += " AND NOT t.outbound_pending";
   // Snoozed tickets drop out of the open queues until their wake time (a closed-view listing still
   // shows them). The wake sweep clears the flag, but the predicate also resurfaces them the instant
   // the time passes even before the sweep runs.

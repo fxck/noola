@@ -6,6 +6,7 @@ import {
   broadcastReplyAddress,
   parseInboundAddress,
 } from "../src/email.js";
+import { listTickets } from "../src/tickets.js";
 
 // Lazy-promotion of broadcast replies (0116). A broadcast holds NO ticket at send time; it stamps a
 // signed `+b.<recipientRow>` Reply-To. A recipient's reply carrying that token materializes a ticket
@@ -138,6 +139,56 @@ async function main() {
       const t = await c.query("SELECT source_broadcast_id FROM tickets WHERE id = $1", [r?.ticketId ?? ""]);
       check("forged token leaves the ticket unstamped", t.rows[0]?.source_broadcast_id === null);
     });
+  }
+
+  // ── EAGER (0117): a broadcast opens a conversation per recipient AT SEND ─────
+  // Seed an outbound_pending ticket + a recipient row pointing at it (as runSend would), then reply.
+  {
+    const b3 = await superPool.query(
+      "INSERT INTO broadcasts (tenant_id, subject, status, channel) VALUES ($1,'BCASTPROMO eager','sent','email') RETURNING id",
+      [A],
+    );
+    const eagerEmail = "bcastpromo-eager@example.test";
+    const co = await superPool.query(
+      "INSERT INTO contacts (tenant_id, email, name) VALUES ($1,$2,'Eager Lead') RETURNING id",
+      [A, eagerEmail],
+    );
+    const eagerTicket = await superPool.query(
+      `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id, whose_turn, outbound_pending, source_broadcast_id, support_mode)
+       VALUES ($1,'BCASTPROMO eager','email',$2,$3,'customer',true,$4,'staffed') RETURNING id`,
+      [A, eagerEmail, co.rows[0].id, b3.rows[0].id],
+    );
+    const eagerTicketId = eagerTicket.rows[0].id as string;
+    await superPool.query(
+      "INSERT INTO messages (tenant_id, ticket_id, author_type, body, channel_type, author_kind) VALUES ($1,$2,'agent','BCASTPROMO eager body','email','agent')",
+      [A, eagerTicketId],
+    );
+    const rcE = await superPool.query(
+      "INSERT INTO broadcast_recipients (tenant_id, broadcast_id, contact_id, handle, status, ticket_id) VALUES ($1,$2,$3,$4,'sent',$5) RETURNING id",
+      [A, b3.rows[0].id, co.rows[0].id, eagerEmail, eagerTicketId],
+    );
+
+    // Before reply: the eager ticket is hidden from the active inbox, shown only in the Outbound view.
+    const allBefore = await listTickets(A, "all");
+    const outboundBefore = await listTickets(A, "outbound");
+    check("eager conversation is HIDDEN from the active inbox", !allBefore.some((t) => t.id === eagerTicketId));
+    check("eager conversation shows in the Outbound view", outboundBefore.some((t) => t.id === eagerTicketId));
+
+    // The recipient replies → routes onto the SAME eager ticket, clears outbound_pending.
+    const r = await handleInboundEmail({
+      messageId: "bcastpromo-eager-reply", from: eagerEmail, to: broadcastReplyAddress(ROUTE, rcE.rows[0].id as string),
+      subject: "Re: BCASTPROMO eager", body: "BCASTPROMO eager reply",
+    });
+    check("reply routes onto the eager conversation (no new ticket)", r?.ticketId === eagerTicketId && r?.ticketCreated === false);
+    const allAfter = await listTickets(A, "all");
+    check("after reply the conversation surfaces into the active inbox", allAfter.some((t) => t.id === eagerTicketId));
+    await withTenant(A, async (c) => {
+      const t = await c.query("SELECT outbound_pending FROM tickets WHERE id=$1", [eagerTicketId]);
+      check("reply cleared outbound_pending", t.rows[0].outbound_pending === false);
+    });
+    await superPool.query("DELETE FROM messages WHERE ticket_id=$1", [eagerTicketId]);
+    await superPool.query("DELETE FROM tickets WHERE id=$1", [eagerTicketId]);
+    await superPool.query("DELETE FROM contacts WHERE email=$1", [eagerEmail]);
   }
 
   await clean();

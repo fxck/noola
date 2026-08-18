@@ -242,7 +242,7 @@ export interface Message {
   author_external_avatar_url?: string | null;
 }
 
-export type ViewKey = "all" | "needs_reply" | "approval" | "unassigned" | "my" | "closed" | "spam";
+export type ViewKey = "all" | "needs_reply" | "approval" | "unassigned" | "my" | "closed" | "spam" | "outbound";
 
 // ---- Fetchers (tenant is server-authoritative from the session token) ------
 
@@ -255,6 +255,11 @@ export async function fetchClosedTickets(): Promise<Ticket[]> {
 /** The spam-hidden tickets — the low-traffic review lane. Same list endpoint, view=spam. */
 export async function fetchSpamTickets(): Promise<Ticket[]> {
   return (await api<{ tickets: Ticket[] }>("/tickets?view=spam")).tickets;
+}
+/** The Outbound lane (0117): conversations WE opened (broadcast recipients / one-to-one) that the
+ *  contact hasn't replied to yet — kept out of the active queues, openable here. view=outbound. */
+export async function fetchOutboundTickets(): Promise<Ticket[]> {
+  return (await api<{ tickets: Ticket[] }>("/tickets?view=outbound")).tickets;
 }
 export async function fetchUsers(): Promise<AgentUser[]> {
   return (await api<{ users: AgentUser[] }>("/users")).users;
@@ -547,6 +552,7 @@ export function filterByView(
   myId: string,
   approvalIds: ReadonlySet<string> = EMPTY_SET,
   spam: Ticket[] = [],
+  outbound: Ticket[] = [],
 ): Ticket[] {
   switch (view) {
     case "needs_reply":
@@ -561,6 +567,8 @@ export function filterByView(
       return closed;
     case "spam":
       return spam;
+    case "outbound":
+      return outbound;
     case "all":
     default:
       return open;
@@ -575,6 +583,7 @@ export function viewCounts(
   myId: string,
   approvalIds: ReadonlySet<string> = EMPTY_SET,
   spam: Ticket[] = [],
+  outbound: Ticket[] = [],
 ): Record<ViewKey, number> {
   return {
     all: open.length,
@@ -584,6 +593,7 @@ export function viewCounts(
     my: open.filter((t) => t.assignee_id === myId).length,
     closed: closed.length,
     spam: spam.length,
+    outbound: outbound.length,
   };
 }
 

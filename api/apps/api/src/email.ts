@@ -334,21 +334,29 @@ export async function handleInboundEmail(
 
   // Exact-ticket routing (P4): a verified reply-to token beats From-address threading — the reply
   // lands on THAT ticket (reopening it if it closed meanwhile), so a contact with several open
-  // conversations can answer each one's email correctly. Token invalid / ticket gone → fall
-  // through to the normal contact threading below.
-  if (parsed.ticketId) {
+  // conversations can answer each one's email correctly. A `+b.` broadcast token resolves to the
+  // eager conversation opened for that recipient (0117), routed the same way. Token invalid / ticket
+  // gone → fall through to the normal contact threading below.
+  const broadcastTicketId = parsed.broadcastRecipientId
+    ? await resolveBroadcastReplyTicket(tenantId, parsed.broadcastRecipientId)
+    : null;
+  const routeTicketId = parsed.ticketId ?? broadcastTicketId;
+  if (routeTicketId) {
     const exists = await withTenant(tenantId, async (c) => {
-      const r = await c.query("SELECT status FROM tickets WHERE id = $1", [parsed.ticketId]);
+      const r = await c.query("SELECT status FROM tickets WHERE id = $1", [routeTicketId]);
       if (!r.rowCount) return false;
-      if ((r.rows[0].status as string) !== "open") {
-        await c.query("UPDATE tickets SET status = 'open', updated_at = now() WHERE id = $1", [parsed.ticketId]);
-      }
+      // Reopen if it closed meanwhile AND clear outbound_pending — the recipient's reply is exactly
+      // what promotes an eager broadcast conversation out of the Outbound lane into the active inbox.
+      await c.query(
+        "UPDATE tickets SET status = CASE WHEN status <> 'open' THEN 'open' ELSE status END, outbound_pending = false, updated_at = now() WHERE id = $1",
+        [routeTicketId],
+      );
       return true;
     }).catch(() => false);
     if (exists) {
       const result = await ingestInbound({
         tenantId,
-        ticketId: parsed.ticketId,
+        ticketId: routeTicketId,
         body,
         authorType: "customer",
         idempotencyKey: `email:${m.messageId}`,
@@ -377,13 +385,22 @@ export async function handleInboundEmail(
   });
   // A replayed (idempotency-deduped) message already carried its files/cc/quote the first time.
   if (!result.replay) await finishInboundEmail(result, m, quoted);
-  // Broadcast lazy-promotion: a reply carrying a signed `+b.` token materialized a ticket via the
-  // contact-threading above (a broadcast holds no ticket at send time). Tag that ticket with the
-  // broadcast it answered so the conversation is born with its outbound origin.
-  if (parsed.broadcastRecipientId && !result.replay) {
+  // Broadcast lazy-promotion FALLBACK: only for a `+b.` reply whose recipient had NO eager conversation
+  // (pre-0117 sends). The reply materialized a ticket via contact-threading above; tag it with the
+  // broadcast it answered. Post-0117 sends resolve to their eager ticket and returned earlier.
+  if (parsed.broadcastRecipientId && !broadcastTicketId && !result.replay) {
     await linkBroadcastReply(tenantId, result.ticketId, parsed.broadcastRecipientId).catch(() => {});
   }
   return result;
+}
+
+/** Resolve a `+b.` broadcast reply token to the eager conversation opened for that recipient at send
+ *  (0117), or null when the recipient predates eager conversations (pre-0117 send → lazy fallback). */
+async function resolveBroadcastReplyTicket(tenantId: string, recipientId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT ticket_id FROM broadcast_recipients WHERE id = $1", [recipientId]);
+    return (r.rows[0]?.ticket_id as string | null) ?? null;
+  }).catch(() => null);
 }
 
 /** Tag a freshly-threaded reply with the broadcast it answered. The reply already resolved/created a
