@@ -534,6 +534,10 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
     const { name, company, attributes, page, userHash, userJwt } = parsed.data;
+    // Company is a plain NAME string (legacy embeds) or an Intercom-style object with YOUR company_id
+    // (the external id we dedup on). Normalize both shapes to (name, externalId) for the upsert.
+    const companyName = typeof company === "string" ? company : company?.name;
+    const companyExternalId = typeof company === "object" && company ? company.company_id : undefined;
     // Identity is either proven by a signed JWT (identity from its claims) or a user_hash HMAC.
     const rid = resolveVerifiedIdentity(wk, { userId: parsed.data.userId, email: parsed.data.email, userHash, userJwt });
     if (!rid.email && !rid.userId) return { ok: true, identified: false };
@@ -563,7 +567,8 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       external_id: rid.userId ?? undefined,
       email: rid.email ?? undefined,
       name,
-      company,
+      company: companyName,
+      company_external_id: companyExternalId,
       attributes: merged,
     });
     void bumpContactSeen(wk.tenantId, contact.id); // presence, best-effort

@@ -309,7 +309,7 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
     const parsed = CompanyInput.safeParse(req.body);
     if (!parsed.success || !parsed.data.name) return reply.code(400).send({ error: "name is required" });
     try {
-      return reply.code(201).send({ company: await createCompany(tenantId, { name: parsed.data.name, domain: parsed.data.domain, plan: parsed.data.plan, attributes: parsed.data.attributes }) });
+      return reply.code(201).send({ company: await createCompany(tenantId, { name: parsed.data.name, external_id: parsed.data.external_id, domain: parsed.data.domain, plan: parsed.data.plan, attributes: parsed.data.attributes }) });
     } catch (e) {
       if ((e as { code?: string }).code === "23505") return reply.code(409).send({ error: "a company with that name already exists" });
       throw e;

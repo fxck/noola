@@ -550,6 +550,9 @@ export const ContactInput = z
 /** Create/update a company (account record). Create requires a name; update is partial. */
 export const CompanyInput = z.object({
   name: z.string().min(1).max(300).optional(),
+  /** Your external id for this account (Intercom company `company_id`). "" clears it; omitted leaves
+   *  it unchanged. The dedup key for identify (external_id first, then name). */
+  external_id: z.string().max(200).optional(),
   domain: z.string().max(300).optional(),
   plan: z.string().max(120).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
@@ -971,7 +974,19 @@ export const PublicIdentifyInput = z.object({
   email: z.string().trim().email().max(320).optional(),
   name: z.string().trim().min(1).max(200).optional(),
   userId: z.string().trim().min(1).max(200).optional(),
-  company: z.string().trim().max(200).optional(),
+  // Company: a plain NAME string (legacy), or an Intercom-style object carrying YOUR own
+  // `company_id` (the external id we dedup on, external_id-first then name) plus name/plan/domain.
+  company: z
+    .union([
+      z.string().trim().max(200),
+      z.object({
+        company_id: z.string().trim().max(200).optional(),
+        name: z.string().trim().max(200).optional(),
+        plan: z.string().trim().max(120).optional(),
+        domain: z.string().trim().max(300).optional(),
+      }),
+    ])
+    .optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
   page: z.object({ url: z.string().max(2048).optional(), title: z.string().max(500).optional() }).optional(),
   // Live-enrichment signals the widget reports (the browser knows them exactly); the server derives

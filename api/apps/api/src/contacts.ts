@@ -52,6 +52,9 @@ export interface ContactInputShape {
   email?: string | null;
   name?: string;
   company?: string;
+  /** Your external id for the contact's company (Intercom company `company_id`) — when present it is
+   *  the dedup key for resolving the company (external_id first, then the `company` name). */
+  company_external_id?: string | null;
   company_id?: string | null;
   /** Many-to-many company membership (0111). ORDERED — first = primary. When defined it REPLACES
    *  the contact's full company set (overriding company/company_id, which are derived from the
@@ -709,16 +712,48 @@ async function upsertOne(
  *  Companies/clients list on the person detail rendered empty). The FIRST company observed stays
  *  primary — we only set is_primary when the contact has none yet, so re-logins never flip it and the
  *  one-primary partial-unique index is never violated. Returns the resolved company id. */
-async function mergeCompanyByName(c: PoolClient, contactId: string, rawName: string): Promise<string | null> {
-  const name = (rawName ?? "").trim();
-  if (!name) return null;
-  const cr = await c.query(
-    `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
-     ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET name = companies.name
-     RETURNING id`,
-    [name],
-  );
-  const companyId = cr.rows[0].id as string;
+async function mergeCompany(
+  c: PoolClient,
+  contactId: string,
+  spec: { externalId?: string | null; name?: string | null },
+): Promise<string | null> {
+  const externalId = (spec.externalId ?? "").trim();
+  const name = (spec.name ?? "").trim();
+  if (!externalId && !name) return null;
+
+  let companyId: string;
+  if (externalId) {
+    // Dedup by external_id FIRST (a rename can't fork the account). On a hit, absorb the latest name.
+    const byExt = await c.query(`SELECT id FROM companies WHERE external_id = $1 LIMIT 1`, [externalId]);
+    if (byExt.rowCount) {
+      companyId = byExt.rows[0].id as string;
+      if (name) {
+        await c.query(`UPDATE companies SET name = $2, updated_at = now() WHERE id = $1 AND name IS DISTINCT FROM $2`, [companyId, name]);
+      }
+    } else {
+      // No external_id match yet: adopt an existing name-matched company (stamp the external_id onto it
+      // if it has none) or create a fresh one. The name falls back to the id when only an id was sent.
+      const ins = await c.query(
+        `INSERT INTO companies (tenant_id, name, external_id) VALUES (current_tenant(), $1, $2)
+         ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET external_id = COALESCE(companies.external_id, EXCLUDED.external_id), updated_at = now()
+         RETURNING id`,
+        [name || externalId, externalId],
+      );
+      companyId = ins.rows[0].id as string;
+    }
+  } else {
+    // Name-only (legacy widget/identify): resolve-or-create by name.
+    const ins = await c.query(
+      `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
+       ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET name = companies.name
+       RETURNING id`,
+      [name],
+    );
+    companyId = ins.rows[0].id as string;
+  }
+
+  // Additive membership — the first company observed stays primary (re-logins under other clients
+  // accumulate rather than clobber); the one-primary partial-unique index is never violated.
   const hasPrimary = ((await c.query(
     `SELECT 1 FROM contact_companies WHERE contact_id = $1 AND is_primary LIMIT 1`,
     [contactId],
@@ -747,8 +782,9 @@ async function syncUpsertCompanies(
     await c.query(`UPDATE contacts SET company_id = $2, company = $3 WHERE id = $1`, [contactId, primaryId, primaryName]);
   } else if (cid) {
     await ensurePrimaryCompany(c, contactId, cid);
-  } else if ((input.company ?? "").trim()) {
-    const primaryId = await mergeCompanyByName(c, contactId, input.company!);
+  } else if ((input.company ?? "").trim() || (input.company_external_id ?? "").trim()) {
+    // Resolve by external_id FIRST, then the company name (the "external_id first, then name" dedup).
+    const primaryId = await mergeCompany(c, contactId, { externalId: input.company_external_id, name: input.company });
     // Pin the denormalized primary pointer only when it's still empty — keeps company_id referencing
     // a real account without disturbing an already-chosen primary.
     if (primaryId) {
