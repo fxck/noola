@@ -13,6 +13,10 @@
 // The SDK command queue is global as window.Noola(...). The plain <script data-noola-key> embed
 // (no boot call) still works exactly as before — an anonymous visitor.
 //
+// Colour scheme: the widget follows the OS (prefers-color-scheme) by default. A host that runs its
+// own light/dark toggle can pin it — data-noola-theme="dark|light" on the embed, {theme:'dark'} in
+// boot/update, or Noola('theme', 'dark'|'light'|'auto') live from the toggle handler.
+//
 // Written with single-quoted strings + concatenation only (no backticks / ${…}) so it survives
 // being embedded in this template literal.
 export const WIDGET_JS = String.raw`(function () {
@@ -28,11 +32,17 @@ export const WIDGET_JS = String.raw`(function () {
   // agent replies stream in live over a WebSocket; polling stays on as a fallback.
   var EDGE = ((script && script.getAttribute('data-noola-edge')) || '').replace(/\/+$/, '');
 
+  // Colour scheme: 'light' | 'dark' pin the widget regardless of the OS; anything else (incl.
+  // 'system' / 'auto' / unset) = follow prefers-color-scheme. Comes from data-noola-theme,
+  // Noola('boot'|'update',{theme}) or Noola('theme', value) — the host app can flip it live.
+  function normTheme(v) { v = (v == null ? '' : String(v)).toLowerCase(); return (v === 'light' || v === 'dark') ? v : 'auto'; }
+
   var CFG = {
     accent: (script && script.getAttribute('data-noola-accent')) || '#4f46e5',
     title: (script && script.getAttribute('data-noola-title')) || 'Ask us anything',
     greeting: 'Get an instant answer from our AI, or browse the help center.',
     position: 'right',
+    theme: normTheme(script && script.getAttribute('data-noola-theme')),
     tabs: { home: true, messages: true, help: true }
   };
 
@@ -148,6 +158,17 @@ export const WIDGET_JS = String.raw`(function () {
     return Math.floor(d / 86400) + 'd ago';
   }
 
+  // Dark palette tokens, emitted twice below: under the OS media query (auto mode — only when the
+  // embed has NOT pinned data-noola-theme) AND under :host([data-noola-theme="dark"]) so a host can
+  // force dark against a light OS. Light is the bare :host default, so "light" needs no rule of its own.
+  var DARK_VARS =
+    '--bg:#0b0e13;--s1:#161b22;--s2:#1e2530;' +
+    '--fg:#f4f5f7;--fg2:rgba(255,255,255,.62);--fg3:rgba(255,255,255,.40);' +
+    '--bd:rgba(255,255,255,.09);--bd2:rgba(255,255,255,.16);--dv:rgba(255,255,255,.09);' +
+    '--send-idle:rgba(255,255,255,.12);--send-idle-fg:rgba(255,255,255,.55);--ghost-hover:rgba(255,255,255,.07);' +
+    '--hd-a:#0a1210;--hd-b:#0d1a16;--hd-c:#07100d;' +
+    '--shadow-panel:0 18px 56px rgba(0,0,0,.6),0 3px 10px rgba(0,0,0,.42);color-scheme:dark';
+
   var CSS =
     ':host,*{box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}' +
     ':host{' +
@@ -161,13 +182,8 @@ export const WIDGET_JS = String.raw`(function () {
       '--shadow-sm:0 1px 2px rgba(16,24,40,.05);--shadow-card:0 1px 3px rgba(16,24,40,.07),0 1px 2px rgba(16,24,40,.04);' +
       '--shadow-panel:0 16px 48px rgba(16,24,40,.18),0 3px 10px rgba(16,24,40,.08);' +
       '--r:20px;--rp:22px;--rc:14px;--rb:18px;color-scheme:light}' +
-    '@media (prefers-color-scheme:dark){:host{' +
-      '--bg:#0b0e13;--s1:#161b22;--s2:#1e2530;' +
-      '--fg:#f4f5f7;--fg2:rgba(255,255,255,.62);--fg3:rgba(255,255,255,.40);' +
-      '--bd:rgba(255,255,255,.09);--bd2:rgba(255,255,255,.16);--dv:rgba(255,255,255,.09);' +
-      '--send-idle:rgba(255,255,255,.12);--send-idle-fg:rgba(255,255,255,.55);--ghost-hover:rgba(255,255,255,.07);' +
-      '--hd-a:#0a1210;--hd-b:#0d1a16;--hd-c:#07100d;' +
-      '--shadow-panel:0 18px 56px rgba(0,0,0,.6),0 3px 10px rgba(0,0,0,.42);color-scheme:dark}}' +
+    '@media (prefers-color-scheme:dark){:host(:not([data-noola-theme])){' + DARK_VARS + '}}' +
+    ':host([data-noola-theme="dark"]){' + DARK_VARS + '}' +
     '.noola{position:fixed;bottom:0;right:0;z-index:2147483000}' +
     '.bubble{position:fixed;bottom:20px;right:20px;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;' +
       'background:var(--ba);color:var(--ba-fg);box-shadow:0 8px 24px rgba(0,0,0,.22);display:grid;place-items:center;z-index:2147483001;' +
@@ -189,7 +205,8 @@ export const WIDGET_JS = String.raw`(function () {
       'background:var(--bg);color:var(--fg);border-radius:var(--r);box-shadow:var(--shadow-panel);display:none;flex-direction:column;' +
       'overflow:hidden;z-index:2147483001;transform-origin:bottom right;opacity:0;transform:translateY(8px) scale(.96);' +
       'transition:opacity .28s var(--ease),transform .28s var(--ease)}' +
-    '@media (prefers-color-scheme:dark){.panel{border:1px solid var(--bd)}}' +
+    '@media (prefers-color-scheme:dark){:host(:not([data-noola-theme])) .panel{border:1px solid var(--bd)}}' +
+    ':host([data-noola-theme="dark"]) .panel{border:1px solid var(--bd)}' +
     '.pos-left .panel{left:20px;right:auto;transform-origin:bottom left}' +
     '.panel.on{opacity:1;transform:none}' +
     // Persistent chrome: the header shell (#hdwrap) stays mounted and smoothly animates its HEIGHT
@@ -324,7 +341,8 @@ export const WIDGET_JS = String.raw`(function () {
     '.rowm.me{background:var(--ba);color:#fff;border-bottom-right-radius:6px}' +
     '.rowm.agent{background:var(--s2);color:var(--fg);box-shadow:var(--shadow-sm)}' +
     '.rowm.ai{background:var(--s2);color:var(--fg);box-shadow:var(--shadow-sm)}' +
-    '@media (prefers-color-scheme:dark){.rowm.ai,.rowm.agent{box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}}' +
+    '@media (prefers-color-scheme:dark){:host(:not([data-noola-theme])) .rowm.ai,:host(:not([data-noola-theme])) .rowm.agent{box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}}' +
+    ':host([data-noola-theme="dark"]) .rowm.ai,:host([data-noola-theme="dark"]) .rowm.agent{box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}' +
     '.mrow.left .rowm{border-bottom-left-radius:6px}' +
     '.rowm code{background:rgba(127,127,127,.16);border-radius:4px;padding:0 4px;font-size:.92em;font-family:ui-monospace,Menlo,Consolas,monospace}' +
     '.rowm.me code{background:rgba(255,255,255,.24)}' +
@@ -474,6 +492,12 @@ export const WIDGET_JS = String.raw`(function () {
   function applyConfig() {
     if (!varStyle) return;
     varStyle.textContent = ':host{--ba:' + CFG.accent + '}';
+    // Pin the colour scheme on the shadow host: 'light'/'dark' set data-noola-theme (which the CSS
+    // above keys off, beating the OS media query); anything else clears it → follow the OS.
+    if (host && host.setAttribute) {
+      if (CFG.theme === 'light' || CFG.theme === 'dark') host.setAttribute('data-noola-theme', CFG.theme);
+      else host.removeAttribute('data-noola-theme');
+    }
     wrapEl.className = 'noola' + (CFG.position === 'left' ? ' pos-left' : '');
     // keep the default view on an enabled tab
     var tabs = enabledTabs();
@@ -1576,6 +1600,7 @@ export const WIDGET_JS = String.raw`(function () {
       case 'boot': {
         if (a && a.key) KEY = String(a.key);
         if (a && (a.api || a.api_base)) API = String(a.api || a.api_base).replace(/\/+$/, '');
+        if (a && a.theme != null) CFG.theme = normTheme(a.theme);
         if (!KEY) { console.warn('[noola] boot: missing key'); return; }
         loadIdentity(); ingestIdentity(a || {}); loadConvs();
         mount(); loadConfig();
@@ -1583,7 +1608,10 @@ export const WIDGET_JS = String.raw`(function () {
         hookActivity(); recordPageView();
         break;
       }
-      case 'update': { ingestIdentity(a || {}); sendIdentify(); break; }
+      case 'update': { if (a && a.theme != null) { CFG.theme = normTheme(a.theme); applyConfig(); } ingestIdentity(a || {}); sendIdentify(); break; }
+      // Host-driven colour scheme, e.g. Noola('theme', 'dark') from the app's own theme toggle.
+      // Pure CSS-variable swap on the shadow host — the browser repaints, no re-render needed.
+      case 'theme': { CFG.theme = normTheme(a); applyConfig(); break; }
       case 'track': { if (typeof a === 'string' && a) trackActivity(a, b || {}); break; }
       case 'show': { launcherHidden = false; mount(); if (bubbleEl) bubbleEl.style.display = 'grid'; renderBadge(); break; }
       case 'hide': { launcherHidden = true; closePanel(); if (bubbleEl) bubbleEl.style.display = 'none'; if (badgeEl) badgeEl.style.display = 'none'; break; }
