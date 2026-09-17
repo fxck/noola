@@ -21,6 +21,10 @@
 // being embedded in this template literal.
 export const WIDGET_JS = String.raw`(function () {
   'use strict';
+  // Loaded twice (a second <script> tag, an SPA re-injecting it)? A second copy would boot its own
+  // launcher, timers and pops, and window.Noola would only reach the newest copy. Keep the first.
+  if (window.__noolaWidgetLoaded) return;
+  window.__noolaWidgetLoaded = true;
 
   // ---- config from the embedding <script> tag (fallback until /public/config resolves) ----
   var script = document.currentScript || document.querySelector('script[data-noola-key]');
@@ -70,6 +74,12 @@ export const WIDGET_JS = String.raw`(function () {
   // rebuild #log from the server — the answer isn't persisted until the stream's 'done', so a
   // mid-stream hydrate would wipe the live bubble. Set to the conversation id during a stream.
   var streamingConv = null;
+  // Bumped on every identity reset (shutdown / account switch). A response to a request started under the
+  // previous identity is dropped instead of writing that user's conversations into the new session.
+  var sessionGen = 0;
+  // In-flight latches for the human handoff / AI resume — memory only, never persisted (a reload during
+  // a request used to leave a stored "escalating" flag behind and the button silently dead).
+  var escalatingIds = {}, resumingIds = {};
 
   // ---- storage helpers ----
   function skey(sfx) { return 'noola_' + sfx + '_' + KEY; }
@@ -82,8 +92,40 @@ export const WIDGET_JS = String.raw`(function () {
   }
   function saveIdentity() { saveJSON(skey('ident'), identity); }
   function isIdentified() { return !!(identity.email || identity.user_id || identity.user_jwt); }
+  function emptyIdentity() { return { email: null, name: null, user_id: null, user_hash: null, user_jwt: null, company: null, attributes: {} }; }
+  // Who the stored conversations belong to: the user id when known, else the email.
+  function identityKey() { return identity.user_id ? 'u:' + String(identity.user_id) : (identity.email ? 'e:' + String(identity.email).toLowerCase() : ''); }
+  // True when boot/update options name a DIFFERENT person than the current identity (account switch).
+  // Only compares like with like, so adding an email to a user-id identity isn't a switch.
+  function isDifferentUser(a) {
+    if (!a || typeof a !== 'object') return false;
+    var uid = a.user_id != null ? a.user_id : a.userId;
+    if (uid != null && identity.user_id) return String(uid) !== String(identity.user_id);
+    if (uid == null && typeof a.email === 'string' && a.email && !identity.user_id && identity.email) return a.email.toLowerCase() !== String(identity.email).toLowerCase();
+    return false;
+  }
+  function ownerMismatch(owner) {
+    var me = identityKey();
+    return !!(owner && me && owner.charAt(0) === me.charAt(0) && owner !== me);
+  }
+  // The newest agent reply this visitor has already been shown (auto-opened or opened), per identity.
+  // A pop needs a reply NEWER than this, so a lost or failed seen-stamp can never re-pop the same reply.
+  function popMark() { var m = loadJSON(skey('popmark'), null); return (m && m.owner === identityKey()) ? (m.at || 0) : 0; }
+  function setPopMark(at) { if (at && at > popMark()) saveJSON(skey('popmark'), { owner: identityKey(), at: at }); }
+  function isEnded(status) { return status === 'closed' || status === 'resolved'; }
+  function newestAgentAt(c) {
+    var at = 0, ms = (c && c.msgs) || [];
+    for (var i = 0; i < ms.length; i++) { var m = ms[i]; if ((m.role === 'agent' || m.role === 'ai') && m.id && m.id !== 'preview' && m.at > at) at = m.at; }
+    return Math.max(at, (c && c.unseenAt) || 0);
+  }
 
   function loadConvs() {
+    // Stored conversations belong to one identity — never load another user's list into this session.
+    if (ownerMismatch(loadJSON(skey('owner'), null))) {
+      convs = [];
+      try { localStorage.removeItem(skey('convs')); localStorage.removeItem(skey('owner')); } catch (e) {}
+      return;
+    }
     convs = loadJSON(skey('convs'), null) || [];
     if (!convs.length) {
       // migrate the legacy single-conversation id (pre-multi-conversation widget)
@@ -92,8 +134,27 @@ export const WIDGET_JS = String.raw`(function () {
     }
   }
   function saveConvs() {
-    for (var i = 0; i < convs.length; i++) { if (convs[i].msgs && convs[i].msgs.length > 120) convs[i].msgs = convs[i].msgs.slice(-120); }
-    saveJSON(skey('convs'), convs.slice(0, 20));
+    // Persist a trimmed COPY. Trimming the live list made every later poll see the older server messages
+    // as "new" and pop the messenger open again — on every poll.
+    var out = [];
+    for (var i = 0; i < convs.length && out.length < 20; i++) {
+      var c = convs[i], copy = {};
+      for (var k in c) if (c.hasOwnProperty(k) && k !== 'escalating') copy[k] = c[k];
+      if (copy.msgs && copy.msgs.length > 120) copy.msgs = copy.msgs.slice(-120);
+      out.push(copy);
+    }
+    saveJSON(skey('convs'), out);
+    saveJSON(skey('owner'), identityKey());
+  }
+  // Forget the current session's conversations + live lanes (shutdown, or a different user booting).
+  function resetSession() {
+    sessionGen++;
+    stopPoll(); closeWS();
+    convs = []; threadId = null; activeConvId = null; serverConvsSynced = false;
+    escalatingIds = {}; resumingIds = {};
+    if (view === 'thread') view = 'home';
+    try { localStorage.removeItem(skey('convs')); localStorage.removeItem(skey('owner')); localStorage.removeItem('noola_conv_' + KEY); } catch (e) {}
+    renderBadge();
   }
   function uuid() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('c' + Date.now() + Math.floor(Math.random() * 1e6)); }
   function getConv(id) { for (var i = 0; i < convs.length; i++) if (convs[i].id === id) return convs[i]; return null; }
@@ -107,31 +168,41 @@ export const WIDGET_JS = String.raw`(function () {
   // user sees their past chats on the Messages tab (not just the ones this browser started). Each
   // server conversation becomes a stub with a one-line preview; opening it hydrates the full transcript.
   var serverConvsSynced = false;
+  // cb(changed, list): list is the server's conversations on success, null on any failure — callers that
+  // act on it (the boot pop) must do nothing unless the sync actually succeeded.
   function syncServerConvs(cb) {
-    if (!identity.email && !identity.user_id && !identity.user_jwt) { if (cb) cb(false); return; }
+    if (!isIdentified()) { if (cb) cb(false, null); return; }
+    var gen = sessionGen;
     fetch(API + '/public/conversations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, email: identity.email || undefined, userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined }) })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
-        if (!d || !d.conversations) { if (cb) cb(false); return; }
-        var changed = false;
+        if (gen !== sessionGen) return;   // identity changed while in flight
+        if (!d || !d.conversations) { if (cb) cb(false, null); return; }
+        var changed = false, listed = {};
         for (var i = 0; i < d.conversations.length; i++) {
           var sc = d.conversations[i];
+          listed[sc.conversationId] = 1;
           var at = +new Date(sc.updatedAt) || Date.now();
+          var unseenAt = sc.unseenAt ? +new Date(sc.unseenAt) : 0;
           var preview = sc.lastBody ? [{ role: sc.lastFromAgent ? 'agent' : 'me', id: 'preview', body: sc.lastBody, at: at }] : [];
           var existing = getConv(sc.conversationId);
           if (existing) {
-            existing.escalated = sc.assistantEnabled === false;
-            existing.unseen = sc.unseen === true;
+            var esc = sc.assistantEnabled === false, unseen = sc.unseen === true, st = sc.status || null;
+            if (existing.escalated !== esc || existing.unseen !== unseen || existing.status !== st || existing.unseenAt !== unseenAt) changed = true;
+            existing.escalated = esc; existing.unseen = unseen; existing.status = st; existing.unseenAt = unseenAt;
             if (!existing.msgs.length && preview.length) { existing.msgs = preview; existing.updatedAt = at; changed = true; }
           } else {
-            convs.push({ id: sc.conversationId, escalated: sc.assistantEnabled === false, updatedAt: at, unread: 0, unseen: sc.unseen === true, msgs: preview });
+            convs.push({ id: sc.conversationId, escalated: sc.assistantEnabled === false, status: sc.status || null, updatedAt: at, unread: 0, unseen: sc.unseen === true, unseenAt: unseenAt, msgs: preview });
             changed = true;
           }
         }
+        // The server list is the truth for "unseen": a conversation it doesn't report can't still be unseen.
+        // (Left stale in localStorage, that flag re-popped an old conversation on every reload.)
+        for (var j = 0; j < convs.length; j++) if (!listed[convs[j].id] && convs[j].unseen) { convs[j].unseen = false; changed = true; }
         if (changed) saveConvs();
-        if (cb) cb(changed);
+        if (cb) cb(changed, d.conversations);
       })
-      .catch(function () { if (cb) cb(false); });
+      .catch(function () { if (gen === sessionGen && cb) cb(false, null); });
   }
   function totalUnread() { var n = 0; for (var i = 0; i < convs.length; i++) n += (convs[i].unread || 0); return n; }
 
@@ -568,9 +639,11 @@ export const WIDGET_JS = String.raw`(function () {
   // and for messages that landed while they were away (surfaced on the first reconcile after load).
   // Works even when the launcher is hidden (custom-launcher embeds). Panel-closed only; markRead
   // clears the badge and the reconcile persists the message, so it pops at most once per new message.
-  function autoOpenThread(convId) {
+  function autoOpenThread(convId, replyAt) {
     if (panelOpen) return;
-    if (!getConv(convId)) return;
+    var c = getConv(convId);
+    if (!c || isEnded(c.status)) return;   // an ended conversation never pops
+    setPopMark(replyAt || newestAgentAt(c)); // surfaced — this reply can't pop again
     view = 'thread'; threadId = convId; pendingDir = 'none';
     openPanel();          // shows the panel + renders the thread (wire scrolls to the latest message)
     markRead(convId);     // they're viewing it now — clear the unread badge
@@ -584,13 +657,18 @@ export const WIDGET_JS = String.raw`(function () {
   function bootSyncPop() {
     if (!isIdentified() || panelOpen || serverConvsSynced) return;
     serverConvsSynced = true;
-    syncServerConvs(function () {
-      if (panelOpen) return;
-      var best = null;
-      for (var i = 0; i < convs.length; i++) {
-        if (convs[i].unseen && (!best || (convs[i].updatedAt || 0) > (best.updatedAt || 0))) best = convs[i];
+    syncServerConvs(function (_changed, list) {
+      // Act only on a sync that succeeded, and only on what the server just reported: an OPEN conversation
+      // whose unseen agent reply is newer than the last one already surfaced. (Scanning cached local flags
+      // popped an old — even closed — conversation on every reload, including another account's.)
+      if (panelOpen || !list) return;
+      var mark = popMark(), best = null;
+      for (var i = 0; i < list.length; i++) {
+        var sc = list[i], at = sc.unseenAt ? +new Date(sc.unseenAt) : 0;
+        if (!sc.unseen || !at || at <= mark || isEnded(sc.status)) continue;
+        if (!best || at > best.at) best = { id: sc.conversationId, at: at };
       }
-      if (best && !panelOpen) autoOpenThread(best.id);
+      if (best) autoOpenThread(best.id, best.at);
     });
   }
 
@@ -953,9 +1031,11 @@ export const WIDGET_JS = String.raw`(function () {
     // after a human has replied — so a customer who resumed the AI (or whose thread a human dipped
     // into) can always escalate again. (The earlier version hid it once any agent had replied, which
     // stranded the customer with no way back to a human after resuming.)
+    // While the request is in flight the button is disabled and says so — a button that "did nothing"
+    // got tapped again, and each tap used to post another handoff message.
     var toggle = c.escalated
-      ? '<button class="talk" id="resume" type="button">' + iconNoola() + '<span>Ask Noola</span></button>'
-      : '<button class="talk" id="talk" type="button">' + iconUser() + '<span>Talk to a human</span></button>';
+      ? '<button class="talk" id="resume" type="button"' + (resumingIds[c.id] ? ' disabled aria-busy="true"' : '') + '>' + iconNoola() + '<span>Ask Noola</span></button>'
+      : '<button class="talk" id="talk" type="button"' + (escalatingIds[c.id] ? ' disabled aria-busy="true"' : '') + '>' + iconUser() + '<span>' + (escalatingIds[c.id] ? 'Connecting you…' : 'Talk to a human') + '</span></button>';
     return out + toggle;
   }
   function refreshLog(convId) {
@@ -978,6 +1058,9 @@ export const WIDGET_JS = String.raw`(function () {
     // Don't reconcile a conversation whose AI answer is mid-stream — the persisted answer doesn't
     // exist yet, so rebuilding from the server would erase the live streaming bubble.
     if (streamingConv === convId) { if (cb) cb(); return; }
+    var gen = sessionGen;
+    var startConv = getConv(convId);
+    var modeSeqAtStart = startConv ? (startConv.modeSeq || 0) : 0;
     // Read receipt: tell the server we are actively LOOKING at this thread only on a foreground poll
     // (panel open + this exact conversation on screen). Background/closed polls send false, so agent
     // replies are stamped seen only when the customer is genuinely viewing them.
@@ -985,23 +1068,45 @@ export const WIDGET_JS = String.raw`(function () {
     fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId, viewing: viewingReq }) })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
+        if (gen !== sessionGen) return;
         var c = getConv(convId); if (!c || !d) { if (cb) cb(); return; }
+        // The server doesn't know this conversation (null) → keep what we have. It used to be read as
+        // "AI on", which re-offered "Talk to a human" and wiped the local transcript.
+        if (d.assistantEnabled === null && d.status === null) { if (cb) cb(); return; }
         var wasEsc = !!c.escalated;
-        c.escalated = d.assistantEnabled === false;
+        // A poll that started before a local escalate/resume took effect carries the OLD mode — ignore it,
+        // or the button flips back for a few seconds and invites a second tap.
+        if ((c.modeSeq || 0) === modeSeqAtStart && typeof d.assistantEnabled === 'boolean') c.escalated = d.assistantEnabled === false;
         c.status = d.status || null;
         var server = (d.messages || []).map(function (m) { return { role: m.role === 'agent' ? 'agent' : m.role === 'ai' ? 'ai' : 'me', id: m.id, body: m.body, attachments: m.attachments || [], at: m.at ? +new Date(m.at) : Date.now(), authorName: m.authorName || null, authorAvatarUrl: m.authorAvatarUrl || null }; });
         var localIds = c.msgs.map(function (m) { return m.id || ''; }).join('|');
         var serverIds = server.map(function (m) { return m.id; }).join('|');
         var changed = localIds !== serverIds;
-        var poppable = false;
+        var poppable = false, freshAt = 0;
         if (changed) {
           // If the visitor isn't looking at this thread, count freshly-arrived agent/AI turns as unread
           // for the launcher badge (a background poll reconciles silently otherwise).
           var viewing = panelOpen && view === 'thread' && threadId === convId;
           if (!viewing) {
-            var known = {}; for (var i = 0; i < c.msgs.length; i++) if (c.msgs[i].id) known[c.msgs[i].id] = 1;
-            var fresh = 0; for (var j = 0; j < server.length; j++) if ((server[j].role === 'agent' || server[j].role === 'ai') && !known[server[j].id]) fresh++;
-            if (fresh) { c.unread = (c.unread || 0) + fresh; renderBadge(); if (!panelOpen) poppable = true; }
+            // "Fresh" = newer than the newest server message we already had — not "an id we don't have".
+            // The cached copy is capped at 120 messages and a synced conversation starts as a preview with
+            // no ids, so id-diffing counted OLD replies as new and popped the messenger on every poll.
+            var known = {}, newestKnown = 0, hadReal = false;
+            for (var i = 0; i < c.msgs.length; i++) {
+              var lm = c.msgs[i];
+              if (lm.id && lm.id !== 'preview') { known[lm.id] = 1; hadReal = true; if (lm.at > newestKnown) newestKnown = lm.at; }
+            }
+            var fresh = 0;
+            if (hadReal) {
+              for (var j = 0; j < server.length; j++) {
+                var sm = server[j];
+                if ((sm.role === 'agent' || sm.role === 'ai') && !known[sm.id] && sm.at > newestKnown) { fresh++; if (sm.at > freshAt) freshAt = sm.at; }
+              }
+            }
+            if (fresh) {
+              c.unread = (c.unread || 0) + fresh; renderBadge();
+              if (!panelOpen && !isEnded(c.status) && freshAt > popMark()) poppable = true;
+            }
           }
           c.msgs = server; c.updatedAt = Date.now();
         }
@@ -1017,7 +1122,7 @@ export const WIDGET_JS = String.raw`(function () {
         // An agent reply the visitor hasn't seen — arrived live, OR while they were away and now
         // surfaced on the first reconcile after (re)load — pop the messenger open to it, panel-closed
         // only. Done after msgs/escalated reconcile so the opened thread shows the message.
-        if (poppable && !panelOpen) autoOpenThread(convId);
+        if (poppable && !panelOpen) autoOpenThread(convId, freshAt);
         if (cb) cb();
       })
       .catch(function () { if (cb) cb(); });
@@ -1201,7 +1306,13 @@ export const WIDGET_JS = String.raw`(function () {
   }
   function markRead(convId) {
     var c = getConv(convId);
-    if (c && c.unread) { c.unread = 0; saveConvs(); renderBadge(); }
+    if (c) {
+      var dirty = false;
+      if (c.unread) { c.unread = 0; dirty = true; }
+      if (c.unseen) { c.unseen = false; dirty = true; }
+      setPopMark(newestAgentAt(c));   // they've seen everything up to here — don't pop it again
+      if (dirty) { saveConvs(); renderBadge(); }
+    }
     stampSeen(convId);   // also clear the server-side unseen watermark, so the boot-pop doesn't repeat
   }
 
@@ -1368,39 +1479,55 @@ export const WIDGET_JS = String.raw`(function () {
   // surfaces the thread in the agents' "needs reply" queue — the full AI transcript stays on the
   // same ticket. UI reflects the new mode once the server has confirmed it (no optimistic race).
   function escalate(convId) {
-    var c = getConv(convId); if (!c || c.escalated || c.escalating || busy) return;
-    // Synchronous in-flight latch: c.escalated is only set once the server confirms (below), so
-    // without this a rapid double-tap / re-click fires TWO handoff requests before the first resolves
-    // — the "talk to a human" message got posted twice. escalating guards the window; it's cleared on
-    // completion (success flips to escalated; failure reopens the affordance for a retry).
-    c.escalating = true;
-    var b = { key: KEY, question: 'I’d like to talk to a human, please.', conversationId: convId, escalate: true };
+    var c = getConv(convId); if (!c || c.escalated || escalatingIds[convId] || busy) return;
+    // Synchronous in-flight latch (memory only) + a disabled "Connecting you…" button.
+    escalatingIds[convId] = true;
+    c.modeSeq = (c.modeSeq || 0) + 1;
+    refreshLog(convId);
+    // Stable per handoff attempt (bumped only when the visitor hands back to the AI): a retry of the same
+    // handoff is collapsed server-side into one message. The server also no-ops if already escalated.
+    var b = { key: KEY, question: 'I’d like to talk to a human, please.', conversationId: convId, escalate: true, clientMessageId: 'esc-' + convId + '-' + (c.escSeq || 0) };
     if (identity.email) b.email = identity.email;
     if (identity.name) b.name = identity.name;
     if (identity.user_id) b.userId = identity.user_id;
     if (identity.user_hash) b.userHash = identity.user_hash;
     if (identity.user_jwt) b.userJwt = identity.user_jwt;
     trackActivity('requested_human', { conversationId: convId });
+    var gen = sessionGen;
     fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) })
-      .then(function () {
-        c.escalating = false; c.escalated = true; saveConvs();
+      .then(function (r) { if (!r.ok) throw new Error('escalate failed: ' + r.status); return r.json(); })
+      .then(function (d) {
+        delete escalatingIds[convId];
+        if (gen !== sessionGen) return;
+        var cc = getConv(convId); if (!cc) return;   // re-read: a boot may have replaced the list meanwhile
+        cc.escalated = !!(d && (d.escalated || d.alreadyEscalated));
+        cc.modeSeq = (cc.modeSeq || 0) + 1;
+        saveConvs();
         if (view === 'thread' && threadId === convId) { pendingDir = 'none'; render(); }
-        startLive(convId);
+        if (cc.escalated) startLive(convId);
       })
-      .catch(function () { c.escalating = false; });
+      .catch(function () { delete escalatingIds[convId]; refreshLog(convId); });
   }
 
-  // Bring the AI back ("Ask the assistant"): un-mute the assistant server-side, then reflect it. The
-  // whole transcript is intact on the ticket, so the AI answers the next question with full context.
+  // Bring the AI back ("Ask Noola"): un-mute the assistant server-side, then reflect it. The whole
+  // transcript is intact on the ticket, so the AI answers the next question with full context.
   function resumeAssistant(convId) {
-    var c = getConv(convId); if (!c || !c.escalated || busy) return;
+    var c = getConv(convId); if (!c || !c.escalated || resumingIds[convId] || busy) return;
+    resumingIds[convId] = true;
+    c.modeSeq = (c.modeSeq || 0) + 1;
+    refreshLog(convId);
+    var gen = sessionGen;
     fetch(API + '/public/assistant-mode', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId, enabled: true }) })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (r) { if (!r.ok) throw new Error('resume failed: ' + r.status); return r.json(); })
       .then(function () {
-        c.escalated = false; saveConvs();
+        delete resumingIds[convId];
+        if (gen !== sessionGen) return;
+        var cc = getConv(convId); if (!cc) return;
+        cc.escalated = false; cc.escSeq = (cc.escSeq || 0) + 1; cc.modeSeq = (cc.modeSeq || 0) + 1;
+        saveConvs();
         if (view === 'thread' && threadId === convId) { pendingDir = 'none'; render(); var qq = sel('#q'); if (qq) qq.focus(); }
       })
-      .catch(function () {});
+      .catch(function () { delete resumingIds[convId]; refreshLog(convId); });
   }
 
   // ---- live lane (poll + WS) scoped to one escalated conversation ----
@@ -1439,16 +1566,23 @@ export const WIDGET_JS = String.raw`(function () {
   function poll() { if (activeConvId) hydrateThread(activeConvId); }
   function connectWS() {
     if (!EDGE || ws || !activeConvId) return;
-    var topic = 'widget:' + activeConvId;
+    // Every handler is bound to THIS socket and THIS conversation. A socket closed when the live lane
+    // moved to another conversation used to fire its onclose later and clobber the new socket, and route
+    // messages to whatever conversation was active by then.
+    var conv = activeConvId;
+    var topic = 'widget:' + conv;
     var url = EDGE + '/widget-socket/websocket?vsn=2.0.0&key=' + encodeURIComponent(KEY);
-    try { ws = new WebSocket(url); } catch (e) { ws = null; return; }
-    ws.onopen = function () {
-      ws.send(JSON.stringify(['1', '1', topic, 'phx_join', { key: KEY }]));
-      wsHb = setInterval(function () { if (ws && ws.readyState === 1) ws.send(JSON.stringify([null, 'hb' + (++wsRef), 'phoenix', 'heartbeat', {}])); }, 30000);
+    var sock;
+    try { sock = new WebSocket(url); } catch (e) { return; }
+    ws = sock;
+    sock.onopen = function () {
+      if (ws !== sock) return;
+      sock.send(JSON.stringify(['1', '1', topic, 'phx_join', { key: KEY }]));
+      wsHb = setInterval(function () { if (ws === sock && sock.readyState === 1) sock.send(JSON.stringify([null, 'hb' + (++wsRef), 'phoenix', 'heartbeat', {}])); }, 30000);
     };
-    ws.onmessage = function (ev) { var f; try { f = JSON.parse(ev.data); } catch (e) { return; } if (f && f[2] === topic && f[3] === 'message' && f[4]) onAgent(activeConvId, f[4].id, f[4].body); };
-    ws.onclose = function () { if (wsHb) { clearInterval(wsHb); wsHb = null; } ws = null; if (activeConvId) setTimeout(connectWS, 3000); };
-    ws.onerror = function () { try { ws && ws.close(); } catch (e) {} };
+    sock.onmessage = function (ev) { if (ws !== sock) return; var f; try { f = JSON.parse(ev.data); } catch (e) { return; } if (f && f[2] === topic && f[3] === 'message' && f[4]) onAgent(conv, f[4].id, f[4].body); };
+    sock.onclose = function () { if (ws !== sock) return; if (wsHb) { clearInterval(wsHb); wsHb = null; } ws = null; if (activeConvId === conv) setTimeout(connectWS, 3000); };
+    sock.onerror = function () { try { sock.close(); } catch (e) {} };
   }
   function closeWS() { if (wsHb) { clearInterval(wsHb); wsHb = null; } if (ws) { try { ws.close(); } catch (e) {} ws = null; } }
 
@@ -1602,13 +1736,28 @@ export const WIDGET_JS = String.raw`(function () {
         if (a && (a.api || a.api_base)) API = String(a.api || a.api_base).replace(/\/+$/, '');
         if (a && a.theme != null) CFG.theme = normTheme(a.theme);
         if (!KEY) { console.warn('[noola] boot: missing key'); return; }
-        loadIdentity(); ingestIdentity(a || {}); loadConvs();
-        mount(); loadConfig();
+        loadIdentity();
+        // Booting a DIFFERENT user than the one stored (account switch without shutdown): start clean, so
+        // the previous user's identity proof, attributes and conversations don't leak into this session.
+        if (isDifferentUser(a)) { identity = emptyIdentity(); resetSession(); }
+        ingestIdentity(a || {}); loadConvs();
+        if (mounted) { renderBadge(); resumeLive(); bootSyncPop(); if (panelOpen) { pendingDir = 'none'; render(); } }
+        else mount();
+        loadConfig();
         if (!launcherHidden && bubbleEl) bubbleEl.style.display = 'grid';
         hookActivity(); recordPageView();
         break;
       }
-      case 'update': { if (a && a.theme != null) { CFG.theme = normTheme(a.theme); applyConfig(); } ingestIdentity(a || {}); sendIdentify(); break; }
+      case 'update': {
+        if (a && a.theme != null) { CFG.theme = normTheme(a.theme); applyConfig(); }
+        var switched = isDifferentUser(a);
+        if (switched) { identity = emptyIdentity(); resetSession(); }
+        var wasIdentified = isIdentified();
+        ingestIdentity(a || {}); sendIdentify();
+        // A new (or newly identified) user: pick up their conversations now, not on the next reload.
+        if (mounted && (switched || (!wasIdentified && isIdentified()))) { resumeLive(); bootSyncPop(); if (panelOpen) { pendingDir = 'none'; render(); } }
+        break;
+      }
       // Host-driven colour scheme, e.g. Noola('theme', 'dark') from the app's own theme toggle.
       // Pure CSS-variable swap on the shadow host — the browser repaints, no re-render needed.
       case 'theme': { CFG.theme = normTheme(a); applyConfig(); break; }
@@ -1618,10 +1767,10 @@ export const WIDGET_JS = String.raw`(function () {
       case 'open': { openPanel(); break; }
       case 'close': { closePanel(); break; }
       case 'shutdown': {
-        try { localStorage.removeItem(skey('ident')); localStorage.removeItem(skey('convs')); } catch (e) {}
-        identity = { email: null, name: null, user_id: null, user_hash: null, user_jwt: null, company: null, attributes: {} };
-        convs = []; threadId = null; activeConvId = null; stopPoll(); closeWS();
-        closePanel(); renderBadge();
+        try { localStorage.removeItem(skey('ident')); } catch (e) {}
+        identity = emptyIdentity();
+        closePanel();
+        resetSession();   // conversations, live lanes, in-flight callbacks, sync flag
         break;
       }
       default: console.warn('[noola] unknown command: ' + cmd);

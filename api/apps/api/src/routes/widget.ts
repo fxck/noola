@@ -57,6 +57,29 @@ async function setWidgetAssistantMode(tenantId: string, conversationId: string, 
     ),
   );
 }
+/** The widget ticket a conversation handle currently points at: the OPEN one first (a closed ticket can
+ *  share the handle after the visitor wrote again), newest first. */
+async function findWidgetTicket(
+  tenantId: string,
+  conversationId: string,
+): Promise<{ id: string; status: string; assistantEnabled: boolean } | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, status, assistant_enabled FROM tickets
+        WHERE channel_type = 'widget' AND (id::text = $1 OR external_channel_id = $1)
+        ORDER BY (status = 'open') DESC, updated_at DESC LIMIT 1`,
+      [conversationId],
+    );
+    if (!r.rowCount) return null;
+    return { id: r.rows[0].id as string, status: r.rows[0].status as string, assistantEnabled: r.rows[0].assistant_enabled !== false };
+  });
+}
+/** Hand exactly the ticket a message landed on to a human (mute its assistant). */
+async function muteWidgetTicket(tenantId: string, ticketId: string): Promise<void> {
+  await withTenant(tenantId, (c) =>
+    c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled IS DISTINCT FROM false", [ticketId]),
+  );
+}
 async function widgetAssistantEnabled(tenantId: string, ticketId: string): Promise<boolean> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(`SELECT assistant_enabled FROM tickets WHERE id = $1 LIMIT 1`, [ticketId]);
@@ -202,13 +225,21 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       identName = null;
     }
 
-    // AI mode is authoritative on the ticket. Escalation MUTES the assistant (set BEFORE ingest so the
-    // handoff message itself can't trigger a bot reply); "Ask the assistant" un-mutes it. Both target
-    // the existing widget ticket by its conversation handle (external_channel_id).
-    // A typed human-request ("talk to a human") ALSO mutes the assistant, same as the escalate button.
+    // AI mode is authoritative on the ticket. A typed human-request ("talk to a human") hands off the same
+    // way as the escalate button; "Ask the assistant" (resumeAi) un-mutes before this turn is answered.
     const humanRequest = wantsHuman(text);
-    if (conversationId && (escalate || humanRequest || resumeAi)) {
-      await setWidgetAssistantMode(wk.tenantId, conversationId, !escalate && !humanRequest && resumeAi === true);
+
+    // Escalation happens ONCE per conversation. If its open ticket is already with a human, a repeated
+    // escalate (stale button, second tab, retry, a poll that briefly showed the button again) is a no-op:
+    // no second canned message in the inbox, no second Discord post / webhook / notification.
+    if (escalate && conversationId) {
+      const current = await findWidgetTicket(wk.tenantId, conversationId);
+      if (current && current.status === "open" && !current.assistantEnabled) {
+        return reply.code(200).send({ escalated: true, alreadyEscalated: true, conversationId: current.id });
+      }
+    }
+    if (conversationId && resumeAi === true && !escalate && !humanRequest) {
+      await setWidgetAssistantMode(wk.tenantId, conversationId, true);
     }
 
     // Persist the visitor's message onto the widget ticket (creates it on the first turn, then threads
@@ -227,7 +258,13 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       deferMirror: files.length > 0,
       // Idempotency: a retried turn (same token) is collapsed to one visitor message, not duplicated.
       idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
+      // A handoff turn is for a human — never let ambient autoreply answer it.
+      skipAutoreply: !!escalate || humanRequest,
     });
+    // Mute AFTER the message is stored, on the ticket it actually landed on. The old pre-ingest mute keyed
+    // on the conversation handle, which on a first-turn escalation matched no ticket yet — the AI stayed
+    // on, the next poll read "not escalated", "Talk to a human" came back, and visitors tapped it again.
+    if (escalate || humanRequest) await muteWidgetTicket(wk.tenantId, inbound.ticketId);
 
     // Store + claim any inline files onto the persisted message (first-class attachments the agent
     // console renders natively; the widget re-fetches them via /public/attachment).
@@ -328,7 +365,6 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     // handoff message itself must not trigger a bot reply — and drops the conversation to the human
     // queue. This SSE lane is the one a typed message actually uses, so the handoff has to happen here.
     const humanRequest = wantsHuman(text);
-    if (humanRequest && conversationId) await setWidgetAssistantMode(wk.tenantId, conversationId, false);
 
     // Persist the visitor's message onto the widget ticket (creates/threads by identity), exactly
     // like /public/ask, BEFORE opening the stream — so a mid-stream disconnect never loses the ask.
@@ -345,7 +381,10 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       // Idempotency: persist-before-stream means a mid-stream failure + retry could double the ask;
       // the same token collapses it to one message.
       idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
+      skipAutoreply: humanRequest,
     });
+    // Hand off AFTER storing, keyed on the ticket the message landed on (see /public/ask).
+    if (humanRequest) await muteWidgetTicket(wk.tenantId, inbound.ticketId);
     if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
 
     // Store + claim any inline files onto the persisted message — the same first-class attachments the
@@ -618,7 +657,10 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     }
     const data = await withTenant(wk.tenantId, async (c) => {
       const t = await c.query(
-        `SELECT id, status, assistant_enabled, contact_id FROM tickets WHERE channel_type = 'widget' AND external_channel_id = $1 LIMIT 1`,
+        // Open ticket first, newest first — a closed ticket can share the handle once the visitor wrote
+        // again, and an unordered LIMIT 1 read (and stamped) whichever the planner returned.
+        `SELECT id, status, assistant_enabled, contact_id FROM tickets WHERE channel_type = 'widget' AND external_channel_id = $1
+          ORDER BY (status = 'open') DESC, updated_at DESC LIMIT 1`,
         [parsed.data.conversationId],
       );
       if (!t.rowCount) return null;
@@ -638,14 +680,21 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       // seen — the agent console then renders a "Seen" receipt. Best-effort; runs last so a stamp
       // hiccup can never break the transcript we just read.
       if (parsed.data.viewing === true) {
+        // Stamp every widget ticket behind this handle, so an unseen reply on a sibling ticket can't keep
+        // the conversation "unseen" forever (the list marks it unseen across all of them).
         await c.query(
-          `UPDATE messages SET seen_at = now() WHERE ticket_id = $1 AND author_type = 'agent' AND seen_at IS NULL`,
-          [t.rows[0].id],
+          `UPDATE messages m SET seen_at = now()
+             FROM tickets t
+            WHERE m.ticket_id = t.id AND t.channel_type = 'widget' AND t.external_channel_id = $1
+              AND m.author_type = 'agent' AND m.seen_at IS NULL`,
+          [parsed.data.conversationId],
         ).catch(() => {});
       }
       return { ticketId: t.rows[0].id as string, status: t.rows[0].status as string, assistantEnabled: t.rows[0].assistant_enabled !== false, messages: m.rows };
     });
-    if (!data) return { status: null, assistantEnabled: true, messages: [] };
+    // Unknown handle → say so (null), not "AI on": the widget used to read this as a mode flip, re-offer
+    // "Talk to a human" and wipe the transcript it had.
+    if (!data) return { status: null, assistantEnabled: null, messages: [] };
     // Attachments per message (same seam the agent thread uses) — the widget renders images inline
     // and files as chips, fetching bytes from /public/attachment scoped to this conversation.
     const attByMsg = await attachmentsForTicket(wk.tenantId, data.ticketId);
@@ -715,31 +764,45 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
         [email, userId],
       );
       if (!contact.rowCount) return [];
+      // One row per conversation handle: a handle can be shared by several tickets (a closed one plus the
+      // one the visitor reopened by writing again) — pick the open/newest as the conversation, but treat
+      // it as unseen if ANY of its tickets has an unseen agent reply. `status` + `unseen_at` let the widget
+      // pop responsibly: never a closed conversation, and never the same reply twice.
       const r = await c.query(
-        `SELECT t.external_channel_id AS cid, t.assistant_enabled, t.updated_at,
-                (SELECT m.body FROM messages m
-                   WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
-                   ORDER BY m.created_at DESC LIMIT 1) AS last_body,
-                (SELECT m.author_type FROM messages m
-                   WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
-                   ORDER BY m.created_at DESC LIMIT 1) AS last_author,
-                EXISTS (SELECT 1 FROM messages m
-                         WHERE m.ticket_id = t.id AND m.author_type = 'agent' AND m.seen_at IS NULL) AS has_unseen
-           FROM tickets t
-          WHERE t.channel_type = 'widget' AND t.external_channel_id IS NOT NULL AND t.contact_id = $1
-          ORDER BY t.updated_at DESC LIMIT 20`,
+        `SELECT * FROM (
+           SELECT DISTINCT ON (t.external_channel_id)
+                  t.external_channel_id AS cid, t.status, t.assistant_enabled, t.updated_at,
+                  (SELECT m.body FROM messages m
+                     WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
+                     ORDER BY m.created_at DESC LIMIT 1) AS last_body,
+                  (SELECT m.author_type FROM messages m
+                     WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
+                     ORDER BY m.created_at DESC LIMIT 1) AS last_author,
+                  (SELECT max(m.created_at) FROM messages m
+                     JOIN tickets t2 ON t2.id = m.ticket_id
+                    WHERE t2.channel_type = 'widget' AND t2.external_channel_id = t.external_channel_id
+                      AND t2.contact_id = $1 AND m.author_type = 'agent' AND m.seen_at IS NULL) AS unseen_at
+             FROM tickets t
+            WHERE t.channel_type = 'widget' AND t.external_channel_id IS NOT NULL AND t.contact_id = $1
+            ORDER BY t.external_channel_id, (t.status = 'open') DESC, t.updated_at DESC
+         ) conv
+         ORDER BY conv.updated_at DESC LIMIT 20`,
         [contact.rows[0].id],
       );
       return r.rows;
     });
     return {
-      conversations: (rows as Array<{ cid: string; assistant_enabled: boolean; updated_at: string; last_body: string | null; last_author: string | null; has_unseen: boolean }>).map((x) => ({
+      conversations: (rows as Array<{ cid: string; status: string; assistant_enabled: boolean; updated_at: string; last_body: string | null; last_author: string | null; unseen_at: string | Date | null }>).map((x) => ({
         conversationId: x.cid,
+        status: x.status,
         lastBody: x.last_body ?? "",
         lastFromAgent: x.last_author === "agent",
         assistantEnabled: x.assistant_enabled !== false,
         updatedAt: x.updated_at,
-        unseen: x.has_unseen === true,
+        unseen: x.unseen_at !== null,
+        // When the newest still-unseen agent reply was written — the widget pops only for a reply newer
+        // than the last one it already surfaced, so a stamp that fails can't re-pop the same reply.
+        unseenAt: x.unseen_at ? new Date(x.unseen_at).toISOString() : null,
       })),
     };
   });
