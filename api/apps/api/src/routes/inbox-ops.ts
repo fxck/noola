@@ -208,7 +208,7 @@ export default async function inboxOpsRoutes(app: FastifyInstance): Promise<void
       // A bulk reopen must also unarchive any mirror forum post (single /reopen already does this);
       // without it a bulk-reopened mirrored ticket stays archived on Discord.
       else if (action === "reopen")
-        for (const id of affected) void import("../discord-mirror.js").then((m) => m.syncMirrorState(tenantId, id)).catch(() => {});
+        void import("../discord-mirror.js").then((m) => { for (const id of affected) m.requestMirrorSync(tenantId, id); }).catch(() => {});
       return { updated: affected.length };
     } catch (err) {
       if ((err as { code?: string }).code === "23503") return reply.code(400).send({ error: "invalid assignee or team" });

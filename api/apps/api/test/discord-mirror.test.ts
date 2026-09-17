@@ -6,6 +6,7 @@ import {
   matchesMirrorFilter, relayTicketMessage, syncMirrorState,
   handleMirrorPostMessage, handleMirrorReaction, PROMOTE_EMOJI,
   onConversationSpam, onConversationUnspam,
+  flushMirrorSyncs,
 } from "../src/discord-mirror.js";
 import { drainDiscordRelay } from "../src/discord-relay-outbox.js";
 import { markConversationSpam, unmarkConversationSpam } from "../src/spam.js";
@@ -321,6 +322,7 @@ async function main() {
     const closedRow = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
     check("✅ closed the ticket", closedRow.rows[0].status === "closed");
     check("✅ archived the post", archived.get(thread1) === true);
+    await drainDiscordRelay(); // the 🆗 ack is durable now (relay outbox), sent before the archive lands
     check("🆗 confirmation react", calls.some((c) => c.fn === "react" && c.args[2] === "🆗"));
 
     const gateRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-eve", emoji: "🔄", reactorRoleIds: [] });
@@ -330,6 +332,7 @@ async function main() {
     check("🔄 triages reopen", reopenRes.action === "reopen" && !reopenRes.reason);
     const reopened = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
     check("🔄 reopened the ticket", reopened.rows[0].status === "open");
+    await flushMirrorSyncs(); // reopen requests a coalesced background sync
     check("🔄 unarchived the post", archived.get(thread1) === false);
 
     const snoozeRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "💤", reactorRoleIds: [ROLE] });
@@ -370,6 +373,7 @@ async function main() {
       check("🚫 triages spam", spamRes.action === "spam" && !spamRes.reason);
       const spammed = await withTenant(A, (c) => c.query("SELECT spam_at FROM tickets WHERE id = $1", [t1]));
       check("🚫 marked the ticket spam", spammed.rows[0].spam_at !== null);
+      await drainDiscordRelay();
       check("🆗 confirmation react on spam", calls.some((c) => c.fn === "react" && c.args[2] === "🆗"));
       await unmarkConversationSpam(A, t1); // restore so the downstream direct-hook spam checks start clean
     }

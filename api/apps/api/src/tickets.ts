@@ -499,6 +499,7 @@ export async function setTicketStatus(
   tenantId: string,
   ticketId: string,
   status: "open" | "closed",
+  opts: { onlyIfChanged?: boolean } = {},
 ): Promise<{ ticketId: string; status: string } | null> {
   const closedAt = status === "closed" ? "now()" : "NULL";
   const out = await withTenant(tenantId, async (c) => {
@@ -506,8 +507,11 @@ export async function setTicketStatus(
     // status_category='open' (reporting/SLA read status_category). status ∈ {open,closed} == the
     // category domain, so it reuses $1.
     const r = await c.query(
-      `UPDATE tickets SET status = $1, status_category = $1, closed_at = ${closedAt}, updated_at = now() WHERE id = $2 RETURNING id`,
-      [status, ticketId],
+      // onlyIfChanged: a no-op transition returns null, so event-driven callers (Discord reactions and
+      // thread updates) emit ticket.closed once, even when the same gesture is delivered twice.
+      `UPDATE tickets SET status = $1, status_category = $1, closed_at = ${closedAt}, updated_at = now()
+        WHERE id = $2 AND ($3::boolean IS NOT TRUE OR status IS DISTINCT FROM $1) RETURNING id`,
+      [status, ticketId, opts.onlyIfChanged === true],
     );
     return r.rowCount ? { ticketId: r.rows[0].id as string, status } : null;
   });

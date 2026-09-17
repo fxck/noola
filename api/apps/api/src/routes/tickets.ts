@@ -23,7 +23,7 @@ import { suggestReply } from "../copilot.js";
 import { getChannelDriver } from "../channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "../translate.js";
 import { claimAttachments, attachmentsForTicket } from "../attachments.js";
-import { getTicketMirror, pushTicketToDiscord, mirrorUrl, syncMirrorState, mirrorEligibility, pingSeatInMirror } from "../discord-mirror.js";
+import { getTicketMirror, pushTicketToDiscord, mirrorUrl, requestMirrorSync, mirrorEligibility, pingSeatInMirror } from "../discord-mirror.js";
 import { getObject } from "../storage.js";
 import { notifyContactByEmailIfAway, tenantSupportAddress, stripOwnCcAddresses, type MailAttachment } from "../email.js";
 import { tenantReplyAddress } from "../email-provider.js";
@@ -248,8 +248,8 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     const out = await setTicketStatus(tenantId, id, "open");
     if (!out) return reply.code(404).send({ error: "ticket_not_found" });
     void unindexThread(id).catch((err) => app.log.warn({ err, ticketId: id }, "unindex thread failed"));
-    // No ticket.reopened trigger exists, so the ops-mirror unarchive is called directly here.
-    void syncMirrorState(tenantId, id).catch(() => {});
+    // No ticket.reopened trigger exists, so the ops-mirror unarchive is requested directly here.
+    requestMirrorSync(tenantId, id);
     return out;
   }));
 

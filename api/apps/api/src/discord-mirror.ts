@@ -13,7 +13,7 @@ import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
 import { mdToDiscord } from "./channels/format.js";
-import { enqueueRelay, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
+import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
 // (email/widget/…) can be selectively mirrored as ONE forum post in a Discord forum channel; the
@@ -321,6 +321,15 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
   const t = await loadTicketBrief(tenantId, ticketId);
   if (!t) return null;
 
+  // A creation that crashed mid-flight (process restart) left its `pending:` claim behind forever, which
+  // blocked this ticket from ever being mirrored and parked every relay for it as "mirror not ready".
+  // A claim that old can't still be in progress — release it so this attempt can proceed.
+  await relayPool
+    .query(
+      "DELETE FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 AND post_thread_id LIKE 'pending:%' AND created_at < now() - interval '15 minutes'",
+      [tenantId, ticketId],
+    )
+    .catch(() => {});
   const claim = await relayPool.query(
     `INSERT INTO ticket_mirror (tenant_id, ticket_id, binding_id, guild_id, forum_channel_id, post_thread_id)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -369,7 +378,7 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
 export async function evaluateAutoMirror(tenantId: string, ticketId: string, opts?: { recheck?: boolean }): Promise<void> {
   const existing = await getTicketMirror(tenantId, ticketId);
   if (existing) {
-    await syncMirrorState(tenantId, ticketId).catch(() => {});
+    requestMirrorSync(tenantId, ticketId);
     return;
   }
   const bindings = (await listMirrorBindings(tenantId)).filter((b) => b.enabled);
@@ -560,10 +569,10 @@ export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
   if (row.kind === "message") {
     const messageId = String(row.payload.messageId ?? "");
     if (!messageId) return { ok: false, retriable: false, error: "missing messageId" };
-    return deliverMessageRelay(tp, mirror, row.tenant_id, row.ticket_id, messageId);
+    return deliverMessageRelay(tp, mirror, row.tenant_id, row.ticket_id, messageId, relayNonce(row.id));
   }
   if (row.kind === "note") {
-    return deliverNoteRelay(tp, mirror, (row.payload.authorName as string | null) ?? null, String(row.payload.body ?? ""));
+    return deliverNoteRelay(tp, mirror, (row.payload.authorName as string | null) ?? null, String(row.payload.body ?? ""), relayNonce(row.id));
   }
   if (row.kind === "react") {
     return deliverReactRelay(tp, String(row.payload.threadId ?? ""), String(row.payload.discordMessageId ?? ""), String(row.payload.emoji ?? ""));
@@ -577,6 +586,7 @@ async function deliverMessageRelay(
   tenantId: string,
   ticketId: string,
   messageId: string,
+  nonce: string,
 ): Promise<DeliverResult> {
   const row = await withTenant(tenantId, async (c) => {
     const r = await c.query(
@@ -596,20 +606,30 @@ async function deliverMessageRelay(
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
   const { files, dropped } = await loadMirrorFiles(tenantId, messageId);
   try {
-    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(row.body))}${droppedNote(dropped)}`, files);
+    const posted = await tp.postToThread(
+      mirror.post_thread_id,
+      `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(row.body))}${droppedNote(dropped)}`,
+      files,
+      undefined,
+      { nonce },
+    );
     if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
   } catch (e) {
     return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
   }
-  await syncMirrorState(tenantId, ticketId).catch(() => {});
+  // The write landed — report success NOW. The forum tag/archive sync used to be awaited here, inside
+  // the drainer's deadline; Discord rate-limits thread edits hard, so that sync routinely outlived the
+  // deadline and the drainer re-posted an already-delivered message on every retry (prod: one message
+  // posted 10x). The sync is background work with its own coalescing and never affects delivery.
+  requestMirrorSync(tenantId, ticketId);
   return { ok: true, retriable: false };
 }
 
-async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorName: string | null, body: string): Promise<DeliverResult> {
+async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorName: string | null, body: string, nonce: string): Promise<DeliverResult> {
   const name = authorName?.trim() || "Agent";
   const label = `📝 **${name}** _(internal note)_:`;
   try {
-    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(body))}`);
+    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(body))}`, undefined, undefined, { nonce });
     if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
   } catch (e) {
     return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
@@ -627,8 +647,69 @@ async function deliverReactRelay(tp: MirrorTransport, threadId: string, discordM
   }
 }
 
+// ── coalesced forum-state sync ─────────────────────────────────────────────────────────────────────────
+// Every relayed message, reaction, patch and automation used to call syncMirrorState inline and await
+// it. Each call issues thread PATCHes (tags, archive); Discord rate-limits thread edits per channel, and
+// discord.js silently SLEEPS on the limit — so a burst of activity on one ticket stacked PATCHes that
+// held their callers for minutes (the relay deadline tripped and re-posted; a reaction's ✅ back-mark
+// waited behind them). Callers on hot paths now REQUEST a sync instead: requests for the same ticket
+// collapse into one run after a short quiet period, only one run per ticket is in flight at a time
+// (a request that arrives mid-run schedules exactly one follow-up), and nothing waits on it.
+const SYNC_DEBOUNCE_MS = 2_500;
+const SYNC_SLOW_WARN_MS = 30_000;
+const syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const syncInFlight = new Set<string>();
+const syncRerun = new Set<string>();
+
+/** Ask for the ticket's mirror post to be brought in line with its current status/priority. Returns
+ *  immediately; bursts collapse into a single sync. Safe to call from any hot path. */
+export function requestMirrorSync(tenantId: string, ticketId: string): void {
+  const key = `${tenantId}:${ticketId}`;
+  const pending = syncTimers.get(key);
+  if (pending) clearTimeout(pending);
+  const timer = setTimeout(() => {
+    syncTimers.delete(key);
+    void runMirrorSync(tenantId, ticketId, key);
+  }, SYNC_DEBOUNCE_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  syncTimers.set(key, timer);
+}
+
+async function runMirrorSync(tenantId: string, ticketId: string, key: string): Promise<void> {
+  if (syncInFlight.has(key)) {
+    syncRerun.add(key); // one follow-up after the current run settles picks up the latest state
+    return;
+  }
+  syncInFlight.add(key);
+  const slow = setTimeout(() => {
+    try { console.warn(`[discord-sync] still syncing ticket ${ticketId} after ${SYNC_SLOW_WARN_MS / 1000}s (Discord rate limit?)`); } catch { /* noop */ }
+  }, SYNC_SLOW_WARN_MS);
+  if (typeof slow.unref === "function") slow.unref();
+  try {
+    await syncMirrorState(tenantId, ticketId);
+  } catch (e) {
+    try { console.warn(`[discord-sync] ticket ${ticketId}: ${(e as Error)?.message ?? String(e)}`); } catch { /* noop */ }
+  } finally {
+    clearTimeout(slow);
+    syncInFlight.delete(key);
+    if (syncRerun.delete(key)) requestMirrorSync(tenantId, ticketId);
+  }
+}
+
+/** Run every requested-but-not-yet-started sync now and wait for it (tests; graceful shutdown). */
+export async function flushMirrorSyncs(): Promise<void> {
+  const pending = [...syncTimers.entries()];
+  for (const [key, timer] of pending) {
+    clearTimeout(timer);
+    syncTimers.delete(key);
+    const [tenantId, ticketId] = key.split(":");
+    await runMirrorSync(tenantId, ticketId, key);
+  }
+}
+
 /** Re-apply forum tags from the ticket's current status/priority; archive on closed, unarchive
- *  otherwise (D4 lifecycle). Cheap + idempotent, so callers can fire it after any change. */
+ *  otherwise (D4 lifecycle). Idempotent (no-op edits are skipped by the transport). Prefer
+ *  requestMirrorSync() on hot paths — this performs the Discord edits and can wait on rate limits. */
 export async function syncMirrorState(tenantId: string, ticketId: string): Promise<void> {
   const mirror = await getTicketMirror(tenantId, ticketId);
   if (!mirror) return;
@@ -658,7 +739,13 @@ async function closeAction(
   fn: () => Promise<unknown>,
 ): Promise<{ ok: boolean; missingPerms: boolean }> {
   try {
-    await fn();
+    const out = await fn();
+    // The transport reports "couldn't reach the thread" as `false` rather than throwing — that used to
+    // count as success. (Tags return false when the forum has no matching tags; that's not a failure.)
+    if (out === false && action !== "tag") {
+      console.warn(`[discord-close] ${action} not applied tenant=${ctx.tenantId} ticket=${ctx.ticketId} thread=${ctx.threadId} (thread unreachable)`);
+      return { ok: false, missingPerms: false };
+    }
     return { ok: true, missingPerms: false };
   } catch (e) {
     const missingPerms = isMissingPerms(e);
@@ -683,10 +770,12 @@ const MANAGE_POSTS_HINT =
  * Skipped for the origin thread when the close came FROM Discord (source='discord') — the thread is
  * already archived/locked there and re-posting would echo. Best-effort throughout.
  */
+const THREAD_STATE_CLOSE_REASONS = new Set(["discord_archived", "discord_locked", "discord_solved_tag", "discord_thread_deleted"]);
+
 export async function onTicketClosed(
   tenantId: string,
   ticketId: string,
-  opts: { source?: string | null; agentName?: string | null } = {},
+  opts: { source?: string | null; closeReason?: string | null; agentName?: string | null } = {},
 ): Promise<void> {
   const mirror = await getTicketMirror(tenantId, ticketId);
   if (mirror) {
@@ -705,7 +794,11 @@ export async function onTicketClosed(
     }
     return;
   }
-  if (opts.source === "discord") return; // closed from the origin thread itself — nothing to push back
+  // A close that began on Discord only needs no write-back when the thread ITSELF already shows it
+  // (archived / locked / solved-tagged / deleted). A teammate's ✅ reaction or a deleted last message
+  // leaves the thread open — skipping those (the old blanket `source === 'discord'` check) meant the
+  // ticket closed in Noola while the thread stayed open with no notice, tag or archive.
+  if (opts.source === "discord" && THREAD_STATE_CLOSE_REASONS.has(opts.closeReason ?? "")) return;
   await archiveIntakeThreadOnClose(tenantId, ticketId, opts.agentName ?? null);
 }
 
@@ -976,6 +1069,15 @@ export async function handleMirrorReaction(
     idempotencyKey: `discord-mirror-promote:${r.discordMessageId}`,
   });
 
+  // Durable ✅ confirmation, enqueued as soon as the reply is RECORDED. It used to be the last step, so
+  // any later failure (dispatch, bookkeeping) meant no ✅ — and promoted_at was already claimed, so the
+  // teammate couldn't retry. The drainer retries until it lands.
+  await enqueueRelay("react", row.tenant_id, result.ticketId, `react:${r.discordMessageId}:${PROMOTED_EMOJI}`, {
+    threadId: r.threadId,
+    discordMessageId: r.discordMessageId,
+    emoji: PROMOTED_EMOJI,
+  });
+
   // A promoted message BECOMES the customer reply, so move any attachments the original Discord message
   // carried from the internal note onto the reply (the widget + agent thread both render message
   // attachments), then drop the now-duplicate note. The promote's own message.created event makes the
@@ -1027,14 +1129,6 @@ export async function handleMirrorReaction(
     "UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1",
     [r.discordMessageId, result.messageId],
   );
-  // Durable ✅ confirmation: enqueue instead of a fire-and-forget react. The old inline react hung in
-  // discord.js's queue on a degraded connection (observed: ✅ landing ~30 min late, or never), so the
-  // "sent" confirmation could silently never appear. The drainer retries until it lands.
-  await enqueueRelay("react", row.tenant_id, result.ticketId, `react:${r.discordMessageId}:${PROMOTED_EMOJI}`, {
-    threadId: r.threadId,
-    discordMessageId: r.discordMessageId,
-    emoji: PROMOTED_EMOJI,
-  });
   return { promoted: true, reason: out.delivered ? undefined : out.reason };
 }
 
@@ -1062,7 +1156,8 @@ async function applyMirrorTriage(
 
   switch (action) {
     case "close": {
-      const closed = await setTicketStatus(tenantId, ticketId, "closed");
+      // onlyIfChanged: a re-delivered or repeated ✅ must not re-post "Resolved" or re-send CSAT.
+      const closed = await setTicketStatus(tenantId, ticketId, "closed", { onlyIfChanged: true });
       if (closed) {
         // Mirror the web /tickets/:id/close route EXACTLY so a reaction-close isn't a half-close:
         //  - index the resolved thread as a knowledge source (the old reaction path skipped this), and
@@ -1079,7 +1174,7 @@ async function applyMirrorTriage(
       break;
     }
     case "reopen":
-      await setTicketStatus(tenantId, ticketId, "open");
+      await setTicketStatus(tenantId, ticketId, "open", { onlyIfChanged: true });
       break;
     case "snooze":
       await snoozeTicket(tenantId, ticketId, snoozeUntil());
@@ -1117,15 +1212,36 @@ async function applyMirrorTriage(
       // drop the lead (defaults on). Reversible from the web Spam view. Attributed to the reactor.
       // markConversationSpam already posts the spam notice + archives THIS post — so return early
       // rather than fall through to syncMirrorState, which would un-archive it (spam ≠ status=closed).
+      // Ack FIRST: markConversationSpam archives this post, and Discord refuses reactions on an archived
+      // thread (the old order silently lost the 🆗).
+      await enqueueTriageAck(mirror, r.discordMessageId);
       await markConversationSpam(tenantId, ticketId, { block: true, dropLead: true, actorId: agentId });
-      await transport()?.react(mirror.post_thread_id, r.discordMessageId, TRIAGED_EMOJI).catch(() => {});
       return { promoted: false, action };
     default:
       // 'note'/'priority' need a value an emoji can't carry — Slack-only kinds, ignored here.
       return { promoted: false, action, reason: "unsupported_action" };
   }
 
-  await syncMirrorState(tenantId, ticketId).catch(() => {});
-  await transport()?.react(mirror.post_thread_id, r.discordMessageId, TRIAGED_EMOJI).catch(() => {});
+  // Ack FIRST, durably. The 🆗 used to be sent inline AFTER an awaited forum sync: the sync archived the
+  // post on a close (Discord then rejects the reaction, and the failure was swallowed) or sat behind
+  // Discord's thread-edit rate limit — the "changed in Noola, not marked on Discord" reports. It now goes
+  // through the relay outbox (retried; the transport handles archived threads).
+  await enqueueTriageAck(mirror, r.discordMessageId);
+  // A close is reflected by onTicketClosed (notice + tags + archive); a second concurrent sync from here
+  // raced it. Everything else just requests a (coalesced) sync.
+  if (action !== "close") requestMirrorSync(tenantId, ticketId);
   return { promoted: false, action };
+}
+
+/** Durably add the bot's 🆗 acknowledgment to a triaged message. Re-applies on every triage (a
+ *  finished ack row is reset to pending) — adding a reaction that's already there is a Discord no-op. */
+async function enqueueTriageAck(mirror: MirrorRef, discordMessageId: string): Promise<void> {
+  await enqueueRelay(
+    "react",
+    mirror.tenant_id,
+    mirror.ticket_id,
+    `react:${discordMessageId}:${TRIAGED_EMOJI}`,
+    { threadId: mirror.post_thread_id, discordMessageId, emoji: TRIAGED_EMOJI },
+    { reapply: true },
+  );
 }
