@@ -220,6 +220,12 @@ async function runAction(
           void import("./threads.js")
             .then((m) => (status === "closed" ? m.indexResolvedThread(tenantId, ticketId) : m.unindexThread(ticketId)))
             .catch(() => {});
+          // Chained automation events run the rules directly and skip the domain-event seam that
+          // reflects state onto Discord — so an automation close/reopen never reached the mirror post
+          // or the origin thread. Reflect it here.
+          void import("./discord-mirror.js")
+            .then((m) => (status === "closed" ? m.onTicketClosed(tenantId, ticketId, {}) : m.requestMirrorSync(tenantId, ticketId)))
+            .catch(() => {});
         }
         return {
           type: action.type,
@@ -1292,8 +1298,9 @@ export function emitDomainEvent(tenantId: string, event: AutomationTrigger, seed
       // Skipped for the origin thread when the close came FROM Discord (seed.source='discord').
       const source = typeof seed.source === "string" ? seed.source : null;
       const actorName = typeof seed.actorName === "string" ? seed.actorName : null;
+      const closeReason = typeof seed.closeReason === "string" ? seed.closeReason : null;
       void import("./discord-mirror.js")
-        .then((m) => m.onTicketClosed(tenantId, ticketId, { source, agentName: actorName }))
+        .then((m) => m.onTicketClosed(tenantId, ticketId, { source, closeReason, agentName: actorName }))
         .catch(() => {});
     }
   }

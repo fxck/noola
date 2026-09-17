@@ -63,6 +63,7 @@
     "test:crawler-quality": "tsx apps/api/test/crawler-quality.test.ts",
     "test:classification": "tsx apps/api/test/classification.test.ts",
     "test:discord-mirror": "tsx apps/api/test/discord-mirror.test.ts",
+    "test:discord-intake-close": "tsx apps/api/test/discord-intake-close.test.ts",
     "test:pilot": "tsx apps/api/test/pilot-readiness.test.ts",
     "test:discord-vip": "tsx apps/api/test/discord-vip.test.ts",
     "test:translation": "tsx apps/api/test/translation.test.ts",

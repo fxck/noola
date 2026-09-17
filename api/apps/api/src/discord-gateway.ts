@@ -1,10 +1,11 @@
 import {
   Client, GatewayIntentBits, Events, ChannelType, Partials,
-  SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
+  SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
   type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
   type ForumChannel, type ThreadChannel, type Message,
 } from "discord.js";
 import { relayPool } from "@repo/db";
+import { isDiscordEventLeader, startDiscordLeaderElection } from "./discord-leader.js";
 import { splitForDiscord } from "./channels/format.js";
 import {
   handleInboundMessage,
@@ -58,8 +59,10 @@ export interface MirrorTransport {
   createForumPost(forumChannelId: string, name: string, content: string, tagNames: string[], files?: MirrorFile[]): Promise<{ threadId: string } | null>;
   /** Anchor a thread on an existing channel message (VIP thread-per-message bindings, D5). */
   createMessageThread(channelId: string, messageId: string, name: string): Promise<{ threadId: string } | null>;
-  /** Post into a thread; optional `files` upload as Discord attachments (on the first content chunk). */
-  postToThread(threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[]): Promise<boolean>;
+  /** Post into a thread; optional `files` upload as Discord attachments (on the first content chunk).
+   *  `opts.nonce` (<= 21 chars) is sent per chunk with enforce_nonce, so a retried write whose earlier
+   *  attempt already landed is collapsed by Discord instead of posting a second copy. */
+  postToThread(threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[], opts?: { nonce?: string }): Promise<boolean>;
   setArchived(threadId: string, archived: boolean): Promise<boolean>;
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
   /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
@@ -189,7 +192,7 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       const t = await msg.startThread({ name: name.slice(0, 100) || "Conversation" }).catch(() => null);
       return t ? { threadId: t.id } : null;
     },
-    async postToThread(threadId, content, files, mentionUserIds) {
+    async postToThread(threadId, content, files, mentionUserIds, opts) {
       const t = await thread(threadId);
       if (!t) return false;
       if (t.archived) await t.setArchived(false).catch(() => {});
@@ -201,7 +204,13 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       for (let i = 0; i < chunks.length; i++) {
         // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads. The ping
         // rides the first chunk (where the <@id> mention text is).
-        await t.send({ content: chunks[i], allowedMentions: i === 0 ? allow : { parse: [] }, ...(i === 0 && df.length ? { files: df } : {}) });
+        await t.send({
+          content: chunks[i],
+          allowedMentions: i === 0 ? allow : { parse: [] },
+          ...(i === 0 && df.length ? { files: df } : {}),
+          // Idempotent retries: same row → same nonce per chunk → Discord returns the existing message.
+          ...(opts?.nonce ? { nonce: `${opts.nonce}.${i}`, enforceNonce: true } : {}),
+        });
       }
       return true;
     },
@@ -217,6 +226,12 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       if (!t || t.parent?.type !== ChannelType.GuildForum) return false;
       const ids = await resolveForumTagIds(t.parent as ForumChannel, tagNames).catch(() => []);
       if (!ids.length) return false;
+      // Already exactly these tags → nothing to do. This used to PATCH unconditionally (unarchive, set,
+      // re-archive = 3 thread edits) on EVERY sync, i.e. after every relayed message. Discord rate-limits
+      // thread edits per channel and discord.js sleeps on the limit, so an active ticket's syncs queued up
+      // for minutes and stalled everything waiting on them (duplicate relay posts, missing ✅ marks).
+      const current = [...(t.appliedTags ?? [])].sort().join(",");
+      if (current === [...ids].sort().join(",")) return true;
       // setAppliedTags on an archived thread 400s — unarchive/rearchive around it.
       const wasArchived = t.archived === true;
       if (wasArchived) await t.setArchived(false).catch(() => {});
@@ -250,13 +265,30 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       return true;
     },
     async react(threadId, messageId, emoji) {
-      const t = await thread(threadId);
-      if (!t) return false;
-      const msg = await t.messages.fetch(messageId).catch(() => null);
-      if (!msg) return false;
-      // Report the ACTUAL outcome — the old `.catch(() => false); return true` swallowed the failure and
-      // reported success regardless, so the relay drainer could never know the react didn't land.
-      return await msg.react(emoji).then(() => true).catch(() => false);
+      // One direct REST call (PUT own reaction). The old path fetched the channel and then the message
+      // before reacting — two extra round-trips that queue behind anything else on that channel, which is
+      // how the ✅/🆗 confirmation ended up missing. Adding a reaction that's already there is a no-op on
+      // Discord's side, so retries are safe. Report the ACTUAL outcome so the relay drainer can retry.
+      const put = () => client.rest.put(Routes.channelMessageOwnReaction(threadId, messageId, encodeURIComponent(emoji)));
+      try {
+        await put();
+        return true;
+      } catch (e) {
+        // 50083: the thread was archived (e.g. a ✅ close archived the post before the confirmation
+        // landed). Reacting needs it active — unarchive, react, then put it back.
+        if ((e as { code?: number }).code !== 50083) return false;
+        const t = await thread(threadId);
+        if (!t) return false;
+        await t.setArchived(false).catch(() => {});
+        try {
+          await put();
+          return true;
+        } catch {
+          return false;
+        } finally {
+          await t.setArchived(true).catch(() => {});
+        }
+      }
     },
     async memberRoleIds(guildId, userId) {
       const guild = await client.guilds.fetch(guildId).catch(() => null);
@@ -532,6 +564,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   mirrorTransports.set(botId, buildMirrorTransport(client));
 
   client.on(Events.MessageCreate, async (msg) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     if (!msg.guildId) return; // DM — dropped (the seam re-checks; keep the cheap guard here too)
     try {
       // §5.10 fetch-on-demand fallback: msg.member can be null (uncached/webhook) OR present with an
@@ -599,6 +632,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   });
 
   client.on(Events.ThreadCreate, async (thread) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       const parentIsForum = thread.parent?.type === ChannelType.GuildForum;
       const owner = thread.ownerId
@@ -623,25 +657,28 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   });
 
   client.on(Events.ThreadUpdate, async (_old, thread) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       // Resolve applied forum-tag ids → names — a "Solved/Resolved" tag is a close gesture. archived
       // (manual resolve OR Discord's inactivity auto-archive) and locked also close the intake ticket.
       const parent = thread.parent as { availableTags?: { id: string; name: string }[] } | null;
       const available = parent?.availableTags ?? [];
-      const appliedTagNames = (thread.appliedTags ?? [])
-        .map((id) => available.find((t) => t.id === id)?.name)
-        .filter((n): n is string => Boolean(n));
+      const names = (ids: readonly string[] | null | undefined) =>
+        (ids ?? []).map((id) => available.find((t) => t.id === id)?.name).filter((n): n is string => Boolean(n));
+      // The previous state lets the handler act only on transitions (our own edits echo back here).
+      const previous = _old && !_old.partial ? { locked: _old.locked ?? false, archived: _old.archived ?? false, appliedTagNames: names(_old.appliedTags) } : null;
       await handleThreadUpdate(thread.guildId, thread.id, {
         locked: thread.locked ?? false,
         archived: thread.archived ?? false,
-        appliedTagNames,
-      });
+        appliedTagNames: names(thread.appliedTags),
+      }, previous);
     } catch (err) {
       log.error({ err }, "discord ThreadUpdate failed");
     }
   });
 
   client.on(Events.ThreadDelete, async (thread) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       await handleThreadDelete(thread.guildId, thread.id);
     } catch (err) {
@@ -650,6 +687,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   });
 
   client.on(Events.MessageUpdate, async (_old, msg) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       if (!msg.guildId) return;
       await handleMessageUpdate({ guildId: msg.guildId, messageId: msg.id, newContent: msg.content ?? "" });
@@ -659,6 +697,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   });
 
   client.on(Events.MessageDelete, async (msg) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       if (!msg.guildId) return;
       await handleMessageDelete({ guildId: msg.guildId, messageId: msg.id });
@@ -672,6 +711,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   // Partials are fetched so reactions on pre-restart messages still resolve; non-mirror threads
   // no-op instantly on the ticket_mirror lookup.
   client.on(Events.MessageReactionAdd, async (reaction, user) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       if (user.bot) return;
       const full = reaction.partial ? await reaction.fetch().catch(() => null) : reaction;
@@ -708,6 +748,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
 
   // Phase 5: route slash-command + button interactions to the on-demand handlers.
   client.on(Events.InteractionCreate, async (interaction) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
       if (interaction.isChatInputCommand()) {
         if (interaction.commandName === "ask") await onAsk(interaction, send, log);
@@ -747,6 +788,9 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
  */
 export function startDiscord(log: Log): void {
   const token = process.env.DISCORD_BOT_TOKEN;
+  // Every replica logs in (outbound REST needs the client), but only the elected leader acts on gateway
+  // events — otherwise each event is handled once per replica.
+  if (token || process.env.DISCORD_MULTIBOT_ENABLED === "1") startDiscordLeaderElection(log);
   if (token) openBot("shared", token, "shared", null, log);
   else log.warn("DISCORD_BOT_TOKEN not set — shared Discord bot disabled");
 

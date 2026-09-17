@@ -505,26 +505,36 @@ async function closeIntakeTicketByThread(tenantId: string, threadId: string, rea
   if (!found.rowCount) return;
   const ticketId = found.rows[0].id as string;
   const { setTicketStatus } = await import("./tickets.js");
-  await setTicketStatus(tenantId, ticketId, "closed");
+  // Only the call that actually flips it emits — a duplicate delivery of the same gesture is a no-op.
+  if (!(await setTicketStatus(tenantId, ticketId, "closed", { onlyIfChanged: true }))) return;
   const { indexResolvedThread } = await import("./threads.js");
   void indexResolvedThread(tenantId, ticketId).catch(() => {});
   const { emitDomainEvent } = await import("./automations.js");
   emitDomainEvent(tenantId, "ticket.closed", { ticketId, source: "discord", closeReason: reason });
 }
 
-/** ThreadUpdate (§5.6) — a Discord-side RESOLVE gesture closes the intake ticket: the thread was
- *  locked, archived, or tagged with a "solved/resolved/closed" forum tag. A plain edit is a no-op.
- *  A later customer message reopens the ticket via the ingest upsert (status closed→open, §I.4). */
+type ThreadState = { locked?: boolean; archived?: boolean; appliedTagNames?: string[] };
+const isSolvedTag = (names?: string[]) => (names ?? []).some((n) => /solv|resolv|clos|done|complete|answered|fixed/i.test(n));
+
+/** ThreadUpdate (§5.6) — a Discord-side RESOLVE gesture closes the intake ticket: the thread BECAME
+ *  locked, archived, or tagged with a "solved/resolved/closed" forum tag. Only a TRANSITION counts when
+ *  the previous state is known: our own writes echo back as ThreadUpdates, and reacting to the current
+ *  state re-closed a ticket that was reopened in Noola the moment an agent reply unarchived its thread
+ *  (the solved tag was still on it). A later customer message reopens via the ingest upsert. */
 export async function handleThreadUpdate(
   guildId: string,
   threadId: string,
-  state: { locked?: boolean; archived?: boolean; appliedTagNames?: string[] },
+  state: ThreadState,
+  previous?: ThreadState | null,
 ): Promise<void> {
-  const solvedTag = (state.appliedTagNames ?? []).some((n) => /solv|resolv|clos|done|complete|answered|fixed/i.test(n));
-  if (!state.locked && !state.archived && !solvedTag) return;
+  const solvedTag = isSolvedTag(state.appliedTagNames);
+  const becameArchived = !!state.archived && !(previous && previous.archived);
+  const becameLocked = !!state.locked && !(previous && previous.locked);
+  const becameSolved = solvedTag && !(previous && isSolvedTag(previous.appliedTagNames));
+  if (!becameLocked && !becameArchived && !becameSolved) return;
   const tenantId = await resolveTenant(guildId);
   if (!tenantId) return;
-  const reason = state.archived ? "discord_archived" : state.locked ? "discord_locked" : "discord_solved_tag";
+  const reason = becameArchived ? "discord_archived" : becameLocked ? "discord_locked" : "discord_solved_tag";
   await closeIntakeTicketByThread(tenantId, threadId, reason);
 }
 
