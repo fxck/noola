@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import type { ContactFilterCondition, ContactSortField } from "@repo/contracts";
 import { countryCentroid, jitterFromId } from "./country-centroids.js";
 import { versionStatusSql } from "./tech-status.js";
+import { resolveCompanyByName } from "./companies.js";
 
 // The contacts directory + back-office sync. A tenant-scoped people/company directory
 // with free-form attributes (RLS-isolated), an idempotent upsert (on the caller's stable
@@ -97,6 +98,11 @@ export interface ContactInputShape {
   last_seen_at?: string | null;
   /** "Customer since" — from Intercom's Signed up / First Seen. Backfills the real created_at. */
   created_at?: string | null;
+  /** May a free-text `company` name be matched to an existing SYNCED client? True for anything an
+   *  agent or a verified identity supplies. The widget passes false for an UNVERIFIED visitor, whose
+   *  self-reported employer is a claim, not proof — they get the id-less company instead of being
+   *  filed under someone's real account. Default true. */
+  company_name_trusted?: boolean;
 }
 
 export interface ListFilters {
@@ -922,7 +928,7 @@ async function upsertOne(
 async function mergeCompany(
   c: PoolClient,
   contactId: string,
-  spec: { externalId?: string | null; name?: string | null },
+  spec: { externalId?: string | null; name?: string | null; trustName?: boolean },
 ): Promise<string | null> {
   const externalId = (spec.externalId ?? "").trim();
   const name = (spec.name ?? "").trim();
@@ -955,8 +961,9 @@ async function mergeCompany(
           )).rows[0];
       companyId = row.id as string;
     }
-  } else {
-    // Name-only (legacy widget/identify): resolve-or-create by name.
+  } else if (spec.trustName === false) {
+    // Name-only from an UNVERIFIED widget visitor: resolve-or-create among id-less companies only.
+    // Their typed employer must never attach them to a real client's account record.
     const ins = await c.query(
       `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
        ON CONFLICT (tenant_id, lower(name)) WHERE external_id IS NULL DO UPDATE SET name = companies.name
@@ -964,6 +971,12 @@ async function mergeCompany(
       [name],
     );
     companyId = ins.rows[0].id as string;
+  } else {
+    // Name-only from an agent (console form, CSV/JSON import) or a verified identity: match the real
+    // client of that name when there is exactly one, else resolve-or-create an id-less company.
+    const resolved = await resolveCompanyByName(c, name);
+    if (!resolved) return null;
+    companyId = resolved;
   }
 
   // Additive membership — the first company observed stays primary (re-logins under other clients
@@ -998,7 +1011,9 @@ async function syncUpsertCompanies(
     await ensurePrimaryCompany(c, contactId, cid);
   } else if ((input.company ?? "").trim() || (input.company_external_id ?? "").trim()) {
     // Resolve by external_id FIRST, then the company name (the "external_id first, then name" dedup).
-    const primaryId = await mergeCompany(c, contactId, { externalId: input.company_external_id, name: input.company });
+    const primaryId = await mergeCompany(c, contactId, {
+      externalId: input.company_external_id, name: input.company, trustName: input.company_name_trusted !== false,
+    });
     // Pin the denormalized primary pointer only when it's still empty — keeps company_id referencing
     // a real account without disturbing an already-chosen primary.
     if (primaryId) {
@@ -1048,71 +1063,36 @@ async function linkIdentity(c: PoolClient, contactId: string, channelType: strin
  * Fold an ANONYMOUS shell (no email, no external_id — a widget visitor we only know by a conversation
  * handle) into `keepId`, on the caller's tenant-scoped client so it commits with whatever transaction
  * it is part of. This is the lead -> user conversion: the person who chatted before they told us who
- * they are is the same person, so their conversations, authored messages, activity, channel handles
- * and company memberships move onto the identified contact and the shell is deleted — one record,
- * history intact.
+ * they are is the same person, so their conversations, activity and history move onto the identified
+ * contact and the shell is deleted — one record, history intact.
  *
  * Refuses (returns false) when the drop carries an identity of its own. An identified contact is
- * NEVER swallowed automatically — that is a real person's profile and needs the agent-driven
- * mergeContacts, not a conversation handle someone else happens to send us.
+ * NEVER swallowed on a conversation handle someone else happens to send us.
  */
 export async function absorbAnonymousContact(c: PoolClient, keepId: string, dropId: string): Promise<boolean> {
-  if (!keepId || !dropId || keepId === dropId) return false;
   const drop = await c.query(
     `SELECT id FROM contacts WHERE id = $1 AND coalesce(email,'') = '' AND external_id IS NULL`,
     [dropId],
   );
   if (!drop.rowCount) return false;
-  // tickets/messages are ON DELETE SET NULL — re-home them BEFORE the delete or the conversation is
-  // orphaned (contact_id nulled) instead of carried over.
-  await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
-  await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [keepId, dropId]);
-  await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
-  // Handles + memberships move only where the survivor doesn't already hold them; the rest cascade
-  // with the shell below (the kept side wins).
-  await c.query(
-    `UPDATE contact_identities ci SET contact_id = $1
-      WHERE ci.contact_id = $2
-        AND NOT EXISTS (
-          SELECT 1 FROM contact_identities k
-           WHERE k.tenant_id = ci.tenant_id AND k.contact_id = $1
-             AND k.channel_type = ci.channel_type
-             AND lower(k.external_id) = lower(ci.external_id))`,
-    [keepId, dropId],
-  );
-  await c.query(
-    `UPDATE contact_companies cc SET contact_id = $1, is_primary = false
-      WHERE cc.contact_id = $2
-        AND NOT EXISTS (
-          SELECT 1 FROM contact_companies k
-           WHERE k.tenant_id = cc.tenant_id AND k.contact_id = $1 AND k.company_id = cc.company_id)`,
-    [keepId, dropId],
-  );
-  // Carry what the shell learned and the survivor lacks: display name, the widget's live enrichment
-  // (page/browser/geo — the survivor's own values win), avatar, presence, tags, and the EARLIEST
-  // created_at, so "known since" dates from the first anonymous visit rather than the signup.
-  // Consent is deliberately untouched: an emailless shell can hold no marketing opt-out.
-  await c.query(
-    `UPDATE contacts k
-        SET name = CASE WHEN coalesce(k.name,'') = '' THEN d.name ELSE k.name END,
-            company = CASE WHEN coalesce(k.company,'') = '' THEN d.company ELSE k.company END,
-            company_id = COALESCE(k.company_id, d.company_id),
-            attributes = d.attributes || k.attributes,
-            avatar_url = COALESCE(k.avatar_url, d.avatar_url),
-            last_seen_at = GREATEST(k.last_seen_at, d.last_seen_at),
-            created_at = LEAST(k.created_at, d.created_at),
-            tags = COALESCE((
-              SELECT array_agg(t ORDER BY t) FROM (
-                SELECT DISTINCT ON (lower(t)) t
-                  FROM unnest(k.tags || d.tags) WITH ORDINALITY AS u(t, ord)
-                 ORDER BY lower(t), ord) x), '{}'),
-            updated_at = now()
-       FROM contacts d
-      WHERE k.id = $1 AND d.id = $2`,
-    [keepId, dropId],
-  );
-  await c.query("DELETE FROM contacts WHERE id = $1", [dropId]);
-  return true;
+  return foldContactOn(c, keepId, dropId);
+}
+
+/**
+ * Fold a LEAD — a contact that has never been synced (no external_id), however much we know about
+ * them — into `keepId`. The sync's case: the email a system of record just moved onto an account is
+ * held by someone we met first (an imported conference row, a person who emailed in, a widget
+ * visitor who gave their address). Same human, so the lead CONVERTS instead of blocking the sync,
+ * and their conversations, tags and first-seen come with them.
+ *
+ * A contact carrying an external_id of its own is never folded: that is a second real account, and
+ * two accounts fighting over one email is a conflict for the caller to report, not something to
+ * merge away silently.
+ */
+export async function absorbLeadContact(c: PoolClient, keepId: string, dropId: string): Promise<boolean> {
+  const drop = await c.query(`SELECT id FROM contacts WHERE id = $1 AND external_id IS NULL`, [dropId]);
+  if (!drop.rowCount) return false;
+  return foldContactOn(c, keepId, dropId);
 }
 
 /**
@@ -1344,21 +1324,36 @@ function latestTs(a: string | null | undefined, b: string | null | undefined): s
   return a >= b ? a : b;
 }
 
-export async function mergeContacts(
-  tenantId: string,
-  keepId: string,
-  dropId: string,
-): Promise<ContactRow | null> {
-  if (keepId === dropId) return getContact(tenantId, keepId);
-  const keep = await getContact(tenantId, keepId);
-  const drop = await getContact(tenantId, dropId);
-  if (!keep || !drop) return null;
+/**
+ * The ONE merge body, on the caller's tenant-scoped client: fold `dropId` into `keepId`. Re-homes
+ * conversations, authored messages, activity, channel handles and company memberships, merges the two
+ * profiles (kept side wins, its blanks fill from the dropped one), then deletes the dropped contact.
+ *
+ * Every caller owns the question of WHO may be dropped — mergeContacts (an agent said so),
+ * absorbAnonymousContact (a widget shell), absorbLeadContact (a lead the sync just claimed) — so the
+ * merge itself stays one implementation instead of three that drift apart.
+ */
+async function foldContactOn(c: PoolClient, keepId: string, dropId: string): Promise<boolean> {
+  if (!keepId || !dropId || keepId === dropId) return false;
+  const rows = await c.query(
+    `SELECT ${COLS}, last_seen_at, synced_at, sync_removed_at FROM contacts WHERE id = ANY($1::uuid[])`,
+    [[keepId, dropId]],
+  );
+  type FoldRow = ContactRow & { synced_at: string | null; sync_removed_at: string | null };
+  const all = rows.rows as FoldRow[];
+  const keep = all.find((r) => r.id === keepId);
+  const drop = all.find((r) => r.id === dropId);
+  if (!keep || !drop) return false;
+
   const mergedName = pickMergedName(keep, drop);
   const mergedCompany = keep.company || drop.company;
   const mergedCompanyId = keep.company_id ?? drop.company_id; // don't drop account linkage
   const mergedEmail = keep.email || drop.email || null;
   const mergedExternal = keep.external_id || drop.external_id || null;
   const mergedAttrs = { ...drop.attributes, ...keep.attributes };
+  // Tags are a union, deduped case-insensitively with the kept contact's spelling winning — a merge
+  // must not lose the label an import or an agent put on the other record.
+  const mergedTags = normalizeTags([...(keep.tags ?? []), ...(drop.tags ?? [])]);
   const mergedUnsub = earliestTs(keep.unsubscribed_at, drop.unsubscribed_at); // opt-out sticky
   // Source of the merged opt-out: 'api' only if every opted-out side was an api opt-out, so a merge
   // can't turn a person's own opt-out into one the public API may undo. Legacy null stays null.
@@ -1370,52 +1365,74 @@ export async function mergeContacts(
       : optedOutSources.find((s) => s !== "api") ?? null;
   const mergedAvatar = keep.avatar_url ?? drop.avatar_url;
   const mergedSeen = latestTs(keep.last_seen_at, drop.last_seen_at);
+  // "Known since" is the EARLIEST of the two — the person was already here under the other record.
+  const mergedCreated = earliestTs(keep.created_at, drop.created_at);
+  // Sync provenance follows the surviving external_id, or account_status would read 'lead' on a
+  // contact that now carries a synced account's id (and vice-versa).
+  const syncSide = keep.external_id ? keep : drop.external_id ? drop : null;
+
+  // Re-home ALL of the dropped contact's conversations, INCLUDING Discord thread-tickets — those
+  // were being orphaned (contact_id → NULL) and vanishing from the survivor. tickets_thread_uq keys
+  // on external_thread_id, not contact_id, so re-homing them is safe.
+  await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
+  // Preserve authored-message attribution across the merge for thread-tickets and everything else.
+  await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [keepId, dropId]);
+  await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
+  // Move channel identities that don't collide with one the kept contact already owns; the rest
+  // cascade-delete with the dropped contact below (the kept handle wins).
+  await c.query(
+    `UPDATE contact_identities ci SET contact_id = $1
+      WHERE ci.contact_id = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM contact_identities k
+           WHERE k.tenant_id = ci.tenant_id AND k.contact_id = $1
+             AND k.channel_type = ci.channel_type
+             AND lower(k.external_id) = lower(ci.external_id))`,
+    [keepId, dropId],
+  );
+  // Re-home the dropped contact's company memberships (0111) onto the kept contact — union of both
+  // accounts. Move as NON-primary (the kept contact's primary wins; ensurePrimaryCompany reconciles
+  // below); rows that already exist on the kept side cascade-delete with the dropped contact.
+  await c.query(
+    `UPDATE contact_companies cc SET contact_id = $1, is_primary = false
+      WHERE cc.contact_id = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM contact_companies k
+           WHERE k.tenant_id = cc.tenant_id AND k.contact_id = $1 AND k.company_id = cc.company_id)`,
+    [keepId, dropId],
+  );
+  // Delete the duplicate (cascading its leftover identities + company memberships) so a unique
+  // email/external_id it holds can't collide with the kept contact's fill-in.
+  await c.query("DELETE FROM contacts WHERE id = $1", [dropId]);
+  await c.query(
+    `UPDATE contacts
+        SET name = $2, company = $3, company_id = $4, email = $5, external_id = $6,
+            attributes = $7::jsonb, unsubscribed_at = $8::timestamptz, avatar_url = $9,
+            last_seen_at = $10::timestamptz, unsubscribed_source = $11, tags = $12::text[],
+            created_at = $13::timestamptz, synced_at = $14::timestamptz,
+            sync_removed_at = $15::timestamptz, updated_at = now()
+      WHERE id = $1`,
+    [keepId, mergedName, mergedCompany, mergedCompanyId, mergedEmail, mergedExternal,
+     JSON.stringify(mergedAttrs), mergedUnsub, mergedAvatar, mergedSeen, mergedUnsubSource,
+     mergedTags, mergedCreated, syncSide?.synced_at ?? null, syncSide?.sync_removed_at ?? null],
+  );
+  // Pin the junction primary to the merged company (or clear it when neither side had one).
+  if (mergedCompanyId) await ensurePrimaryCompany(c, keepId, mergedCompanyId);
+  else await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [keepId]);
+  return true;
+}
+
+/** Identity resolution from the console: an agent says these two rows are the same person. The agent
+ *  is the guard here — any contact may be dropped, including a synced one (its external_id and sync
+ *  stamps move to the survivor). */
+export async function mergeContacts(
+  tenantId: string,
+  keepId: string,
+  dropId: string,
+): Promise<ContactRow | null> {
+  if (keepId === dropId) return getContact(tenantId, keepId);
   return withTenant(tenantId, async (c) => {
-    // Re-home ALL of the dropped contact's conversations, INCLUDING Discord thread-tickets — those
-    // were being orphaned (contact_id → NULL) and vanishing from the survivor. tickets_thread_uq keys
-    // on external_thread_id, not contact_id, so re-homing them is safe.
-    await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
-    // Preserve authored-message attribution across the merge for thread-tickets and everything else.
-    await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [keepId, dropId]);
-    await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
-    // Move channel identities that don't collide with one the kept contact already owns; the rest
-    // cascade-delete with the dropped contact below (the kept handle wins).
-    await c.query(
-      `UPDATE contact_identities ci SET contact_id = $1
-        WHERE ci.contact_id = $2
-          AND NOT EXISTS (
-            SELECT 1 FROM contact_identities k
-             WHERE k.tenant_id = ci.tenant_id AND k.contact_id = $1
-               AND k.channel_type = ci.channel_type
-               AND lower(k.external_id) = lower(ci.external_id))`,
-      [keepId, dropId],
-    );
-    // Re-home the dropped contact's company memberships (0111) onto the kept contact — union of both
-    // accounts. Move as NON-primary (the kept contact's primary wins; ensurePrimaryCompany reconciles
-    // below); rows that already exist on the kept side cascade-delete with the dropped contact.
-    await c.query(
-      `UPDATE contact_companies cc SET contact_id = $1, is_primary = false
-        WHERE cc.contact_id = $2
-          AND NOT EXISTS (
-            SELECT 1 FROM contact_companies k
-             WHERE k.tenant_id = cc.tenant_id AND k.contact_id = $1 AND k.company_id = cc.company_id)`,
-      [keepId, dropId],
-    );
-    // Delete the duplicate (cascading its leftover identities + company memberships) so a unique
-    // email/external_id it holds can't collide with the kept contact's fill-in.
-    await c.query("DELETE FROM contacts WHERE id = $1", [dropId]);
-    await c.query(
-      `UPDATE contacts
-          SET name = $2, company = $3, company_id = $4, email = $5, external_id = $6,
-              attributes = $7::jsonb, unsubscribed_at = $8::timestamptz, avatar_url = $9,
-              last_seen_at = $10::timestamptz, unsubscribed_source = $11, updated_at = now()
-        WHERE id = $1`,
-      [keepId, mergedName, mergedCompany, mergedCompanyId, mergedEmail, mergedExternal,
-       JSON.stringify(mergedAttrs), mergedUnsub, mergedAvatar, mergedSeen, mergedUnsubSource],
-    );
-    // Pin the junction primary to the merged company (or clear it when neither side had one).
-    if (mergedCompanyId) await ensurePrimaryCompany(c, keepId, mergedCompanyId);
-    else await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [keepId]);
+    if (!(await foldContactOn(c, keepId, dropId))) return null;
     const sel = await c.query(`SELECT ${DERIVED_COLS} FROM contacts WHERE id = $1`, [keepId]);
     return sel.rowCount ? (sel.rows[0] as ContactRow) : null;
   });

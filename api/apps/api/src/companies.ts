@@ -1,4 +1,5 @@
 import { withTenant } from "@repo/db";
+import type { PoolClient } from "pg";
 
 // Companies (account records) — first-class accounts, one step up from a contact's free-text company.
 // A company rolls up its contacts + their email-channel tickets into a health signal. Tickets link to
@@ -491,15 +492,41 @@ export async function ensureCompaniesByName(
   if (!uniq.length) return map;
   return withTenant(tenantId, async (c) => {
     for (const name of uniq) {
-      // DO UPDATE (no-op) instead of DO NOTHING so RETURNING yields the row on conflict too.
-      const r = await c.query(
-        `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
-         ON CONFLICT (tenant_id, lower(name)) WHERE external_id IS NULL DO UPDATE SET name = companies.name
-         RETURNING id`,
-        [name],
-      );
-      map.set(name.toLowerCase(), r.rows[0].id as string);
+      const id = await resolveCompanyByName(c, name);
+      if (id) map.set(name.toLowerCase(), id);
     }
     return map;
   });
+}
+
+/**
+ * Resolve a free-text company NAME to a company id, on the caller's tenant-scoped client.
+ *
+ * Prefers the tenant's REAL client — a SYNCED company (external_id set) whose name matches — so an
+ * imported lead lands on the account they belong to instead of forking a look-alike company next to
+ * it in the directory. Only an UNAMBIGUOUS match counts: two synced clients may legitimately share a
+ * name (which is exactly why companies_name_uq covers only id-less companies, 0121), and guessing
+ * between them would file people under the wrong client. Otherwise: the existing id-less company of
+ * that name, else a new one.
+ *
+ * Linking here does NOT make anyone a customer — account_status counts only sync-owned memberships
+ * (contact_companies.source = 'sync'), and these are 'manual'. The lead stays a lead; it just sits
+ * under the right account.
+ */
+export async function resolveCompanyByName(c: PoolClient, name: string): Promise<string | null> {
+  const n = (name ?? "").trim();
+  if (!n) return null;
+  const synced = await c.query(
+    `SELECT id FROM companies WHERE external_id IS NOT NULL AND lower(name) = lower($1) LIMIT 2`,
+    [n],
+  );
+  if (synced.rowCount === 1) return synced.rows[0].id as string;
+  // DO UPDATE (no-op) instead of DO NOTHING so RETURNING yields the row on conflict too.
+  const r = await c.query(
+    `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
+     ON CONFLICT (tenant_id, lower(name)) WHERE external_id IS NULL DO UPDATE SET name = companies.name
+     RETURNING id`,
+    [n],
+  );
+  return r.rows[0].id as string;
 }

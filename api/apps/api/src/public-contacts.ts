@@ -2,7 +2,8 @@ import { withTenant } from "@repo/db";
 import type { PoolClient } from "pg";
 import { PublicContactInput } from "@repo/contracts";
 import {
-  fireWebhook, optOutSourceSql, CONTACT_ACCOUNT_STATUS_SQL, type UnsubscribeSource, type ContactAccountStatus,
+  fireWebhook, optOutSourceSql, absorbLeadContact, CONTACT_ACCOUNT_STATUS_SQL,
+  type UnsubscribeSource, type ContactAccountStatus,
 } from "./contacts.js";
 
 // The public (api-key) contacts surface: server-to-server sync from an external system of record,
@@ -12,7 +13,10 @@ import {
 //   - external_id match            → update that contact
 //   - no id match, email held by a contact WITHOUT an external_id (widget/email-created)
 //                                  → attach the id to it (dedup), matched_by = "email"
-//   - the email is held by a contact with a DIFFERENT external_id (new contact, or an email change)
+//   - id match AND the email is held by a LEAD (no external_id of its own — an imported row, an
+//     email sender, a widget visitor): the account just moved onto an address we already knew
+//                                  → fold the lead into the synced contact, warning "lead_merged"
+//   - the email is held by a contact with a DIFFERENT external_id (two real accounts, one email)
 //                                  → conflict; nothing written
 //   - otherwise                    → create
 // Consent (`subscribed`) opts out with source 'api'; re-subscribing is allowed only for an 'api'
@@ -64,6 +68,9 @@ export type UpsertOutcome =
 /** The resubscribe-blocked warning/error code, shared by upsert (warning) and subscription (409). */
 export const RESUBSCRIBE_BLOCKED = "resubscribe_blocked";
 
+/** Warning code: this upsert absorbed a never-synced contact (a lead) that was holding the email. */
+export const LEAD_MERGED = "lead_merged";
+
 /** One strict upsert on the caller's transaction. Never throws for a business conflict (returns
  *  status "conflict"); a unique-violation race still throws pg 23505 for the caller to map. */
 async function upsertStrict(c: PoolClient, input: PublicContactInput): Promise<UpsertOutcome> {
@@ -76,6 +83,7 @@ async function upsertStrict(c: PoolClient, input: PublicContactInput): Promise<U
   let target = byId.rows[0] as { id: string; unsubscribed_at: Date | null; unsubscribed_source: string | null } | undefined;
   let matchedBy: MatchedBy | null = target ? "external_id" : null;
 
+  const warnings: string[] = [];
   if (email) {
     const holder = (
       await c.query(
@@ -85,7 +93,9 @@ async function upsertStrict(c: PoolClient, input: PublicContactInput): Promise<U
       )
     ).rows[0] as { id: string; external_id: string | null; unsubscribed_at: Date | null; unsubscribed_source: string | null } | undefined;
     if (holder && holder.id !== target?.id) {
-      if (target || holder.external_id) {
+      if (holder.external_id) {
+        // Two synced accounts claiming one address. Never merged automatically — which of the two is
+        // the person is a question only the system of record can answer.
         return {
           status: "conflict",
           error: target
@@ -94,12 +104,20 @@ async function upsertStrict(c: PoolClient, input: PublicContactInput): Promise<U
           conflict: { contact_id: holder.id, external_id: holder.external_id },
         };
       }
-      target = holder;
-      matchedBy = "email";
+      if (target) {
+        // The address moved onto this account and a LEAD holds it — the person we met before they
+        // signed up (imported list, email sender, widget visitor). Same human: convert the lead into
+        // this account instead of refusing the sync and leaving the email stuck on the old value.
+        // Their conversations, tags, first-seen and opt-out come along (absorbLeadContact); the
+        // address itself is freed by the fold, so the UPDATE below can take it.
+        if (await absorbLeadContact(c, target.id, holder.id)) warnings.push(LEAD_MERGED);
+      } else {
+        target = holder;
+        matchedBy = "email";
+      }
     }
   }
 
-  const warnings: string[] = [];
   if (!target) {
     const optOut = input.subscribed === false;
     const ins = await c.query(
