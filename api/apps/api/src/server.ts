@@ -20,6 +20,7 @@ import { detectSlaBreaches } from "./sla.js";
 import { runScheduledSourceRefresh } from "./sources.js";
 import { wakeSnoozedTickets } from "./tickets.js";
 import { runBroadcastScheduler } from "./broadcast-scheduler.js";
+import { runZeropsCatalogScheduler } from "./zerops-catalog.js";
 import { runRetentionSweep } from "./governance.js";
 import { pollEmail } from "./email.js";
 import { pollTelegram } from "./telegram.js";
@@ -224,6 +225,19 @@ const PUBLIC_ROUTES = new Set([
   "POST /v1/public/csat",
   "POST /v1/public/nps",
   "POST /v1/public/events",
+  "POST /v1/public/contacts/upsert",
+  "POST /v1/public/contacts/bulk",
+  "GET /v1/public/contacts",
+  "POST /v1/public/contacts/subscription",
+  "POST /v1/public/contacts/remove",
+  "POST /v1/public/contacts/topics",
+  "GET /v1/public/topics",
+  "POST /v1/public/companies/upsert",
+  "POST /v1/public/companies/bulk",
+  "GET /v1/public/companies",
+  "POST /v1/public/companies/remove",
+  "PUT /v1/public/technologies",
+  "GET /v1/public/technologies",
   // SCIM v2 provisioning — Bearer api-key ('scim' scope) resolved pre-context (./routes/scim.ts).
   "GET /scim/v2/Users",
   "GET /scim/v2/Users/:id",
@@ -350,7 +364,15 @@ async function drainOutbox(): Promise<void> {
   if (!js || draining) return;
   draining = true;
   try {
-    const c = await relayPool.connect();
+    // A failed checkout (e.g. the database out of connection slots) must not escape: this runs from a
+    // bare setInterval, and an unhandled rejection there takes the whole api process down.
+    let c: import("pg").PoolClient;
+    try {
+      c = await relayPool.connect();
+    } catch (err) {
+      app.log.warn({ err }, "outbox drain skipped — no database connection");
+      return;
+    }
     try {
       await c.query("BEGIN");
       const rows = await c.query(
@@ -371,6 +393,13 @@ async function drainOutbox(): Promise<void> {
     draining = false;
   }
 }
+
+// Last line of defence for the background jobs above (bare setInterval/setTimeout callers): a
+// transient failure — typically the database refusing a connection under load — is logged instead of
+// crashing the process, which would log every agent out mid-session.
+process.on("unhandledRejection", (err) => {
+  app.log.error({ err }, "unhandled rejection (kept the process alive)");
+});
 
 // ---- Liveness ------------------------------------------------------------
 app.get("/health", async () => {
@@ -462,6 +491,11 @@ setInterval(() => void wakeSnoozedTickets(app.log), 60_000);
 // Broadcast scheduler (0068): fire due scheduled broadcasts + tick continuous ones (send once
 // to first-time audience matchers). Cross-tenant; overlap-guarded; no-op when nothing is live.
 setInterval(() => void runBroadcastScheduler(app.log), 30_000);
+// Zerops technology catalog (0122): tenants on the Zerops catalog re-import the public zerops.yml +
+// import.yml schemas daily — checked hourly (a tenant is due 23h after its last import), first a
+// minute after boot.
+setTimeout(() => void runZeropsCatalogScheduler(app.log), 60_000);
+setInterval(() => void runZeropsCatalogScheduler(app.log), 60 * 60_000);
 // Data-retention sweep (0092): hard-delete closed tickets past each tenant's window. Cheap
 // no-op for tenants without a window; 6h cadence (idempotent), first pass shortly after boot.
 setTimeout(() => void runRetentionSweep(app.log), 120_000);

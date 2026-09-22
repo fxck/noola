@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, getRouteApi, useNavigate } from "@tanstack/react-router";
-import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight, Search, Download, X, SlidersHorizontal, ListFilter, Globe, Tag } from "lucide-react";
+import { Building2, Plus, ArrowLeft, Trash2, Users, Pencil, Upload, ChevronLeft, ChevronRight, Search, Download, X, SlidersHorizontal, ListFilter, Globe, Tag, BadgeCheck, FolderKanban } from "lucide-react";
 import {
   type Company,
   type CompanyDetail,
@@ -13,6 +13,7 @@ import {
   updateCompany,
   deleteCompany,
   importCompaniesCsv,
+  formatSpend,
 } from "@/lib/companies";
 import { relativeTime, initials, avatarHue } from "@/lib/tickets";
 import { useLiveRefresh } from "@/lib/realtime-context";
@@ -121,6 +122,17 @@ function buildCompanyColumns(): ColumnDef<Company, any>[] {
           </span>
         );
       },
+    }),
+    ccolHelp.accessor((c) => c.avg_monthly_spend ?? -1, {
+      id: "spend",
+      header: "Spend / mo",
+      meta: { label: "Spend / mo", align: "right" },
+      cell: ({ row }) =>
+        row.original.avg_monthly_spend != null ? (
+          <span className="tabular-nums">{formatSpend(row.original.avg_monthly_spend, row.original.currency)}</span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
     }),
     ccolHelp.accessor((c) => c.contactCount, {
       id: "contacts",
@@ -746,6 +758,8 @@ export function CompanyDetailPage() {
                   </div>
                 </section>
 
+                {company.projects.length > 0 && <CompanyProjects company={company} />}
+
                 {/* below xl the rail is hidden — the same facts stack here instead */}
                 <div className="mt-8 xl:hidden">
                   <CompanyFacts company={company} onChanged={load} />
@@ -789,6 +803,22 @@ function CompanyFacts({ company, onChanged }: { company: CompanyDetail; onChange
       <CompanyEditCard company={company} onChanged={onChanged} />
       <div className="px-4 py-3">
         <dl className="flex flex-col">
+          {company.account_status !== "other" && (
+            <FactRow label="Account">
+              {company.account_status === "customer" ? (
+                <span className="flex items-center gap-1 text-primary" title={company.synced_at ? `Synced ${relativeTime(company.synced_at)}` : undefined}>
+                  <BadgeCheck className="size-3.5" /> Customer
+                </span>
+              ) : (
+                <span className="text-muted-foreground">Former customer</span>
+              )}
+            </FactRow>
+          )}
+          {company.avg_monthly_spend != null && (
+            <FactRow label="Spend / month">
+              <span className="tabular-nums">{formatSpend(company.avg_monthly_spend, company.currency)}</span>
+            </FactRow>
+          )}
           {company.external_id && (
             <FactRow label="External ID">
               <span className="min-w-0 truncate font-mono text-xs" title={company.external_id}>{company.external_id}</span>
@@ -845,7 +875,8 @@ function CompanyFacts({ company, onChanged }: { company: CompanyDetail; onChange
                 >
                   <Avatar name={p.name || p.email || "?"} className="size-5 shrink-0 text-[9px]" />
                   <span className="min-w-0 flex-1 truncate">{p.name || "Unnamed"}</span>
-                  {p.email && (
+                  {p.role && <span className="shrink-0 text-micro text-muted-foreground">{p.role}</span>}
+                  {p.email && !p.role && (
                     <span className="min-w-0 max-w-[45%] truncate text-micro text-muted-foreground">
                       {p.email}
                     </span>
@@ -857,6 +888,42 @@ function CompanyFacts({ company, onChanged }: { company: CompanyDetail; onChange
         )}
       </RailSection>
     </>
+  );
+}
+
+// The account's projects (account sync) — each with its spend and its services' technologies.
+function CompanyProjects({ company }: { company: CompanyDetail }) {
+  return (
+    <section className="mt-8">
+      <h3 className="mb-2 flex items-center gap-1.5 text-micro font-semibold uppercase tracking-wide text-muted-foreground">
+        <FolderKanban className="size-3.5" /> Projects
+        <span className="tabular-nums font-normal">{company.projects.length}</span>
+      </h3>
+      <ul className="flex flex-col divide-y rounded-lg border">
+        {company.projects.map((p) => (
+          <li key={p.id} className="px-3 py-2.5">
+            <div className="flex items-baseline gap-2">
+              <span className="min-w-0 flex-1 truncate font-medium">{p.name || p.external_id}</span>
+              {p.status && <span className="text-micro text-muted-foreground">{p.status}</span>}
+              <span className="tabular-nums text-small">{formatSpend(p.avg_monthly_spend, company.currency)}</span>
+            </div>
+            {p.services.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                {p.services.map((s, i) => (
+                  <span
+                    key={`${s.hostname}-${i}`}
+                    title={`${s.hostname ? `${s.hostname}: ` : ""}${s.raw_type}`}
+                    className="rounded border bg-muted/40 px-1.5 py-0.5 font-mono text-micro"
+                  >
+                    {s.technology}{s.version ? ` ${s.version}` : ""}{s.mode === "ha" ? " · HA" : ""}
+                  </span>
+                ))}
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

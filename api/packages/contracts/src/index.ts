@@ -201,10 +201,10 @@ export const SegmentInput = z.object({
 export type SegmentInput = z.infer<typeof SegmentInput>;
 
 // --- Public API keys (Wave A extensibility spine) ---
-export const API_SCOPES = ["answer", "tickets:read", "tickets:write", "events:write", "scim"] as const;
+export const API_SCOPES = ["answer", "tickets:read", "tickets:write", "events:write", "scim", "contacts:read", "contacts:write", "accounts:read", "accounts:write"] as const;
 export const ApiKeyInput = z.object({
   name: z.string().max(120).optional(),
-  scopes: z.array(z.enum(API_SCOPES)).max(8).default([]),
+  scopes: z.array(z.enum(API_SCOPES)).max(16).default([]),
 });
 export type ApiKeyInput = z.infer<typeof ApiKeyInput>;
 
@@ -538,12 +538,15 @@ export const ContactInput = z
      *  [] clears all companies. Overrides the single company/company_id when both are sent. */
     company_ids: z.array(z.guid()).max(50).optional(),
     attributes: z.record(z.string(), z.unknown()).optional(),
+    /** Replaces the contact's tag set (0123). */
+    tags: z.array(z.string().max(60)).max(100).optional(),
   })
   .refine(
     (v) =>
       Boolean(v.external_id || v.email || v.name || v.company) ||
       v.company_id !== undefined ||
-      v.company_ids !== undefined,
+      v.company_ids !== undefined ||
+      v.tags !== undefined,
     { message: "at least one of external_id, email, name, company is required" },
   );
 
@@ -579,6 +582,14 @@ export const BulkContactsInput = z.object({
 });
 export type BulkContactsInput = z.infer<typeof BulkContactsInput>;
 
+/** Bulk add/remove tags on selected contacts (0123). */
+export const ContactTagsInput = z.object({
+  ids: z.array(z.guid()).min(1).max(5000),
+  add: z.array(z.string().max(60)).max(20).default([]),
+  remove: z.array(z.string().max(60)).max(20).default([]),
+});
+export type ContactTagsInput = z.infer<typeof ContactTagsInput>;
+
 /** Directory data-list filtering (the Intercom-grade filter builder). A condition targets
  *  a core column (name/email/company/created_at/updated_at) or an attribute (field
  *  `attr:<key>`), with a per-field operator. `value` is required for the value ops
@@ -595,6 +606,10 @@ export const CONTACT_FILTER_OPS = [
   "not_exists",
   "before",
   "after",
+  // Numeric / version ordering (0121): account spend + project count, and technology versions
+  // compared component-wise (16 > 14, 8.4 > 8.1).
+  "lt",
+  "gt",
 ] as const;
 export type ContactFilterOp = (typeof CONTACT_FILTER_OPS)[number];
 
@@ -1499,6 +1514,117 @@ export const PublicEventInput = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 export type PublicEventInput = z.infer<typeof PublicEventInput>;
+
+// ── Public contacts API (contacts:read / contacts:write) ─────────────────────────
+// Server-to-server sync from an external system of record, keyed by ITS stable id (external_id).
+// Stricter than the console upsert: an email already held by a DIFFERENT contact is a 409, never a
+// silent fold — except a contact with no external_id yet (a widget/email-created one), which the
+// incoming id is attached to. Omitted fields are left unchanged.
+
+/** One contact in a public upsert (single or bulk row). `subscribed` mirrors marketing consent:
+ *  false opts out; true re-subscribes only an opt-out the API itself made (see PublicSubscriptionInput
+ *  for the forced override). */
+export const PublicContactInput = z.object({
+  external_id: z.string().trim().min(1).max(200),
+  email: z.string().trim().email().max(320).optional(),
+  name: z.string().trim().max(300).optional(),
+  subscribed: z.boolean().optional(),
+});
+export type PublicContactInput = z.infer<typeof PublicContactInput>;
+
+/** Bulk upsert. Rows are validated one by one (an invalid row is reported, not fatal), so the
+ *  array itself is only shape-checked here. */
+export const PublicContactsBulkInput = z.object({
+  contacts: z.array(z.unknown()).min(1).max(1000),
+});
+export type PublicContactsBulkInput = z.infer<typeof PublicContactsBulkInput>;
+
+/** Set marketing consent. Re-subscribing a contact who opted out by other means than the API (their
+ *  own unsubscribe link, an agent, an import) is refused with 409 unless `force` is true — use force
+ *  only when the person has given consent again in your system. Forced re-subscribes are audited. */
+export const PublicSubscriptionInput = z.object({
+  external_id: z.string().trim().min(1).max(200),
+  subscribed: z.boolean(),
+  force: z.boolean().optional(),
+});
+export type PublicSubscriptionInput = z.infer<typeof PublicSubscriptionInput>;
+
+/** Remove a synced person (deleted in the system of record) — soft; see publicRemoveContact. */
+export const PublicExternalIdInput = z.object({
+  external_id: z.string().trim().min(1).max(200),
+});
+export type PublicExternalIdInput = z.infer<typeof PublicExternalIdInput>;
+
+/** Opt a contact out of (subscribed:false) or back into one subscription topic. */
+export const PublicTopicInput = z.object({
+  external_id: z.string().trim().min(1).max(200),
+  topic_id: z.guid(),
+  subscribed: z.boolean(),
+});
+export type PublicTopicInput = z.infer<typeof PublicTopicInput>;
+
+// ── Public accounts API (accounts:read / accounts:write) ──────────────────────────
+// A company (the system's client) as a SNAPSHOT keyed by its external_id: name + spend, and —
+// when present — its full member list and full project list, each REPLACING what the previous sync
+// wrote (manual, agent-made memberships are never touched). Omitting `members` / `projects` leaves
+// them unchanged, so a spend-only update is just {external_id, avg_monthly_spend}.
+
+const Money = z.number().finite().min(0).max(1e12);
+
+export const PublicServiceInput = z.object({
+  /** The service type exactly as the platform has it — the RESOLVED runtime/service type, e.g.
+   *  "ubuntu/nodejs@22", "postgresql:ha@16", "php-nginx@8.4+1.22", "object-storage". */
+  type: z.string().trim().min(1).max(120),
+  hostname: z.string().trim().max(120).optional(),
+  external_id: z.string().trim().max(200).optional(),
+});
+export type PublicServiceInput = z.infer<typeof PublicServiceInput>;
+
+export const PublicProjectInput = z.object({
+  external_id: z.string().trim().min(1).max(200),
+  name: z.string().trim().max(300).optional(),
+  status: z.string().trim().max(60).optional(),
+  avg_monthly_spend: Money.nullable().optional(),
+  services: z.array(PublicServiceInput).max(300).default([]),
+});
+export type PublicProjectInput = z.infer<typeof PublicProjectInput>;
+
+export const PublicCompanyMemberInput = z.object({
+  /** The person's external_id — the contact must already be synced (contacts/upsert first). */
+  external_id: z.string().trim().min(1).max(200),
+  role: z.string().trim().max(60).optional(),
+});
+
+export const PublicCompanyInput = z.object({
+  external_id: z.string().trim().min(1).max(200),
+  name: z.string().trim().min(1).max(300).optional(),
+  avg_monthly_spend: Money.nullable().optional(),
+  currency: z.string().trim().length(3).toUpperCase().optional(),
+  members: z.array(PublicCompanyMemberInput).max(2000).optional(),
+  projects: z.array(PublicProjectInput).max(1000).optional(),
+});
+export type PublicCompanyInput = z.infer<typeof PublicCompanyInput>;
+
+/** Bulk company snapshots — validated row by row like the contacts bulk. */
+export const PublicCompaniesBulkInput = z.object({
+  companies: z.array(z.unknown()).min(1).max(200),
+});
+
+/** The technology catalog, REPLACED wholesale (e.g. generated from the Zerops zerops.yaml and
+ *  import.yaml JSON schemas). `aliases` fold spelling variants onto `key` (golang → go). */
+export const PublicTechnologyCatalogInput = z.object({
+  technologies: z.array(z.object({
+    key: z.string().trim().toLowerCase().min(1).max(60).regex(/^[a-z0-9][a-z0-9.+-]*$/),
+    name: z.string().trim().max(120).optional(),
+    category: z.string().trim().max(60).optional(),
+    aliases: z.array(z.string().trim().toLowerCase().min(1).max(60)).max(20).default([]),
+    versions: z.array(z.object({
+      version: z.string().trim().min(1).max(40),
+      status: z.enum(["supported", "deprecated", "eol"]).default("supported"),
+    })).max(200).default([]),
+  })).max(500),
+});
+export type PublicTechnologyCatalogInput = z.infer<typeof PublicTechnologyCatalogInput>;
 
 // ── Contact attribute classification ─────────────────────────────────────────
 // Signals Noola can HONESTLY derive from a request (enrich.ts + widget identify). The test for

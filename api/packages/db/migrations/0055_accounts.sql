@@ -36,7 +36,8 @@ INSERT INTO companies (tenant_id, name)
 SELECT DISTINCT ON (tenant_id, lower(company)) tenant_id, company
   FROM contacts
  WHERE company <> ''
-ON CONFLICT (tenant_id, lower(name)) DO NOTHING;
+-- Untargeted: companies_name_uq is partial since 0121 (id-less companies only), and this file re-runs.
+ON CONFLICT DO NOTHING;
 
 UPDATE contacts c
    SET company_id = co.id

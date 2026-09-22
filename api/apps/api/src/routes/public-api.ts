@@ -1,5 +1,9 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
-import { PublicAnswerInput, PublicTicketInput, CsatInput, NpsInput, ApiKeyInput, PublicEventInput } from "@repo/contracts";
+import {
+  PublicAnswerInput, PublicTicketInput, CsatInput, NpsInput, ApiKeyInput, PublicEventInput,
+  PublicContactInput, PublicContactsBulkInput, PublicSubscriptionInput, PublicExternalIdInput, PublicTopicInput,
+  PublicCompanyInput, PublicCompaniesBulkInput, PublicTechnologyCatalogInput,
+} from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { rateLimit } from "../ratelimit.js";
 import { resolveApiKey, listApiKeys, createApiKey, revokeApiKey } from "../apikeys.js";
@@ -13,6 +17,13 @@ import { emitDomainEvent } from "../automations.js";
 import { handleMcp, mcpToolManifest } from "../mcp.js";
 import { buildOpenApiSpec } from "../openapi.js";
 import { recordAudit } from "../audit.js";
+import {
+  publicUpsertContact, publicBulkUpsertContacts, publicGetContact, publicSetSubscription, publicRemoveContact, publicSetTopic,
+} from "../public-contacts.js";
+import {
+  publicSyncCompany, publicSyncCompaniesBulk, publicGetCompany, publicRemoveCompany, publicPutTechnologies, technologyOverview,
+} from "../public-accounts.js";
+import { listTopics } from "../subscription-topics.js";
 
 const PUBLIC_RATE_LIMIT = 120; // requests per key per minute
 
@@ -176,6 +187,168 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
     return reply.code(201).send({ id: event.id, contactId: event.contact_id, name: event.name, createdAt: event.created_at });
   }
 
+  // Public contacts API — sync people from an external system of record, keyed by ITS stable id
+  // (external_id). Strict about dedup: an email held by a contact with a different external_id is a
+  // 409 (never a silent fold); see public-contacts.ts for the full matching rules. v1-only (no legacy
+  // unversioned alias for a new surface).
+  async function handlePublicContactUpsert(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:write");
+    if (!key) return;
+    const parsed = PublicContactInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const out = await publicUpsertContact(key.tenantId, parsed.data);
+    if (out.status === "conflict") return reply.code(409).send({ error: out.error, conflict: out.conflict });
+    return reply.code(out.status === "created" ? 201 : 200).send({
+      contact: out.contact, created: out.status === "created", matched_by: out.matched_by, warnings: out.warnings,
+    });
+  }
+
+  async function handlePublicContactBulk(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:write");
+    if (!key) return;
+    const parsed = PublicContactsBulkInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return publicBulkUpsertContacts(key.tenantId, parsed.data.contacts);
+  }
+
+  async function handlePublicContactGet(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:read");
+    if (!key) return;
+    const externalId = ((req.query as { external_id?: string } | undefined)?.external_id ?? "").trim();
+    if (!externalId) return reply.code(400).send({ error: "external_id query parameter is required" });
+    const contact = await publicGetContact(key.tenantId, externalId);
+    if (!contact) return reply.code(404).send({ error: "not found" });
+    return { contact };
+  }
+
+  async function handlePublicContactSubscription(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:write");
+    if (!key) return;
+    const parsed = PublicSubscriptionInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const { external_id, subscribed, force } = parsed.data;
+    const out = await publicSetSubscription(key.tenantId, external_id, subscribed, force === true);
+    if (out.status === "not_found") return reply.code(404).send({ error: "not found" });
+    if (out.status === "blocked") {
+      return reply.code(409).send({
+        error: "resubscribe_blocked",
+        detail: "The contact opted out outside the API (their own unsubscribe, an agent, or an import). Send force: true only if they consented again in your system.",
+        unsubscribed_at: out.unsubscribed_at,
+        unsubscribed_source: out.unsubscribed_source,
+      });
+    }
+    if (out.forced) {
+      void recordAudit(key.tenantId, {
+        actorId: null,
+        actorName: `api key ${key.id}`,
+        action: "contact.resubscribed_forced",
+        entityType: "contact",
+        entityId: out.contact.id,
+        meta: { external_id, apiKeyId: key.id },
+      });
+    }
+    return { contact: out.contact };
+  }
+
+  async function handlePublicContactRemove(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:write");
+    if (!key) return;
+    const parsed = PublicExternalIdInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const contact = await publicRemoveContact(key.tenantId, parsed.data.external_id);
+    if (!contact) return reply.code(404).send({ error: "not found" });
+    return { contact };
+  }
+
+  async function handlePublicContactTopic(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:write");
+    if (!key) return;
+    const parsed = PublicTopicInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const out = await publicSetTopic(key.tenantId, parsed.data.external_id, parsed.data.topic_id, parsed.data.subscribed);
+    if (out.status === "not_found") return reply.code(404).send({ error: `${out.what} not found` });
+    return { topics: out.topics };
+  }
+
+  async function handlePublicTopicsList(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "contacts:read");
+    if (!key) return;
+    const topics = await listTopics(key.tenantId);
+    return { topics: topics.map((t) => ({ id: t.id, name: t.name, description: t.description })) };
+  }
+
+  // Public accounts API — the system's clients as snapshots (spend, members, projects + services),
+  // keyed by external_id only; plus the technology catalog and its usage overview.
+  async function handlePublicCompanyUpsert(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "accounts:write");
+    if (!key) return;
+    const parsed = PublicCompanyInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    try {
+      const out = await publicSyncCompany(key.tenantId, parsed.data);
+      return reply.code(out.created ? 201 : 200).send(out);
+    } catch (e) {
+      if ((e as { code?: string }).code === "23505") return reply.code(409).send({ error: "concurrent write — retry" });
+      throw e;
+    }
+  }
+
+  async function handlePublicCompaniesBulk(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "accounts:write");
+    if (!key) return;
+    const parsed = PublicCompaniesBulkInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return publicSyncCompaniesBulk(key.tenantId, parsed.data.companies);
+  }
+
+  async function handlePublicCompanyGet(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "accounts:read");
+    if (!key) return;
+    const externalId = ((req.query as { external_id?: string } | undefined)?.external_id ?? "").trim();
+    if (!externalId) return reply.code(400).send({ error: "external_id query parameter is required" });
+    const company = await publicGetCompany(key.tenantId, externalId);
+    if (!company) return reply.code(404).send({ error: "not found" });
+    return { company };
+  }
+
+  async function handlePublicCompanyRemove(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "accounts:write");
+    if (!key) return;
+    const parsed = PublicExternalIdInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const company = await publicRemoveCompany(key.tenantId, parsed.data.external_id);
+    if (!company) return reply.code(404).send({ error: "not found" });
+    return { company };
+  }
+
+  async function handlePublicTechnologiesPut(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "accounts:write");
+    if (!key) return;
+    const parsed = PublicTechnologyCatalogInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return publicPutTechnologies(key.tenantId, parsed.data);
+  }
+
+  async function handlePublicTechnologiesGet(req: FastifyRequest, reply: FastifyReply) {
+    const key = await requireApiKey(req, reply, "accounts:read");
+    if (!key) return;
+    return { usage: await technologyOverview(key.tenantId) };
+  }
+
+  app.post("/v1/public/contacts/upsert", handlePublicContactUpsert);
+  app.post("/v1/public/contacts/bulk", { bodyLimit: 5 * 1024 * 1024 }, handlePublicContactBulk);
+  app.get("/v1/public/contacts", handlePublicContactGet);
+  app.post("/v1/public/contacts/subscription", handlePublicContactSubscription);
+  app.post("/v1/public/contacts/remove", handlePublicContactRemove);
+  app.post("/v1/public/contacts/topics", handlePublicContactTopic);
+  app.get("/v1/public/topics", handlePublicTopicsList);
+  app.post("/v1/public/companies/upsert", { bodyLimit: 5 * 1024 * 1024 }, handlePublicCompanyUpsert);
+  app.post("/v1/public/companies/bulk", { bodyLimit: 20 * 1024 * 1024 }, handlePublicCompaniesBulk);
+  app.get("/v1/public/companies", handlePublicCompanyGet);
+  app.post("/v1/public/companies/remove", handlePublicCompanyRemove);
+  app.put("/v1/public/technologies", { bodyLimit: 5 * 1024 * 1024 }, handlePublicTechnologiesPut);
+  app.get("/v1/public/technologies", handlePublicTechnologiesGet);
+
   for (const prefix of ["/public", "/v1/public"]) {
     app.post(`${prefix}/answer`, handlePublicAnswer);
     app.post(`${prefix}/tickets`, handlePublicTicketCreate);
@@ -226,6 +399,21 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
       { method: "POST", path: "/v1/public/tickets", scope: "tickets:write" },
       { method: "POST", path: "/v1/public/tickets/list", scope: "tickets:read" },
       { method: "POST", path: "/v1/public/csat", scope: "tickets:write" },
+      { method: "POST", path: "/v1/public/nps", scope: "tickets:write" },
+      { method: "POST", path: "/v1/public/events", scope: "events:write" },
+      { method: "POST", path: "/v1/public/contacts/upsert", scope: "contacts:write" },
+      { method: "POST", path: "/v1/public/contacts/bulk", scope: "contacts:write" },
+      { method: "GET", path: "/v1/public/contacts?external_id=", scope: "contacts:read" },
+      { method: "POST", path: "/v1/public/contacts/subscription", scope: "contacts:write" },
+      { method: "POST", path: "/v1/public/contacts/remove", scope: "contacts:write" },
+      { method: "POST", path: "/v1/public/contacts/topics", scope: "contacts:write" },
+      { method: "GET", path: "/v1/public/topics", scope: "contacts:read" },
+      { method: "POST", path: "/v1/public/companies/upsert", scope: "accounts:write" },
+      { method: "POST", path: "/v1/public/companies/bulk", scope: "accounts:write" },
+      { method: "GET", path: "/v1/public/companies?external_id=", scope: "accounts:read" },
+      { method: "POST", path: "/v1/public/companies/remove", scope: "accounts:write" },
+      { method: "PUT", path: "/v1/public/technologies", scope: "accounts:write" },
+      { method: "GET", path: "/v1/public/technologies", scope: "accounts:read" },
     ],
   }));
 

@@ -1,14 +1,15 @@
 import type { FastifyInstance } from "fastify";
 import {
   ContactInput, BulkContactsInput, ContactMergeInput, CompanyInput,
-  FeatureRequestInput, FeatureLinkInput, SegmentInput, ContactEventInput,
+  FeatureRequestInput, FeatureLinkInput, SegmentInput, ContactEventInput, ContactTagsInput,
   ContactFilterConditions, ContactFilterConditionGroups, CONTACT_SORT_FIELDS, type ContactSortField,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import {
   listContacts, getContact, createContact, updateContact, deleteContact,
   upsertContact, bulkUpsertContacts, contactHistory, mergeContacts, listContactIdentities,
-  listContactGeoPoints,
+  listContactGeoPoints, normalizeTags, tagContacts, tagContactsByIdentity, existingRowIndexes, listContactTags,
+  upsertContactsWithoutEmail,
 } from "../contacts.js";
 import { recordContactEvent, listContactEvents } from "../contact-events.js";
 import { listCompanies, countCompanies, getCompany, createCompany, updateCompany, deleteCompany, bulkUpsertCompanies, ensureCompaniesByName, type HealthBand } from "../companies.js";
@@ -22,6 +23,8 @@ import { recordAudit } from "../audit.js";
 import { exportContactData, eraseContact } from "../governance.js";
 import { roleAtLeast } from "../rbac.js";
 import { parseCsvContacts, parseCsvCompanies } from "../csv-import.js";
+import { technologyOverview } from "../public-accounts.js";
+import { getCatalogState, syncZeropsCatalog, disableZeropsCatalog } from "../zerops-catalog.js";
 
 // The customer-directory surfaces: contacts (people), companies (accounts + health), feature
 // requests (voice-of-customer with ticket evidence), and saved segments (reusable filters).
@@ -150,7 +153,7 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
     }
     const id = (req.params as { id: string }).id;
     const { setSubscription } = await import("../unsubscribe.js");
-    const who = await setSubscription(tenantId, id, unsubscribed);
+    const who = await setSubscription(tenantId, id, unsubscribed, "agent");
     if (!who) return reply.code(404).send({ error: "not found" });
     const contact = await getContact(tenantId, id);
     return { contact };
@@ -181,27 +184,65 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
 
   // CSV import (0092): header-mapped rows ride the same idempotent upsert as /contacts/bulk.
   // Body is the raw CSV text (the SPA reads the file client-side); returns per-outcome counts.
+  // Optional `tag` (0123) labels every row's contact (e.g. the event the list came from). With a
+  // tag, contacts that ALREADY exist are left exactly as they are and only gain the tag — an event
+  // list must never overwrite a real customer's synced details — unless `updateExisting` is true.
   app.post("/contacts/import", { bodyLimit: 24 * 1024 * 1024 }, tenanted(async (tenantId, req, reply) => {
-    const b = (req.body ?? {}) as Partial<{ csv: string }>;
+    const b = (req.body ?? {}) as Partial<{ csv: string; tag: unknown; updateExisting: unknown }>;
     if (!b.csv || typeof b.csv !== "string") return reply.code(400).send({ error: "csv text is required" });
     if (b.csv.length > 20_000_000) return reply.code(413).send({ error: "csv too large (20MB max)" });
+    const tags = typeof b.tag === "string" ? normalizeTags([b.tag]) : [];
     const parsed = parseCsvContacts(b.csv);
     if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
-    if (!parsed.rows.length) return reply.code(400).send({ error: "no importable rows found" });
+    if (!parsed.rows.length && !parsed.withoutEmail.length) {
+      const why = parsed.issues.slice(0, 3).map((i) => `row ${i.row}: ${i.reason}`).join("; ");
+      return reply.code(400).send({ error: `no importable rows found${why ? ` — ${why}` : ""}`, issues: parsed.issues });
+    }
+
+    // Rows to write: all of them, or — tagging without updateExisting — only the new people.
+    let writeRows = parsed.rows;
+    let taggedExisting = 0;
+    if (tags.length && b.updateExisting !== true) {
+      const existing = await existingRowIndexes(tenantId, parsed.rows);
+      writeRows = parsed.rows.filter((_, i) => !existing.has(i));
+      taggedExisting = existing.size;
+    }
     // Connect people to accounts: resolve each row's free-text company name → a real company_id
     // (creating the company if it's new), so imported contacts land linked, not just labeled.
-    const companyMap = await ensureCompaniesByName(tenantId, parsed.rows.map((r) => r.company ?? ""));
+    const companyMap = await ensureCompaniesByName(tenantId, [...writeRows, ...parsed.withoutEmail].map((r) => r.company ?? ""));
     let linked = 0;
-    for (const r of parsed.rows) {
+    for (const r of [...writeRows, ...parsed.withoutEmail]) {
       const id = r.company ? companyMap.get(r.company.trim().toLowerCase()) : undefined;
       if (id) { r.company_id = id; linked++; }
     }
-    const result = await bulkUpsertContacts(tenantId, parsed.rows);
+    const result = writeRows.length ? await bulkUpsertContacts(tenantId, writeRows) : { created: 0, updated: 0 };
+    let tagged = tags.length ? await tagContactsByIdentity(tenantId, parsed.rows, tags) : 0;
+    // Name-only rows (no email / external id): leads that can't be emailed, matched by name + company.
+    const named = parsed.withoutEmail.length
+      ? await upsertContactsWithoutEmail(tenantId, parsed.withoutEmail, { tags, updateExisting: b.updateExisting === true })
+      : { created: 0, updated: 0, tagged: 0, existing: 0 };
+    if (tags.length && b.updateExisting !== true) taggedExisting += named.existing;
+    result.created += named.created;
+    result.updated += named.updated;
+    tagged += named.tagged;
     await recordAudit(tenantId, {
       actorId: req.session?.userId ?? null, action: "contacts.imported", entityType: "contact",
-      meta: { created: result.created, updated: result.updated, skipped: parsed.skipped, linked },
+      meta: { created: result.created, updated: result.updated, skipped: parsed.skipped, linked, tag: tags[0] ?? null, tagged, taggedExisting },
     }).catch(() => {});
-    return { ...result, skipped: parsed.skipped, linked };
+    return {
+      ...result, skipped: parsed.skipped, linked, tag: tags[0] ?? null, tagged, tagged_existing: taggedExisting,
+      without_email: parsed.withoutEmail.length, issues: parsed.issues,
+    };
+  }));
+
+  // Tags (0123): every tag in use with its contact count (filter suggestions / pickers), and the
+  // bulk add/remove action over selected contacts.
+  app.get("/contacts/tags", tenanted(async (tenantId) => ({ tags: await listContactTags(tenantId) })));
+  app.post("/contacts/tags", tenanted(async (tenantId, req, reply) => {
+    const parsed = ContactTagsInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const changed = await tagContacts(tenantId, parsed.data.ids, parsed.data.add, parsed.data.remove);
+    return { changed };
   }));
 
   app.get("/contacts/:id/history", tenanted(async (tenantId, req, reply) => {
@@ -251,6 +292,32 @@ export default async function directoryRoutes(app: FastifyInstance): Promise<voi
       meta: { droppedId: parsed.data.dropId },
     });
     return { contact };
+  }));
+
+  // Technology usage across synced accounts (0121): per technology version — services, projects,
+  // companies, reachable contacts, project spend, catalog lifecycle status.
+  app.get("/technologies", tenanted(async (tenantId) => ({ usage: await technologyOverview(tenantId) })));
+
+  // The technology catalog's source (0122): GET its state; PUT {source:"zerops"} imports the Zerops
+  // catalog now and keeps it refreshed daily (unlisted in-use versions then read as EOL),
+  // {source:"manual"} stops the import; POST …/sync re-imports on demand.
+  app.get("/technologies/catalog", tenanted(async (tenantId) => ({ catalog: await getCatalogState(tenantId) })));
+  app.put("/technologies/catalog", tenanted(async (tenantId, req, reply) => {
+    const source = (req.body as { source?: unknown } | undefined)?.source;
+    if (source !== "zerops" && source !== "manual") return reply.code(400).send({ error: 'source must be "zerops" or "manual"' });
+    if (source === "manual") return { catalog: await disableZeropsCatalog(tenantId) };
+    try {
+      return { catalog: await syncZeropsCatalog(tenantId) };
+    } catch (e) {
+      return reply.code(502).send({ error: `Zerops schema import failed: ${(e as Error).message}`, catalog: await getCatalogState(tenantId) });
+    }
+  }));
+  app.post("/technologies/catalog/sync", tenanted(async (tenantId, _req, reply) => {
+    try {
+      return { catalog: await syncZeropsCatalog(tenantId) };
+    } catch (e) {
+      return reply.code(502).send({ error: `Zerops schema import failed: ${(e as Error).message}`, catalog: await getCatalogState(tenantId) });
+    }
   }));
 
   // ---- Companies (account records) -----------------------------------------

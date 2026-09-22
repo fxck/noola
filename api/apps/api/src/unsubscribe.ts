@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { withTenant } from "@repo/db";
 import { publicApiBase } from "./env.js";
 import { recordContactUnsubscribe } from "./broadcast-events.js";
+import { optOutSourceSql, type UnsubscribeSource } from "./contacts.js";
 
 // Marketing opt-out — the compliance seam for broadcasts (CAN-SPAM/GDPR). Every broadcast
 // email carries a per-recipient signed unsubscribe URL (footer link + RFC 8058
@@ -96,21 +97,28 @@ export function unsubscribeUrl(tenantId: string, contactId: string, topicId?: st
   return `${publicApiBase()}/u/${token}${q}`;
 }
 
-/** Flip one contact's marketing subscription. Returns the contact's email-ish display handle
+/** Flip one contact's marketing subscription. `source` records who opted out (0120) — the default
+ *  'contact' is the person themselves (links, one-click, preference center). Returns the contact's email-ish display handle
  *  for the confirmation page, or null when the contact is gone. Idempotent — re-clicking a
  *  link keeps the original opt-out timestamp. */
 export async function setSubscription(
   tenantId: string,
   contactId: string,
   unsubscribed: boolean,
+  source: UnsubscribeSource = "contact",
 ): Promise<{ email: string | null; name: string } | null> {
   return withTenant(tenantId, async (c) => {
-    const r = await c.query(
-      unsubscribed
-        ? "UPDATE contacts SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1 RETURNING email, name"
-        : "UPDATE contacts SET unsubscribed_at = NULL WHERE id = $1 RETURNING email, name",
-      [contactId],
-    );
+    const r = unsubscribed
+      ? await c.query(
+          `UPDATE contacts SET unsubscribed_source = ${optOutSourceSql("$2")},
+                  unsubscribed_at = COALESCE(unsubscribed_at, now())
+            WHERE id = $1 RETURNING email, name`,
+          [contactId, source],
+        )
+      : await c.query(
+          "UPDATE contacts SET unsubscribed_at = NULL, unsubscribed_source = NULL WHERE id = $1 RETURNING email, name",
+          [contactId],
+        );
     if (!r.rowCount) return null;
     // Reflect the opt-out onto the broadcast that most likely prompted it, so the per-broadcast
     // Unsubscribed count moves (best-effort — analytics must never fail the compliance opt-out).

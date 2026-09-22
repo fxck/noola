@@ -33,6 +33,8 @@ import {
   ListFilter,
   SlidersHorizontal,
   Activity,
+  BadgeCheck,
+  UserX,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useLiveRefresh } from "@/lib/realtime-context";
@@ -42,6 +44,7 @@ import {
   SUBSCRIPTION_OP_LABEL,
   fetchContacts,
   deleteContact,
+  bulkTagContacts,
   isContactsUnavailable,
 } from "@/lib/contacts";
 import { contactDisplayName } from "@/lib/contact-display";
@@ -72,6 +75,9 @@ import { attributeColumns, useHideAttrsByDefault } from "@/components/data-table
 import { PageSizeSelect, PAGE_SIZE_OPTIONS } from "@/components/data-table/page-size-select";
 import { usePersistentVisibility, usePersistentNumber, usePersistentOrder } from "@/components/data-table/persist";
 import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
+import { useAccountFilterFields, useTagFilterField } from "@/components/data-table/account-filter-fields";
+import { TagChips, useTagSuggestions } from "@/components/contacts/contact-tags";
+import { FormDialog } from "@/components/ui/form-dialog";
 import {
   type FilterCondition,
   type FilterOp,
@@ -146,6 +152,17 @@ const COLUMNS: ColumnDef<Contact>[] = [
         >
           {contactDisplayName(row.original)}
         </Link>
+        {/* account sync status — a quiet icon, not a chip (§4): verified customer / former customer */}
+        {row.original.account_status === "customer" && (
+          <span title="Customer — synced from your system" className="shrink-0 text-primary">
+            <BadgeCheck className="size-3.5" aria-label="Customer" />
+          </span>
+        )}
+        {row.original.account_status === "former" && (
+          <span title="Former customer — removed in your system" className="shrink-0 text-muted-foreground/60">
+            <UserX className="size-3.5" aria-label="Former customer" />
+          </span>
+        )}
         {/* marketing opt-out — a quiet icon, not a chip (§4); broadcasts skip them */}
         {row.original.unsubscribed_at && (
           <span
@@ -157,6 +174,14 @@ const COLUMNS: ColumnDef<Contact>[] = [
         )}
       </div>
     ),
+  },
+  {
+    id: "tags",
+    accessorFn: (c) => (c.tags ?? []).join(", "),
+    header: "Tags",
+    meta: { label: "Tags" },
+    enableSorting: false,
+    cell: ({ row }) => <TagChips tags={row.original.tags ?? []} />,
   },
   {
     accessorKey: "email",
@@ -319,6 +344,11 @@ export function ContactsPage() {
   const [editing, setEditing] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [bulkConfirm, setBulkConfirm] = useState(false);
+  // Bulk tag (0123): the dialog's draft tag.
+  const [tagDialog, setTagDialog] = useState(false);
+  const [bulkTag, setBulkTag] = useState("");
+  const [tagging, setTagging] = useState(false);
+  const tagSuggestions = useTagSuggestions();
 
   // ⌘K "New contact" deep-links here with ?create — open the editor once, then strip the param
   // (replace, so Back doesn't re-trigger it).
@@ -442,6 +472,8 @@ export function ContactsPage() {
   // The fields the builder targets: core columns + every attribute key seen + dates. No live
   // value counts/suggestions — with server-side data we don't hold the full set (and there's no
   // distinct-values endpoint); the free-text value input carries the UX.
+  const accountFields = useAccountFilterFields();
+  const tagField = useTagFilterField();
   const filterFields = useMemo<BuilderFieldDef[]>(
     () => [
       { key: "name", label: "Name", type: "text", icon: User },
@@ -471,8 +503,11 @@ export function ContactsPage() {
         opLabels: SUBSCRIPTION_OP_LABEL,
         icon: MailX,
       },
+      tagField,
+      // Client accounts: status, role, spend, projects, technologies (shared with broadcasts).
+      ...accountFields,
     ],
-    [attrKeys],
+    [attrKeys, accountFields, tagField],
   );
 
   const pageCount = Math.max(1, Math.ceil(total / pagination.pageSize));
@@ -611,6 +646,25 @@ export function ContactsPage() {
     reload();
   }
 
+  async function tagSelected() {
+    const ids = selectedRows.map((r) => r.original.id);
+    const tag = bulkTag.trim();
+    if (!ids.length || !tag) return;
+    setTagging(true);
+    try {
+      const changed = await bulkTagContacts(ids, [tag]);
+      toast.success(`Tagged ${changed} contact${changed === 1 ? "" : "s"} “${tag}”.`);
+      setTagDialog(false);
+      setBulkTag("");
+      table.resetRowSelection();
+      reload();
+    } catch {
+      toast.error("Couldn't tag the contacts.");
+    } finally {
+      setTagging(false);
+    }
+  }
+
   function exportSelected() {
     const rows = selectedRows.map((r) => r.original);
     if (!rows.length) return;
@@ -648,6 +702,9 @@ export function ContactsPage() {
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <span className="text-sm font-semibold tabular-nums tracking-tight">{selectedCount} selected</span>
             <span className="mx-1 h-4 w-px bg-border" />
+            <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" onClick={() => setTagDialog(true)}>
+              <Tag className="size-3.5" /> Tag
+            </Button>
             <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" onClick={exportSelected}>
               <Download className="size-3.5" /> Export CSV
             </Button>
@@ -917,6 +974,29 @@ export function ContactsPage() {
         onCancel={() => setBulkConfirm(false)}
       />
 
+      <FormDialog
+        open={tagDialog}
+        title={`Tag ${selectedCount} contact${selectedCount === 1 ? "" : "s"}`}
+        description="Adds the tag; other tags stay as they are."
+        onClose={() => setTagDialog(false)}
+        onSubmit={() => void tagSelected()}
+        submitLabel="Add tag"
+        submitDisabled={!bulkTag.trim()}
+        busy={tagging}
+      >
+        <Input
+          autoFocus
+          list="bulk-tag-suggestions"
+          value={bulkTag}
+          maxLength={60}
+          onChange={(e) => setBulkTag(e.target.value)}
+          placeholder="e.g. DevConf 2026"
+        />
+        <datalist id="bulk-tag-suggestions">
+          {tagSuggestions.map((t) => <option key={t.tag} value={t.tag} />)}
+        </datalist>
+      </FormDialog>
+
       {importOpen && (
         <BulkImportDialog
           onClose={() => setImportOpen(false)}
@@ -924,7 +1004,11 @@ export function ContactsPage() {
             setImportOpen(false);
             const skipped = res.skipped ? `, ${res.skipped} skipped` : "";
             const linked = res.linked ? `, ${res.linked} linked to companies` : "";
-            toast.success(`Imported — ${res.created} created, ${res.updated} updated${linked}${skipped}.`);
+            const noEmail = res.without_email ? `, ${res.without_email} without email` : "";
+            const tagged = res.tag
+              ? ` Tagged ${res.tagged ?? 0} “${res.tag}”${res.tagged_existing ? ` (${res.tagged_existing} already existed — only the tag was added)` : ""}.`
+              : "";
+            toast.success(`Imported — ${res.created} created, ${res.updated} updated${linked}${noEmail}${skipped}.${tagged}`);
             resetPage();
             reload();
           }}

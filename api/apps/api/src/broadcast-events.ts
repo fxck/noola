@@ -1,5 +1,6 @@
 import type { PoolClient } from "pg";
 import { withTenant } from "@repo/db";
+import { optOutSourceSql } from "./contacts.js";
 
 // Delivery-event ingestion — the outbound twin of resend-inbound.ts. Email providers (Resend,
 // SendGrid) fire delivery-lifecycle webhooks for every send: delivered, bounced, complained
@@ -162,7 +163,12 @@ export async function recordDeliveryEvent(tenantId: string, ev: DeliveryEvent): 
       );
       suppressed = true;
       if (ev.type === "complained" && contactId) {
-        await c.query("UPDATE contacts SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1", [contactId]);
+        await c.query(
+          `UPDATE contacts SET unsubscribed_source = ${optOutSourceSql("'contact'")},
+                  unsubscribed_at = COALESCE(unsubscribed_at, now())
+            WHERE id = $1`,
+          [contactId],
+        );
         if (rid) await c.query("UPDATE broadcast_recipients SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1", [rid]);
       }
     }

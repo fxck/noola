@@ -36,7 +36,9 @@ export type FilterOp =
   | "exists"
   | "not_exists"
   | "before"
-  | "after";
+  | "after"
+  | "lt"
+  | "gt";
 
 export type FilterFieldType = "text" | "date" | "attribute" | "event";
 
@@ -93,6 +95,8 @@ export const OP_LABEL: Record<FilterOp, string> = {
   not_exists: "is unknown",
   before: "before",
   after: "after",
+  lt: "less than",
+  gt: "more than",
 };
 
 /** Ops that carry no value input (existence checks). */

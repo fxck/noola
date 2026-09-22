@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
  * is a pane-header control, always the same slot). One nav entity, three views
  * of the same customer base; routes stay /contacts, /companies, /contacts/map.
  */
-export function CustomersViewSwitch({ current }: { current: "people" | "companies" | "map" }) {
+export function CustomersViewSwitch({ current }: { current: "people" | "companies" | "map" | "technologies" }) {
   return (
     <div
       role="tablist"
@@ -37,6 +37,14 @@ export function CustomersViewSwitch({ current }: { current: "people" | "companie
         className={cn(TAB_BASE, current === "map" ? TAB_ON : TAB_OFF)}
       >
         Map
+      </Link>
+      <Link
+        to="/technologies"
+        role="tab"
+        aria-selected={current === "technologies"}
+        className={cn(TAB_BASE, current === "technologies" ? TAB_ON : TAB_OFF)}
+      >
+        Technologies
       </Link>
     </div>
   );
