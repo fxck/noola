@@ -39,6 +39,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useLiveRefresh } from "@/lib/realtime-context";
 import {
+  type AccountStatus,
   type Contact,
   type ContactFilter,
   SUBSCRIPTION_OP_LABEL,
@@ -265,6 +266,21 @@ const COLUMNS: ColumnDef<Contact>[] = [
 
 const byName = (a: Segment, b: Segment) => a.name.localeCompare(b.name);
 
+// The account cut, as a first-class chip row: customers / users / leads / former, the users-vs-leads
+// separation the directory is built on. `account_status` is derived from account-sync provenance,
+// NOT from how a row was created — a LEAD is anyone never synced from the system of record (widget
+// visitor, imported conference contact, someone who emailed in). It is a different axis from the
+// identity cut next to it: an anonymous visitor and a named conference contact are both leads, one
+// just hasn't given up their details yet. A lead that signs up converts into the SAME contact (the
+// widget fold on identify, the email match on sync), so nobody has to reconcile two records by hand.
+const ACCOUNT_CHIPS: { value: "" | AccountStatus; label: string }[] = [
+  { value: "", label: "All" },
+  { value: "customer", label: "Customers" },
+  { value: "user", label: "Users" },
+  { value: "lead", label: "Leads" },
+  { value: "former", label: "Former" },
+];
+
 // The "View" column-visibility control — lifted out of the old DataTableToolbar band
 // into the pane header (§3: a compact popover control, not chrome of its own).
 function ColumnVisibility({ table }: { table: TanstackTable<Contact> }) {
@@ -368,6 +384,8 @@ export function ContactsPage() {
   const [showFilters, setShowFilters] = useState(false);
   // Identity cut: all / identified (has name or email) / anonymous (widget visitors etc.).
   const [identity, setIdentity] = useState<"" | "identified" | "anonymous">("");
+  // Account cut: all / customer / user / lead / former (see ACCOUNT_CHIPS).
+  const [account, setAccount] = useState<"" | AccountStatus>("");
   useEffect(() => {
     fetchSegments("contacts")
       .then((list) => setSegments([...list].sort(byName)))
@@ -411,7 +429,11 @@ export function ContactsPage() {
         try {
           const res = await fetchContacts({
             q: q.trim() || undefined,
-            filters: serverFilters,
+            // The account chip is an implicit AND on top of the builder's conditions — the same
+            // grammar, so a saved segment that already names account_status keeps working.
+            filters: account
+              ? [...(serverFilters ?? []), { field: "account_status", op: "is", value: account }]
+              : serverFilters,
             filterGroups: serverFilterGroups,
             identity: identity || undefined,
             sortBy,
@@ -454,7 +476,7 @@ export function ContactsPage() {
       clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, serverFilters, serverFilterGroups, identity, sortBy, sortDir, pagination.pageIndex, pagination.pageSize, reloadSignal]);
+  }, [q, serverFilters, serverFilterGroups, identity, account, sortBy, sortDir, pagination.pageIndex, pagination.pageSize, reloadSignal]);
   const reload = () => setReloadSignal((n) => n + 1);
   // Live: refetch when a contact or company changes anywhere (create/delete/edit).
   useLiveRefresh(["contact.", "company."], reload);
@@ -797,6 +819,27 @@ export function ContactsPage() {
                   <MenuItem icon={BookmarkPlus} label="Save current view…" onSelect={() => setShowSave(true)} />
                 </Menu>
               )}
+
+              {/* account cut — customers / users / leads, the sync-provenance separation */}
+              <div className="inline-flex h-8 items-center rounded-md bg-muted/60 p-0.5 text-xs">
+                {ACCOUNT_CHIPS.map((chip) => (
+                  <button
+                    key={chip.value || "all"}
+                    type="button"
+                    aria-pressed={account === chip.value}
+                    onClick={() => {
+                      setAccount(chip.value);
+                      resetPage();
+                    }}
+                    className={cn(
+                      "rounded px-2 py-1 transition-colors",
+                      account === chip.value ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {chip.label}
+                  </button>
+                ))}
+              </div>
 
               {/* identity cut — identified people vs anonymous visitors (widget etc.) */}
               <div className="inline-flex h-8 items-center rounded-md bg-muted/60 p-0.5 text-xs">

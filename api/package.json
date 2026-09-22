@@ -35,6 +35,7 @@
     "test:public-contacts": "tsx apps/api/test/public-contacts.test.ts",
     "test:public-accounts": "tsx apps/api/test/public-accounts.test.ts",
     "test:contact-tags": "tsx apps/api/test/contact-tags.test.ts",
+    "test:lead-conversion": "tsx apps/api/test/lead-conversion.test.ts",
     "test:segments": "tsx apps/api/test/segments.test.ts",
     "test:projection": "tsx apps/api/test/projection.test.ts",
     "test:rbac": "tsx apps/api/test/rbac.test.ts",

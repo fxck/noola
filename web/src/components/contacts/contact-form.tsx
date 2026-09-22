@@ -540,7 +540,10 @@ export function BulkImportDialog({
               <code className="rounded bg-muted px-1 py-0.5 text-xs">name</code>,{" "}
               <code className="rounded bg-muted px-1 py-0.5 text-xs">external_id</code> and{" "}
               <code className="rounded bg-muted px-1 py-0.5 text-xs">company</code> are recognized; any
-              other column becomes a custom attribute. Rows need an email or external_id.
+              other column becomes a custom attribute. A row needs an email, an external_id or a name —
+              name-only rows import as leads, matched on name + company. Everyone imported here is a{" "}
+              <strong className="font-medium text-foreground">lead</strong> until the account sync
+              claims them; signing up later converts the same contact, it doesn't create a second one.
             </p>
           ) : (
             <p className="text-sm text-muted-foreground">
