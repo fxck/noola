@@ -608,6 +608,11 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       name,
       company: companyName,
       company_external_id: companyExternalId,
+      // A company NAME from an unverified visitor is a claim, not proof: it resolves among the
+      // tenant's own id-less companies and can never file them under a real synced client. A verified
+      // identity (JWT / user_hash) is the customer's backend talking, so its name is trusted — and a
+      // `company_id` is authoritative either way (it dedups on external_id, above).
+      company_name_trusted: rid.verified,
       attributes: merged,
     });
     // Lead -> user: this visitor may have chatted BEFORE they identified, as one anonymous contact per
