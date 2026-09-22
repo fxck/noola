@@ -50,6 +50,7 @@ import { SettingsSsoPage } from "@/routes/settings-sso";
 import { SettingsAuditPage } from "@/routes/settings-audit";
 import { HelpCenterPage, HelpArticlePage } from "@/routes/help";
 import { CompaniesPage, CompanyDetailPage } from "@/routes/companies";
+import { TechnologiesPage } from "@/routes/technologies";
 import { FeaturesPage } from "@/routes/features";
 import { SettingsPersonaPage } from "@/routes/settings-persona";
 import { SettingsCustomFieldsPage } from "@/routes/settings-custom-fields";
@@ -349,6 +350,15 @@ const companyDetailRoute = createRoute({
   component: CompanyDetailPage,
 });
 
+const technologiesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/technologies",
+  beforeLoad: ({ context }) => {
+    if (!context.auth.isAuthed) throw redirect({ to: "/login" });
+  },
+  component: TechnologiesPage,
+});
+
 const featuresRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/features",
@@ -366,8 +376,10 @@ const broadcastsRoute = createRoute({
   },
   // ?edit=<draft id> — the detail page's Edit hands off to the list surface,
   // which opens the composer seeded from that draft (drafts only).
-  validateSearch: (search: Record<string, unknown>): { edit?: string } => ({
+  // ?audience=<json conditions> opens a NEW composer with that audience (Technologies hand-off).
+  validateSearch: (search: Record<string, unknown>): { edit?: string; audience?: string } => ({
     edit: typeof search.edit === "string" ? search.edit : undefined,
+    audience: typeof search.audience === "string" ? search.audience : undefined,
   }),
   component: BroadcastsPage,
 });
@@ -734,6 +746,7 @@ const routeTree = rootRoute.addChildren([
   contactDetailRoute,
   companiesRoute,
   companyDetailRoute,
+  technologiesRoute,
   featuresRoute,
   broadcastsRoute,
   broadcastDetailRoute,

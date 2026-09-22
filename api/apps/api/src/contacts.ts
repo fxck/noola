@@ -2,6 +2,7 @@ import { withTenant } from "@repo/db";
 import type { PoolClient } from "pg";
 import type { ContactFilterCondition, ContactSortField } from "@repo/contracts";
 import { countryCentroid, jitterFromId } from "./country-centroids.js";
+import { versionStatusSql } from "./tech-status.js";
 
 // The contacts directory + back-office sync. A tenant-scoped people/company directory
 // with free-form attributes (RLS-isolated), an idempotent upsert (on the caller's stable
@@ -22,6 +23,10 @@ export interface ContactRow {
   updated_at: string;
   avatar_url: string | null;
   unsubscribed_at: string | null; // marketing opt-out (0065); null = subscribed
+  /** Who opted out (0120): 'api' | 'contact' | 'agent' | 'import'; null while subscribed (or legacy). */
+  unsubscribed_source: UnsubscribeSource | null;
+  /** Free-form labels (0123), e.g. the event a person was imported from. Sorted, deduped. */
+  tags: string[];
   /** Derived (list/get only): a human-recognizable contact (has a name or an email). False =
    *  anonymous — e.g. a widget visitor keyed only by conversation id. Not a stored column. */
   identified?: boolean;
@@ -35,7 +40,26 @@ export interface ContactRow {
   /** Derived (list/get only): the contact's company memberships (0111 junction), primary first.
    *  The primary mirrors the legacy company_id/company columns; the rest are extra accounts. */
   companies?: ContactCompany[];
+  /** Derived (list/get only, 0121): see contactAccountStatusSql. */
+  account_status?: ContactAccountStatus;
 }
+
+/** customer = synced member of a live synced company; user = synced person with no live company;
+ *  former = was synced (person or company membership) but removed in the system of record;
+ *  lead = never synced (widget visitor, CSV/conference contact, email sender). */
+export type ContactAccountStatus = "customer" | "user" | "former" | "lead";
+
+/** SQL for a contact's account_status, correlated on the unaliased `contacts` table (every filter
+ *  consumer — directory, segment preview, broadcast resolution — selects FROM contacts). Only a
+ *  SYNC-owned membership makes a customer: an agent linking a lead to a synced company by hand
+ *  doesn't. */
+export const CONTACT_ACCOUNT_STATUS_SQL = `(CASE
+  WHEN EXISTS (SELECT 1 FROM contact_companies acc JOIN companies aco ON aco.tenant_id = acc.tenant_id AND aco.id = acc.company_id
+                WHERE acc.contact_id = contacts.id AND acc.source = 'sync'
+                  AND aco.synced_at IS NOT NULL AND aco.sync_removed_at IS NULL) THEN 'customer'
+  WHEN contacts.synced_at IS NOT NULL AND contacts.sync_removed_at IS NULL THEN 'user'
+  WHEN contacts.synced_at IS NOT NULL OR EXISTS (SELECT 1 FROM contact_companies acc WHERE acc.contact_id = contacts.id AND acc.source = 'sync') THEN 'former'
+  ELSE 'lead' END)`;
 
 /** One company a contact belongs to (0111 many-to-many). `is_primary` marks the account that
  *  keeps the denormalized contacts.company_id / contacts.company columns in sync. */
@@ -43,6 +67,9 @@ export interface ContactCompany {
   id: string;
   name: string;
   is_primary: boolean;
+  role?: string;
+  /** 'sync' = owned by the account sync (replaced on every members sync); 'manual' otherwise. */
+  source?: string;
 }
 
 /** A partial patch for a contact — the fields a caller may set. Undefined = leave alone;
@@ -61,6 +88,8 @@ export interface ContactInputShape {
    *  primary); [] clears all. Left undefined = leave memberships untouched. */
   company_ids?: string[];
   attributes?: Record<string, unknown>;
+  /** Replaces the contact's tag set (updateContact). Normalized via normalizeTags. */
+  tags?: string[];
   /** Semantic fields the CSV importer maps onto real columns (Intercom parity). All optional;
    *  written by upsertOne only, and only when provided (COALESCE keeps the stored value otherwise). */
   avatar_url?: string | null;
@@ -87,7 +116,18 @@ export interface ListFilters {
 }
 
 const COLS =
-  "id, external_id, email, name, company, company_id, attributes, created_at, updated_at, avatar_url, unsubscribed_at";
+  "id, external_id, email, name, company, company_id, attributes, created_at, updated_at, avatar_url, unsubscribed_at, unsubscribed_source, tags";
+
+export type UnsubscribeSource = "api" | "contact" | "agent" | "import";
+
+/** SQL for `unsubscribed_source` in an UPDATE that opts a contact out (0120), with `param` the
+ *  placeholder holding the new source. The FIRST opt-out's source sticks — except an 'api' one,
+ *  which any later opt-out upgrades — so a person's own opt-out is never relabeled 'api' (which
+ *  would let the public API re-subscribe them without `force`). Must be evaluated in the same SET
+ *  as the unsubscribed_at write: it reads the pre-update unsubscribed_at. */
+export function optOutSourceSql(param: string): string {
+  return `CASE WHEN unsubscribed_at IS NULL OR unsubscribed_source = 'api' THEN ${param} ELSE unsubscribed_source END`;
+}
 
 // Read-side derived columns (list/get): identity status, first channel identity, presence.
 // "Identified" = human-recognizable (name or email); everything else renders as an anonymous
@@ -98,12 +138,14 @@ const DERIVED_COLS = `${COLS}, last_seen_at,
     ORDER BY ci.created_at ASC LIMIT 1) AS primary_channel,
   (last_seen_at IS NOT NULL AND last_seen_at > now() - interval '3 minutes') AS online,
   COALESCE((
-    SELECT json_agg(json_build_object('id', co.id, 'name', co.name, 'is_primary', cc.is_primary)
+    SELECT json_agg(json_build_object('id', co.id, 'name', co.name, 'is_primary', cc.is_primary,
+                                      'role', cc.role, 'source', cc.source)
              ORDER BY cc.is_primary DESC, co.name ASC)
       FROM contact_companies cc
       JOIN companies co ON co.tenant_id = cc.tenant_id AND co.id = cc.company_id
      WHERE cc.contact_id = contacts.id
-  ), '[]'::json) AS companies`;
+  ), '[]'::json) AS companies,
+  ${CONTACT_ACCOUNT_STATUS_SQL} AS account_status`;
 
 // Whitelisted sortable/filterable core columns → safe SQL identifiers. Field names can't be
 // parameterized, so ONLY these literal identifiers ever reach the query; anything else is an
@@ -123,7 +165,115 @@ const DATE_FIELDS = new Set(["created_at", "updated_at", "unsubscribed_at"]);
  *  the shared params array. Unknown fields / incomplete value-ops are skipped (the schema
  *  validates shape upstream; this is the last-line safety). Attribute keys are always bound
  *  as params — never interpolated — so free-form keys can't inject. */
-function compileCondition(cond: ContactFilterCondition, clauses: string[], params: unknown[]): void {
+/** Per-group context: `company_role is X` conditions in the same AND group, folded into every
+ *  account condition (tech / spend / project count) so they're evaluated on the SAME membership —
+ *  "owners of clients running PostgreSQL 13", not "an owner of anything who is in some client
+ *  running PostgreSQL 13". */
+interface ConditionCtx {
+  roles?: string[];
+}
+
+function rolesOf(conds: ContactFilterCondition[] | undefined): string[] {
+  return (conds ?? []).filter((c) => c.field === "company_role" && c.op === "is" && c.value).map((c) => c.value as string);
+}
+
+const VERSION_RE = /^[0-9]+(\.[0-9]+)*$/;
+
+/** A contact's LIVE account memberships: sync-owned links to synced, not-removed companies
+ *  (aliases acc_m / acc_co). `rolesParam` restricts to the group's roles. */
+function membershipFrom(rolesParam: string | null): string {
+  return `contact_companies acc_m
+      JOIN companies acc_co ON acc_co.tenant_id = acc_m.tenant_id AND acc_co.id = acc_m.company_id
+     WHERE acc_m.contact_id = contacts.id AND acc_m.source = 'sync'
+       AND acc_co.synced_at IS NOT NULL AND acc_co.sync_removed_at IS NULL
+       ${rolesParam ? `AND lower(acc_m.role) = ANY(${rolesParam}::text[])` : ""}`;
+}
+
+/** Account conditions (0121): technology usage/version, EOL usage, role, client spend, project
+ *  count — all over the contact's live memberships. Returns true when `field` was one of them. */
+function compileAccountCondition(
+  cond: ContactFilterCondition,
+  clauses: string[],
+  params: unknown[],
+  ctx: ConditionCtx,
+): boolean {
+  const { field, op } = cond;
+  const value = (cond.value ?? "").trim();
+  const isAccountField =
+    field.startsWith("tech:") || field === "tech_eol" || field === "company_role" ||
+    field === "company.avg_monthly_spend" || field === "company.project_count";
+  if (!isAccountField) return false;
+
+  const rolesParam = (): string | null => {
+    if (!ctx.roles?.length || field === "company_role") return null;
+    params.push(ctx.roles.map((r) => r.toLowerCase()));
+    return `$${params.length}`;
+  };
+  const exists = (body: string, negate = false) => clauses.push(`${negate ? "NOT " : ""}EXISTS (SELECT 1 FROM ${body})`);
+  const services = (rp: string | null) => `${membershipFrom(rp).replace(/WHERE/, `JOIN company_projects acc_p ON acc_p.tenant_id = acc_co.tenant_id AND acc_p.company_id = acc_co.id
+      JOIN project_services acc_s ON acc_s.tenant_id = acc_p.tenant_id AND acc_s.project_id = acc_p.id
+     WHERE`)}`;
+
+  if (field.startsWith("tech:")) {
+    const tech = field.slice(5).trim().toLowerCase();
+    if (!tech) return true;
+    const rp = rolesParam();
+    params.push(tech);
+    const techPred = `acc_s.technology = $${params.length}`;
+    if (op === "exists" || op === "not_exists") {
+      exists(`${services(rp)} AND ${techPred}`, op === "not_exists");
+      return true;
+    }
+    if (!VERSION_RE.test(value)) return true; // version ops need a numeric version
+    if (op === "is" || op === "is_not") {
+      params.push(value);
+      const v = `$${params.length}`;
+      // "16" matches 16 and 16.x (a major pins its minors); "8.4" matches 8.4 and 8.4.x.
+      exists(`${services(rp)} AND ${techPred} AND (acc_s.version = ${v} OR acc_s.version LIKE ${v} || '.%')`, op === "is_not");
+    } else if (op === "lt" || op === "gt") {
+      params.push(value.split(".").map(Number));
+      const v = `$${params.length}::int[]`;
+      exists(`${services(rp)} AND ${techPred} AND acc_s.version ~ '^[0-9]+(\\.[0-9]+)*$'
+                AND string_to_array(acc_s.version, '.')::int[] ${op === "lt" ? "<" : ">"} ${v}`);
+    }
+    return true;
+  }
+
+  if (field === "tech_eol") {
+    if (op !== "exists" && op !== "not_exists") return true;
+    const rp = rolesParam();
+    // Same lifecycle resolution as the Technologies overview (tech-status.ts): with the Zerops
+    // catalog, a version the schemas no longer offer counts as EOL.
+    exists(`${services(rp)} AND ${versionStatusSql("acc_s")} = 'eol'`, op === "not_exists");
+    return true;
+  }
+
+  if (field === "company_role") {
+    if (op === "exists" || op === "not_exists") {
+      exists(`${membershipFrom(null)} AND acc_m.role <> ''`, op === "not_exists");
+    } else if ((op === "is" || op === "is_not") && value) {
+      params.push(value);
+      exists(`${membershipFrom(null)} AND lower(acc_m.role) = lower($${params.length})`, op === "is_not");
+    }
+    return true;
+  }
+
+  // Numeric account fields: any live membership whose company satisfies it.
+  if (!/^-?[0-9]+(\.[0-9]+)?$/.test(value)) return true;
+  const cmp = op === "lt" ? "<" : op === "gt" ? ">" : op === "is" ? "=" : op === "is_not" ? "<>" : null;
+  if (!cmp) return true;
+  const rp = rolesParam();
+  params.push(value);
+  const v = `$${params.length}`;
+  const expr = field === "company.avg_monthly_spend"
+    ? `acc_co.avg_monthly_spend ${cmp} ${v}::numeric`
+    : `(SELECT count(*) FROM company_projects acc_pc WHERE acc_pc.company_id = acc_co.id) ${cmp} ${v}::int`;
+  exists(`${membershipFrom(rp)} AND ${expr}`);
+  return true;
+}
+
+function compileCondition(cond: ContactFilterCondition, clauses: string[], params: unknown[], ctx: ConditionCtx = {}): void {
+  if (compileAccountCondition(cond, clauses, params, ctx)) return;
   const { field, op } = cond;
   const value = cond.value;
   const needsValue =
@@ -210,6 +360,53 @@ function compileCondition(cond: ContactFilterCondition, clauses: string[], param
     return;
   }
 
+  // Company: match ANY of the contact's companies (the 0111 junction), not only the primary that the
+  // denormalized contacts.company column mirrors — a member of several accounts must be reachable by
+  // each. The free-text column still counts (a company name with no account record).
+  if (field === "company") {
+    const names = `(SELECT co.name FROM contact_companies cc JOIN companies co ON co.tenant_id = cc.tenant_id AND co.id = cc.company_id
+                     WHERE cc.contact_id = contacts.id
+                    UNION ALL SELECT contacts.company WHERE contacts.company <> '') AS m(name)`;
+    const any = (pred: string) => `EXISTS (SELECT 1 FROM ${names} WHERE ${pred})`;
+    const none = (pred: string) => `NOT EXISTS (SELECT 1 FROM ${names} WHERE ${pred})`;
+    if (op === "exists") { clauses.push(any("true")); return; }
+    if (op === "not_exists") { clauses.push(none("true")); return; }
+    const pattern =
+      op === "contains" || op === "not_contains" ? `%${likeLiteral(String(value))}%`
+      : op === "starts_with" ? `${likeLiteral(String(value))}%`
+      : op === "ends_with" ? `%${likeLiteral(String(value))}`
+      : null;
+    if (op === "is" || op === "is_not") {
+      params.push(value);
+      const pred = `m.name = $${params.length}`;
+      clauses.push(op === "is" ? any(pred) : none(pred));
+    } else if (pattern !== null) {
+      params.push(pattern);
+      const pred = `m.name ILIKE $${params.length}`;
+      clauses.push(op === "not_contains" ? none(pred) : any(pred));
+    }
+    return;
+  }
+  // Tags (0123): is / is_not = carries / lacks that exact tag (case-insensitive); contains = any tag
+  // containing the text; exists / not_exists = has any tag / none.
+  if (field === "tag") {
+    if (op === "exists") { clauses.push("cardinality(tags) > 0"); return; }
+    if (op === "not_exists") { clauses.push("cardinality(tags) = 0"); return; }
+    if (op === "is" || op === "is_not") {
+      params.push(String(value).trim());
+      clauses.push(`${op === "is_not" ? "NOT " : ""}EXISTS (SELECT 1 FROM unnest(contacts.tags) tg WHERE lower(tg) = lower($${params.length}))`);
+    } else if (op === "contains" || op === "not_contains") {
+      params.push(`%${likeLiteral(String(value))}%`);
+      clauses.push(`${op === "not_contains" ? "NOT " : ""}EXISTS (SELECT 1 FROM unnest(contacts.tags) tg WHERE tg ILIKE $${params.length})`);
+    }
+    return;
+  }
+  // Account status (0121): customer / user / former / lead — see CONTACT_ACCOUNT_STATUS_SQL.
+  if (field === "account_status") {
+    if (op === "is" || op === "is_not") valueClause(CONTACT_ACCOUNT_STATUS_SQL);
+    return;
+  }
+
   const col = CORE_COL[field];
   if (!col) return; // not a whitelisted core column
   // exists/not_exists is type-aware: timestamps can't compare against '' (Postgres would
@@ -248,8 +445,7 @@ export function buildContactWhere(filters: ListFilters = {}): { clauses: string[
     clauses.push(`(name ILIKE ${p} OR email ILIKE ${p} OR company ILIKE ${p})`);
   }
   if (filters.company && filters.company.trim()) {
-    params.push(filters.company.trim());
-    clauses.push(`company = $${params.length}`);
+    compileCondition({ field: "company", op: "is", value: filters.company.trim() }, clauses, params);
   }
   if (filters.attrKey && filters.attrKey.trim()) {
     const key = filters.attrKey.trim();
@@ -265,15 +461,19 @@ export function buildContactWhere(filters: ListFilters = {}): { clauses: string[
     }
   }
   // The filter-builder conditions (AND-combined with the simple params above).
+  const topCtx: ConditionCtx = { roles: rolesOf(filters.conditions) };
   for (const cond of filters.conditions ?? []) {
-    compileCondition(cond, clauses, params);
+    compileCondition(cond, clauses, params, topCtx);
   }
   // OR groups: compile each group into its own clause list, AND within, OR across. A group
   // whose conditions all get skipped disappears; if EVERY group vanishes, so does the OR.
   const groupSqls: string[] = [];
   for (const group of filters.conditionGroups ?? []) {
     const groupClauses: string[] = [];
-    for (const cond of group) compileCondition(cond, groupClauses, params);
+    // A group's roles fold into its own account conditions (and the top-level roles still apply,
+    // the flat conditions AND with every group).
+    const groupCtx: ConditionCtx = { roles: [...(topCtx.roles ?? []), ...rolesOf(group)] };
+    for (const cond of group) compileCondition(cond, groupClauses, params, groupCtx);
     if (groupClauses.length) groupSqls.push(`(${groupClauses.join(" AND ")})`);
   }
   if (groupSqls.length) clauses.push(`(${groupSqls.join(" OR ")})`);
@@ -283,7 +483,7 @@ export function buildContactWhere(filters: ListFilters = {}): { clauses: string[
 /** Fire an outbound webhook event, fire-and-forget. Dynamic import keeps webhooks out of
  *  the contacts module graph and matches the ingest⇄autoreply pattern; errors are
  *  swallowed so a webhook never affects the contact write that just committed. */
-function fireWebhook(tenantId: string, event: string, data: unknown): void {
+export function fireWebhook(tenantId: string, event: string, data: unknown): void {
   void import("./webhooks.js")
     .then((m) => m.fireEvent(tenantId, event, data))
     .catch(() => {});
@@ -533,6 +733,10 @@ export async function updateContact(
     params.push(JSON.stringify(input.attributes));
     sets.push(`attributes = $${params.length}::jsonb`);
   }
+  if (input.tags !== undefined) {
+    params.push(normalizeTags(input.tags));
+    sets.push(`tags = $${params.length}::text[]`);
+  }
 
   const contact = await withTenant(tenantId, async (c) => {
     const exists = await c.query(`SELECT 1 FROM contacts WHERE id = $1`, [id]);
@@ -676,6 +880,8 @@ async function upsertOne(
          company_id = COALESCE($4::uuid, company_id),
          attributes = attributes || COALESCE($5::jsonb,'{}'::jsonb),
          avatar_url = COALESCE($6::text, avatar_url),
+         unsubscribed_source = CASE WHEN $7::timestamptz IS NULL THEN unsubscribed_source
+                                    ELSE ${optOutSourceSql("'import'")} END,
          unsubscribed_at = COALESCE($7::timestamptz, unsubscribed_at),
          last_seen_at = COALESCE($8::timestamptz, last_seen_at),
          email = CASE WHEN $9::text IS NOT NULL AND NOT EXISTS
@@ -694,8 +900,9 @@ async function upsertOne(
   }
 
   const ins = await c.query(
-    `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, last_seen_at, created_at)
-     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz, $9::timestamptz, COALESCE($10::timestamptz, now()))
+    `INSERT INTO contacts (tenant_id, external_id, email, name, company, company_id, attributes, avatar_url, unsubscribed_at, unsubscribed_source, last_seen_at, created_at)
+     VALUES (current_tenant(), $1, $2, COALESCE($3,''), COALESCE($4,''), $5, COALESCE($6,'{}'::jsonb), $7, $8::timestamptz,
+             CASE WHEN $8::timestamptz IS NULL THEN NULL ELSE 'import' END, $9::timestamptz, COALESCE($10::timestamptz, now()))
      RETURNING id`,
     [ext, email, input.name ?? null, input.company ?? null, cid, attrs, avatar, unsub, seen, created],
   );
@@ -731,21 +938,28 @@ async function mergeCompany(
         await c.query(`UPDATE companies SET name = $2, updated_at = now() WHERE id = $1 AND name IS DISTINCT FROM $2`, [companyId, name]);
       }
     } else {
-      // No external_id match yet: adopt an existing name-matched company (stamp the external_id onto it
-      // if it has none) or create a fresh one. The name falls back to the id when only an id was sent.
-      const ins = await c.query(
-        `INSERT INTO companies (tenant_id, name, external_id) VALUES (current_tenant(), $1, $2)
-         ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET external_id = COALESCE(companies.external_id, EXCLUDED.external_id), updated_at = now()
-         RETURNING id`,
+      // No external_id match yet: adopt an existing name-matched company that has no external_id
+      // (stamp the id onto it) or create a fresh one. The name falls back to the id when only an id was
+      // sent. Resolved explicitly — companies_name_uq only covers id-less companies (0121).
+      const adopt = await c.query(
+        `UPDATE companies SET external_id = $2, updated_at = now()
+          WHERE id = (SELECT id FROM companies WHERE external_id IS NULL AND lower(name) = lower($1) LIMIT 1)
+          RETURNING id`,
         [name || externalId, externalId],
       );
-      companyId = ins.rows[0].id as string;
+      const row = adopt.rowCount
+        ? adopt.rows[0]
+        : (await c.query(
+            `INSERT INTO companies (tenant_id, name, external_id) VALUES (current_tenant(), $1, $2) RETURNING id`,
+            [name || externalId, externalId],
+          )).rows[0];
+      companyId = row.id as string;
     }
   } else {
     // Name-only (legacy widget/identify): resolve-or-create by name.
     const ins = await c.query(
       `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
-       ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET name = companies.name
+       ON CONFLICT (tenant_id, lower(name)) WHERE external_id IS NULL DO UPDATE SET name = companies.name
        RETURNING id`,
       [name],
     );
@@ -1037,6 +1251,14 @@ export async function mergeContacts(
   const mergedExternal = keep.external_id || drop.external_id || null;
   const mergedAttrs = { ...drop.attributes, ...keep.attributes };
   const mergedUnsub = earliestTs(keep.unsubscribed_at, drop.unsubscribed_at); // opt-out sticky
+  // Source of the merged opt-out: 'api' only if every opted-out side was an api opt-out, so a merge
+  // can't turn a person's own opt-out into one the public API may undo. Legacy null stays null.
+  const optedOutSources = [keep, drop].filter((x) => x.unsubscribed_at).map((x) => x.unsubscribed_source);
+  const mergedUnsubSource = !mergedUnsub
+    ? null
+    : optedOutSources.every((s) => s === "api")
+      ? "api"
+      : optedOutSources.find((s) => s !== "api") ?? null;
   const mergedAvatar = keep.avatar_url ?? drop.avatar_url;
   const mergedSeen = latestTs(keep.last_seen_at, drop.last_seen_at);
   return withTenant(tenantId, async (c) => {
@@ -1077,15 +1299,170 @@ export async function mergeContacts(
       `UPDATE contacts
           SET name = $2, company = $3, company_id = $4, email = $5, external_id = $6,
               attributes = $7::jsonb, unsubscribed_at = $8::timestamptz, avatar_url = $9,
-              last_seen_at = $10::timestamptz, updated_at = now()
+              last_seen_at = $10::timestamptz, unsubscribed_source = $11, updated_at = now()
         WHERE id = $1`,
       [keepId, mergedName, mergedCompany, mergedCompanyId, mergedEmail, mergedExternal,
-       JSON.stringify(mergedAttrs), mergedUnsub, mergedAvatar, mergedSeen],
+       JSON.stringify(mergedAttrs), mergedUnsub, mergedAvatar, mergedSeen, mergedUnsubSource],
     );
     // Pin the junction primary to the merged company (or clear it when neither side had one).
     if (mergedCompanyId) await ensurePrimaryCompany(c, keepId, mergedCompanyId);
     else await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [keepId]);
     const sel = await c.query(`SELECT ${DERIVED_COLS} FROM contacts WHERE id = $1`, [keepId]);
     return sel.rowCount ? (sel.rows[0] as ContactRow) : null;
+  });
+}
+
+// ── Tags (0123) ──────────────────────────────────────────────────────────────
+
+/** Trim, collapse inner whitespace, cap at 60 chars, drop empties, dedupe case-insensitively
+ *  (first spelling wins), sort. */
+export function normalizeTags(tags: unknown[]): string[] {
+  const seen = new Map<string, string>();
+  for (const t of tags) {
+    if (typeof t !== "string") continue;
+    const v = t.trim().replace(/\s+/g, " ").slice(0, 60);
+    if (v && !seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
+  }
+  return [...seen.values()].sort((a, b) => a.localeCompare(b));
+}
+
+/** SQL expression: `tags` plus/minus the given arrays, deduped case-insensitively (the spelling
+ *  already on the contact wins over an incoming variant — ordinality puts existing tags first) and
+ *  sorted. */
+const MERGED_TAGS_SQL = (addParam: string, removeParam: string) => `COALESCE((
+  SELECT array_agg(t ORDER BY t) FROM (
+    SELECT DISTINCT ON (lower(t)) t FROM unnest(tags || ${addParam}::text[]) WITH ORDINALITY AS u(t, ord)
+     WHERE lower(t) <> ALL (SELECT lower(r) FROM unnest(${removeParam}::text[]) r)
+     ORDER BY lower(t), ord
+  ) d), '{}')`;
+
+/** Add / remove tags on contacts by id (bulk action). Returns how many contacts changed. */
+export async function tagContacts(
+  tenantId: string,
+  ids: string[],
+  add: string[],
+  remove: string[] = [],
+): Promise<number> {
+  const a = normalizeTags(add);
+  const r = normalizeTags(remove);
+  if (!ids.length || (!a.length && !r.length)) return 0;
+  return withTenant(tenantId, async (c) => {
+    const res = await c.query(
+      `UPDATE contacts SET tags = ${MERGED_TAGS_SQL("$2", "$3")}, updated_at = now()
+        WHERE id = ANY($1::uuid[]) AND tags IS DISTINCT FROM ${MERGED_TAGS_SQL("$2", "$3")}`,
+      [ids, a, r],
+    );
+    return res.rowCount ?? 0;
+  });
+}
+
+/** Add tags to every contact identified by the rows (external_id, else email) — the import's
+ *  tagging pass, run after its writes so new and existing contacts alike carry the tag. */
+export async function tagContactsByIdentity(
+  tenantId: string,
+  rows: ContactInputShape[],
+  add: string[],
+): Promise<number> {
+  const a = normalizeTags(add);
+  const exts = [...new Set(rows.map((r) => r.external_id).filter((x): x is string => !!x))];
+  const emails = [...new Set(rows.map((r) => r.email?.toLowerCase()).filter((x): x is string => !!x))];
+  if (!a.length || (!exts.length && !emails.length)) return 0;
+  return withTenant(tenantId, async (c) => {
+    const res = await c.query(
+      `UPDATE contacts SET tags = ${MERGED_TAGS_SQL("$3", "'{}'")}, updated_at = now()
+        WHERE (external_id = ANY($1::text[]) OR (email <> '' AND lower(email) = ANY($2::text[])))
+          AND spam_at IS NULL`,
+      [exts, emails, a],
+    );
+    return res.rowCount ?? 0;
+  });
+}
+
+/** Indexes of the rows that match an EXISTING contact (external_id, else email) — the import uses
+ *  it to leave existing people untouched and only tag them. */
+export async function existingRowIndexes(tenantId: string, rows: ContactInputShape[]): Promise<Set<number>> {
+  const exts = rows.map((r) => r.external_id).filter((x): x is string => !!x);
+  const emails = rows.map((r) => r.email?.toLowerCase()).filter((x): x is string => !!x);
+  const out = new Set<number>();
+  if (!exts.length && !emails.length) return out;
+  const found = await withTenant(tenantId, (c) =>
+    c.query(
+      `SELECT external_id, lower(email) AS email FROM contacts
+        WHERE external_id = ANY($1::text[]) OR (email <> '' AND lower(email) = ANY($2::text[]))`,
+      [exts, emails],
+    ),
+  );
+  const extSet = new Set(found.rows.map((r) => r.external_id).filter(Boolean));
+  const emailSet = new Set(found.rows.map((r) => r.email).filter(Boolean));
+  rows.forEach((r, i) => {
+    if ((r.external_id && extSet.has(r.external_id)) || (r.email && emailSet.has(r.email.toLowerCase()))) out.add(i);
+  });
+  return out;
+}
+
+/** Every tag in use with its contact count, most used first (filter suggestions, tag pickers). */
+export async function listContactTags(tenantId: string): Promise<{ tag: string; count: number }[]> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT t AS tag, count(*)::int AS count FROM contacts, unnest(tags) t
+        WHERE spam_at IS NULL GROUP BY t ORDER BY count(*) DESC, t LIMIT 500`,
+    );
+    return r.rows as { tag: string; count: number }[];
+  });
+}
+
+/** Import rows that carry a name but no email / external id (e.g. a badge scan). They can't be
+ *  emailed and have no dedup key, so a re-import matches them by name + company among contacts that
+ *  have neither an email nor an external id — never onto an identified person. Existing matches only
+ *  gain the tags (their details stay) unless `updateExisting`; new ones are created with the tags. */
+export async function upsertContactsWithoutEmail(
+  tenantId: string,
+  rows: ContactInputShape[],
+  opts: { tags?: string[]; updateExisting?: boolean } = {},
+): Promise<{ created: number; updated: number; tagged: number; existing: number }> {
+  const tags = normalizeTags(opts.tags ?? []);
+  return withTenant(tenantId, async (c) => {
+    let created = 0;
+    let updated = 0;
+    let tagged = 0;
+    let existing = 0;
+    for (const r of rows) {
+      const name = (r.name ?? "").trim();
+      if (!name) continue;
+      const company = (r.company ?? "").trim();
+      const found = await c.query(
+        `SELECT id FROM contacts
+          WHERE (email IS NULL OR email = '') AND external_id IS NULL AND spam_at IS NULL
+            AND lower(name) = lower($1) AND lower(coalesce(company, '')) = lower($2)
+          ORDER BY created_at LIMIT 1`,
+        [name, company],
+      );
+      if (found.rowCount) {
+        const id = found.rows[0].id as string;
+        const res = await c.query(
+          `UPDATE contacts SET
+             tags = ${MERGED_TAGS_SQL("$2", "'{}'")},
+             attributes = CASE WHEN $3::boolean THEN attributes || COALESCE($4::jsonb, '{}'::jsonb) ELSE attributes END,
+             updated_at = now()
+           WHERE id = $1
+           RETURNING (cardinality($2::text[]) > 0) AS tagged`,
+          [id, tags, opts.updateExisting === true, jsonOrNull(r.attributes)],
+        );
+        existing++;
+        if (opts.updateExisting) updated++;
+        if (res.rows[0]?.tagged) tagged++;
+        continue;
+      }
+      const ins = await c.query(
+        `INSERT INTO contacts (tenant_id, name, company, company_id, attributes, tags)
+         VALUES (current_tenant(), $1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb), $5::text[])
+         RETURNING id`,
+        [name, company, r.company_id ?? null, jsonOrNull(r.attributes), tags],
+      );
+      if (r.company_id) await ensurePrimaryCompany(c, ins.rows[0].id as string, r.company_id);
+      created++;
+      if (tags.length) tagged++;
+    }
+    return { created, updated, tagged, existing };
   });
 }

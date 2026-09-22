@@ -24,6 +24,13 @@ export interface Company {
   domain: string;
   plan: string;
   attributes: Record<string, unknown>;
+  /** Average monthly spend from the account sync; null when unknown. */
+  avg_monthly_spend: number | null;
+  currency: string | null;
+  /** customer = synced from your system and live; former = removed there; other = never synced. */
+  account_status: "customer" | "former" | "other";
+  synced_at: string | null;
+  sync_removed_at: string | null;
   contactCount: number;
   health: AccountHealth;
   created_at: string;
@@ -31,7 +38,30 @@ export interface Company {
 }
 
 export interface CompanyDetail extends Company {
-  contacts: { id: string; name: string; email: string | null }[];
+  /** Every member (many-to-many), not only people whose primary company this is. */
+  contacts: { id: string; name: string; email: string | null; role: string; is_primary: boolean; source: string }[];
+  projects: CompanyProject[];
+}
+
+export interface CompanyProject {
+  id: string;
+  external_id: string;
+  name: string;
+  status: string;
+  avg_monthly_spend: number | null;
+  services: { hostname: string; raw_type: string; technology: string; version: string; os: string; mode: string }[];
+}
+
+/** Format a spend amount in the account's currency; a plain number when the currency is unknown
+ *  (e.g. a sum across accounts). */
+export function formatSpend(amount: number | null, currency: string | null): string {
+  if (amount == null) return "—";
+  if (!currency) return amount.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency, maximumFractionDigits: 0 }).format(amount);
+  } catch {
+    return amount.toLocaleString();
+  }
 }
 
 export interface CompanyInput {

@@ -78,6 +78,7 @@ import { type EmailTemplate, fetchEmailTemplates } from "@/lib/email-templates";
 import { type Segment as SavedSegment, fetchSegments } from "@/lib/segments";
 import { SUBSCRIPTION_OP_LABEL, fetchContacts } from "@/lib/contacts";
 import { FilterBuilder, type BuilderFieldDef } from "@/components/data-table/filter-builder";
+import { useAccountFilterFields, useTagFilterField } from "@/components/data-table/account-filter-fields";
 import {
   type FilterCondition,
   type FilterOp,
@@ -308,6 +309,17 @@ const CORE_FIELD_LABEL: Record<string, string> = {
   created_at: "Created",
   updated_at: "Last activity",
   unsubscribed_at: "Subscription",
+  account_status: "Account",
+  company_role: "Role at client",
+  "company.avg_monthly_spend": "Client spend / month",
+  "company.project_count": "Client projects",
+  tech_eol: "EOL technology",
+  tag: "Tag",
+};
+
+// Technology conditions (tech:<key>) read as the technology + a version phrase.
+const TECH_CLAUSE_OP: Record<string, string> = {
+  exists: "is used", not_exists: "is not used", lt: "version below", gt: "version above", is: "version is", is_not: "version is not",
 };
 
 // One condition as a labeled clause. Attribute fields read by their key, event
@@ -318,6 +330,13 @@ function conditionClause(c: SegmentCondition): { label: string; value: string } 
     const opText = EVENT_OP_LABEL[c.op] ?? c.op;
     const val = c.value?.trim() ? ` “${c.value.trim()}”` : "";
     return { label: "Event", value: `${c.field.slice(6)} · ${opText}${val}` };
+  }
+  if (c.field.startsWith("tech:")) {
+    const opText = TECH_CLAUSE_OP[c.op] ?? c.op;
+    return { label: c.field.slice(5), value: c.value?.trim() ? `${opText} ${c.value.trim()}` : opText };
+  }
+  if (c.field === "tech_eol") {
+    return { label: "EOL technology", value: c.op === "exists" ? "is in use" : "is not in use" };
   }
   const label = c.field.startsWith("attr:") ? c.field.slice(5) : CORE_FIELD_LABEL[c.field] ?? c.field;
   const opText =
@@ -594,7 +613,7 @@ export function BroadcastsPage() {
   const navigate = useNavigate();
   // ?edit=<id> — the detail page's Edit click-through lands here and opens the
   // composer seeded from that draft once the list has loaded.
-  const { edit: editParam } = listRouteApi.useSearch();
+  const { edit: editParam, audience: audienceParam } = listRouteApi.useSearch();
 
   const [broadcasts, setBroadcasts] = useState<Broadcast[] | null>(null);
   const [state, setState] = useState<LoadState>("ok");
@@ -644,8 +663,27 @@ export function BroadcastsPage() {
 
   function openCompose() {
     setEditing(null);
+    setSeedSegment(undefined);
     setComposing(true);
   }
+
+  // ?audience=<json conditions> — another view (Technologies) hands over a ready audience: open a
+  // NEW composer seeded with it, then drop the param so a refresh doesn't re-open it.
+  const [seedSegment, setSeedSegment] = useState<Segment | undefined>(undefined);
+  useEffect(() => {
+    if (!audienceParam) return;
+    try {
+      const conditions = JSON.parse(audienceParam) as SegmentCondition[];
+      if (Array.isArray(conditions)) {
+        setEditing(null);
+        setSeedSegment({ conditions });
+        setComposing(true);
+      }
+    } catch {
+      /* malformed ?audience= — ignore */
+    }
+    void navigate({ to: "/broadcasts", search: {}, replace: true });
+  }, [audienceParam, navigate]);
 
   function openEdit(b: Broadcast) {
     setEditing(b);
@@ -738,6 +776,7 @@ export function BroadcastsPage() {
           <ComposeBroadcast
             key={editing?.id ?? "new"}
             draft={editing}
+            seedSegment={seedSegment}
             onCancel={() => {
               setComposing(false);
               setEditing(null);
@@ -869,9 +908,12 @@ function ComposeBroadcast({
   onCancel,
   onSaved,
   onError,
+  seedSegment,
 }: {
   /** The draft being re-edited; null composes a NEW broadcast. */
   draft: Broadcast | null;
+  /** A NEW broadcast's starting audience (e.g. handed over from the Technologies view). */
+  seedSegment?: Segment;
   onCancel: () => void;
   /** Fires after create (updated=false) or a successful PATCH (updated=true). */
   onSaved: (b: Broadcast, updated: boolean) => void;
@@ -936,10 +978,10 @@ function ComposeBroadcast({
   useEffect(() => {
     fetchEmailTemplates().then(setTemplates).catch(() => setTemplates([]));
   }, []);
-  const [q, setQ] = useState(draft?.segment?.q ?? "");
+  const [q, setQ] = useState(draft?.segment?.q ?? seedSegment?.q ?? "");
   // Audience filters as OR groups: rows OR together, conditions within a row AND
   // together. One (possibly empty) group = the classic flat filter.
-  const [groups, setGroups] = useState<FilterCondition[][]>(() => seedGroups(draft?.segment));
+  const [groups, setGroups] = useState<FilterCondition[][]>(() => seedGroups(draft?.segment ?? seedSegment));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1004,6 +1046,8 @@ function ComposeBroadcast({
 
   // The same field catalog the contacts directory filters on (contacts-list.tsx),
   // so a segment composed here matches what Customers would show.
+  const accountFields = useAccountFilterFields();
+  const tagField = useTagFilterField();
   const filterFields = useMemo<BuilderFieldDef[]>(
     () => [
       { key: "name", label: "Name", type: "text", icon: User },
@@ -1033,8 +1077,10 @@ function ComposeBroadcast({
         opLabels: SUBSCRIPTION_OP_LABEL,
         icon: MailX,
       },
+      tagField,
+      ...accountFields,
     ],
-    [attrKeys],
+    [attrKeys, accountFields, tagField],
   );
 
   // Channel catalog (GET /channels) — gates the picker: a channel without its

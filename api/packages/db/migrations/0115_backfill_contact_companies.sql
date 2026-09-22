@@ -16,7 +16,8 @@ INSERT INTO companies (tenant_id, name)
 SELECT DISTINCT c.tenant_id, c.company
   FROM contacts c
  WHERE c.company IS NOT NULL AND c.company <> ''
-ON CONFLICT (tenant_id, lower(name)) DO NOTHING;
+-- Untargeted: companies_name_uq is partial since 0121 (id-less companies only), and this file re-runs.
+ON CONFLICT DO NOTHING;
 
 -- 2. Add a primary membership for each contact that has a scalar company but no junction row yet.
 --    (is_primary = true is safe: the NOT EXISTS guarantees the contact has no membership, so the

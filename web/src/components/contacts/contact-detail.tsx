@@ -37,6 +37,7 @@ import {
   fetchContactIdentities,
   mergeContact,
   setContactSubscription,
+  updateContact,
   exportContactData,
   isContactsUnavailable,
 } from "@/lib/contacts";
@@ -58,6 +59,7 @@ import { contactDisplayName, systemAttributeGroup, isTechnicalAttribute, SYSTEM_
 import { contactIntel, type ContactIntel, type Tone } from "@/lib/contact-intel";
 import { ErrorState } from "@/components/ui/error-state";
 import { MessageContactDialog } from "@/components/contacts/message-contact-dialog";
+import { TagEditor } from "@/components/contacts/contact-tags";
 
 const abs = (s: string) => {
   const d = new Date(s);
@@ -215,6 +217,19 @@ export function ContactDetail({
       toast.error("Couldn't update the subscription. Please try again.");
     } finally {
       setTogglingSubscription(false);
+    }
+  }
+
+  // Tags (0123): optimistic — the chip moves at once; a failed save rolls it back.
+  async function saveTags(tags: string[]) {
+    if (!contact) return;
+    const before = contact;
+    setContact({ ...contact, tags });
+    try {
+      setContact(await updateContact(contactId, { tags }));
+    } catch {
+      setContact(before);
+      toast.error("Couldn't save the tags. Please try again.");
     }
   }
 
@@ -407,6 +422,7 @@ export function ContactDetail({
                 history={history}
                 identities={identities}
                 intel={intel}
+                onTagsChange={(t) => void saveTags(t)}
               />
             </div>
           </div>
@@ -420,6 +436,7 @@ export function ContactDetail({
             history={history}
             identities={identities}
             intel={intel}
+            onTagsChange={(t) => void saveTags(t)}
           />
         </aside>
       </div>
@@ -505,12 +522,14 @@ function ContactFacts({
   history,
   identities,
   intel,
+  onTagsChange,
 }: {
   contact: Contact;
   companyId: string | null;
   history: ContactHistory | null;
   identities: ContactIdentity[];
   intel: ContactIntel;
+  onTagsChange: (tags: string[]) => void;
 }) {
   const attrEntries = Object.entries(c.attributes ?? {});
   const planEntry = attrEntries.find(([k]) => k.toLowerCase() === "plan");
@@ -610,6 +629,9 @@ function ContactFacts({
               </span>
             </FactRow>
           )}
+          <FactRow label="Tags">
+            <TagEditor tags={c.tags ?? []} onChange={onTagsChange} />
+          </FactRow>
           {/* subscribed is the default state — it stays quiet; only the opt-out
               carries weight (agents check this before broadcasting) */}
           <FactRow label="Marketing">

@@ -23,6 +23,8 @@ export interface Contact {
   avatar_url: string | null;
   /** Marketing opt-out timestamp — null means subscribed (the default). */
   unsubscribed_at: string | null;
+  /** Free-form labels, e.g. the event a person was imported from. Sorted. */
+  tags?: string[];
   created_at: string;
   updated_at: string;
   /** Derived: has a name or email (false = anonymous visitor, e.g. a widget conversation). */
@@ -33,7 +35,19 @@ export interface Contact {
   last_seen_at?: string | null;
   /** Derived: last_seen_at within the online window — "active now". */
   online?: boolean;
+  /** Derived (account sync): customer = synced member of a live synced company; user = synced
+   *  person without one; former = removed in the system of record; lead = never synced. */
+  account_status?: AccountStatus;
 }
+
+export type AccountStatus = "customer" | "user" | "former" | "lead";
+
+export const ACCOUNT_STATUS_LABEL: Record<AccountStatus, string> = {
+  customer: "Customer",
+  user: "User (no client)",
+  former: "Former customer",
+  lead: "Lead",
+};
 
 /** One filter-builder condition sent to the API. `field` is a core column key,
  *  "attr:<key>", or "event:<name>" (contact_events timeline — ops limited to
@@ -74,6 +88,10 @@ export interface ContactCompany {
   id: string;
   name: string;
   is_primary: boolean;
+  /** Role label on the membership (e.g. "owner"), set by the account sync. */
+  role?: string;
+  /** "sync" = owned by the account sync (replaced on each sync); "manual" = linked by hand. */
+  source?: string;
 }
 
 /** Create/update payload. All optional — the server fills gaps and owns the id. */
@@ -86,6 +104,8 @@ export interface ContactInput {
   company_ids?: string[];
   external_id?: string | null;
   attributes?: Record<string, string>;
+  /** Replaces the contact's tag set. */
+  tags?: string[];
 }
 
 /** Filter-chip phrasing for the unsubscribed_at field — the generic date op labels
@@ -261,13 +281,49 @@ export async function bulkImportContacts(
 
 /** CSV import (0092): the api parses the header row and maps email/name/external_id/company +
  *  free-form attribute columns onto the same idempotent upsert. Returns per-outcome counts. */
+export interface CsvImportResult {
+  created: number;
+  updated: number;
+  skipped: number;
+  linked?: number;
+  /** The tag applied (null when none). */
+  tag?: string | null;
+  /** Contacts that now carry the tag (new + existing). */
+  tagged?: number;
+  /** Existing contacts left untouched except for gaining the tag. */
+  tagged_existing?: number;
+  /** Rows imported with a name but no email (can't be emailed; matched by name + company). */
+  without_email?: number;
+  /** Rows that couldn't be imported, with their spreadsheet row number (header = row 1). */
+  issues?: { row: number; reason: string }[];
+}
+
+/** CSV import. With `tag`, every row's contact gets it; contacts that already exist are left as they
+ *  are and only gain the tag, unless `updateExisting` is set. */
 export async function importContactsCsv(
   csv: string,
-): Promise<{ created: number; updated: number; skipped: number; linked?: number }> {
-  return api<{ created: number; updated: number; skipped: number; linked?: number }>("/contacts/import", {
+  opts: { tag?: string; updateExisting?: boolean } = {},
+): Promise<CsvImportResult> {
+  return api<CsvImportResult>("/contacts/import", {
     method: "POST",
-    body: JSON.stringify({ csv }),
+    body: JSON.stringify({ csv, ...(opts.tag?.trim() ? { tag: opts.tag.trim(), updateExisting: !!opts.updateExisting } : {}) }),
   });
+}
+
+/** Every tag in use with its contact count, most used first. Several widgets on one screen ask for it
+ *  at once (filter field, tag pickers), so concurrent calls share one request for a few seconds. */
+let tagsInFlight: { at: number; p: Promise<{ tag: string; count: number }[]> } | null = null;
+export async function fetchContactTags(): Promise<{ tag: string; count: number }[]> {
+  if (tagsInFlight && Date.now() - tagsInFlight.at < 5_000) return tagsInFlight.p;
+  const p = api<{ tags: { tag: string; count: number }[] }>("/contacts/tags").then((r) => r.tags);
+  tagsInFlight = { at: Date.now(), p };
+  p.catch(() => { tagsInFlight = null; });
+  return p;
+}
+
+/** Add and/or remove tags on the given contacts. Returns how many contacts changed. */
+export async function bulkTagContacts(ids: string[], add: string[], remove: string[] = []): Promise<number> {
+  return (await api<{ changed: number }>("/contacts/tags", { method: "POST", body: JSON.stringify({ ids, add, remove }) })).changed;
 }
 
 /** Download everything we hold about a contact as a JSON bundle (GDPR export, 0092). */

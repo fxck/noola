@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Plus, Upload, X, Loader2, ChevronLeft, Star, Building2 } from "lucide-react";
+import { Plus, Upload, X, Loader2, ChevronLeft, Star, Building2, Tag } from "lucide-react";
+import { useTagSuggestions } from "@/components/contacts/contact-tags";
 import {
   type Contact,
   type ContactInput,
@@ -9,6 +10,7 @@ import {
   bulkImportContacts,
   importContactsCsv,
   isContactsUnavailable,
+  type CsvImportResult,
 } from "@/lib/contacts";
 import { fetchCompanies, ensureCompanies } from "@/lib/companies";
 import { Button } from "@/components/ui/button";
@@ -395,13 +397,21 @@ export function BulkImportDialog({
   onError,
 }: {
   onClose: () => void;
-  onDone: (res: { created: number; updated: number; skipped?: number; linked?: number }) => void;
+  onDone: (res: CsvImportResult) => void;
   onError: (msg: string) => void;
 }) {
   // Two source formats (0092): a CSV file/paste (the everyday path — export from a spreadsheet)
   // or a raw JSON array (the sync-shaped path). CSV is the default.
   const [format, setFormat] = useState<"csv" | "json">("csv");
   const [text, setText] = useState("");
+  // Tag every imported contact (e.g. the event the list came from). Existing contacts then only
+  // gain the tag — their details stay — unless the agent opts into updating them too.
+  const [tag, setTag] = useState("");
+  const [updateExisting, setUpdateExisting] = useState(false);
+  const tagSuggestions = useTagSuggestions();
+  // A CSV import that skipped rows (or took name-only ones) stays open on a summary, so the agent
+  // sees exactly which rows didn't make it and why instead of a bare "N skipped".
+  const [result, setResult] = useState<CsvImportResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
 
@@ -446,13 +456,14 @@ export function BulkImportDialog({
     try {
       if (format === "csv") {
         if (!text.trim()) { setParseError("Paste some CSV or choose a file first."); setBusy(false); return; }
-        const res = await importContactsCsv(text);
-        onDone(res);
+        const res = await importContactsCsv(text, { tag, updateExisting });
+        if ((res.issues?.length ?? 0) > 0 || (res.without_email ?? 0) > 0) setResult(res);
+        else onDone(res);
       } else {
         const rows = parseRows();
         if (!rows) { setBusy(false); return; }
         const res = await bulkImportContacts(rows);
-        onDone(res);
+        onDone({ ...res, skipped: 0 });
       }
     } catch (e) {
       if (isContactsUnavailable(e)) onError("Import isn't available on this server yet.");
@@ -500,6 +511,10 @@ export function BulkImportDialog({
             <X className="size-4" />
           </Button>
         </div>
+        {result ? (
+          <ImportSummary result={result} onDone={() => onDone(result)} />
+        ) : (
+        <>
         <div className="space-y-2 p-5">
           {/* Format toggle */}
           <div className="inline-flex rounded-lg border bg-muted/40 p-0.5 text-xs">
@@ -553,6 +568,39 @@ export function BulkImportDialog({
             spellCheck={false}
             autoFocus
           />
+          {format === "csv" && (
+            <div className="space-y-1.5 rounded-lg border bg-muted/20 p-3">
+              <label htmlFor="import-tag" className="flex items-center gap-1.5 text-xs font-medium">
+                <Tag className="size-3.5" /> Tag these contacts <span className="font-normal text-muted-foreground">(optional)</span>
+              </label>
+              <Input
+                id="import-tag"
+                list="import-tag-suggestions"
+                value={tag}
+                maxLength={60}
+                onChange={(e) => setTag(e.target.value)}
+                placeholder="e.g. DevConf 2026"
+                className="h-8 text-xs"
+              />
+              <datalist id="import-tag-suggestions">
+                {tagSuggestions.map((t) => <option key={t.tag} value={t.tag} />)}
+              </datalist>
+              {tag.trim() && (
+                <label className="flex cursor-pointer items-start gap-2 pt-0.5 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={updateExisting}
+                    onChange={(e) => setUpdateExisting(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    Also update details of contacts that already exist.{" "}
+                    {!updateExisting && <>Off: existing contacts keep their name, company and other details — they only get the tag.</>}
+                  </span>
+                </label>
+              )}
+            </div>
+          )}
           {parseError ? (
             <p className="text-xs text-destructive">{parseError}</p>
           ) : (
@@ -577,7 +625,56 @@ export function BulkImportDialog({
             )}
           </Button>
         </div>
+        </>
+        )}
       </div>
     </div>
+  );
+}
+
+// What a CSV import did, when there's something worth reading: imported / tagged counts, the
+// name-only leads (no email), and every row that was left out with its row number and reason.
+function ImportSummary({ result, onDone }: { result: CsvImportResult; onDone: () => void }) {
+  const issues = result.issues ?? [];
+  return (
+    <>
+      <div className="space-y-3 p-5 text-sm">
+        <p>
+          <span className="font-medium">{result.created}</span> created, <span className="font-medium">{result.updated}</span> updated
+          {result.tag ? (
+            <>
+              , <span className="font-medium">{result.tagged ?? 0}</span> tagged “{result.tag}”
+              {result.tagged_existing ? ` (${result.tagged_existing} already existed — only the tag was added)` : ""}
+            </>
+          ) : null}
+          .
+        </p>
+        {(result.without_email ?? 0) > 0 && (
+          <p className="text-muted-foreground">
+            {result.without_email} {result.without_email === 1 ? "row has" : "rows have"} a name but no email — imported as leads
+            that can't be emailed. Re-importing the same list won't duplicate them (matched by name + company); if you later get
+            their email, merge the two contacts on the contact page.
+          </p>
+        )}
+        {issues.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="font-medium text-destructive">
+              {result.skipped} {result.skipped === 1 ? "row was" : "rows were"} not imported — fix {result.skipped === 1 ? "it" : "them"} and import again:
+            </p>
+            <ul className="max-h-48 overflow-y-auto rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs">
+              {issues.map((i) => (
+                <li key={i.row}>
+                  row {i.row}: {i.reason}
+                </li>
+              ))}
+              {result.skipped > issues.length && <li className="text-muted-foreground">…and {result.skipped - issues.length} more</li>}
+            </ul>
+          </div>
+        )}
+      </div>
+      <div className="flex items-center justify-end border-t px-5 py-3.5">
+        <Button onClick={onDone}>Done</Button>
+      </div>
+    </>
   );
 }

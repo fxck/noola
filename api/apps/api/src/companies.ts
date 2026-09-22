@@ -14,8 +14,25 @@ export interface Company {
   domain: string;
   plan: string;
   attributes: Record<string, unknown>;
+  /** Average monthly spend, as sent by the account sync (0121). Null when unknown. */
+  avg_monthly_spend: number | null;
+  currency: string | null;
+  /** Account-sync provenance (0121): last written by the sync API / removed in the system of record. */
+  synced_at: string | null;
+  sync_removed_at: string | null;
+  /** Derived: 'customer' = synced and live, 'former' = removed in the system of record, 'other' =
+   *  never synced (created by hand, CSV, or a lead's free-text company). */
+  account_status: AccountStatus;
   created_at: string;
   updated_at: string;
+}
+
+export type AccountStatus = "customer" | "former" | "other";
+
+/** SQL for a company's account_status over a `companies` row aliased `alias`. */
+export function companyAccountStatusSql(alias: string): string {
+  return `CASE WHEN ${alias}.synced_at IS NULL THEN 'other'
+               WHEN ${alias}.sync_removed_at IS NOT NULL THEN 'former' ELSE 'customer' END`;
 }
 
 export type HealthBand = "healthy" | "at_risk" | "critical";
@@ -35,7 +52,7 @@ export interface CompanyRow extends Company {
   health: AccountHealth;
 }
 
-const COLS = "id, name, external_id, domain, plan, attributes, created_at, updated_at";
+const COLS = "id, name, external_id, domain, plan, attributes, avg_monthly_spend, currency, synced_at, sync_removed_at, created_at, updated_at";
 
 /**
  * Deterministic, explainable account health. Starts at 100 and deducts for the signals that predict
@@ -67,13 +84,13 @@ export function computeHealth(a: {
 }
 
 // The rolled-up per-company ticket/CSAT aggregates, keyed by company_id, in one round-trip. Reused by
-// the list (all companies) and the detail (one company, via the optional filter).
+// the list (all companies) and the detail (one company, via the optional filter). A contact's tickets
+// count toward EVERY company it belongs to (the contact_companies junction, 0111), not just its primary.
 const ROLLUP_CTE = `
   WITH matched AS (
-    SELECT c.company_id, t.id AS ticket_id, t.status, t.sentiment, t.updated_at
-      FROM contacts c
-      JOIN tickets t ON t.tenant_id = c.tenant_id AND t.contact_id = c.id
-     WHERE c.company_id IS NOT NULL
+    SELECT cc.company_id, t.id AS ticket_id, t.status, t.sentiment, t.updated_at
+      FROM contact_companies cc
+      JOIN tickets t ON t.tenant_id = cc.tenant_id AND t.contact_id = cc.contact_id
   ),
   ticket_stats AS (
     SELECT company_id,
@@ -99,6 +116,8 @@ function rowToHealth(r: Record<string, unknown>): AccountHealth {
   });
 }
 
+const isoOrNull = (v: unknown): string | null => (v == null ? null : v instanceof Date ? v.toISOString() : String(v));
+
 const mapCompany = (r: Record<string, unknown>): Company => ({
   id: r.id as string,
   name: r.name as string,
@@ -106,6 +125,11 @@ const mapCompany = (r: Record<string, unknown>): Company => ({
   domain: (r.domain as string) ?? "",
   plan: (r.plan as string) ?? "",
   attributes: (r.attributes as Record<string, unknown>) ?? {},
+  avg_monthly_spend: r.avg_monthly_spend == null ? null : Number(r.avg_monthly_spend),
+  currency: (r.currency as string | null) ?? null,
+  synced_at: isoOrNull(r.synced_at),
+  sync_removed_at: isoOrNull(r.sync_removed_at),
+  account_status: !r.synced_at ? "other" : r.sync_removed_at ? "former" : "customer",
   created_at: r.created_at instanceof Date ? (r.created_at as Date).toISOString() : String(r.created_at),
   updated_at: r.updated_at instanceof Date ? (r.updated_at as Date).toISOString() : String(r.updated_at),
 });
@@ -141,6 +165,7 @@ const COMPANY_SORT_SQL: Record<string, string> = {
   name: "name",
   health: "health_score",
   contacts: "contact_count",
+  spend: "avg_monthly_spend",
   created: "created_at",
   lastActivity: "last_activity",
 };
@@ -166,6 +191,7 @@ function compileCompanyCondition(cond: CompanyFilterCondition, clauses: string[]
   if (field === "name") colExpr = "name";
   else if (field === "domain") colExpr = "domain";
   else if (field === "plan") colExpr = "plan";
+  else if (field === "account_status") colExpr = `(${companyAccountStatusSql("base")})`;
   else if (isAttr) {
     const key = field.slice(5).trim();
     if (!key) return;
@@ -230,7 +256,7 @@ function companyBaseCte(q?: string): { cte: string; params: unknown[] } {
   const cte = `${ROLLUP_CTE}
     , base AS (
       SELECT co.${COLS.split(", ").join(", co.")},
-             (SELECT count(*)::int FROM contacts x WHERE x.company_id = co.id) AS contact_count,
+             (SELECT count(*)::int FROM contact_companies x WHERE x.company_id = co.id) AS contact_count,
              ts.open_tickets, ts.neg_open, ts.total_tickets, ts.last_activity, cs.avg_csat,
              ${HEALTH_SCORE_SQL} AS health_score
         FROM companies co
@@ -278,7 +304,18 @@ export async function countCompanies(tenantId: string, opts: CompanyListOpts = {
 }
 
 export interface CompanyDetail extends CompanyRow {
-  contacts: { id: string; name: string; email: string | null }[];
+  /** Every member (contact_companies), not just contacts whose primary company this is. */
+  contacts: { id: string; name: string; email: string | null; role: string; is_primary: boolean; source: string }[];
+  projects: CompanyProject[];
+}
+
+export interface CompanyProject {
+  id: string;
+  external_id: string;
+  name: string;
+  status: string;
+  avg_monthly_spend: number | null;
+  services: { hostname: string; raw_type: string; technology: string; version: string; os: string; mode: string }[];
 }
 
 /** One company: its record, health, and its contacts. Null if not in this tenant. */
@@ -287,7 +324,7 @@ export async function getCompany(tenantId: string, id: string): Promise<CompanyD
     const cr = await c.query(
       `${ROLLUP_CTE}
        SELECT co.${COLS.split(", ").join(", co.")},
-              (SELECT count(*)::int FROM contacts x WHERE x.company_id = co.id) AS contact_count,
+              (SELECT count(*)::int FROM contact_companies x WHERE x.company_id = co.id) AS contact_count,
               ts.open_tickets, ts.neg_open, ts.total_tickets, ts.last_activity, cs.avg_csat
          FROM companies co
          LEFT JOIN ticket_stats ts ON ts.company_id = co.id
@@ -298,14 +335,33 @@ export async function getCompany(tenantId: string, id: string): Promise<CompanyD
     if (!cr.rowCount) return null;
     const row = cr.rows[0] as Record<string, unknown>;
     const contactsR = await c.query(
-      "SELECT id, name, email FROM contacts WHERE company_id = $1 ORDER BY name LIMIT 200",
+      `SELECT ct.id, ct.name, ct.email, cc.role, cc.is_primary, cc.source
+         FROM contact_companies cc JOIN contacts ct ON ct.tenant_id = cc.tenant_id AND ct.id = cc.contact_id
+        WHERE cc.company_id = $1 ORDER BY ct.name LIMIT 500`,
+      [id],
+    );
+    const projectsR = await c.query(
+      `SELECT p.id, p.external_id, p.name, p.status, p.avg_monthly_spend,
+              COALESCE((SELECT json_agg(json_build_object('hostname', s.hostname, 'raw_type', s.raw_type,
+                          'technology', s.technology, 'version', s.version, 'os', s.os, 'mode', s.mode)
+                          ORDER BY s.technology, s.hostname)
+                          FROM project_services s WHERE s.project_id = p.id), '[]'::json) AS services
+         FROM company_projects p WHERE p.company_id = $1 ORDER BY p.name`,
       [id],
     );
     return {
       ...mapCompany(row),
       contactCount: Number(row.contact_count ?? 0),
       health: rowToHealth(row),
-      contacts: contactsR.rows.map((x) => ({ id: x.id as string, name: x.name as string, email: (x.email as string) ?? null })),
+      contacts: contactsR.rows.map((x) => ({
+        id: x.id as string, name: x.name as string, email: (x.email as string) ?? null,
+        role: (x.role as string) ?? "", is_primary: !!x.is_primary, source: (x.source as string) ?? "manual",
+      })),
+      projects: projectsR.rows.map((p) => ({
+        id: p.id as string, external_id: p.external_id as string, name: p.name as string, status: p.status as string,
+        avg_monthly_spend: p.avg_monthly_spend == null ? null : Number(p.avg_monthly_spend),
+        services: p.services as CompanyProject["services"],
+      })),
     };
   });
 }
@@ -368,10 +424,12 @@ export interface CompanyImportRow {
 }
 
 /**
- * Bulk import companies (CSV). Idempotent per row, keyed on lower(name) via the companies_name_uq
- * index (migration 0055) — a re-import updates in place, never duplicates. Provided scalar fields
- * overwrite (unless blank, which keeps the stored value) and attributes shallow-merge. One
- * tenant-scoped transaction. Returns how many rows were inserted vs updated.
+ * Bulk import companies (CSV). Idempotent per row: matched by external_id when the row carries one,
+ * else by lower(name) among companies WITHOUT an external_id (companies_name_uq is partial since
+ * 0121 — synced accounts may share a name). A name match with no external_id yet gets the row's id
+ * stamped on. Provided scalar fields overwrite (unless blank, which keeps the stored value) and
+ * attributes shallow-merge. One tenant-scoped transaction. Returns how many rows were inserted vs
+ * updated.
  */
 export async function bulkUpsertCompanies(
   tenantId: string,
@@ -383,22 +441,37 @@ export async function bulkUpsertCompanies(
     for (const r of rows) {
       const name = (r.name ?? "").trim();
       if (!name) continue;
-      const res = await c.query(
-        `INSERT INTO companies (tenant_id, name, external_id, domain, plan, attributes, created_at)
-         VALUES (current_tenant(), $1, NULLIF($6,''), COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb), COALESCE($5::timestamptz, now()))
-         ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET
-           -- Keep an already-stored external_id (don't clobber); only fill it when currently empty.
-           external_id = COALESCE(companies.external_id, NULLIF($6,'')),
-           domain = CASE WHEN COALESCE($2,'') = '' THEN companies.domain ELSE EXCLUDED.domain END,
-           plan = CASE WHEN COALESCE($3,'') = '' THEN companies.plan ELSE EXCLUDED.plan END,
-           attributes = companies.attributes || COALESCE($4::jsonb,'{}'::jsonb),
-           created_at = COALESCE($5::timestamptz, companies.created_at),
-           updated_at = now()
-         RETURNING (xmax = 0) AS created`,
-        [name, r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null, r.created_at ?? null, r.external_id ?? ""],
-      );
-      if (res.rows[0].created) created++;
-      else updated++;
+      const ext = (r.external_id ?? "").trim() || null;
+      const fields = [r.domain ?? null, r.plan ?? null, r.attributes ? JSON.stringify(r.attributes) : null, r.created_at ?? null, ext];
+      let id: string | null = null;
+      if (ext) id = ((await c.query(`SELECT id FROM companies WHERE external_id = $1`, [ext])).rows[0]?.id as string) ?? null;
+      if (!id) {
+        id = ((await c.query(
+          `SELECT id FROM companies WHERE external_id IS NULL AND lower(name) = lower($1) LIMIT 1`, [name],
+        )).rows[0]?.id as string) ?? null;
+      }
+      if (id) {
+        await c.query(
+          `UPDATE companies SET
+             -- Keep an already-stored external_id (don't clobber); only fill it when currently empty.
+             external_id = COALESCE(external_id, $5),
+             domain = CASE WHEN COALESCE($1,'') = '' THEN domain ELSE $1 END,
+             plan = CASE WHEN COALESCE($2,'') = '' THEN plan ELSE $2 END,
+             attributes = attributes || COALESCE($3::jsonb,'{}'::jsonb),
+             created_at = COALESCE($4::timestamptz, created_at),
+             updated_at = now()
+           WHERE id = $6`,
+          [...fields, id],
+        );
+        updated++;
+      } else {
+        await c.query(
+          `INSERT INTO companies (tenant_id, name, external_id, domain, plan, attributes, created_at)
+           VALUES (current_tenant(), $1, $6, COALESCE($2,''), COALESCE($3,''), COALESCE($4::jsonb,'{}'::jsonb), COALESCE($5::timestamptz, now()))`,
+          [name, ...fields],
+        );
+        created++;
+      }
     }
     return { created, updated };
   });
@@ -421,7 +494,7 @@ export async function ensureCompaniesByName(
       // DO UPDATE (no-op) instead of DO NOTHING so RETURNING yields the row on conflict too.
       const r = await c.query(
         `INSERT INTO companies (tenant_id, name) VALUES (current_tenant(), $1)
-         ON CONFLICT (tenant_id, lower(name)) DO UPDATE SET name = companies.name
+         ON CONFLICT (tenant_id, lower(name)) WHERE external_id IS NULL DO UPDATE SET name = companies.name
          RETURNING id`,
         [name],
       );
