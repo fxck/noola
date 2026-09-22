@@ -986,6 +986,10 @@ export function resolveStoredWidgetConfig(stored: unknown): WidgetConfig {
 export const PublicIdentifyInput = z.object({
   key: z.string().min(1).max(200),
   conversationId: z.string().min(1).max(200).optional(),
+  // Every conversation handle the widget holds locally. A visitor who chatted before identifying has
+  // one anonymous contact per handle; identify folds them into the now-identified contact (the
+  // lead -> user conversion). Sent on every identify — already-folded handles are a no-op.
+  conversationIds: z.array(z.string().trim().min(1).max(200)).max(20).optional(),
   email: z.string().trim().email().max(320).optional(),
   name: z.string().trim().min(1).max(200).optional(),
   userId: z.string().trim().min(1).max(200).optional(),

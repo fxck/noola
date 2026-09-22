@@ -8,7 +8,8 @@
 //   POST /public/conversation — poll agent replies once escalated (two-way live chat)
 //   GET  /public/kb[/search]  — help center articles + search
 //   GET  /public/kb/:slug     — a single article
-//   POST /public/identify     — Noola('boot'|'update') → upsert the contact + last-seen
+//   POST /public/identify     — Noola('boot'|'update') → upsert the contact + last-seen, and fold
+//                               the anonymous contacts behind this browser's conversations into it
 //   POST /public/track        — Noola('track', name, meta) → a custom activity event
 // The SDK command queue is global as window.Noola(...). The plain <script data-noola-key> embed
 // (no boot call) still works exactly as before — an anonymous visitor.
@@ -1690,15 +1691,26 @@ export const WIDGET_JS = String.raw`(function () {
     var tz; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
     return { timezone: tz || undefined, referrer: document.referrer || undefined, language: (navigator && navigator.language) || undefined };
   }
+  // The conversation handles this browser holds. Sent on identify so the server can fold the
+  // ANONYMOUS contact behind each one into the person who just identified — the lead -> user
+  // conversion. A visitor who chats before signing up keeps their history; handles already folded
+  // (or owned by someone else) are a server-side no-op, so this is safe to send every time.
+  function localConvIds() {
+    var out = [];
+    for (var i = 0; i < convs.length && out.length < 20; i++) if (convs[i] && convs[i].id) out.push(String(convs[i].id));
+    return out;
+  }
   function sendIdentify(extra) {
     if (!isIdentified() || !KEY) return;
     var attrs = {}; for (var k in identity.attributes) if (identity.attributes.hasOwnProperty(k)) attrs[k] = identity.attributes[k];
     if (extra) for (var k2 in extra) if (extra.hasOwnProperty(k2)) attrs[k2] = extra[k2];
     var cc = clientCtx();
+    var cids = localConvIds();
     fetch(API + '/public/identify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
       key: KEY, email: identity.email || undefined, name: identity.name || undefined,
       userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined,
       company: identity.company || undefined, attributes: attrs, page: currentPage(),
+      conversationIds: cids.length ? cids : undefined,
       timezone: cc.timezone, referrer: cc.referrer, language: cc.language
     }) }).catch(function () {});
   }

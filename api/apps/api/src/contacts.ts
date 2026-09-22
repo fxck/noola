@@ -1045,6 +1045,126 @@ async function linkIdentity(c: PoolClient, contactId: string, channelType: strin
 }
 
 /**
+ * Fold an ANONYMOUS shell (no email, no external_id — a widget visitor we only know by a conversation
+ * handle) into `keepId`, on the caller's tenant-scoped client so it commits with whatever transaction
+ * it is part of. This is the lead -> user conversion: the person who chatted before they told us who
+ * they are is the same person, so their conversations, authored messages, activity, channel handles
+ * and company memberships move onto the identified contact and the shell is deleted — one record,
+ * history intact.
+ *
+ * Refuses (returns false) when the drop carries an identity of its own. An identified contact is
+ * NEVER swallowed automatically — that is a real person's profile and needs the agent-driven
+ * mergeContacts, not a conversation handle someone else happens to send us.
+ */
+export async function absorbAnonymousContact(c: PoolClient, keepId: string, dropId: string): Promise<boolean> {
+  if (!keepId || !dropId || keepId === dropId) return false;
+  const drop = await c.query(
+    `SELECT id FROM contacts WHERE id = $1 AND coalesce(email,'') = '' AND external_id IS NULL`,
+    [dropId],
+  );
+  if (!drop.rowCount) return false;
+  // tickets/messages are ON DELETE SET NULL — re-home them BEFORE the delete or the conversation is
+  // orphaned (contact_id nulled) instead of carried over.
+  await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
+  await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [keepId, dropId]);
+  await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [keepId, dropId]);
+  // Handles + memberships move only where the survivor doesn't already hold them; the rest cascade
+  // with the shell below (the kept side wins).
+  await c.query(
+    `UPDATE contact_identities ci SET contact_id = $1
+      WHERE ci.contact_id = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM contact_identities k
+           WHERE k.tenant_id = ci.tenant_id AND k.contact_id = $1
+             AND k.channel_type = ci.channel_type
+             AND lower(k.external_id) = lower(ci.external_id))`,
+    [keepId, dropId],
+  );
+  await c.query(
+    `UPDATE contact_companies cc SET contact_id = $1, is_primary = false
+      WHERE cc.contact_id = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM contact_companies k
+           WHERE k.tenant_id = cc.tenant_id AND k.contact_id = $1 AND k.company_id = cc.company_id)`,
+    [keepId, dropId],
+  );
+  // Carry what the shell learned and the survivor lacks: display name, the widget's live enrichment
+  // (page/browser/geo — the survivor's own values win), avatar, presence, tags, and the EARLIEST
+  // created_at, so "known since" dates from the first anonymous visit rather than the signup.
+  // Consent is deliberately untouched: an emailless shell can hold no marketing opt-out.
+  await c.query(
+    `UPDATE contacts k
+        SET name = CASE WHEN coalesce(k.name,'') = '' THEN d.name ELSE k.name END,
+            company = CASE WHEN coalesce(k.company,'') = '' THEN d.company ELSE k.company END,
+            company_id = COALESCE(k.company_id, d.company_id),
+            attributes = d.attributes || k.attributes,
+            avatar_url = COALESCE(k.avatar_url, d.avatar_url),
+            last_seen_at = GREATEST(k.last_seen_at, d.last_seen_at),
+            created_at = LEAST(k.created_at, d.created_at),
+            tags = COALESCE((
+              SELECT array_agg(t ORDER BY t) FROM (
+                SELECT DISTINCT ON (lower(t)) t
+                  FROM unnest(k.tags || d.tags) WITH ORDINALITY AS u(t, ord)
+                 ORDER BY lower(t), ord) x), '{}'),
+            updated_at = now()
+       FROM contacts d
+      WHERE k.id = $1 AND d.id = $2`,
+    [keepId, dropId],
+  );
+  await c.query("DELETE FROM contacts WHERE id = $1", [dropId]);
+  return true;
+}
+
+/**
+ * The identify-time half of the lead -> user conversion (Intercom converts the lead the same way):
+ * fold every anonymous contact reachable from the conversation handles a widget holds locally into
+ * the now-identified contact. Handles are matched against the channel identity map AND the
+ * conversations themselves — a first-turn ticket carries the handle as external_channel_id, and a
+ * server-id conversation is the ticket id. Handles the caller can't prove ownership of are harmless:
+ * only an anonymous shell is ever absorbed, and knowing a conversation id already grants access to
+ * that conversation (/public/conversation). Returns how many shells were absorbed.
+ */
+export async function absorbAnonymousByHandles(
+  tenantId: string,
+  keepId: string,
+  channelType: string,
+  handles: string[],
+): Promise<number> {
+  const uniq = [...new Set(handles.map((h) => (h ?? "").trim().toLowerCase()).filter(Boolean))].slice(0, 20);
+  if (!keepId || !uniq.length) return 0;
+  return withTenant(tenantId, async (c) => {
+    const cand = await c.query(
+      `SELECT DISTINCT contact_id FROM (
+         SELECT ci.contact_id FROM contact_identities ci
+          WHERE ci.channel_type = $2 AND lower(ci.external_id) = ANY($3::text[])
+         UNION ALL
+         SELECT t.contact_id FROM tickets t
+          WHERE t.channel_type = $2
+            AND (lower(t.external_channel_id) = ANY($3::text[]) OR t.id::text = ANY($3::text[]))
+       ) x
+       WHERE contact_id IS NOT NULL AND contact_id <> $1`,
+      [keepId, channelType, uniq],
+    );
+    let folded = 0;
+    for (const row of cand.rows as { contact_id: string }[]) {
+      if (await absorbAnonymousContact(c, keepId, row.contact_id)) folded++;
+    }
+    // Bind any still-unclaimed handle to this contact, so the NEXT message on that conversation
+    // threads onto the identified person instead of minting a fresh shell. A handle another contact
+    // already owns is left alone (ON CONFLICT DO NOTHING) — we never re-point someone else's.
+    for (const h of uniq) {
+      await c.query(
+        `INSERT INTO contact_identities (tenant_id, contact_id, channel_type, external_id)
+         VALUES (current_tenant(), $1, $2, $3)
+         ON CONFLICT (tenant_id, channel_type, lower(external_id)) DO NOTHING`,
+        [keepId, channelType, h],
+      );
+    }
+    return folded;
+  });
+}
+
+/**
  * Resolve (or create) the contact behind an inbound message, on the ingest transaction's client so it
  * commits atomically with the ticket/message. Precedence:
  *   1. email present  → upsert the contact by email (the cross-channel unifier), then map this handle.
@@ -1071,28 +1191,17 @@ export async function resolveContactForInbound(c: PoolClient, identity: Identity
     );
     const contactId = r.rows[0].id as string;
     // Unify identify vs ask: if this channel handle already mapped to a DIFFERENT (anonymous) contact
-    // — the visitor asked before they identified — fold that contact's conversations/events onto the
-    // now-email-identified one and re-point the handle, instead of leaving two split contacts.
+    // — the visitor asked before they identified — fold that shell onto the now-email-identified
+    // contact and re-point the handle, instead of leaving two split contacts. A handle owned by an
+    // already-IDENTIFIED contact is left where it is (absorb refuses): re-pointing it used to hand
+    // that person's conversations to whoever sent the same conversation id.
     if (handle) {
       const prior = await c.query(
         `SELECT contact_id FROM contact_identities
           WHERE channel_type = $1 AND lower(external_id) = lower($2) AND contact_id <> $3 LIMIT 1`,
         [identity.channelType, handle, contactId],
       );
-      if (prior.rowCount) {
-        const oldId = prior.rows[0].contact_id as string;
-        await c.query("UPDATE tickets SET contact_id = $1 WHERE contact_id = $2", [contactId, oldId]);
-        await c.query("UPDATE messages SET author_contact_id = $1 WHERE author_contact_id = $2", [contactId, oldId]);
-        await c.query("UPDATE contact_events SET contact_id = $1 WHERE contact_id = $2", [contactId, oldId]);
-        // Drop the now-empty anonymous shell if it holds no OTHER identity (its only handle re-points below).
-        await c.query(
-          `DELETE FROM contacts WHERE id = $1 AND coalesce(email,'') = '' AND external_id IS NULL
-             AND NOT EXISTS (
-               SELECT 1 FROM contact_identities x WHERE x.contact_id = $1
-                 AND NOT (x.channel_type = $2 AND lower(x.external_id) = lower($3)))`,
-          [oldId, identity.channelType, handle],
-        );
-      }
+      if (prior.rowCount) await absorbAnonymousContact(c, contactId, prior.rows[0].contact_id as string);
     }
     await linkIdentity(c, contactId, identity.channelType, handle);
     return contactId;

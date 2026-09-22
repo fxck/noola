@@ -20,7 +20,7 @@ import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
 import { suggestionMeta } from "../autoreply.js";
 import { wantsHuman, type DraftImage } from "../model.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
-import { upsertContact, bumpContactSeen } from "../contacts.js";
+import { upsertContact, bumpContactSeen, absorbAnonymousByHandles } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
 import { deriveContactContext } from "../enrich.js";
 import { listPublicArticles, listPublicCollections, getPublicArticleBySlug, searchPublicArticles } from "../kb.js";
@@ -610,8 +610,24 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       company_external_id: companyExternalId,
       attributes: merged,
     });
+    // Lead -> user: this visitor may have chatted BEFORE they identified, as one anonymous contact per
+    // conversation. Fold those shells into the contact we just resolved, so signing up converts the
+    // lead (history, tags, first-seen carried over) instead of stranding it next to a fresh profile.
+    // Until now the widget's conversation handles were accepted here and ignored — the only fold ran
+    // on message ingest, so "chat anonymously, sign up, come back logged in" left two contacts.
+    const handles = [parsed.data.conversationId, ...(parsed.data.conversationIds ?? [])]
+      .filter((h): h is string => typeof h === "string" && h.trim() !== "");
+    let folded = 0;
+    if (handles.length) {
+      // Best-effort: a failed fold must never fail the identify (the profile write already landed).
+      try {
+        folded = await absorbAnonymousByHandles(wk.tenantId, contact.id, "widget", handles);
+      } catch (e) {
+        req.log.warn({ err: e, contactId: contact.id }, "widget identify: anonymous fold failed");
+      }
+    }
     void bumpContactSeen(wk.tenantId, contact.id); // presence, best-effort
-    return { ok: true, identified: true };
+    return { ok: true, identified: true, converted: folded };
   });
 
   // Track a custom activity event (Noola('track', name, metadata?)). Upserts the contact by
