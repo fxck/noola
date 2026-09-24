@@ -8,12 +8,22 @@ const base = {
   database: process.env.DB_NAME,
 };
 
+/** Per-pool ceiling, overridable per environment. The three pools below can demand 23 connections
+ *  from ONE api process — more than a small Postgres allows in total (a dev instance caps out at 20,
+ *  a few of them reserved for superusers), so the dev api intermittently 500s with
+ *  "remaining connection slots are reserved for roles with the SUPERUSER attribute" on nothing more
+ *  than a page load. The defaults are unchanged; a cramped instance sets the knob instead. */
+const poolMax = (key: string, fallback: number): number => {
+  const v = Number(process.env[key]);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+};
+
 /** Request-path pool — RLS-bound role. Every query MUST run inside withTenant(). */
 export const appPool = new Pool({
   ...base,
   user: process.env.APP_DB_USER ?? "app_user",
   password: process.env.APP_DB_PASSWORD,
-  max: 10,
+  max: poolMax("DB_POOL_MAX", 10),
 });
 
 /** Cross-tenant pool — BYPASSRLS role. Started life as just the outbox drainer, but it's now the
@@ -25,7 +35,7 @@ export const relayPool = new Pool({
   ...base,
   user: process.env.RELAY_DB_USER ?? "event_relay",
   password: process.env.RELAY_DB_PASSWORD,
-  max: 8,
+  max: poolMax("DB_RELAY_POOL_MAX", 8),
 });
 
 /** Identity-surface pool — the least-privilege `auth_user` role (better-auth's DB
@@ -35,7 +45,7 @@ export const authPool = new Pool({
   ...base,
   user: process.env.AUTH_DB_USER ?? "auth_user",
   password: process.env.AUTH_DB_PASSWORD,
-  max: 5,
+  max: poolMax("DB_AUTH_POOL_MAX", 5),
 });
 
 // A pooled client can emit 'error' ASYNCHRONOUSLY while sitting idle in the pool — the
