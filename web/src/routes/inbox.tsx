@@ -15,6 +15,7 @@ import {
   filterByView,
   viewCounts,
   fetchUnreadTicketIds,
+  fetchTicket,
   markTicketRead,
   bulkTickets,
 } from "@/lib/tickets";
@@ -105,7 +106,7 @@ const inboxRouteApi = getRouteApi("/");
 
 export function InboxPage() {
   const { user } = useAuth();
-  const { ticket: selectedId, view: viewParam } = inboxRouteApi.useSearch();
+  const { ticket: selectedId, view: viewParam, team: teamParam } = inboxRouteApi.useSearch();
   const navigate = inboxRouteApi.useNavigate();
   const { subscribe, resyncEpoch } = useRealtime();
   const { nerd } = useNerdMode();
@@ -116,19 +117,33 @@ export function InboxPage() {
   const [users, setUsers] = useState<AgentUser[]>([]);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState<ViewKey>(() =>
-    VIEWS.some((v) => v.key === viewParam) ? (viewParam as ViewKey) : "all",
-  );
+  // The lane lives in the URL, not in component state: `/?view=closed`, `/?team=<id>`, alone or
+  // alongside `?ticket=`. So a link carries WHERE you were as well as what you were reading, reload
+  // and the browser's history keep it, and a deep-linked ticket can point the rail at its own lane
+  // (below). The default Open lane is left OUT of the URL — it keeps links clean, and its absence is
+  // what tells us no lane was chosen explicitly.
+  const view: ViewKey = VIEWS.some((v) => v.key === viewParam) ? (viewParam as ViewKey) : "all";
   // Team lanes (Teams, Wave 2). A team acts as its own view: selecting one
   // shows that team's open tickets; picking a fixed view clears it (and vice
   // versa). Teams load once, best-effort — [] renders no Teams section at all.
   const [teams, setTeams] = useState<Team[]>([]);
-  const [teamId, setTeamId] = useState<string | null>(null);
-  const selectView = (v: ViewKey) => {
-    setTeamId(null);
-    setView(v);
+  const teamId = teamParam ?? null;
+  const setLane = (next: { view?: ViewKey; team?: string | null }, opts?: { replace?: boolean }) => {
+    const v = next.view ?? "all";
+    void navigate({
+      search: (s) => ({
+        ...s,
+        view: next.team ? undefined : v === "all" ? undefined : v,
+        team: next.team ?? undefined,
+      }),
+      // Picking a lane is a navigation: it goes on the history stack, so Back returns to the lane you
+      // came from. Only the automatic writes replace (keyboard cycling, the deep-link lane sync) —
+      // those would otherwise bury the real history under one entry per keystroke.
+      replace: opts?.replace ?? false,
+    });
   };
-  const selectTeam = (id: string) => setTeamId(id);
+  const selectView = (v: ViewKey) => setLane({ view: v });
+  const selectTeam = (id: string) => setLane({ team: id });
   // Per-agent unread set (open tickets with an unseen customer message). Fetched alongside the
   // lists; opening a ticket clears it optimistically and marks it read server-side.
   const [unreadIds, setUnreadIds] = useState<Set<string>>(() => new Set());
@@ -303,10 +318,53 @@ export function InboxPage() {
     return sortTickets(filterByView(view, open ?? [], closed, myId, approvalIds, spam, outbound), sort);
   }, [searchMode, searchResults, activeTeam, view, open, closed, spam, outbound, myId, sort]);
 
-  const selected = useMemo(
+  const listed = useMemo(
     () => [...(open ?? []), ...closed, ...spam, ...outbound, ...(searchResults ?? [])].find((t) => t.id === selectedId) ?? null,
     [open, closed, spam, outbound, searchResults, selectedId],
   );
+  // A conversation can sit outside every loaded lane — the lists are capped at 100 rows server-side,
+  // so a link to an older closed ticket used to open an empty reading pane. Fetch that one by id.
+  const [linkedTicket, setLinkedTicket] = useState<Ticket | null>(null);
+  useEffect(() => {
+    if (!selectedId || listed || open === null) return;
+    if (linkedTicket?.id === selectedId) return;
+    let live = true;
+    void fetchTicket(selectedId)
+      .then((t) => { if (live) setLinkedTicket(t); })
+      .catch(() => { if (live) setLinkedTicket(null); });
+    return () => { live = false; };
+  }, [selectedId, listed, open, linkedTicket]);
+  const selected = listed ?? (linkedTicket?.id === selectedId ? linkedTicket : null);
+
+  // Which lane HOLDS a conversation. Membership first (exact — the Outbound lane isn't derivable
+  // from the row), then the ticket's own state for one fetched by id. Null while we can't tell yet.
+  const laneOf = (id: string): ViewKey | null => {
+    if (spam.some((t) => t.id === id)) return "spam";
+    if (closed.some((t) => t.id === id)) return "closed";
+    if (outbound.some((t) => t.id === id)) return "outbound";
+    if ((open ?? []).some((t) => t.id === id)) return "all";
+    const t = linkedTicket?.id === id ? linkedTicket : null;
+    if (!t) return null;
+    if (t.spam_at) return "spam";
+    return t.status === "closed" || t.status === "solved" ? "closed" : "all";
+  };
+
+  // Open a link to a conversation and the rail should show the lane it actually lives in — a closed
+  // ticket shouldn't land on Open with its row nowhere in the list. Once per ticket id, and never
+  // over a lane the URL already names (a shared ?ticket=…&view=… link, or the agent's own choice).
+  const laneSyncedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selectedId || loading || open === null) return;
+    if (laneSyncedRef.current === selectedId) return;
+    if (viewParam || teamParam) { laneSyncedRef.current = selectedId; return; }
+    const lane = laneOf(selectedId);
+    if (!lane) return; // still resolving (a by-id fetch in flight) — try again when it lands
+    laneSyncedRef.current = selectedId;
+    if (lane !== "all") {
+      void navigate({ search: (s) => ({ ...s, view: lane }), replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, loading, open, closed, spam, outbound, linkedTicket, viewParam, teamParam]);
   const activeView = VIEWS.find((v) => v.key === view)!;
 
   // Auto-select the top row on desktop after the first load so the reading pane is
@@ -332,8 +390,12 @@ export function InboxPage() {
   useEffect(() => {
     const cycleView = (dir: number) => {
       const i = VIEWS.findIndex((v) => v.key === kbd.current.view);
-      setTeamId(null); // [ ] walk the fixed views — leaving any team lane
-      setView(VIEWS[(i + dir + VIEWS.length) % VIEWS.length].key);
+      // [ ] walk the fixed views — leaving any team lane. Through the URL, like every other switch.
+      const next = VIEWS[(i + dir + VIEWS.length) % VIEWS.length].key;
+      void navigate({
+        search: (s) => ({ ...s, view: next === "all" ? undefined : next, team: undefined }),
+        replace: true,
+      });
     };
     const bulkThenReload = async (id: string, action: "close" | "reopen") => {
       try {
