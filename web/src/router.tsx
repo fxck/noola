@@ -149,9 +149,10 @@ const inboxRoute = createRoute({
   path: "/",
   // Optional deep-links: `/?ticket=<id>` preselects a thread; `/?view=approval`
   // opens a specific inbox view (the old /queue redirects here).
-  validateSearch: (search: Record<string, unknown>): { ticket?: string; view?: string } => ({
+  validateSearch: (search: Record<string, unknown>): { ticket?: string; view?: string; team?: string } => ({
     ticket: typeof search.ticket === "string" ? search.ticket : undefined,
     view: typeof search.view === "string" ? search.view : undefined,
+    team: typeof search.team === "string" ? search.team : undefined,
   }),
   beforeLoad: ({ context }) => {
     if (!context.auth.isAuthed) throw redirect({ to: "/login" });
