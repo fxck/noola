@@ -2,9 +2,12 @@ import {
   Client, GatewayIntentBits, Events, ChannelType, Partials, PermissionFlagsBits,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
   type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
-  type ForumChannel, type ThreadChannel, type Message,
+  type ForumChannel, type ThreadChannel, type Message, type RateLimitData, RateLimitError,
 } from "discord.js";
+import { SimpleShardingStrategy, type WebSocketManager } from "@discordjs/ws";
+import type { Agent as HttpAgent } from "node:http";
 import { relayPool } from "@repo/db";
+import { discordEgress, proxiedMakeRequest } from "./discord-egress.js";
 import { isDiscordEventLeader, startDiscordLeaderElection } from "./discord-leader.js";
 import { splitForDiscord } from "./channels/format.js";
 import {
@@ -136,8 +139,12 @@ function buildMirrorTransport(client: Client): MirrorTransport {
     const ch = await client.channels.fetch(id).catch(() => null);
     return ch?.type === ChannelType.GuildForum ? (ch as ForumChannel) : null;
   };
-  const thread = async (id: string): Promise<ThreadChannel | null> => {
-    const ch = await client.channels.fetch(id).catch(() => null);
+  // `rethrowRateLimit` lets a forum-state edit report a fail-fast rate limit, so the mirror sync can retry it.
+  const thread = async (id: string, rethrowRateLimit = false): Promise<ThreadChannel | null> => {
+    const ch = await client.channels.fetch(id).catch((e: unknown) => {
+      if (rethrowRateLimit && e instanceof RateLimitError) throw e;
+      return null;
+    });
     return ch && "isThread" in ch && (ch as ThreadChannel).isThread() ? (ch as ThreadChannel) : null;
   };
   return {
@@ -215,14 +222,14 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       return true;
     },
     async setArchived(threadId, archived) {
-      const t = await thread(threadId);
+      const t = await thread(threadId, true);
       if (!t) return false;
       if (t.archived === archived) return true;
       await t.setArchived(archived);
       return true;
     },
     async applyTags(threadId, tagNames) {
-      const t = await thread(threadId);
+      const t = await thread(threadId, true);
       if (!t || t.parent?.type !== ChannelType.GuildForum) return false;
       const ids = await resolveForumTagIds(t.parent as ForumChannel, tagNames).catch(() => []);
       if (!ids.length) return false;
@@ -258,7 +265,7 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       return f ? f.availableTags.map((tg) => tg.name) : [];
     },
     async setLocked(threadId, locked) {
-      const t = await thread(threadId);
+      const t = await thread(threadId, true);
       if (!t) return false;
       if (t.locked === locked) return true;
       await t.setLocked(locked);
@@ -509,6 +516,36 @@ async function onPostDraft(interaction: ButtonInteraction, log: Log): Promise<vo
   });
 }
 
+// discord.js waits out every 429 before retrying, and a Cloudflare IP ban sends a Retry-After of about an hour.
+// Waiting that long stalls every caller behind the request.
+// Below the relay outbox's 20 s deliver deadline, so a write that discord.js holds back never outlives it.
+const MAX_RATE_LIMIT_WAIT_MS = 15_000;
+
+/** How long discord.js would wait. A header-less Cloudflare 429 puts its Retry-After in sublimitTimeout. */
+export function rateLimitWaitMs(d: Pick<RateLimitData, "timeToReset" | "retryAfter" | "sublimitTimeout">): number {
+  return Math.max(d.timeToReset, d.retryAfter, d.sublimitTimeout);
+}
+
+/** True rejects the request with a RateLimitError, false lets discord.js wait. */
+export function failFastOnLongRateLimit(d: RateLimitData, log: Log): boolean {
+  const waitMs = rateLimitWaitMs(d);
+  if (waitMs <= MAX_RATE_LIMIT_WAIT_MS) return false;
+  log.warn(
+    `discord: ${d.method.toUpperCase()} ${d.route} is rate-limited for ${Math.round(waitMs / 1000)}s (global=${d.global}, scope=${d.scope}) - failing fast. ` +
+      "A wait of about an hour usually means Cloudflare banned the egress IP.",
+  );
+  return true;
+}
+
+/** The patched @discordjs/ws (api/patches) passes `options.agent` to the gateway socket.
+ *  discord.js forwards only the `ws` options it knows, so the agent is added to the manager here. */
+export function gatewayStrategy(agent: HttpAgent) {
+  return (manager: WebSocketManager) => {
+    Object.assign(manager.options, { agent });
+    return new SimpleShardingStrategy(manager);
+  };
+}
+
 /**
  * Start the shared-bot gateway consumer. Guarded on DISCORD_BOT_TOKEN — absent, the
  * Discord channel is simply off (like initNats without a broker). Holds one Gateway
@@ -522,7 +559,13 @@ async function onPostDraft(interaction: ButtonInteraction, log: Log): Promise<vo
  */
 function openBot(botId: string, token: string, scope: "shared" | "tenant", tenantId: string | null, log: Log): void {
   void tenantId; // reserved for per-guild outbound routing when the prod multibot gate lands
+  const egress = discordEgress();
   const client = new Client({
+    rest: {
+      rejectOnRateLimit: (d) => failFastOnLongRateLimit(d, log),
+      ...(egress ? { makeRequest: proxiedMakeRequest(egress.dispatcher) } : {}),
+    },
+    ...(egress ? { ws: { buildStrategy: gatewayStrategy(egress.gatewayAgent) } } : {}),
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
@@ -778,6 +821,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   client.on(Events.GuildCreate, (guild) => void registerCommandsForGuild(guild, log));
 
   client.once(Events.ClientReady, async (c) => {
+    loginAttempts.delete(botId);
     const label = scope === "shared" ? "shared bot" : `tenant bot ${botId.slice(0, 8)}`;
     log.info(`discord: connected as ${c.user.tag} (${label})`);
     for (const guild of c.guilds.cache.values()) await registerCommandsForGuild(guild, log);
@@ -785,11 +829,38 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   });
   if (scope === "tenant") client.on(Events.ShardDisconnect, () => void markBotDisconnect(botId));
   client.login(token).catch((err: unknown) => {
-    log.error({ err }, `discord login failed (${scope} ${botId})`);
-    // A per-tenant bot with a bad/revoked token is quarantined so the manager stops retrying it; the
-    // shared bot just logs (its token is operator-managed).
-    if (scope === "tenant") void quarantineBot(botId, "login_failed");
+    // A tenant bot with a revoked token is disabled. The shared bot's token is operator-managed, so it keeps retrying.
+    if (scope === "tenant" && isInvalidToken(err)) {
+      log.error({ err }, `discord login failed (tenant ${botId}): invalid token - disabling the bot`);
+      void quarantineBot(botId, "login_failed");
+      return;
+    }
+    const attempt = (loginAttempts.get(botId) ?? 0) + 1;
+    loginAttempts.set(botId, attempt);
+    const delayMs = loginRetryDelayMs(attempt, err);
+    log.error({ err }, `discord login failed (${scope} ${botId}) - retrying in ${Math.round(delayMs / 1000)}s`);
+    // login() destroyed this client, so the retry opens a fresh one.
+    const t = setTimeout(() => openBot(botId, token, scope, tenantId, log), delayMs);
+    if (typeof t.unref === "function") t.unref();
   });
+}
+
+// Exiting or retrying at once after a failed login turns into a tight request loop against a banned IP.
+const LOGIN_RETRY_MIN_MS = 30_000;
+const LOGIN_RETRY_MAX_MS = 10 * 60_000;
+const MAX_TIMER_MS = 60 * 60_000;
+const loginAttempts = new Map<string, number>();
+
+function isInvalidToken(err: unknown): boolean {
+  const e = err as { code?: unknown; status?: unknown } | null;
+  return e?.code === "TokenInvalid" || e?.status === 401;
+}
+
+/** 30 s doubling to 10 min, or longer when Discord's rate limit says so. */
+export function loginRetryDelayMs(attempt: number, err: unknown): number {
+  const backoff = Math.min(LOGIN_RETRY_MIN_MS * 2 ** (attempt - 1), LOGIN_RETRY_MAX_MS);
+  const limited = err instanceof RateLimitError ? rateLimitWaitMs(err) : 0;
+  return Math.min(Math.max(backoff, limited), MAX_TIMER_MS);
 }
 
 /**
@@ -801,6 +872,8 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
  */
 export function startDiscord(log: Log): void {
   const token = process.env.DISCORD_BOT_TOKEN;
+  const egress = discordEgress();
+  log.info(egress ? `discord: traffic goes through the proxy ${egress.label}` : "discord: traffic goes direct (DISCORD_PROXY_URL unset)");
   // Every replica logs in (outbound REST needs the client), but only the elected leader acts on gateway
   // events — otherwise each event is handled once per replica.
   if (token || process.env.DISCORD_MULTIBOT_ENABLED === "1") startDiscordLeaderElection(log);

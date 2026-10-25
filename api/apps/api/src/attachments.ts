@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { withTenant } from "@repo/db";
 import { putBuffer } from "./storage.js";
+import { discordFetchInit } from "./discord-egress.js";
 
 // Message attachments — the DB seam over message_attachments (migration 0061). Upload creates a
 // "pending" row (message_id NULL); the reply CLAIMS the pending rows onto its message. The thread
@@ -87,7 +88,7 @@ async function persistInboundOwned(
     try {
       const u = new URL(f.url);
       if (u.protocol !== "https:" || !INBOUND_CDN_HOSTS.has(u.hostname)) throw new Error("host not allowed");
-      const res = await fetch(f.url);
+      const res = await fetch(f.url, discordFetchInit());
       if (!res.ok) throw new Error(`fetch ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.byteLength > 0) {

@@ -17,6 +17,7 @@
     "test:discord-ondemand": "tsx apps/api/test/discord-ondemand.test.ts",
     "test:slack-ondemand": "tsx apps/api/test/slack-ondemand.test.ts",
     "test:discord-bots": "tsx apps/api/test/discord-bots.test.ts",
+    "test:discord-egress": "tsx apps/api/test/discord-egress.test.ts",
     "test:slack-triage": "tsx apps/api/test/slack-triage.test.ts",
     "test:operating": "tsx apps/api/test/operating.test.ts",
     "test:auth": "tsx apps/api/test/auth.test.ts",
@@ -89,5 +90,8 @@
     "@types/pg": "^8.11.10",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
+  },
+  "patchedDependencies": {
+    "@discordjs/ws@1.2.3": "patches/@discordjs%2Fws@1.2.3.patch"
   }
 }

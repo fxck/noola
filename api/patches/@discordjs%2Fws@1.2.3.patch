@@ -1,0 +1,28 @@
+diff --git a/dist/index.js b/dist/index.js
+index 106b2ec450a248cd5bd7c36c038215145438eade..218894e92b9e19a720179321b227f711a2fd19ab 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -675,7 +675,8 @@ var WebSocketShard = class extends import_async_event_emitter.AsyncEventEmitter
+     const url = `${session?.resumeURL ?? this.strategy.options.gatewayInformation.url}?${params.toString()}`;
+     this.debug([`Connecting to ${url}`]);
+     const connection = new WebSocketConstructor(url, [], {
+-      handshakeTimeout: this.strategy.options.handshakeTimeout ?? void 0
++      handshakeTimeout: this.strategy.options.handshakeTimeout ?? void 0,
++      agent: this.strategy.options.agent
+     });
+     connection.binaryType = "arraybuffer";
+     connection.onmessage = (event) => {
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 0ebc06d477ac54303c7542261cc5bcc9a9537519..8b4e2ed6e5c341b5f0023a23a35380aec1d07367 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -636,7 +636,8 @@ var WebSocketShard = class extends AsyncEventEmitter {
+     const url = `${session?.resumeURL ?? this.strategy.options.gatewayInformation.url}?${params.toString()}`;
+     this.debug([`Connecting to ${url}`]);
+     const connection = new WebSocketConstructor(url, [], {
+-      handshakeTimeout: this.strategy.options.handshakeTimeout ?? void 0
++      handshakeTimeout: this.strategy.options.handshakeTimeout ?? void 0,
++      agent: this.strategy.options.agent
+     });
+     connection.binaryType = "arraybuffer";
+     connection.onmessage = (event) => {

@@ -6,6 +6,7 @@
 // on, so a customer's live bot is never double-consumed from a dev/stage replica.
 import { relayPool } from "@repo/db";
 import { encryptSecret, decryptSecret, encryptionAvailable } from "./crypto.js";
+import { discordFetchInit } from "./discord-egress.js";
 
 export interface DiscordBotRow {
   id: string;
@@ -48,9 +49,9 @@ export async function registerBot(tenantId: string, input: { label?: string | nu
   let botUserId: string | null = null;
   let state = "unverified";
   try {
-    const res = await fetch("https://discord.com/api/v10/oauth2/applications/@me", {
+    const res = await fetch("https://discord.com/api/v10/oauth2/applications/@me", discordFetchInit({
       headers: { authorization: `Bot ${token}` },
-    });
+    }));
     if (res.ok) {
       const j = (await res.json()) as { id?: string; bot?: { id?: string } };
       appId = j.id ?? null;
