@@ -954,6 +954,9 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
   const body = (m.content ?? "").trim();
   const attachments = m.attachments ?? [];
   if (!body && attachments.length === 0) return { handled: true };
+  // A message seen again (a backfill re-reads the end of the previous leader's watch) already has its note.
+  const seen = await relayPool.query("SELECT 1 FROM ticket_mirror_messages WHERE discord_message_id = $1", [m.discordMessageId]);
+  if (seen.rowCount) return { handled: true };
   // An attachment-only message (screenshot, no text) still becomes a note — label it with the file
   // name(s) so the note isn't blank; the file itself attaches below.
   const noteBody = body || attachments.map((a) => a.filename).join(", ") || "(attachment)";

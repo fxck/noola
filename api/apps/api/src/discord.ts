@@ -253,10 +253,14 @@ async function handleVipTopLevelMessage(m: InboundDiscordMessage, binding: Bindi
 
   const body = composeBody(m);
   if (body.trim().length === 0 && (m.attachments ?? []).length === 0) return null;
-
-  const anchored = await getMirrorTransport()
-    ?.createMessageThread(m.channelId, m.discordMessageId, body.slice(0, 90) || "Conversation")
-    .catch(() => null);
+  // A message seen again (a redelivery or a backfill) already has its thread, and anchoring costs a Discord write.
+  // Ingest then replays it onto its ticket.
+  const seen = await messageIngested(tenantId, `discord:${m.discordMessageId}`);
+  const anchored = seen
+    ? null
+    : await getMirrorTransport()
+        ?.createMessageThread(m.channelId, m.discordMessageId, body.slice(0, 90) || "Conversation")
+        .catch(() => null);
   const threadId = anchored?.threadId ?? m.discordMessageId; // fallback: message id still isolates the ticket
 
   const result = await ingestInbound({
@@ -285,6 +289,13 @@ async function handleVipTopLevelMessage(m: InboundDiscordMessage, binding: Bindi
     await applyDiscordChannelAccount(tenantId, m.guildId, m.channelId, result.contactId).catch(() => {});
   }
   return result;
+}
+
+async function messageIngested(tenantId: string, idempotencyKey: string): Promise<boolean> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT 1 FROM messages WHERE idempotency_key = $1 LIMIT 1", [idempotencyKey]);
+    return (r.rowCount ?? 0) > 0;
+  });
 }
 
 // ── customer-channel bindings management (D5 settings surface) ────────────────
