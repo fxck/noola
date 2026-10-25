@@ -2,12 +2,13 @@ import {
   Client, GatewayIntentBits, Events, ChannelType, Partials, PermissionFlagsBits,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
   type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
-  type ForumChannel, type ThreadChannel, type Message, type RateLimitData, RateLimitError,
+  type ForumChannel, type ThreadChannel, type Message, type RateLimitData, RateLimitError, type GuildTextBasedChannel,
 } from "discord.js";
 import { SimpleShardingStrategy, type WebSocketManager } from "@discordjs/ws";
 import type { Agent as HttpAgent } from "node:http";
 import { relayPool } from "@repo/db";
 import { discordEgress, proxiedMakeRequest } from "./discord-egress.js";
+import { backfillChannels, lastSeenConnected, loadGuildScopes, recordSeenConnected, type BackfillChannel } from "./discord-backfill.js";
 import { isDiscordEventLeader, probeDiscordLeaderNow, startDiscordLeaderElection } from "./discord-leader.js";
 import { splitForDiscord } from "./channels/format.js";
 import {
@@ -142,6 +143,8 @@ function withTimeout<T>(p: Promise<T>, ms = DISCORD_FETCH_TIMEOUT_MS): Promise<T
   });
 }
 
+const THREAD_ALREADY_EXISTS = 160004;
+
 function buildMirrorTransport(client: Client): MirrorTransport {
   const forum = async (id: string): Promise<ForumChannel | null> => {
     const ch = await client.channels.fetch(id).catch(() => null);
@@ -204,7 +207,10 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       const msg = await (ch as { messages: { fetch: (id: string) => Promise<{ startThread: (o: { name: string }) => Promise<{ id: string }> } | null> } }).messages
         .fetch(messageId).catch(() => null);
       if (!msg) return null;
-      const t = await msg.startThread({ name: name.slice(0, 100) || "Conversation" }).catch(() => null);
+      const t = await msg.startThread({ name: name.slice(0, 100) || "Conversation" }).catch((e: unknown) =>
+        // Another handler anchored it first. A message's thread has the message's id.
+        (e as { code?: unknown }).code === THREAD_ALREADY_EXISTS ? { id: messageId } : null,
+      );
       return t ? { threadId: t.id } : null;
     },
     async postToThread(threadId, content, files, mentionUserIds, opts) {
@@ -427,6 +433,93 @@ function onLeadershipAcquired(log: Log): void {
   for (const [botId, client] of clients) {
     if (!client.isReady()) continue;
     for (const guild of client.guilds.cache.values()) void registerCommandsForGuild(botId, guild, log);
+    void backfillBot(botId, log);
+  }
+}
+
+// The leader records when each bot was last connected, which is where the next backfill starts. A bot's
+// heartbeat is paused from a disconnect until its backfill has run, so a reconnect can't move that point forward.
+const HEARTBEAT_MS = 30_000;
+const heartbeatPaused = new Set<string>();
+const backfillsRunning = new Set<string>();
+
+function writeHeartbeats(): void {
+  if (!isDiscordEventLeader()) return;
+  const ids = [...gatewayDownSince].filter(([id, down]) => down === null && !heartbeatPaused.has(id)).map(([id]) => id);
+  void recordSeenConnected(ids).catch(() => {});
+}
+
+type GatewayChannel = BackfillChannel<Message> & { raw: GuildTextBasedChannel };
+
+function backfillableChannels(client: Client): GatewayChannel[] {
+  const out: GatewayChannel[] = [];
+  for (const ch of client.channels.cache.values()) {
+    if (ch.isDMBased() || !ch.isTextBased()) continue;
+    const raw = ch as GuildTextBasedChannel;
+    out.push({
+      id: raw.id,
+      guildId: raw.guildId,
+      isThread: raw.isThread(),
+      parentId: raw.isThread() ? raw.parentId : null,
+      lastMessageId: raw.lastMessageId,
+      fetchAfter: async (after, limit) =>
+        [...(await raw.messages.fetch({ after, limit, cache: false })).values()].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1)),
+      raw,
+    });
+  }
+  return out;
+}
+
+/** Read back the messages a bot missed since it was last seen connected, then resume its heartbeat.
+ *  A retry passes the first attempt's `since`, because the heartbeat may have moved on in between. */
+async function backfillBot(botId: string, log: Log, retry?: { since: number | null | undefined; attempt: number }): Promise<void> {
+  const client = clients.get(botId);
+  if (!client?.isReady() || !isDiscordEventLeader() || backfillsRunning.has(botId)) return;
+  backfillsRunning.add(botId);
+  heartbeatPaused.add(botId);
+  let since: number | null | undefined = retry?.since;
+  const retryLater = (delayMs: number) => {
+    // An undefined `since` means the heartbeat was never read, so the retry reads it.
+    const t = setTimeout(() => void backfillBot(botId, log, { since, attempt: (retry?.attempt ?? 0) + 1 }), delayMs);
+    if (typeof t.unref === "function") t.unref();
+  };
+  try {
+    if (since === undefined) since = await lastSeenConnected(botId);
+    if (since === null) {
+      log.info(`discord: no earlier connection recorded for bot ${botId} - nothing to backfill`);
+      heartbeatPaused.delete(botId);
+      return;
+    }
+    const scopes = await loadGuildScopes([...client.guilds.cache.keys()]);
+    const { evaluateAutoreply } = await import("./autoreply.js");
+    const s = await backfillChannels<Message, GatewayChannel>(backfillableChannels(client), scopes, since, {
+      onThreadCreated: async (ch) => {
+        if (ch.raw.isThread()) await ingestGatewayThreadCreate(ch.raw);
+      },
+      onMessage: (m) => ingestGatewayMessage(m, log, { skipAutoreply: true }),
+      onTicketBackfilled: async (tenantId, ticketId, messageId) => {
+        await evaluateAutoreply(tenantId, ticketId, messageId, { combineUnanswered: true });
+      },
+      abortOn: (err) => err instanceof RateLimitError,
+    });
+    log.info(
+      `discord: backfill for bot ${botId} covered ${s.gapSeconds}s - read ${s.fetched} of ${s.checked} channel(s), ` +
+        `${s.messages} message(s), ${s.failed} channel(s) unreadable, ${s.failedMessages} message(s) failed` +
+        (s.truncated ? " - hit the read cap, some messages were not read" : ""),
+    );
+    if (s.abortedBy instanceof RateLimitError) {
+      const delayMs = Math.min(rateLimitWaitMs(s.abortedBy), MAX_TIMER_MS);
+      log.warn(`discord: backfill for bot ${botId} stopped on a rate limit - retrying in ${Math.round(delayMs / 1000)}s`);
+      retryLater(delayMs);
+      return;
+    }
+    heartbeatPaused.delete(botId);
+  } catch (err) {
+    const delayMs = loginRetryDelayMs((retry?.attempt ?? 0) + 1, err);
+    log.warn({ err }, `discord: backfill for bot ${botId} failed - retrying in ${Math.round(delayMs / 1000)}s`);
+    retryLater(delayMs);
+  } finally {
+    backfillsRunning.delete(botId);
   }
 }
 
@@ -582,6 +675,102 @@ export function gatewayStrategy(agent: HttpAgent) {
   };
 }
 
+/** A gateway message, live or backfilled, through the mirror seam or customer ingest.
+ *  Returns the ticket a new message landed on, or null when it was dropped, a note, or already stored. */
+async function ingestGatewayMessage(
+  msg: Message,
+  log: Log,
+  opts: { skipAutoreply?: boolean } = {},
+): Promise<{ tenantId: string; ticketId: string; messageId: string } | null> {
+  if (!msg.guildId) return null; // DM — dropped (the seam re-checks; keep the cheap guard here too)
+  // §5.10 fetch-on-demand fallback: msg.member can be null (uncached/webhook) OR present with an
+  // unpopulated role cache. Fetch UNCONDITIONALLY whenever member is null or its role cache is
+  // empty/absent so the Phase-2 role classifier is correct regardless of the lazy path. (A real
+  // member's role cache always contains at least @everyone, so size 0 signals an uncached member.)
+  let member = msg.member;
+  if ((member === null || member.roles.cache.size === 0) && msg.guild) {
+    const fetched = await msg.guild.members.fetch(msg.author.id).catch(() => null);
+    if (fetched) member = fetched;
+  }
+  const tax = threadTaxonomy(msg.channel);
+  // Resolve <@id>/<#id>/<@&id> tokens to names ONCE, up front, so BOTH seams (mirror note +
+  // customer ingest) persist human-readable text instead of raw mention ids.
+  const resolvedContent = resolveMentions(msg);
+  // Discord CDN attachments (screenshots/files). Built up-front so BOTH seams can persist them —
+  // previously this ran AFTER the mirror-seam early-return, so internal notes lost every file.
+  const attachments = [...msg.attachments.values()].map((a) => ({
+    url: a.url,
+    filename: a.name ?? "file",
+    contentType: a.contentType ?? "application/octet-stream",
+    size: a.size ?? 0,
+  }));
+
+  // Ops-mirror seam: a message inside a mirror forum post is team collaboration on the mirrored
+  // ticket (note by default, 📤 promotes) — it must NEVER fall through to customer ingest. The
+  // handler also swallows bot messages in mirror threads (echo-guard for our own relays).
+  const { handleMirrorPostMessage } = await import("./discord-mirror.js");
+  const mirrored = await handleMirrorPostMessage({
+    guildId: msg.guildId,
+    threadId: tax.threadId,
+    discordMessageId: msg.id,
+    authorId: msg.author.id,
+    authorDisplayName: member?.displayName ?? msg.author.globalName ?? msg.author.username,
+    content: resolvedContent,
+    roleIds: member ? [...member.roles.cache.keys()] : [],
+    attachments,
+    isBotOrWebhook: msg.author.bot || msg.webhookId != null,
+  });
+  if (mirrored.handled) return null;
+
+  const embeds = msg.embeds.map((e) => ({ title: e.title, description: e.description, url: e.url }));
+  const r = await handleInboundMessage({
+    guildId: msg.guildId,
+    channelId: tax.threadId ?? msg.channelId,
+    authorId: msg.author.id,
+    content: resolvedContent,
+    discordMessageId: msg.id,
+    threadId: tax.threadId,
+    parentId: tax.parentId,
+    threadKind: tax.kind,
+    authorDisplayName: member?.displayName ?? msg.author.globalName ?? msg.author.username,
+    authorAvatarUrl: msg.author.displayAvatarURL(),
+    attachments,
+    embeds,
+    threadName: tax.name,
+    roleIds: member ? [...member.roles.cache.keys()] : undefined,
+    memberIsNull: member === null,
+    isBotOrWebhook: msg.author.bot || msg.webhookId != null,
+    skipAutoreply: opts.skipAutoreply,
+  });
+  if (!r) {
+    log.info(`discord: message ${msg.id} not ingested (unlinked/unbound/dropped)`);
+    return null;
+  }
+  return r.replay ? null : { tenantId: r.tenantId, ticketId: r.ticketId, messageId: r.messageId };
+}
+
+/** A new thread, live or backfilled: seats the owner as the customer of a ticket on the thread. */
+async function ingestGatewayThreadCreate(thread: ThreadChannel): Promise<void> {
+  if (thread.ownerId && thread.ownerId === thread.client.user?.id) return;
+  const parentIsForum = thread.parent?.type === ChannelType.GuildForum;
+  const owner = thread.ownerId
+    ? await thread.guild.members.fetch(thread.ownerId).catch(() => null)
+    : null;
+  // A bot-owned thread (our VIP thread-per-message anchor) must not pre-seat a ticket with the
+  // bot as the customer — the triggering message's ingest already seated it on this thread id.
+  if (owner?.user.bot) return;
+  await handleThreadCreate({
+    guildId: thread.guildId,
+    threadId: thread.id,
+    parentId: thread.parentId ?? null,
+    ownerId: thread.ownerId ?? null,
+    name: thread.name ?? null,
+    kind: parentIsForum ? "forum_post" : "text_thread",
+    ownerDisplayName: owner?.displayName ?? null,
+    ownerAvatarUrl: owner?.user.displayAvatarURL() ?? null,
+  });
+}
+
 /**
  * Start the shared-bot gateway consumer. Guarded on DISCORD_BOT_TOKEN — absent, the
  * Discord channel is simply off (like initNats without a broker). Holds one Gateway
@@ -597,6 +786,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   void tenantId; // reserved for per-guild outbound routing when the prod multibot gate lands
   const label = scope === "shared" ? "shared bot" : `tenant bot ${botId.slice(0, 8)}`;
   if (!gatewayDownSince.has(botId)) gatewayDownSince.set(botId, Date.now());
+  heartbeatPaused.add(botId);
   const egress = discordEgress();
   const client = new Client({
     rest: {
@@ -662,67 +852,8 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
 
   client.on(Events.MessageCreate, async (msg) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
-    if (!msg.guildId) return; // DM — dropped (the seam re-checks; keep the cheap guard here too)
     try {
-      // §5.10 fetch-on-demand fallback: msg.member can be null (uncached/webhook) OR present with an
-      // unpopulated role cache. Fetch UNCONDITIONALLY whenever member is null or its role cache is
-      // empty/absent so the Phase-2 role classifier is correct regardless of the lazy path. (A real
-      // member's role cache always contains at least @everyone, so size 0 signals an uncached member.)
-      let member = msg.member;
-      if ((member === null || member.roles.cache.size === 0) && msg.guild) {
-        const fetched = await msg.guild.members.fetch(msg.author.id).catch(() => null);
-        if (fetched) member = fetched;
-      }
-      const tax = threadTaxonomy(msg.channel);
-      // Resolve <@id>/<#id>/<@&id> tokens to names ONCE, up front, so BOTH seams (mirror note +
-      // customer ingest) persist human-readable text instead of raw mention ids.
-      const resolvedContent = resolveMentions(msg);
-      // Discord CDN attachments (screenshots/files). Built up-front so BOTH seams can persist them —
-      // previously this ran AFTER the mirror-seam early-return, so internal notes lost every file.
-      const attachments = [...msg.attachments.values()].map((a) => ({
-        url: a.url,
-        filename: a.name ?? "file",
-        contentType: a.contentType ?? "application/octet-stream",
-        size: a.size ?? 0,
-      }));
-
-      // Ops-mirror seam: a message inside a mirror forum post is team collaboration on the mirrored
-      // ticket (note by default, 📤 promotes) — it must NEVER fall through to customer ingest. The
-      // handler also swallows bot messages in mirror threads (echo-guard for our own relays).
-      const { handleMirrorPostMessage } = await import("./discord-mirror.js");
-      const mirrored = await handleMirrorPostMessage({
-        guildId: msg.guildId,
-        threadId: tax.threadId,
-        discordMessageId: msg.id,
-        authorId: msg.author.id,
-        authorDisplayName: member?.displayName ?? msg.author.globalName ?? msg.author.username,
-        content: resolvedContent,
-        roleIds: member ? [...member.roles.cache.keys()] : [],
-        attachments,
-        isBotOrWebhook: msg.author.bot || msg.webhookId != null,
-      });
-      if (mirrored.handled) return;
-
-      const embeds = msg.embeds.map((e) => ({ title: e.title, description: e.description, url: e.url }));
-      const r = await handleInboundMessage({
-        guildId: msg.guildId,
-        channelId: tax.threadId ?? msg.channelId,
-        authorId: msg.author.id,
-        content: resolvedContent,
-        discordMessageId: msg.id,
-        threadId: tax.threadId,
-        parentId: tax.parentId,
-        threadKind: tax.kind,
-        authorDisplayName: member?.displayName ?? msg.author.globalName ?? msg.author.username,
-        authorAvatarUrl: msg.author.displayAvatarURL(),
-        attachments,
-        embeds,
-        threadName: tax.name,
-        roleIds: member ? [...member.roles.cache.keys()] : undefined,
-        memberIsNull: member === null,
-        isBotOrWebhook: msg.author.bot || msg.webhookId != null,
-      });
-      if (!r) log.info(`discord: message ${msg.id} not ingested (unlinked/unbound/dropped)`);
+      await ingestGatewayMessage(msg, log);
     } catch (err) {
       log.error({ err }, "discord inbound ingest failed");
     }
@@ -731,23 +862,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   client.on(Events.ThreadCreate, async (thread) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
-      const parentIsForum = thread.parent?.type === ChannelType.GuildForum;
-      const owner = thread.ownerId
-        ? await thread.guild.members.fetch(thread.ownerId).catch(() => null)
-        : null;
-      // A bot-owned thread (our VIP thread-per-message anchor) must not pre-seat a ticket with the
-      // bot as the customer — the triggering message's ingest already seated it on this thread id.
-      if (owner?.user.bot) return;
-      await handleThreadCreate({
-        guildId: thread.guildId,
-        threadId: thread.id,
-        parentId: thread.parentId ?? null,
-        ownerId: thread.ownerId ?? null,
-        name: thread.name ?? null,
-        kind: parentIsForum ? "forum_post" : "text_thread",
-        ownerDisplayName: owner?.displayName ?? null,
-        ownerAvatarUrl: owner?.user.displayAvatarURL() ?? null,
-      });
+      await ingestGatewayThreadCreate(thread);
     } catch (err) {
       log.error({ err }, "discord ThreadCreate failed");
     }
@@ -877,14 +992,23 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   };
   const markDisconnected = () => {
     if (gatewayDownSince.get(botId) === null) gatewayDownSince.set(botId, Date.now());
+    heartbeatPaused.add(botId);
   };
   client.on(Events.ShardReady, (shardId, unavailable) => {
     log.info(`discord: ${label} gateway session ready (shard ${shardId}${unavailable?.size ? `, ${unavailable.size} guild(s) unavailable` : ""})`);
     markConnected();
+    // A new session gets no replay of what happened while it was down. On a first session the client is
+    // ready only after this event.
+    const backfill = () => {
+      if (isDiscordEventLeader()) void backfillBot(botId, log);
+    };
+    if (client.isReady()) backfill();
+    else client.once(Events.ClientReady, backfill);
   });
   client.on(Events.ShardResume, (shardId, replayed) => {
     log.info(`discord: ${label} gateway resumed (shard ${shardId}, ${replayed} event(s) replayed)`);
     markConnected();
+    heartbeatPaused.delete(botId);
   });
   client.on(Events.ShardReconnecting, (shardId) => {
     log.warn(`discord: ${label} gateway reconnecting (shard ${shardId})`);
@@ -946,6 +1070,8 @@ export function startDiscord(log: Log): void {
   // events — otherwise each event is handled once per replica.
   if (token || process.env.DISCORD_MULTIBOT_ENABLED === "1") {
     startDiscordLeaderElection({ log, gatewayDownSince: leaderGatewayDownSince, onAcquired: () => onLeadershipAcquired(log) });
+    const t = setInterval(writeHeartbeats, HEARTBEAT_MS);
+    if (typeof t.unref === "function") t.unref();
   }
   if (token) openBot("shared", token, "shared", null, log);
   else log.warn("DISCORD_BOT_TOKEN not set — shared Discord bot disabled");

@@ -404,10 +404,31 @@ export async function evaluateAutoreply(
   tenantId: string,
   ticketId: string,
   messageId: string,
+  opts: { combineUnanswered?: boolean } = {},
 ): Promise<EvaluateResult | null> {
   const policy = await getPolicy(tenantId);
   if (policy.mode === "off") return null; // feature disabled — no work, no audit noise
-  return evaluateForMessage(tenantId, ticketId, messageId, policy);
+  return evaluateForMessage(tenantId, ticketId, messageId, policy, opts);
+}
+
+const MAX_COMBINED_MESSAGES = 10;
+
+/** The customer's messages since the ticket's last agent message, oldest first, joined into one body.
+ *  Used when several messages arrive at once (a Discord backfill), so one reply answers all of them. */
+export async function unansweredCustomerText(tenantId: string, ticketId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query<{ body: string }>(
+      `SELECT body FROM messages m
+        WHERE m.ticket_id = $1 AND m.author_type = 'customer' AND m.deleted_at IS NULL
+          AND coalesce(btrim(m.body), '') <> ''
+          AND m.created_at > coalesce(
+            (SELECT max(a.created_at) FROM messages a WHERE a.ticket_id = $1 AND a.author_type = 'agent'), '-infinity')
+        ORDER BY m.created_at DESC
+        LIMIT ${MAX_COMBINED_MESSAGES}`,
+      [ticketId],
+    );
+    return r.rowCount ? r.rows.map((x) => x.body).reverse().join("\n\n") : null;
+  });
 }
 
 /**
@@ -422,9 +443,12 @@ async function evaluateForMessage(
   ticketId: string,
   messageId: string,
   policy: AutoreplyPolicy,
+  opts: { combineUnanswered?: boolean } = {},
 ): Promise<EvaluateResult | null> {
   const ctx = await loadContext(tenantId, ticketId, messageId);
   if (!ctx) return null;
+  // The handoff and risk checks and the draft then see every unanswered message, not just the newest.
+  if (opts.combineUnanswered) ctx.body = (await unansweredCustomerText(tenantId, ticketId)) ?? ctx.body;
   // Only inbound customer messages where the ball is on us are candidates.
   if (ctx.authorType !== "customer" || ctx.whoseTurn !== "us") return null;
   // The AI is muted on this conversation (visitor asked for a human, or the assistant was

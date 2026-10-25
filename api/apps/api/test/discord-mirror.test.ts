@@ -233,6 +233,14 @@ async function main() {
   check("note lands on the ticket, Discord-attributed", notes.rows.some((r) => r.author_name === "Bob (Discord)" && r.body === "MIRTEST internal thought from Bob"));
   const tmm = await relayPool.query("SELECT is_responder, promoted_at FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-1'");
   check("promotion ledger row (responder)", tmm.rowCount === 1 && tmm.rows[0].is_responder === true && tmm.rows[0].promoted_at === null);
+  // A backfill hands the same message in again.
+  const noteAgain = await handleMirrorPostMessage({
+    guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1",
+    authorId: "mirtest-user-bob", authorDisplayName: "Bob",
+    content: "MIRTEST internal thought from Bob", roleIds: [ROLE], isBotOrWebhook: false,
+  });
+  const notesAgain = await withTenant(A, (c) => c.query("SELECT count(*)::int AS n FROM ticket_notes WHERE ticket_id = $1 AND body = 'MIRTEST internal thought from Bob'", [t1]));
+  check("a message seen again adds no second note", noteAgain.handled && notesAgain.rows[0].n === 1, notesAgain.rows[0].n);
 
   const outsider = await handleMirrorPostMessage({
     guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-2",
