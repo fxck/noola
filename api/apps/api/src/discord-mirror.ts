@@ -1,3 +1,4 @@
+import { RateLimitError } from "discord.js";
 import { relayPool, withTenant } from "@repo/db";
 import { addNote } from "./notes.js";
 import { persistInboundNoteAttachments, attachmentStorageForMessage } from "./attachments.js";
@@ -6,7 +7,7 @@ import { ingestInbound } from "./ingest.js";
 import { notifyContactByEmailIfAway } from "./email.js";
 import { getChannelDriver } from "./channels/registry.js";
 import { translateOutboundReply, stampOutboundTranslation } from "./translate.js";
-import { getMirrorTransport, setDiscordTransportForTests, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
+import { getMirrorTransport, setDiscordTransportForTests, rateLimitWaitMs, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
 import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
 import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
@@ -657,20 +658,22 @@ async function deliverReactRelay(tp: MirrorTransport, threadId: string, discordM
 // (a request that arrives mid-run schedules exactly one follow-up), and nothing waits on it.
 const SYNC_DEBOUNCE_MS = 2_500;
 const SYNC_SLOW_WARN_MS = 30_000;
+// Node runs a timer above 2^31-1 ms immediately, so a rate-limit retry is capped well below that.
+const MAX_SYNC_RETRY_MS = 60 * 60_000;
 const syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const syncInFlight = new Set<string>();
 const syncRerun = new Set<string>();
 
 /** Ask for the ticket's mirror post to be brought in line with its current status/priority. Returns
  *  immediately; bursts collapse into a single sync. Safe to call from any hot path. */
-export function requestMirrorSync(tenantId: string, ticketId: string): void {
+export function requestMirrorSync(tenantId: string, ticketId: string, delayMs = SYNC_DEBOUNCE_MS): void {
   const key = `${tenantId}:${ticketId}`;
   const pending = syncTimers.get(key);
   if (pending) clearTimeout(pending);
   const timer = setTimeout(() => {
     syncTimers.delete(key);
     void runMirrorSync(tenantId, ticketId, key);
-  }, SYNC_DEBOUNCE_MS);
+  }, delayMs);
   if (typeof timer.unref === "function") timer.unref();
   syncTimers.set(key, timer);
 }
@@ -718,8 +721,11 @@ export async function syncMirrorState(tenantId: string, ticketId: string): Promi
   const t = await loadTicketBrief(tenantId, ticketId);
   if (!t) return;
   const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
-  await closeAction("tag", ctx, () => tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)));
-  await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, t.status === "closed"));
+  const tag = await closeAction("tag", ctx, () => tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)));
+  const archive = await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, t.status === "closed"));
+  // discord.js fails fast on a long rate limit, so try again once it lifts.
+  const retryAfterMs = Math.max(tag.retryAfterMs ?? 0, archive.retryAfterMs ?? 0);
+  if (retryAfterMs > 0) requestMirrorSync(tenantId, ticketId, Math.min(retryAfterMs, MAX_SYNC_RETRY_MS));
 }
 
 /** Discord "you lack the permission" signals — Missing Permissions (50013) / Missing Access (50001).
@@ -737,7 +743,7 @@ async function closeAction(
   action: "tag" | "archive" | "lock",
   ctx: { tenantId: string; ticketId: string; threadId: string },
   fn: () => Promise<unknown>,
-): Promise<{ ok: boolean; missingPerms: boolean }> {
+): Promise<{ ok: boolean; missingPerms: boolean; retryAfterMs?: number }> {
   try {
     const out = await fn();
     // The transport reports "couldn't reach the thread" as `false` rather than throwing — that used to
@@ -752,7 +758,8 @@ async function closeAction(
     console.warn(
       `[discord-close] ${action} failed tenant=${ctx.tenantId} ticket=${ctx.ticketId} thread=${ctx.threadId} missingPerms=${missingPerms}: ${(e as Error)?.message ?? String(e)}`,
     );
-    return { ok: false, missingPerms };
+    const retryAfterMs = e instanceof RateLimitError ? rateLimitWaitMs(e) : undefined;
+    return { ok: false, missingPerms, retryAfterMs };
   }
 }
 

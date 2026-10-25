@@ -3,6 +3,7 @@ import { EVENT_TYPES } from "@repo/contracts";
 import { deleteDocumentsBySource, syncDocuments, type SyncDiff } from "./documents.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { canonicalEmojiName } from "./classification.js";
+import { discordFetchInit } from "./discord-egress.js";
 
 // Live-sources connector vertical. A tenant registers an external source (a docs URL /
 // sitemap now; GitHub / Discord later); a sync engine runs the source's connector,
@@ -877,7 +878,7 @@ export async function fetchDiscordUnits(config: Record<string, unknown>, ctx?: C
   // Channel probe: a FORUM channel gets the solved-thread distillation path (each resolved
   // post → one canonical Q&A doc) instead of raw message batching — chat logs are poor RAG
   // material; distilled resolutions are what you actually want cited.
-  const chRes = await fetchWithTimeout(`${DISCORD_API}/channels/${encodeURIComponent(channelId)}`, { headers }, DISCORD_TIMEOUT_MS);
+  const chRes = await fetchWithTimeout(`${DISCORD_API}/channels/${encodeURIComponent(channelId)}`, discordFetchInit({ headers }), DISCORD_TIMEOUT_MS);
   if (chRes.status === 401 || chRes.status === 403) {
     throw connectorError("discord connector: bot lacks access to this channel (invite the bot / check permissions)", 403);
   }
@@ -896,7 +897,7 @@ export async function fetchDiscordUnits(config: Record<string, unknown>, ctx?: C
   while (collected.length < cap) {
     const page = Math.min(100, cap - collected.length);
     const url = `${DISCORD_API}/channels/${encodeURIComponent(channelId)}/messages?limit=${page}${before ? `&before=${before}` : ""}`;
-    const res = await fetchWithTimeout(url, { headers }, DISCORD_TIMEOUT_MS);
+    const res = await fetchWithTimeout(url, discordFetchInit({ headers }), DISCORD_TIMEOUT_MS);
     if (res.status === 401 || res.status === 403) {
       throw connectorError("discord connector: bot lacks access to this channel (invite the bot / check permissions)", 403);
     }
@@ -993,7 +994,7 @@ async function fetchDiscordForumUnits(
     if (t.id && !seenThreads.has(t.id)) { seenThreads.add(t.id); threads.push(t); }
   };
   if (guildId) {
-    const r = await fetchWithTimeout(`${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/threads/active`, { headers }, DISCORD_TIMEOUT_MS);
+    const r = await fetchWithTimeout(`${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/threads/active`, discordFetchInit({ headers }), DISCORD_TIMEOUT_MS);
     if (r.ok) {
       const j = (await r.json()) as { threads?: DiscordThread[] };
       for (const t of j.threads ?? []) if (t.parent_id === channelId) push(t);
@@ -1002,7 +1003,7 @@ async function fetchDiscordForumUnits(
   let before: string | undefined;
   while (threads.length < FORUM_THREAD_CAP) {
     const url = `${DISCORD_API}/channels/${encodeURIComponent(channelId)}/threads/archived/public?limit=100${before ? `&before=${encodeURIComponent(before)}` : ""}`;
-    const r = await fetchWithTimeout(url, { headers }, DISCORD_TIMEOUT_MS);
+    const r = await fetchWithTimeout(url, discordFetchInit({ headers }), DISCORD_TIMEOUT_MS);
     if (!r.ok) break;
     const j = (await r.json()) as { threads?: DiscordThread[]; has_more?: boolean };
     const batch = j.threads ?? [];
@@ -1021,7 +1022,7 @@ async function fetchDiscordForumUnits(
       units.push({ key, title, contentType: "text/markdown", content: "", keep: true });
       continue;
     }
-    const mr = await fetchWithTimeout(`${DISCORD_API}/channels/${encodeURIComponent(t.id)}/messages?limit=100`, { headers }, DISCORD_TIMEOUT_MS);
+    const mr = await fetchWithTimeout(`${DISCORD_API}/channels/${encodeURIComponent(t.id)}/messages?limit=100`, discordFetchInit({ headers }), DISCORD_TIMEOUT_MS);
     if (!mr.ok) continue;
     const msgs = ((await mr.json()) as DiscordMessage[]).reverse(); // oldest→newest
     if (solvedOnly && !useTagGate && !msgs.some((m) => hasSolvedReaction(m, acceptedReactions))) continue;

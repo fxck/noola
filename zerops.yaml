@@ -95,6 +95,8 @@ zerops:
         # Typecheck gate — tsc across the project references. Bundlers strip types
         # without checking them, so this is the only step that catches type errors.
         - cd api && bun install
+        # The gateway proxy needs the @discordjs/ws patch (api/patches). Fail the build if a cached node_modules lacks it.
+        - cd api && grep -q "agent: this.strategy.options.agent" node_modules/@discordjs/ws/dist/index.mjs
         - cd api && ./node_modules/.bin/tsc --build
         # Bundle server + migrator into self-contained ESM (workspace packages and
         # all deps inlined) — no node_modules, no tsx, no raw source at runtime.
