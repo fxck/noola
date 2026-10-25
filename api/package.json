@@ -18,6 +18,7 @@
     "test:slack-ondemand": "tsx apps/api/test/slack-ondemand.test.ts",
     "test:discord-bots": "tsx apps/api/test/discord-bots.test.ts",
     "test:discord-egress": "tsx apps/api/test/discord-egress.test.ts",
+    "test:discord-leader": "tsx apps/api/test/discord-leader.test.ts",
     "test:slack-triage": "tsx apps/api/test/slack-triage.test.ts",
     "test:operating": "tsx apps/api/test/operating.test.ts",
     "test:auth": "tsx apps/api/test/auth.test.ts",

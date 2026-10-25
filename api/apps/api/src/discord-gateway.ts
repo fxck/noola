@@ -8,7 +8,7 @@ import { SimpleShardingStrategy, type WebSocketManager } from "@discordjs/ws";
 import type { Agent as HttpAgent } from "node:http";
 import { relayPool } from "@repo/db";
 import { discordEgress, proxiedMakeRequest } from "./discord-egress.js";
-import { isDiscordEventLeader, startDiscordLeaderElection } from "./discord-leader.js";
+import { isDiscordEventLeader, probeDiscordLeaderNow, startDiscordLeaderElection } from "./discord-leader.js";
 import { splitForDiscord } from "./channels/format.js";
 import {
   handleInboundMessage,
@@ -35,6 +35,9 @@ type Log = {
 // discord_bots.id for a per-tenant BYO bot). routeOutbound() with no botId uses the shared sender —
 // unchanged behaviour for the single-bot deployment; per-guild bot routing is a prod-multibot concern.
 const senders = new Map<string, Sender>();
+const clients = new Map<string, Client>();
+// When each open bot's gateway was last connected: null while connected, a timestamp while not.
+const gatewayDownSince = new Map<string, number | null>();
 
 /** The live outbound sender for a bot ('shared' by default), or null when it's disabled/unconnected. */
 export function getDiscordSender(botId = "shared"): Sender | null {
@@ -388,7 +391,13 @@ function stashDraft(token: string, v: { ticketId: string; channelId: string; tex
   }
 }
 
-async function registerCommandsForGuild(guild: Guild, log: Log): Promise<void> {
+// Command writes are rate-limited, so only the leader registers, once per guild per process.
+const commandsRegistered = new Set<string>();
+
+async function registerCommandsForGuild(botId: string, guild: Guild, log: Log): Promise<void> {
+  const key = `${botId}:${guild.id}`;
+  if (!isDiscordEventLeader() || commandsRegistered.has(key)) return;
+  commandsRegistered.add(key);
   try {
     await guild.commands.set(SLASH_COMMANDS);
     await relayPool
@@ -396,7 +405,23 @@ async function registerCommandsForGuild(guild: Guild, log: Log): Promise<void> {
       .catch(() => {});
     log.info(`discord: slash commands registered for guild ${guild.id}`);
   } catch (err) {
+    commandsRegistered.delete(key);
     log.warn({ err }, `discord: command registration failed for guild ${guild.id}`);
+  }
+}
+
+/** The shared bot decides eligibility when it is configured, otherwise any connected tenant bot does. */
+function leaderGatewayDownSince(): number | null {
+  if (gatewayDownSince.has("shared")) return gatewayDownSince.get("shared") ?? null;
+  const states = [...gatewayDownSince.values()];
+  if (states.some((v) => v === null)) return null;
+  return states.length ? Math.min(...(states as number[])) : Date.now();
+}
+
+function onLeadershipAcquired(log: Log): void {
+  for (const [botId, client] of clients) {
+    if (!client.isReady()) continue;
+    for (const guild of client.guilds.cache.values()) void registerCommandsForGuild(botId, guild, log);
   }
 }
 
@@ -520,6 +545,7 @@ async function onPostDraft(interaction: ButtonInteraction, log: Log): Promise<vo
 // Waiting that long stalls every caller behind the request.
 // Below the relay outbox's 20 s deliver deadline, so a write that discord.js holds back never outlives it.
 const MAX_RATE_LIMIT_WAIT_MS = 15_000;
+const LOG_RATE_LIMIT_WAIT_MS = 5_000;
 
 /** How long discord.js would wait. A header-less Cloudflare 429 puts its Retry-After in sublimitTimeout. */
 export function rateLimitWaitMs(d: Pick<RateLimitData, "timeToReset" | "retryAfter" | "sublimitTimeout">): number {
@@ -529,7 +555,11 @@ export function rateLimitWaitMs(d: Pick<RateLimitData, "timeToReset" | "retryAft
 /** True rejects the request with a RateLimitError, false lets discord.js wait. */
 export function failFastOnLongRateLimit(d: RateLimitData, log: Log): boolean {
   const waitMs = rateLimitWaitMs(d);
-  if (waitMs <= MAX_RATE_LIMIT_WAIT_MS) return false;
+  if (waitMs < LOG_RATE_LIMIT_WAIT_MS) return false;
+  if (waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
+    log.info(`discord: ${d.method.toUpperCase()} ${d.route} is rate-limited, waiting ${Math.round(waitMs / 1000)}s (global=${d.global}, scope=${d.scope})`);
+    return false;
+  }
   log.warn(
     `discord: ${d.method.toUpperCase()} ${d.route} is rate-limited for ${Math.round(waitMs / 1000)}s (global=${d.global}, scope=${d.scope}) - failing fast. ` +
       "A wait of about an hour usually means Cloudflare banned the egress IP.",
@@ -559,6 +589,8 @@ export function gatewayStrategy(agent: HttpAgent) {
  */
 function openBot(botId: string, token: string, scope: "shared" | "tenant", tenantId: string | null, log: Log): void {
   void tenantId; // reserved for per-guild outbound routing when the prod multibot gate lands
+  const label = scope === "shared" ? "shared bot" : `tenant bot ${botId.slice(0, 8)}`;
+  if (!gatewayDownSince.has(botId)) gatewayDownSince.set(botId, Date.now());
   const egress = discordEgress();
   const client = new Client({
     rest: {
@@ -617,6 +649,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     }
   };
   senders.set(botId, send);
+  clients.set(botId, client);
   mirrorTransports.set(botId, buildMirrorTransport(client));
 
   client.on(Events.MessageCreate, async (msg) => {
@@ -805,6 +838,8 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   // Phase 5: route slash-command + button interactions to the on-demand handlers.
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
+    const what = interaction.isChatInputCommand() ? `/${interaction.commandName}` : interaction.isButton() ? `button ${interaction.customId.split(":")[0]}` : `type ${interaction.type}`;
+    log.info(`discord: interaction ${what} from user ${interaction.user.id} in guild ${interaction.guildId ?? "-"} (${label})`);
     try {
       if (interaction.isChatInputCommand()) {
         if (interaction.commandName === "ask") await onAsk(interaction, send, log);
@@ -818,16 +853,41 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   });
 
   // Register the guild-scoped slash commands: for every guild present at ready, and any joined later.
-  client.on(Events.GuildCreate, (guild) => void registerCommandsForGuild(guild, log));
+  client.on(Events.GuildCreate, (guild) => void registerCommandsForGuild(botId, guild, log));
 
   client.once(Events.ClientReady, async (c) => {
     loginAttempts.delete(botId);
-    const label = scope === "shared" ? "shared bot" : `tenant bot ${botId.slice(0, 8)}`;
     log.info(`discord: connected as ${c.user.tag} (${label})`);
-    for (const guild of c.guilds.cache.values()) await registerCommandsForGuild(guild, log);
+    for (const guild of c.guilds.cache.values()) await registerCommandsForGuild(botId, guild, log);
     if (scope === "tenant") await markBotReady(botId, c.guilds.cache.size);
   });
-  if (scope === "tenant") client.on(Events.ShardDisconnect, () => void markBotDisconnect(botId));
+
+  // Connection lifecycle. Without these logs a deaf bot looks the same as a quiet one.
+  const markConnected = () => {
+    gatewayDownSince.set(botId, null);
+    probeDiscordLeaderNow();
+  };
+  const markDisconnected = () => {
+    if (gatewayDownSince.get(botId) === null) gatewayDownSince.set(botId, Date.now());
+  };
+  client.on(Events.ShardReady, (shardId, unavailable) => {
+    log.info(`discord: ${label} gateway session ready (shard ${shardId}${unavailable?.size ? `, ${unavailable.size} guild(s) unavailable` : ""})`);
+    markConnected();
+  });
+  client.on(Events.ShardResume, (shardId, replayed) => {
+    log.info(`discord: ${label} gateway resumed (shard ${shardId}, ${replayed} event(s) replayed)`);
+    markConnected();
+  });
+  client.on(Events.ShardReconnecting, (shardId) => {
+    log.warn(`discord: ${label} gateway reconnecting (shard ${shardId})`);
+    markDisconnected();
+  });
+  client.on(Events.ShardDisconnect, (event, shardId) => {
+    log.warn(`discord: ${label} gateway disconnected and won't reconnect (shard ${shardId}, close code ${event.code})`);
+    markDisconnected();
+    if (scope === "tenant") void markBotDisconnect(botId);
+  });
+  client.on(Events.ShardError, (err, shardId) => log.warn({ err }, `discord: ${label} gateway error (shard ${shardId})`));
   client.login(token).catch((err: unknown) => {
     // A tenant bot with a revoked token is disabled. The shared bot's token is operator-managed, so it keeps retrying.
     if (scope === "tenant" && isInvalidToken(err)) {
@@ -876,7 +936,9 @@ export function startDiscord(log: Log): void {
   log.info(egress ? `discord: traffic goes through the proxy ${egress.label}` : "discord: traffic goes direct (DISCORD_PROXY_URL unset)");
   // Every replica logs in (outbound REST needs the client), but only the elected leader acts on gateway
   // events — otherwise each event is handled once per replica.
-  if (token || process.env.DISCORD_MULTIBOT_ENABLED === "1") startDiscordLeaderElection(log);
+  if (token || process.env.DISCORD_MULTIBOT_ENABLED === "1") {
+    startDiscordLeaderElection({ log, gatewayDownSince: leaderGatewayDownSince, onAcquired: () => onLeadershipAcquired(log) });
+  }
   if (token) openBot("shared", token, "shared", null, log);
   else log.warn("DISCORD_BOT_TOKEN not set — shared Discord bot disabled");
 
