@@ -13,7 +13,7 @@ import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
-import { mdToDiscord } from "./channels/format.js";
+import { mdToDiscord, plainThreadName } from "./channels/format.js";
 import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
@@ -212,7 +212,7 @@ function webBase(): string {
 }
 
 function postTitle(t: TicketBrief): string {
-  return `${t.subject || "Support ticket"}`.slice(0, 96);
+  return plainThreadName(t.subject || "") || "Support ticket";
 }
 
 /** Fill a quick-link url template with this ticket's values (URL-encoded). Returns null when the

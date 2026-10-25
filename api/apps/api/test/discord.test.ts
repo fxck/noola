@@ -40,11 +40,11 @@ const PARENT_B_STAFF = "disctest-parent-b-staff";     // GUILD_B staffed control
 const MARK = "disctestwidgetzarquon";                 // distinctive KB word for deterministic retrieval
 
 let failures = 0;
-function check(name: string, cond: boolean) {
+function check(name: string, cond: boolean, got?: unknown) {
   if (cond) console.log(`  PASS  ${name}`);
   else {
     failures++;
-    console.error(`  FAIL  ${name}`);
+    console.error(`  FAIL  ${name}${got !== undefined ? ` — got: ${JSON.stringify(got)}` : ""}`);
   }
 }
 
@@ -182,6 +182,26 @@ async function main() {
       check("edit updates the SAME row in place", m.rowCount === 1 && m.rows[0].id === before && m.rows[0].body === "DISCTEST edited body");
       const t = await c.query("SELECT whose_turn FROM tickets WHERE id = $1", [r!.ticketId]);
       check("Discord customer reply → whose_turn='us' (retarget-gate kept)", t.rows[0].whose_turn === "us");
+    });
+    // An edit is stored readable, like a new message, and an edit without text keeps the stored body.
+    await handleMessageUpdate({ guildId: GUILD_A, messageId: "disctest-edit-1", newContent: "DISCTEST edited <:pepe:123456789> at <t:1792954800>" });
+    const blank = await handleMessageUpdate({ guildId: GUILD_A, messageId: "disctest-edit-1", newContent: "  " });
+    await withTenant(A, async (c) => {
+      const m = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-edit-1'");
+      check("an edit converts Discord tokens", m.rows[0].body === "DISCTEST edited :pepe: at 25 Oct 2026 19:00 UTC", m.rows[0].body);
+      check("an edit without text is ignored", blank === false);
+    });
+  }
+
+  // 7b — stickers and polls become readable lines instead of being dropped
+  {
+    const sticker = await handleInboundMessage(thread({ threadId: "disctest-thread-sticker", authorId: "cust-s", discordMessageId: "disctest-sticker-1", content: "", stickers: ["wave"] }));
+    const poll = await handleInboundMessage(thread({ threadId: "disctest-thread-poll", authorId: "cust-p", discordMessageId: "disctest-poll-1", content: "DISCTEST vote please", poll: "Which plan?" }));
+    await withTenant(A, async (c) => {
+      const s = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-sticker-1'");
+      check("a sticker-only message is ingested as a placeholder", !!sticker && s.rows[0]?.body === "[sticker: wave]", s.rows[0]?.body);
+      const p = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-poll-1'");
+      check("a poll keeps its text and adds its question", !!poll && p.rows[0]?.body === "DISCTEST vote please\n\n[poll: Which plan?]", p.rows[0]?.body);
     });
   }
 

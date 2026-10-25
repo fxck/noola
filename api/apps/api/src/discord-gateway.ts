@@ -10,7 +10,7 @@ import { relayPool } from "@repo/db";
 import { discordEgress, proxiedMakeRequest } from "./discord-egress.js";
 import { backfillChannels, lastSeenConnected, loadGuildScopes, recordSeenConnected, type BackfillChannel } from "./discord-backfill.js";
 import { isDiscordEventLeader, probeDiscordLeaderNow, startDiscordLeaderElection } from "./discord-leader.js";
-import { splitForDiscord } from "./channels/format.js";
+import { discordTokensToText, splitForDiscord } from "./channels/format.js";
 import {
   handleInboundMessage,
   handleThreadCreate,
@@ -727,7 +727,8 @@ async function ingestGatewayMessage(
     guildId: msg.guildId,
     channelId: tax.threadId ?? msg.channelId,
     authorId: msg.author.id,
-    content: resolvedContent,
+    // Other Discord tokens are converted for the inbox only. A mirror note can be promoted back to a Discord customer.
+    content: discordTokensToText(resolvedContent),
     discordMessageId: msg.id,
     threadId: tax.threadId,
     parentId: tax.parentId,
@@ -740,6 +741,8 @@ async function ingestGatewayMessage(
     roleIds: member ? [...member.roles.cache.keys()] : undefined,
     memberIsNull: member === null,
     isBotOrWebhook: msg.author.bot || msg.webhookId != null,
+    stickers: [...msg.stickers.values()].map((st) => st.name),
+    poll: msg.poll?.question.text ?? null,
     skipAutoreply: opts.skipAutoreply,
   });
   if (!r) {
@@ -901,8 +904,9 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   client.on(Events.MessageUpdate, async (_old, msg) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
-      if (!msg.guildId) return;
-      await handleMessageUpdate({ guildId: msg.guildId, messageId: msg.id, newContent: msg.content ?? "" });
+      // A partial update has no content, and storing it would blank the message.
+      if (!msg.guildId || msg.partial) return;
+      await handleMessageUpdate({ guildId: msg.guildId, messageId: msg.id, newContent: resolveMentions(msg) });
     } catch (err) {
       log.error({ err }, "discord MessageUpdate failed");
     }
