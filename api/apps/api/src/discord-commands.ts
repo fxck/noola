@@ -9,6 +9,14 @@ import { answerOnDemand } from "./autoreply.js";
 import { suggestForQuery } from "./copilot.js";
 import { resolveTenant, routeOutbound, getSender, handleInboundMessage } from "./discord.js";
 import { emitDomainEvent } from "./automations.js";
+import { classifyDiscordAuthor } from "./discord-classify.js";
+
+/** The Noola seat of a teammate allowed to use /draft (null when the role has no seat), or false for anyone else.
+ *  A draft is grounded in the agent audience, which includes other customers' resolved threads. */
+async function draftTeammate(tenantId: string, guildId: string, invokerId: string, roleIds: string[]): Promise<string | null | false> {
+  const cls = await classifyDiscordAuthor({ tenantId, guildId, authorId: invokerId, roleIds });
+  return cls.action === "ingest" && cls.authorKind === "agent" ? cls.authorId : false;
+}
 
 /** discord_links.ondemand_public — /ask answers in-channel (true) or ephemerally to the asker (false).
  *  discord_links is outside RLS (like resolveTenant), so this reads via relayPool. Default true. */
@@ -111,10 +119,12 @@ function heldNotice(reason: string): string {
 export interface DraftCommandInput {
   guildId: string;
   channelId: string;
+  invokerId: string;
+  invokerRoleIds: string[];
   query: string;
 }
 export interface DraftCommandResult {
-  status: "drafted" | "no_ticket" | "not_connected" | "empty";
+  status: "drafted" | "no_ticket" | "not_connected" | "empty" | "forbidden";
   text: string | null;
   ticketId: string | null;
 }
@@ -128,6 +138,9 @@ export interface DraftCommandResult {
 export async function handleDraftCommand(input: DraftCommandInput): Promise<DraftCommandResult> {
   const tenantId = await resolveTenant(input.guildId);
   if (!tenantId) return { status: "not_connected", text: null, ticketId: null };
+  if ((await draftTeammate(tenantId, input.guildId, input.invokerId, input.invokerRoleIds)) === false) {
+    return { status: "forbidden", text: null, ticketId: null };
+  }
   const query = input.query.trim();
   if (!query) return { status: "empty", text: null, ticketId: null };
   const ticketId = await resolveThreadTicket(tenantId, input.channelId);
@@ -144,15 +157,19 @@ export interface PostDraftInput {
   text: string;
   /** Idempotency anchor (the button interaction id) so a double-click posts once. */
   postId: string;
+  invokerId: string;
+  invokerRoleIds: string[];
 }
 
 /** Post a reviewed /draft: record it as an agent reply on the ticket, then dispatch it to the thread.
  *  Idempotent on postId — a double Post ingests + sends once. */
-export async function postDraft(input: PostDraftInput): Promise<{ delivered: boolean }> {
+export async function postDraft(input: PostDraftInput): Promise<{ delivered: boolean; forbidden?: boolean }> {
   const tenantId = await resolveTenant(input.guildId);
   if (!tenantId) return { delivered: false };
+  const seat = await draftTeammate(tenantId, input.guildId, input.invokerId, input.invokerRoleIds);
+  if (seat === false) return { delivered: false, forbidden: true };
   const ingested = await ingestInbound({
-    tenantId, body: input.text, authorType: "agent", ticketId: input.ticketId,
+    tenantId, body: input.text, authorType: "agent", authorKind: "agent", authorId: seat, ticketId: input.ticketId,
     idempotencyKey: `ondemand-post:${input.postId}`,
     channelType: "discord", externalChannelId: input.channelId,
   });

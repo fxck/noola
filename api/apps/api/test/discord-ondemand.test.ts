@@ -1,6 +1,7 @@
 import pg from "pg";
 import { appPool, relayPool, withTenant } from "@repo/db";
 import { linkGuild, handleInboundMessage } from "../src/discord.js";
+import { setDiscordClassification } from "../src/discord-classify.js";
 import { handleAskCommand, handleDraftCommand, postDraft } from "../src/discord-commands.js";
 import { answerOnDemand, putPolicy, checkHardGates, getPolicy } from "../src/autoreply.js";
 import { claimAnswer } from "../src/answer-claims.js";
@@ -136,7 +137,14 @@ async function main() {
     const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1", [draftTicket]);
     return r.rows[0].n as number;
   });
-  const draft = await handleDraftCommand({ guildId: GUILD, channelId: draftThread, query: "how to resize" });
+  // /draft is grounded in the agent audience, so only a teammate (here: a team-role member) may run it.
+  const TEAM_ROLE = "odtest-team-role";
+  await setDiscordClassification(GUILD, A, { teamRoleIds: [TEAM_ROLE] });
+  const teammate = { invokerId: "odtest-agent", invokerRoleIds: [TEAM_ROLE] };
+  const member = { invokerId: "odtest-cust", invokerRoleIds: [] };
+  const refused = await handleDraftCommand({ guildId: GUILD, channelId: draftThread, query: "how to resize", ...member });
+  check("/draft refuses a non-teammate", refused.status === "forbidden" && refused.text === null);
+  const draft = await handleDraftCommand({ guildId: GUILD, channelId: draftThread, query: "how to resize", ...teammate });
   check("/draft resolves the thread ticket + returns a draft", draft.status === "drafted" && !!draft.text && draft.ticketId === draftTicket);
   const msgsAfterDraft = await withTenant(A, async (c) => {
     const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1", [draftTicket]);
@@ -147,8 +155,10 @@ async function main() {
   check("/draft records no decision", noDraftDecision.rows[0].n === 0);
 
   // Post the draft → one agent reply is ingested; a repeat Post (same postId) is idempotent.
-  await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1" });
-  await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1" });
+  const refusedPost = await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: "ODTEST forged", postId: "odtest-post-0", ...member });
+  check("Post refuses a non-teammate", refusedPost.delivered === false && refusedPost.forbidden === true);
+  await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1", ...teammate });
+  await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1", ...teammate });
   const msgsAfterPost = await withTenant(A, async (c) => {
     const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1 AND author_type = 'agent'", [draftTicket]);
     return r.rows[0].n as number;

@@ -1,5 +1,5 @@
 import {
-  Client, GatewayIntentBits, Events, ChannelType, Partials,
+  Client, GatewayIntentBits, Events, ChannelType, Partials, PermissionFlagsBits,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
   type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
   type ForumChannel, type ThreadChannel, type Message,
@@ -360,9 +360,12 @@ const SLASH_COMMANDS = [
     .setName("ask")
     .setDescription("Ask the assistant — it answers from the knowledge base")
     .addStringOption((o) => o.setName("question").setDescription("What do you want to know?").setRequired(true)),
+  // Hidden from members without Manage Threads, which server admins can grant to a team role in Integrations.
+  // handleDraftCommand still checks that the caller is a teammate.
   new SlashCommandBuilder()
     .setName("draft")
     .setDescription("Draft a private reply you can review, then post to the thread")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageThreads)
     .addStringOption((o) => o.setName("question").setDescription("What should the reply address?").setRequired(true)),
 ];
 
@@ -391,10 +394,12 @@ async function registerCommandsForGuild(guild: Guild, log: Log): Promise<void> {
 }
 
 /** Best-effort role ids for the invoking member (empty ⇒ the classifier defaults to customer, which
- *  is the right fallback for /ask). interaction.member may be a raw API member without a role cache. */
-function invokerRoleIds(interaction: ChatInputCommandInteraction): string[] {
+ *  is the right fallback for /ask). interaction.member may be a raw API member, whose roles are an id array. */
+function invokerRoleIds(interaction: ChatInputCommandInteraction | ButtonInteraction): string[] {
   const m = interaction.member;
-  if (m && "roles" in m && m.roles && typeof m.roles === "object" && "cache" in m.roles) {
+  if (!m || !("roles" in m) || !m.roles) return [];
+  if (Array.isArray(m.roles)) return m.roles.map(String);
+  if (typeof m.roles === "object" && "cache" in m.roles) {
     return [...(m.roles.cache as Map<string, unknown>).keys()];
   }
   return [];
@@ -459,6 +464,8 @@ async function onDraft(interaction: ChatInputCommandInteraction, log: Log): Prom
   const res = await handleDraftCommand({
     guildId: interaction.guildId,
     channelId,
+    invokerId: interaction.user.id,
+    invokerRoleIds: invokerRoleIds(interaction),
     query: interaction.options.getString("question", true),
   });
   if (res.status === "drafted" && res.text && res.ticketId) {
@@ -471,7 +478,8 @@ async function onDraft(interaction: ChatInputCommandInteraction, log: Log): Prom
     return;
   }
   const notice =
-    res.status === "no_ticket" ? "No ticket is linked to this thread yet — reply in the thread first."
+    res.status === "forbidden" ? "Only teammates can use /draft."
+    : res.status === "no_ticket" ? "No ticket is linked to this thread yet — reply in the thread first."
     : res.status === "not_connected" ? "This channel isn't connected to the assistant."
     : res.status === "empty" ? "Please include what the reply should address."
     : "Something went wrong.";
@@ -485,13 +493,18 @@ async function onPostDraft(interaction: ButtonInteraction, log: Log): Promise<vo
     await interaction.update({ content: "This draft expired — run /draft again.", components: [] });
     return;
   }
+  // Posting does DB and Discord work, which can outlast the 3 s acknowledgement window.
+  await interaction.deferUpdate();
   const r = await postDraft({
     guildId: interaction.guildId ?? "",
     channelId: draft.channelId, ticketId: draft.ticketId, text: draft.text, postId: interaction.id,
+    invokerId: interaction.user.id, invokerRoleIds: invokerRoleIds(interaction),
   });
   draftStore.delete(token);
-  await interaction.update({
-    content: r.delivered ? "✅ Posted to the channel." : "Couldn't post — the channel may be disconnected.",
+  await interaction.editReply({
+    content: r.delivered ? "✅ Posted to the channel."
+      : r.forbidden ? "Only teammates can post drafts."
+      : "Couldn't post — the channel may be disconnected.",
     components: [],
   });
 }
