@@ -235,7 +235,7 @@ function fillLink(url: string, t: TicketBrief): string | null {
   return missing ? null : filled;
 }
 
-function postHeader(t: TicketBrief, latestBody: string | null, quickLinks: QuickLink[] = []): string {
+function postHeader(t: TicketBrief, quotedBody: string | null, quickLinks: QuickLink[] = []): string {
   const who = t.contact_name || t.contact_email || "Unknown contact";
   const lines = [
     `**${t.subject || "Support ticket"}**`,
@@ -248,7 +248,7 @@ function postHeader(t: TicketBrief, latestBody: string | null, quickLinks: Quick
   if (t.contact_external_id) meta.push(`ID: ${t.contact_external_id}`);
   if (t.contact_company) meta.push(`Company: ${t.contact_company}`);
   if (meta.length) lines.push(meta.join(" · "));
-  if (latestBody) lines.push("", quote(latestBody));
+  if (quotedBody) lines.push("", quotedBody);
   const base = webBase();
   const links: string[] = [];
   if (base) links.push(`Console: <${base}/tickets/${t.id}>`); // <> suppresses Discord's link-preview embed (matches the quick-links below)
@@ -261,10 +261,6 @@ function postHeader(t: TicketBrief, latestBody: string | null, quickLinks: Quick
   if (links.length) lines.push("", links.join("\n"));
   lines.push("", `_Messages here are internal notes. React ${PROMOTE_EMOJI} on a message to send it to the customer; ✅ closes, 🔄 reopens, 👀 assigns to you, 💤 snoozes, 🚫 marks spam._`);
   return lines.join("\n");
-}
-
-function quote(body: string): string {
-  return body.slice(0, 1500).split("\n").map((l) => `> ${l}`).join("\n");
 }
 
 export interface MirrorRef {
@@ -352,11 +348,12 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
   // Attach that seeding message's files to the initial forum post, so a ticket opened with a
   // screenshot shows it on Discord from the start (not just in later replies).
   const seed = latest ? await loadMirrorFiles(tenantId, latest.id) : { files: [], dropped: 0 };
+  const seedQuote = latest?.body ? fitQuote(latest.body, seed.files) : null;
   const created = await tp
     .createForumPost(
       binding.forum_channel_id, postTitle(t),
-      postHeader(t, latest?.body ?? null, binding.quick_links) + droppedNote(seed.dropped),
-      mirrorTagNames(t), seed.files,
+      postHeader(t, seedQuote?.quoted ?? null, binding.quick_links) + droppedNote(seed.dropped),
+      mirrorTagNames(t), seedQuote?.files ?? seed.files,
     )
     .catch(() => null);
   if (!created) {
@@ -503,14 +500,48 @@ function droppedNote(dropped: number): string {
 /** A thin rule prepended to each relayed message so consecutive posts don't merge into one wall. */
 const MIRROR_DIVIDER = "──────────";
 
+// The transport splits a long post into 2000-char messages on line boundaries. A shorter line keeps its "> " in every piece.
+const QUOTE_LINE_MAX = 1900;
+// Discord takes about one message a second per channel, and a relay must land within the outbox's deadline.
+// A longer body is cut at a line, and the full text is attached as a file.
+const MAX_QUOTED_CHARS = 7_000;
+
+/** `line` in pieces of at most `max` UTF-16 units, never splitting a surrogate pair. */
+function wrapLine(line: string, max: number): string[] {
+  if (line.length <= max) return [line];
+  const out: string[] = [];
+  for (let i = 0; i < line.length; ) {
+    let end = Math.min(i + max, line.length);
+    if (end < line.length && /[\uD800-\uDBFF]/.test(line[end - 1])) end--;
+    out.push(line.slice(i, end));
+    i = end;
+  }
+  return out;
+}
+
+/** The quoted body within MAX_QUOTED_CHARS, plus `files` with the full text added when the body doesn't fit. */
+function fitQuote(body: string, files: MirrorFile[]): { quoted: string; files: MirrorFile[] } {
+  const quoted = quoteBlock(body);
+  if (quoted.length <= MAX_QUOTED_CHARS) return { quoted, files };
+  let cut = "";
+  for (const line of quoted.split("\n")) {
+    if (cut.length + line.length + 1 > MAX_QUOTED_CHARS) break;
+    cut += (cut ? "\n" : "") + line;
+  }
+  if (files.length >= MIRROR_ATTACH_MAX_FILES) return { quoted: `${cut}\n_(message continues - open the ticket in Noola for the rest)_`, files };
+  return {
+    quoted: `${cut}\n_(message continues - the full text is attached as message.txt)_`,
+    files: [...files, { name: "message.txt", data: Buffer.from(body, "utf8") }],
+  };
+}
+
 /** Render a relayed message body as a Discord blockquote: every line (blanks included, to preserve
  *  paragraph spacing inside the quote) gets a "> " prefix, so the body reads as one visually-bracketed
- *  block under its author header instead of flowing straight into the next message. Kept under a tight
- *  budget because the "> " prefixes + header + divider must all fit Discord's 2000-char message cap. */
+ *  block under its author header instead of flowing straight into the next message. */
 function quoteBlock(body: string): string {
   return body
-    .slice(0, 1700)
     .split("\n")
+    .flatMap((line) => wrapLine(line, QUOTE_LINE_MAX))
     .map((line) => `> ${line}`)
     .join("\n");
 }
@@ -609,11 +640,12 @@ async function deliverMessageRelay(
   const isCustomer = row.author_type === "customer";
   const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
-  const { files, dropped } = await loadMirrorFiles(tenantId, messageId);
+  const loaded = await loadMirrorFiles(tenantId, messageId);
+  const { quoted, files } = fitQuote(mdToDiscord(row.body), loaded.files);
   try {
     const posted = await tp.postToThread(
       mirror.post_thread_id,
-      `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(row.body))}${droppedNote(dropped)}`,
+      `${MIRROR_DIVIDER}\n${label}\n${quoted}${droppedNote(loaded.dropped)}`,
       files,
       undefined,
       { nonce },
@@ -634,7 +666,8 @@ async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorNa
   const name = authorName?.trim() || "Agent";
   const label = `📝 **${name}** _(internal note)_:`;
   try {
-    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoteBlock(mdToDiscord(body))}`, undefined, undefined, { nonce });
+    const { quoted, files } = fitQuote(mdToDiscord(body), []);
+    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoted}`, files.length ? files : undefined, undefined, { nonce });
     if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
   } catch (e) {
     return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };

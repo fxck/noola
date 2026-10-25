@@ -144,6 +144,17 @@ function withTimeout<T>(p: Promise<T>, ms = DISCORD_FETCH_TIMEOUT_MS): Promise<T
 }
 
 const THREAD_ALREADY_EXISTS = 160004;
+const PAYLOAD_TOO_LARGE = 40005;
+
+/** Discord refused the upload as larger than the server's limit. */
+function uploadTooLarge(e: unknown): boolean {
+  const err = e as { code?: unknown; status?: unknown } | null;
+  return err?.code === PAYLOAD_TOO_LARGE || err?.status === 413;
+}
+
+function filesNotUploadedNote(n: number): string {
+  return `_(${n} attachment${n > 1 ? "s were" : " was"} too large to upload to Discord - open the ticket in Noola to see ${n > 1 ? "them" : "it"})_`;
+}
 
 function buildMirrorTransport(client: Client): MirrorTransport {
   const forum = async (id: string): Promise<ForumChannel | null> => {
@@ -188,14 +199,21 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       const f = await forum(forumChannelId);
       if (!f) return null;
       const appliedTags = await resolveForumTagIds(f, tagNames).catch(() => []);
-      const chunks = splitForDiscord(content, 2000);
       const df = toDiscordFiles(files);
-      const created = await f.threads.create({
-        name: name.slice(0, 100) || "Support ticket",
-        message: { content: chunks[0], allowedMentions: { parse: [] }, ...(df.length ? { files: df } : {}) },
-        appliedTags,
-      }).catch(() => null);
-      if (!created) return null;
+      const create = (body: string, withFiles: boolean) => {
+        const chunks = splitForDiscord(body, 2000);
+        return f.threads.create({
+          name: name.slice(0, 100) || "Support ticket",
+          message: { content: chunks[0], allowedMentions: { parse: [] }, ...(withFiles && df.length ? { files: df } : {}) },
+          appliedTags,
+        }).then((thread) => ({ thread, chunks }));
+      };
+      // Without the files the post still lands, so a too-large upload doesn't lose the whole mirror.
+      const made = await create(content, true).catch((e: unknown) =>
+        df.length && uploadTooLarge(e) ? create(`${content}\n${filesNotUploadedNote(df.length)}`, false).catch(() => null) : null,
+      );
+      if (!made) return null;
+      const { thread: created, chunks } = made;
       for (let i = 1; i < chunks.length; i++) {
         await created.send({ content: chunks[i], allowedMentions: { parse: [] } }).catch(() => {});
       }
@@ -222,15 +240,32 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       // Mentions stay locked down by default (parse: []); a caller may opt in EXACTLY the user ids it
       // wants to ping (assignee / participant notifications) — @everyone/@here and stray pings never fire.
       const allow = mentionUserIds?.length ? { users: mentionUserIds, parse: [] as never[] } : { parse: [] as never[] };
+      let filesNotUploaded = 0;
       for (let i = 0; i < chunks.length; i++) {
         // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads. The ping
         // rides the first chunk (where the <@id> mention text is).
-        await t.send({
+        const message = {
           content: chunks[i],
           allowedMentions: i === 0 ? allow : { parse: [] },
-          ...(i === 0 && df.length ? { files: df } : {}),
           // Idempotent retries: same row → same nonce per chunk → Discord returns the existing message.
           ...(opts?.nonce ? { nonce: `${opts.nonce}.${i}`, enforceNonce: true } : {}),
+        };
+        if (i === 0 && df.length) {
+          // A refused upload created no message, so the text goes again without the files, under the same nonce.
+          await t.send({ ...message, files: df }).catch(async (e: unknown) => {
+            if (!uploadTooLarge(e)) throw e;
+            filesNotUploaded = df.length;
+            await t.send(message);
+          });
+        } else {
+          await t.send(message);
+        }
+      }
+      if (filesNotUploaded) {
+        await t.send({
+          content: filesNotUploadedNote(filesNotUploaded),
+          allowedMentions: { parse: [] },
+          ...(opts?.nonce ? { nonce: `${opts.nonce}.f`, enforceNonce: true } : {}),
         });
       }
       return true;
