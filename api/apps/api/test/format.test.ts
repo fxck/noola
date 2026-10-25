@@ -1,4 +1,4 @@
-import { mdToSlack, mdToTelegramHtml, mdToWhatsApp, mdToPlain, normalizeBlockquotes } from "../src/channels/format.js";
+import { mdToSlack, mdToTelegramHtml, mdToWhatsApp, mdToPlain, normalizeBlockquotes, discordTokensToText, plainThreadName } from "../src/channels/format.js";
 
 // Per-channel markdown adaptation (channels/format.ts) — pure transforms, no DB. Pins the
 // syntax each surface actually renders: Slack mrkdwn, Telegram HTML, WhatsApp single-marker,
@@ -88,6 +88,36 @@ function check(name: string, cond: boolean, got?: string) {
   // A `>` inside a fenced code block is not treated as a quote boundary.
   const fenced = "```\n> not a quote\ncode\n```\nafter";
   check("bq: fenced code left alone", normalizeBlockquotes(fenced) === fenced, normalizeBlockquotes(fenced));
+}
+
+// ── Discord tokens in inbound text ──
+{
+  const t = (s: string) => discordTokensToText(s);
+  check("dc: custom emoji → :name:", t("hi <:pepe:123456789> and <a:dance:987654321>") === "hi :pepe: and :dance:", t("hi <:pepe:123456789> and <a:dance:987654321>"));
+  check("dc: timestamp → fixed UTC time", t("at <t:1792954800:F> ok") === "at 25 Oct 2026 19:00 UTC ok", t("at <t:1792954800:F> ok"));
+  check("dc: bare timestamp", t("<t:1792954800>") === "25 Oct 2026 19:00 UTC", t("<t:1792954800>"));
+  check("dc: slash-command mention → /cmd sub", t("run </ask question:1234567890>") === "run /ask question", t("run </ask question:1234567890>"));
+  check("dc: subtext marker dropped", t("text\n-# small print") === "text\nsmall print", t("text\n-# small print"));
+  check("dc: markdown is kept", t("**bold** and [link](https://x.io)") === "**bold** and [link](https://x.io)");
+  check("dc: code spans are left alone", t("`<:pepe:123>`") === "`<:pepe:123>`");
+  check("dc: a 12-digit or millisecond timestamp stays as it is", t("<t:999999999999>") === "<t:999999999999>" && t("<t:1792954800000>") === "<t:1792954800000>", t("<t:999999999999>"));
+}
+
+// ── plain-text thread names ──
+{
+  check("tn: markdown and links stripped", plainThreadName("**Login** _broken_ on [the app](https://x.io)") === "Login broken on the app", plainThreadName("**Login** _broken_ on [the app](https://x.io)"));
+  check("tn: snake_case survives", plainThreadName("error in user_id field") === "error in user_id field");
+  check("tn: spoilers stay hidden", plainThreadName("my password is ||hunter2||") === "my password is [spoiler]");
+  check("tn: newlines and quote markers collapse", plainThreadName("> quoted\nline two") === "quoted line two", plainThreadName("> quoted\nline two"));
+  check("tn: emoji token readable", plainThreadName("help <:sad:123>") === "help :sad:");
+  check("tn: inline code is shown literally", plainThreadName("crash in `__init__.py`") === "crash in __init__.py", plainThreadName("crash in `__init__.py`"));
+  check("tn: nested quote markers are stripped", plainThreadName("> > deep quote") === "deep quote", plainThreadName("> > deep quote"));
+  const long = "The dashboard keeps crashing whenever I open the reports page after the latest update rolled out yesterday";
+  const name = plainThreadName(long);
+  check("tn: cut on a word boundary with ...", name.length <= 80 && name.endsWith("...") && long.startsWith(name.slice(0, -3)) && long[name.length - 3] === " ", name);
+  const exact = "a".repeat(10) + " " + "b".repeat(66) + " cc dd";
+  check("tn: a cut that already ends a word keeps the whole word", plainThreadName(exact) === `${"a".repeat(10)} ${"b".repeat(66)}...`, plainThreadName(exact));
+  check("tn: one huge word is hard-cut", plainThreadName("x".repeat(200)).length === 80);
 }
 
 if (failures > 0) {

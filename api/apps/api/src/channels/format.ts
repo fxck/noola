@@ -200,3 +200,55 @@ export function mdToPlain(md: string): string {
     .replace(/```\w*\n?([\s\S]*?)```/g, "$1")
     .replace(/`([^`\n]+)`/g, "$1");
 }
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** A fixed UTC time, e.g. "25 Oct 2026 19:00 UTC", or null outside the range a Date can hold. */
+function utcTime(unixSeconds: number): string | null {
+  const d = new Date(unixSeconds * 1000);
+  if (Number.isNaN(d.getTime())) return null;
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} ${hh}:${mm} UTC`;
+}
+
+/**
+ * Discord-only tokens in inbound text, made readable outside Discord. Markdown is kept, because the inbox renders it.
+ * Mentions are resolved by the gateway, which has the message's mention data.
+ */
+export function discordTokensToText(text: string): string {
+  if (!text) return text;
+  const { text: t, restore } = protectCode(text);
+  const s = t
+    .replace(/<a?:(\w{2,32}):\d+>/g, ":$1:")
+    .replace(/<t:(-?\d{1,11})(?::[tTdDfFR])?>/g, (token: string, secs: string) => utcTime(Number(secs)) ?? token)
+    .replace(/<\/([\w-]{1,32}(?: [\w-]{1,32}){0,2}):\d+>/g, "/$1")
+    .replace(/^(\s*)-# +/gm, "$1");
+  return restore(s);
+}
+
+const THREAD_NAME_MAX = 80;
+
+/** Thread names are plain text: Discord renders no markdown or mentions in them, and caps them at 100 characters. */
+export function plainThreadName(text: string, max = THREAD_NAME_MAX): string {
+  // Inline code is shown literally, so it is kept out of the markdown stripping and loses only its backticks.
+  const { text: protectedText, restore } = protectCode(discordTokensToText(text).replace(/```[\s\S]*?```/g, " "));
+  const plain = restore(
+    protectedText
+      .replace(/\|\|[\s\S]+?\|\|/g, "[spoiler]")
+      .replace(/\[([^\]]+)\]\((?:https?:\/\/[^\s)]+)\)/g, "$1")
+      .replace(/^\s*(?:#{1,6}|(?:>\s*)+|[-*])\s+/gm, "")
+      .replace(/\*\*|__|~~/g, "")
+      .replace(/(^|[\s(])[*_]([^\s*_][^*_\n]*?)[*_](?=[\s).,!?:;]|$)/g, "$1$2"),
+  )
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (plain.length <= max) return plain;
+  const cut = plain.slice(0, max - 3);
+  // Cut on a word boundary, unless the cut already ends a word.
+  const atWordEnd = /\s/.test(plain[max - 3] ?? " ");
+  const lastSpace = cut.lastIndexOf(" ");
+  const head = atWordEnd || lastSpace < (max - 3) / 2 ? cut : cut.slice(0, lastSpace);
+  return `${head.trimEnd()}...`;
+}

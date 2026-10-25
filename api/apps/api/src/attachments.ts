@@ -43,6 +43,8 @@ const INBOUND_CDN_HOSTS = new Set([
   "cdn.discordapp.com",
   "media.discordapp.net",
 ]);
+// The copy is buffered in memory, and a Nitro user can upload up to 500 MB. A larger file keeps only its url.
+const INBOUND_COPY_MAX_BYTES = 25 * 1024 * 1024;
 
 /** Persist inbound-channel attachments (Discord) onto an already-inserted message — one row per file,
  *  best-effort post-commit (mirrors the reply route's claim pattern). We COPY the source bytes into
@@ -88,8 +90,13 @@ async function persistInboundOwned(
     try {
       const u = new URL(f.url);
       if (u.protocol !== "https:" || !INBOUND_CDN_HOSTS.has(u.hostname)) throw new Error("host not allowed");
+      if (f.size > INBOUND_COPY_MAX_BYTES) throw new Error("too large to copy");
       const res = await fetch(f.url, discordFetchInit());
       if (!res.ok) throw new Error(`fetch ${res.status}`);
+      if (Number(res.headers.get("content-length") ?? 0) > INBOUND_COPY_MAX_BYTES) {
+        await res.body?.cancel().catch(() => {});
+        throw new Error("too large to copy");
+      }
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.byteLength > 0) {
         const key = `attachments/${tenantId}/${randomUUID()}-${safe}`;

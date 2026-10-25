@@ -20,9 +20,9 @@ const GUILD = "VIPTEST-guild";
 const CHANNEL = "viptest-vip-channel";
 
 let failures = 0;
-function check(name: string, cond: boolean) {
+function check(name: string, cond: boolean, got?: unknown) {
   if (cond) console.log(`  PASS  ${name}`);
-  else { failures++; console.error(`  FAIL  ${name}`); }
+  else { failures++; console.error(`  FAIL  ${name}${got !== undefined ? ` — got: ${JSON.stringify(got)}` : ""}`); }
 }
 
 let threadSeq = 0;
@@ -104,6 +104,14 @@ async function main() {
 
   const r2 = await handleInboundMessage(topLevel({ discordMessageId: "viptest-m2", authorId: "viptest-user-1", content: "VIPTEST another separate issue" }));
   check("second top-level message mints a SECOND ticket", !!r2 && r2.ticketCreated && r2.ticketId !== t1);
+
+  // The anchored thread's name is plain text, cut on a word boundary.
+  await handleInboundMessage(topLevel({
+    discordMessageId: "viptest-m9", authorId: "viptest-user-1",
+    content: "**VIPTEST** the _billing_ page crashes <:sad:123> every single time I open the invoices section from the account menu",
+  }));
+  const named = threadCalls.find((c) => c.messageId === "viptest-m9")?.name ?? "";
+  check("the VIP thread name is plain text within 80 chars", named.length <= 80 && !named.includes("**") && named.includes(":sad:") && named.endsWith("..."), named);
 
   // In-thread follow-up rides the normal thread path onto the SAME ticket.
   const r3 = await handleInboundMessage({

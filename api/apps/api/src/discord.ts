@@ -3,7 +3,7 @@ import { ingestInbound, type IngestResult } from "./ingest.js";
 import { persistInboundAttachments } from "./attachments.js";
 import { getDiscordSender, getMirrorTransport, rateLimitWaitMs } from "./discord-gateway.js";
 import { classifyDiscordAuthor } from "./discord-classify.js";
-import { normalizeBlockquotes } from "./channels/format.js";
+import { discordTokensToText, normalizeBlockquotes, plainThreadName } from "./channels/format.js";
 import { enqueueRelay, deliverRelayNow, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
 import { RateLimitError } from "discord.js";
 import { randomUUID } from "node:crypto";
@@ -126,6 +126,10 @@ export interface InboundDiscordMessage {
   memberIsNull?: boolean;
   isBotOrWebhook?: boolean;
   skipAutoreply?: boolean;
+  /** Sticker names, which can't be shown outside Discord. */
+  stickers?: string[];
+  /** A poll's question. */
+  poll?: string | null;
 }
 
 /** Content union (§5.4): the message body is the text, else the forum-post title, else an
@@ -133,9 +137,11 @@ export interface InboundDiscordMessage {
  *  no longer silently dropped. Returns "" only when there is genuinely nothing. */
 function composeBody(m: InboundDiscordMessage): string {
   const text = (m.content ?? "").trim();
+  const extras = [m.poll ? `[poll: ${m.poll}]` : null, ...(m.stickers ?? []).map((n) => `[sticker: ${n}]`)].filter(Boolean).join("\n");
   // Discord quotes are per-line `>` with no blank line before the answer text; normalize so the stored
   // body renders as separate quote/text blocks everywhere instead of folding into one big blockquote.
-  if (text) return normalizeBlockquotes(m.content);
+  if (text) return extras ? `${normalizeBlockquotes(m.content)}\n\n${extras}` : normalizeBlockquotes(m.content);
+  if (extras) return extras;
   if (m.threadKind === "forum_post" && m.threadName) return m.threadName;
   const embed = (m.embeds ?? []).find((e) => e.title || e.description || e.url);
   if (embed) return embed.title || embed.description || embed.url || "[embed]";
@@ -259,7 +265,7 @@ async function handleVipTopLevelMessage(m: InboundDiscordMessage, binding: Bindi
   const anchored = seen
     ? null
     : await getMirrorTransport()
-        ?.createMessageThread(m.channelId, m.discordMessageId, body.slice(0, 90) || "Conversation")
+        ?.createMessageThread(m.channelId, m.discordMessageId, plainThreadName(body) || "Conversation")
         .catch(() => null);
   const threadId = anchored?.threadId ?? m.discordMessageId; // fallback: message id still isolates the ticket
 
@@ -461,12 +467,15 @@ export interface MessageUpdateInput {
 /** MessageUpdate (§5.6) — re-ingest an edit IN PLACE by matching the existing discord:<id> row and
  *  updating its body; never mint a new message. Returns true iff a row was updated. */
 export async function handleMessageUpdate(u: MessageUpdateInput): Promise<boolean> {
+  // An edit that removed all text leaves the stored body, which may be an attachment placeholder.
+  if (!u.newContent.trim()) return false;
   const tenantId = await resolveTenant(u.guildId);
   if (!tenantId) return false;
+  const body = normalizeBlockquotes(discordTokensToText(u.newContent));
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       "UPDATE messages SET body = $2 WHERE idempotency_key = $1 RETURNING id",
-      [`discord:${u.messageId}`, u.newContent],
+      [`discord:${u.messageId}`, body],
     );
     return (r.rowCount ?? 0) > 0;
   });
