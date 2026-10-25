@@ -13,6 +13,7 @@ import { markConversationSpam, unmarkConversationSpam } from "../src/spam.js";
 import type { MirrorTransport } from "../src/discord-gateway.js";
 import { ingestInbound } from "../src/ingest.js";
 import { persistBufferAttachments } from "../src/attachments.js";
+import { splitForDiscord } from "../src/channels/format.js";
 
 // Discord forum ops-mirror gate (PILOT-AND-DISCORD-PLAN D1-D4): binding filter → forum post,
 // manual push, timeline relay into the post, note-by-default responder messages, 📤 promote-to-
@@ -25,9 +26,9 @@ const FORUM = "mirtest-forum-1";
 const ROLE = "mirtest-responder-role";
 
 let failures = 0;
-function check(name: string, cond: boolean) {
+function check(name: string, cond: boolean, got?: unknown) {
   if (cond) console.log(`  PASS  ${name}`);
-  else { failures++; console.error(`  FAIL  ${name}`); }
+  else { failures++; console.error(`  FAIL  ${name}${got !== undefined ? ` — got: ${JSON.stringify(got)}` : ""}`); }
 }
 
 // ── Mock transport: records every call, mints deterministic thread ids ────────
@@ -69,6 +70,11 @@ const mock: MirrorTransport = {
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(cond: () => boolean, ms = 5000): Promise<boolean> {
+  const until = Date.now() + ms;
+  while (Date.now() < until && !cond()) await sleep(50);
+  return cond();
+}
 
 async function mintTicket(tag: string, priority = "normal"): Promise<string> {
   const res = await ingestInbound({
@@ -155,7 +161,12 @@ async function main() {
 
   await withTenant(A, (c) => c.query("UPDATE tickets SET priority = 'urgent' WHERE id = $1", [t1]));
   await evaluateAutoMirror(A, t1);
-  const m1 = await getTicketMirror(A, t1);
+  // ticket.created also schedules a delayed re-check, which can win the creation and leave this call a pending claim.
+  let m1 = await getTicketMirror(A, t1);
+  for (let i = 0; !m1 && i < 100; i++) {
+    await sleep(100);
+    m1 = await getTicketMirror(A, t1);
+  }
   check("mirror created on match", !!m1 && m1.post_thread_id.startsWith("mirtest-thread-"));
   check("mirror url shape", !!m1 && mirrorUrl(m1) === `https://discord.com/channels/${GUILD}/${m1.post_thread_id}`);
   const createCall = calls.find((c) => c.fn === "createForumPost");
@@ -197,6 +208,32 @@ async function main() {
   // Readability: the relayed body is blockquoted (each line "> "-prefixed) and preceded by a divider,
   // so consecutive mirrored messages read as distinct blocks instead of one wall of text.
   check("relayed body is blockquoted + divided", calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("──────────") && String(c.args[1]).includes("> MIRTEST console agent reply")));
+
+  // A long message (an e-mail) is relayed whole, and every piece of the split post stays quoted.
+  calls.length = 0;
+  const longBody = ["MIRTEST long start", "", "x".repeat(2500), ...Array.from({ length: 60 }, (_, i) => `line ${i} ${"y".repeat(40)}`), "MIRTEST long end"].join("\n");
+  const longMsg = await ingestInbound({ tenantId: A, body: longBody, authorType: "agent", ticketId: t1, idempotencyKey: "mirtest:auto:long" });
+  await relayTicketMessage(A, t1, longMsg.messageId);
+  await drainDiscordRelay();
+  const longPost = String(calls.find((c) => c.fn === "postToThread" && String(c.args[1]).includes("MIRTEST long start"))?.args[1] ?? "");
+  check("a long message is relayed whole", longPost.includes("MIRTEST long end") && longPost.includes("x".repeat(1900)), longPost.length);
+  check("blank lines stay in the quote as paragraph breaks", longPost.includes("> MIRTEST long start\n> \n> x"), longPost.slice(0, 200));
+  const pieces = splitForDiscord(longPost, 2000);
+  const bodyLines = pieces.flatMap((p) => p.split("\n")).filter((l) => l && !l.startsWith("──") && !l.includes("reply sent to customer"));
+  check("every piece of the split post stays quoted", pieces.length > 1 && pieces.every((p) => p.length <= 2000) && bodyLines.every((l) => l.startsWith("> ")), pieces.map((p) => p.length));
+
+  // A huge message keeps the post to a few Discord messages and attaches the full text.
+  calls.length = 0;
+  const hugeBody = ["MIRTEST huge start", ...Array.from({ length: 600 }, (_, i) => `para ${i} ${"z".repeat(50)}`), "MIRTEST huge end"].join("\n");
+  const hugeMsg = await ingestInbound({ tenantId: A, body: hugeBody, authorType: "agent", ticketId: t1, idempotencyKey: "mirtest:auto:huge" });
+  await relayTicketMessage(A, t1, hugeMsg.messageId);
+  await drainDiscordRelay();
+  const hugeCall = calls.find((c) => c.fn === "postToThread" && String(c.args[1]).includes("MIRTEST huge start"));
+  const hugePost = String(hugeCall?.args[1] ?? "");
+  const hugeFiles = (hugeCall?.args[2] ?? []) as { name: string; data: Buffer }[];
+  check("a huge message is cut to a few Discord messages", hugePost.length < 7_500 && splitForDiscord(hugePost, 2000).length <= 4 && !hugePost.includes("MIRTEST huge end"), hugePost.length);
+  check("and says the full text is attached", hugePost.includes("the full text is attached as message.txt"));
+  check("the attachment carries the whole message", hugeFiles.some((f) => f.name === "message.txt" && f.data.toString("utf8").includes("MIRTEST huge end")), hugeFiles.map((f) => f.name));
 
   // ── D2b: a message's attachments are uploaded into the thread, not dropped ───
   // deferMirror mimics the real callers (widget/email): the mirror relay waits until attachments are
@@ -329,7 +366,8 @@ async function main() {
     check("✅ triages close", closeRes.action === "close" && !closeRes.reason);
     const closedRow = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
     check("✅ closed the ticket", closedRow.rows[0].status === "closed");
-    check("✅ archived the post", archived.get(thread1) === true);
+    // The close's ticket.closed handler archives the post asynchronously.
+    check("✅ archived the post", await waitFor(() => archived.get(thread1) === true));
     await drainDiscordRelay(); // the 🆗 ack is durable now (relay outbox), sent before the archive lands
     check("🆗 confirmation react", calls.some((c) => c.fn === "react" && c.args[2] === "🆗"));
 
@@ -341,7 +379,7 @@ async function main() {
     const reopened = await withTenant(A, (c) => c.query("SELECT status FROM tickets WHERE id = $1", [t1]));
     check("🔄 reopened the ticket", reopened.rows[0].status === "open");
     await flushMirrorSyncs(); // reopen requests a coalesced background sync
-    check("🔄 unarchived the post", archived.get(thread1) === false);
+    check("🔄 unarchived the post", await waitFor(() => archived.get(thread1) === false));
 
     const snoozeRes = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: thread1, reactorId: "mirtest-user-bob", emoji: "💤", reactorRoleIds: [ROLE] });
     check("💤 triages snooze", snoozeRes.action === "snooze" && !snoozeRes.reason);
