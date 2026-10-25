@@ -33,6 +33,8 @@ async function main() {
   });
   const clean = async () => {
     const t = "(SELECT id FROM tickets WHERE external_thread_id LIKE 'odtest-%')";
+    // A Post queues a reply row that no gateway delivers here, and another suite's drainer must not pick it up.
+    await superPool.query(`DELETE FROM discord_relay_outbox WHERE ticket_id IN ${t}`);
     await superPool.query(`DELETE FROM answer_claims WHERE message_id IN (SELECT id FROM messages WHERE ticket_id IN ${t})`);
     await superPool.query(`DELETE FROM autoreply_decisions WHERE ticket_id IN ${t}`);
     await superPool.query(`DELETE FROM messages WHERE ticket_id IN ${t}`);
@@ -157,7 +159,9 @@ async function main() {
   // Post the draft → one agent reply is ingested; a repeat Post (same postId) is idempotent.
   const refusedPost = await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: "ODTEST forged", postId: "odtest-post-0", ...member });
   check("Post refuses a non-teammate", refusedPost.delivered === false && refusedPost.forbidden === true);
-  await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1", ...teammate });
+  const posted = await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1", ...teammate });
+  // No gateway runs in this test, so the post is queued for the outbox to retry.
+  check("Post without a live gateway is queued, not failed", posted.delivered === false && posted.queued === true);
   await postDraft({ guildId: GUILD, channelId: draftThread, ticketId: draftTicket, text: draft.text!, postId: "odtest-post-1", ...teammate });
   const msgsAfterPost = await withTenant(A, async (c) => {
     const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1 AND author_type = 'agent'", [draftTicket]);

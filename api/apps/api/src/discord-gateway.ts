@@ -39,9 +39,14 @@ const clients = new Map<string, Client>();
 // When each open bot's gateway was last connected: null while connected, a timestamp while not.
 const gatewayDownSince = new Map<string, number | null>();
 
+let senderOverride: Sender | null = null;
+export function setDiscordSenderForTests(s: Sender | null): void {
+  senderOverride = s;
+}
+
 /** The live outbound sender for a bot ('shared' by default), or null when it's disabled/unconnected. */
 export function getDiscordSender(botId = "shared"): Sender | null {
-  return senders.get(botId) ?? senders.get("shared") ?? null;
+  return senderOverride ?? senders.get(botId) ?? senders.get("shared") ?? null;
 }
 
 // ── Forum ops-mirror transport (discord-mirror.ts) ─────────────────────────────
@@ -536,6 +541,7 @@ async function onPostDraft(interaction: ButtonInteraction, log: Log): Promise<vo
   await interaction.editReply({
     content: r.delivered ? "✅ Posted to the channel."
       : r.forbidden ? "Only teammates can post drafts."
+      : r.queued ? "Saved on the ticket - posting to the channel is queued and will retry."
       : "Couldn't post — the channel may be disconnected.",
     components: [],
   });
@@ -612,7 +618,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
 
   const send: Sender = async (channelId, content, opts) => {
     const ch = await client.channels.fetch(channelId);
-    if (!(ch && ch.isTextBased() && "send" in ch)) return;
+    if (!(ch && ch.isTextBased() && "send" in ch)) return false;
     // A ticket thread Discord auto-archived after inactivity refuses new messages until it's
     // unarchived — do it first (mirrors postToThread), so an agent reply into a quiet Discord-origin
     // thread doesn't silently fail. Plain text channels aren't threads, so this no-ops for them.
@@ -625,6 +631,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     // a broadcast that accidentally mass-pinged a community would be a self-inflicted incident.
     const allowedMentions = opts?.mentionRoleId ? { roles: [opts.mentionRoleId], parse: [] } : { parse: [] };
     const rolePing = opts?.mentionRoleId ? `<@&${opts.mentionRoleId}>` : "";
+    const nonce = (i: number) => (opts?.nonce ? { nonce: `${opts.nonce}.${i}`, enforceNonce: true } : {});
 
     if (opts?.asEmbed) {
       // Embeds don't ping, so the role mention (if any) rides in a lead `content` line. The
@@ -635,6 +642,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
           ...(i === 0 && rolePing ? { content: rolePing } : {}),
           embeds: [{ ...(i === 0 && opts.title ? { title: opts.title.slice(0, 256) } : {}), description: parts[i] }],
           allowedMentions,
+          ...nonce(i),
         });
       }
       return;
@@ -645,7 +653,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     const chunks = splitForDiscord(content, 2000);
     for (let i = 0; i < chunks.length; i++) {
       const body = i === 0 && rolePing ? `${rolePing} ${chunks[i]}` : chunks[i];
-      await post({ content: body, allowedMentions });
+      await post({ content: body, allowedMentions, ...nonce(i) });
     }
   };
   senders.set(botId, send);

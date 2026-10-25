@@ -1,5 +1,5 @@
 import { relayPool, withTenant } from "@repo/db";
-import { routeOutbound } from "../discord.js";
+import { deliverDiscordReply, routeOutbound } from "../discord.js";
 import { getDiscordSender } from "../discord-gateway.js";
 import { routeEmailOutbound, type MailAttachment } from "../email.js";
 import { routeSlackOutbound } from "../slack.js";
@@ -21,11 +21,15 @@ export interface OutboundContext {
   /** The conversation this reply belongs to — email uses it for the per-ticket reply-to token +
    *  threading headers (P4). Absent for non-conversation sends (broadcasts). */
   ticketId?: string | null;
+  /** The stored message this send delivers. Discord retries a send that has one through the relay outbox. */
+  messageId?: string | null;
 }
 
 export type DispatchResult = {
   delivered: boolean;
   reason?: string;
+  /** Discord: the first attempt didn't land, and the outbox keeps retrying. */
+  queued?: boolean;
   /** Email only (0114): the unangled Message-ID the provider will echo, so the caller can persist it
    *  on the message row for delivery-webhook matching. Absent for channels without provider events. */
   providerMessageId?: string;
@@ -85,7 +89,10 @@ const discord: ChannelDriver = {
       .query("SELECT count(*)::int AS n FROM discord_links WHERE tenant_id = $1", [tenantId])
       .then((r) => r.rows[0].n as number),
   dispatch: (ctx, body, opts) =>
-    routeOutbound(
+    // A broadcast channel-post has no stored message to retry from, so it stays a direct send.
+    ctx.ticketId && ctx.messageId && !opts?.mentionRoleId && !opts?.asEmbed
+      ? deliverDiscordReply({ tenantId: ctx.tenantId, ticketId: ctx.ticketId, messageId: ctx.messageId, channelId: ctx.externalChannelId }, body)
+      : routeOutbound(
       { channelType: ctx.channelType, externalChannelId: ctx.externalChannelId },
       body,
       getDiscordSender(),

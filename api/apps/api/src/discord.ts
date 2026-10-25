@@ -1,9 +1,12 @@
 import { relayPool, withTenant } from "@repo/db";
 import { ingestInbound, type IngestResult } from "./ingest.js";
 import { persistInboundAttachments } from "./attachments.js";
-import { getDiscordSender, getMirrorTransport } from "./discord-gateway.js";
+import { getDiscordSender, getMirrorTransport, rateLimitWaitMs } from "./discord-gateway.js";
 import { classifyDiscordAuthor } from "./discord-classify.js";
 import { normalizeBlockquotes } from "./channels/format.js";
+import { enqueueRelay, deliverRelayNow, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
+import { RateLimitError } from "discord.js";
+import { randomUUID } from "node:crypto";
 
 /** Options a channel-post carries beyond the body (Phase 4). A ticket reply passes none — it
  *  posts plain, pings nothing. A broadcast channel-post may ping ONE role (allowedMentions-gated
@@ -12,12 +15,15 @@ export interface SendOptions {
   mentionRoleId?: string | null;
   asEmbed?: boolean;
   title?: string | null;
+  /** Sent per chunk with enforce_nonce, so Discord collapses a retry of a write that already landed. */
+  nonce?: string;
 }
 
 /** Outbound sender signature. The gateway supplies the real one (chunks >2000-char bodies via
  *  splitForDiscord + honors SendOptions); tests inject a mock. `opts` is optional so existing
- *  ticket-reply callers and mock senders stay source-compatible. */
-export type Sender = (channelId: string, content: string, opts?: SendOptions) => Promise<void>;
+ *  ticket-reply callers and mock senders stay source-compatible. Resolves false when the channel
+ *  can't take messages (not a text channel). */
+export type Sender = (channelId: string, content: string, opts?: SendOptions) => Promise<boolean | void>;
 
 /** A Discord attachment carried through the inbound seam (content union, §5.4). */
 export interface DiscordAttachment {
@@ -580,6 +586,84 @@ export function getSender(): Sender | null {
   return getDiscordSender();
 }
 
+// Replies outlast a long IP ban. With the outbox backoff (capped at 15 min), 20 attempts span about 4 h.
+const REPLY_MAX_ATTEMPTS = 20;
+// How long a reply request waits for the first attempt before it reports the reply as queued.
+const REPLY_FIRST_ATTEMPT_WAIT_MS = 3_000;
+const UNKNOWN_CHANNEL = 10003;
+
+/**
+ * Deliver an agent or AI reply that is already stored as `messageId` into its Discord thread or channel.
+ * It goes through the relay outbox, so a failed send retries with backoff, and messages.delivery_status shows
+ * pending → sent, or failed once the retries run out. The first attempt runs at once.
+ */
+export async function deliverDiscordReply(
+  r: { tenantId: string; ticketId: string; messageId: string; channelId: string | null | undefined },
+  body: string,
+): Promise<{ delivered: boolean; queued?: boolean; reason?: string }> {
+  if (!r.channelId) return { delivered: false, reason: "not-external" };
+  const dedupeKey = `reply:${r.messageId}`;
+  // Before the enqueue, because the drainer may deliver the row as soon as it exists.
+  await setDeliveryStatus(r.tenantId, r.ticketId, r.messageId, "pending").catch(() => {});
+  const payload = { messageId: r.messageId, channelId: r.channelId, body };
+  if (!(await enqueueRelay("reply", r.tenantId, r.ticketId, dedupeKey, payload, { maxAttempts: REPLY_MAX_ATTEMPTS }))) {
+    // Without a row nothing would retry, so this attempt is the only one.
+    const direct = await routeOutbound({ channelType: "discord", externalChannelId: r.channelId }, body, getSender()).catch(() => ({ delivered: false }));
+    await setDeliveryStatus(r.tenantId, r.ticketId, r.messageId, direct.delivered ? "sent" : "failed").catch(() => {});
+    return { delivered: direct.delivered, reason: direct.delivered ? undefined : "failed" };
+  }
+  const outcome = await deliverRelayNow(dedupeKey, REPLY_FIRST_ATTEMPT_WAIT_MS);
+  if (outcome === "delivered") return { delivered: true };
+  return outcome === "failed" ? { delivered: false, reason: "failed" } : { delivered: false, queued: true, reason: "queued" };
+}
+
+/** The relay-outbox deliverer for a 'reply' row. */
+export async function deliverReplyRelay(row: RelayRow): Promise<DeliverResult> {
+  const channelId = String(row.payload.channelId ?? "");
+  const messageId = String(row.payload.messageId ?? "");
+  if (!channelId || !messageId) return { ok: false, retriable: false, error: "missing reply args" };
+  const send = getSender();
+  if (!send) return { ok: false, retriable: true, error: "discord-disconnected" };
+  try {
+    const sent = await send(channelId, String(row.payload.body ?? ""), { nonce: relayNonce(row.id) });
+    if (sent === false) return { ok: false, retriable: false, error: "the channel can't take messages" };
+  } catch (e) {
+    if ((e as { code?: unknown }).code === UNKNOWN_CHANNEL) return { ok: false, retriable: false, error: "the channel no longer exists" };
+    const retryAfterMs = e instanceof RateLimitError ? rateLimitWaitMs(e) : undefined;
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e), retryAfterMs };
+  }
+  await markReplyDelivery(row, "sent").catch(() => {});
+  return { ok: true, retriable: false };
+}
+
+/** Record a reply's final delivery outcome. */
+export async function markReplyDelivery(row: RelayRow, status: "sent" | "failed"): Promise<void> {
+  await setDeliveryStatus(row.tenant_id, row.ticket_id, String(row.payload.messageId ?? ""), status);
+}
+
+/** Sets messages.delivery_status and emits a ticket event, so an open inbox thread refetches the badge.
+ *  'pending' applies only to a message without a status, so it never overwrites an outcome. */
+async function setDeliveryStatus(tenantId: string, ticketId: string, messageId: string, status: "pending" | "sent" | "failed"): Promise<void> {
+  if (!messageId) return;
+  await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      status === "pending"
+        ? "UPDATE messages SET delivery_status = $2 WHERE id = $1 AND delivery_status IS NULL"
+        : "UPDATE messages SET delivery_status = $2 WHERE id = $1 AND delivery_status IS DISTINCT FROM $2",
+      [messageId, status],
+    );
+    if (!r.rowCount) return;
+    const envelope = {
+      id: randomUUID(), type: "ticket.updated", tenantId, ticketId,
+      occurredAt: new Date().toISOString(), data: { messageId, deliveryStatus: status },
+    };
+    await c.query(
+      "INSERT INTO outbox (tenant_id, event_type, subject, payload) VALUES (current_tenant(), 'ticket.updated', 'noola.events.' || current_tenant(), $1::jsonb)",
+      [JSON.stringify(envelope)],
+    );
+  });
+}
+
 /**
  * The outbound seam (tested with a mock send): post an agent reply back to the
  * ticket's origin channel. No-ops (with a reason) for non-Discord tickets or when
@@ -595,6 +679,6 @@ export async function routeOutbound(
     return { delivered: false, reason: "not-external" };
   }
   if (!send) return { delivered: false, reason: "discord-disconnected" };
-  await send(routing.externalChannelId, body, opts);
-  return { delivered: true };
+  const sent = await send(routing.externalChannelId, body, opts);
+  return sent === false ? { delivered: false, reason: "not-a-text-channel" } : { delivered: true };
 }

@@ -310,8 +310,8 @@ export async function sendReply(
   channel?: string,
   cc?: string[],
   clientMessageId?: string,
-): Promise<{ delivered: boolean }> {
-  return api<{ ticketId: string; messageId: string; delivered: boolean }>(
+): Promise<{ delivered: boolean; queued?: boolean }> {
+  return api<{ ticketId: string; messageId: string; delivered: boolean; queued?: boolean }>(
     `/tickets/${ticketId}/reply`,
     {
       method: "POST",

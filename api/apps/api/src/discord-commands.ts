@@ -7,7 +7,7 @@ import { relayPool, withTenant } from "@repo/db";
 import { ingestInbound } from "./ingest.js";
 import { answerOnDemand } from "./autoreply.js";
 import { suggestForQuery } from "./copilot.js";
-import { resolveTenant, routeOutbound, getSender, handleInboundMessage } from "./discord.js";
+import { resolveTenant, deliverDiscordReply, handleInboundMessage } from "./discord.js";
 import { emitDomainEvent } from "./automations.js";
 import { classifyDiscordAuthor } from "./discord-classify.js";
 
@@ -163,7 +163,7 @@ export interface PostDraftInput {
 
 /** Post a reviewed /draft: record it as an agent reply on the ticket, then dispatch it to the thread.
  *  Idempotent on postId — a double Post ingests + sends once. */
-export async function postDraft(input: PostDraftInput): Promise<{ delivered: boolean; forbidden?: boolean }> {
+export async function postDraft(input: PostDraftInput): Promise<{ delivered: boolean; queued?: boolean; forbidden?: boolean }> {
   const tenantId = await resolveTenant(input.guildId);
   if (!tenantId) return { delivered: false };
   const seat = await draftTeammate(tenantId, input.guildId, input.invokerId, input.invokerRoleIds);
@@ -175,6 +175,6 @@ export async function postDraft(input: PostDraftInput): Promise<{ delivered: boo
   });
   // Replay (same postId already posted) ⇒ don't double-dispatch to Discord.
   if (ingested.replay) return { delivered: false };
-  const r = await routeOutbound({ channelType: "discord", externalChannelId: input.channelId }, input.text, getSender());
-  return { delivered: r.delivered };
+  const r = await deliverDiscordReply({ tenantId, ticketId: input.ticketId, messageId: ingested.messageId, channelId: input.channelId }, input.text);
+  return { delivered: r.delivered, queued: r.queued === true };
 }

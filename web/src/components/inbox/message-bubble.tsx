@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound, Check, CheckCheck, Eye, TriangleAlert } from "lucide-react";
+import { StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound, Check, CheckCheck, Eye, TriangleAlert, Clock } from "lucide-react";
 import {
   type Message,
   type MessageMeta,
@@ -36,13 +36,16 @@ function DeliveryBadge({
   bounceKind,
   openedAt,
   viaEmailFallback,
+  channel,
 }: {
   status: string;
   bounceKind?: string | null;
   openedAt?: string | null;
   viaEmailFallback?: boolean;
+  channel?: string | null;
 }) {
   const via = viaEmailFallback ? " · by email" : "";
+  const discord = channel === "discord";
   let icon: ReactNode;
   let label: string;
   let title: string;
@@ -60,8 +63,12 @@ function DeliveryBadge({
   } else if (status === "failed") {
     icon = <TriangleAlert className="size-3" />;
     label = "Failed to send";
-    title = "The email could not be handed off to the provider";
+    title = discord ? "Discord didn't accept this message after repeated retries" : "The email could not be handed off to the provider";
     tone = "text-destructive";
+  } else if (status === "pending") {
+    icon = <Clock className="size-3" />;
+    label = "Sending…";
+    title = "Queued for Discord - retrying until it's delivered";
   } else if (openedAt) {
     icon = <Eye className="size-3" />;
     label = "Opened";
@@ -73,7 +80,7 @@ function DeliveryBadge({
   } else if (status === "sent") {
     icon = <Check className="size-3" />;
     label = "Sent";
-    title = `Handed off to the email provider${via}`;
+    title = discord ? "Delivered to Discord" : `Handed off to the email provider${via}`;
   } else {
     return null;
   }
@@ -268,6 +275,7 @@ export function MessageBubble({
               bounceKind={message.bounce_kind}
               openedAt={message.opened_at}
               viaEmailFallback={message.channel_type === "widget"}
+              channel={message.channel_type}
             />
           )}
         </div>

@@ -562,6 +562,10 @@ export async function relayNoteToMirror(
  *  uses to mark delivered / back off / dead-letter. A missing transport or a not-yet-ready mirror is
  *  RETRIABLE (bot reconnects, forum post finishes creating); a vanished source row is a terminal skip. */
 export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
+  if (row.kind === "reply") {
+    const { deliverReplyRelay } = await import("./discord.js");
+    return deliverReplyRelay(row);
+  }
   const tp = transport();
   if (!tp) return { ok: false, retriable: true, error: "no live discord transport" };
   const mirror = await getTicketMirror(row.tenant_id, row.ticket_id);
@@ -1111,7 +1115,7 @@ export async function handleMirrorReaction(
   const driver = getChannelDriver(result.channelType);
   const out = driver?.dispatch
     ? await driver.dispatch(
-        { tenantId: row.tenant_id, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId },
+        { tenantId: row.tenant_id, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId, messageId: result.messageId },
         dispatchBody,
         // Read receipt: embed the pixel keyed to THIS agent message so an email open stamps seen_at —
         // same as the web composer's reply route. Without it a promoted reply never shows "Seen".
