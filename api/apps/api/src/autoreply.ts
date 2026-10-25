@@ -5,10 +5,9 @@ import { getRiskKeywords } from "./classification.js";
 import { suggestForQuery, type Suggestion } from "./copilot.js";
 import { ingestInbound } from "./ingest.js";
 import { updateTraceGate } from "./trace.js";
-import { routeOutbound } from "./discord.js";
+import { deliverDiscordReply } from "./discord.js";
 import { routeEmailOutbound } from "./email.js";
 import { routeSlackOutbound } from "./slack.js";
-import { getDiscordSender } from "./discord-gateway.js";
 import { claimAnswer } from "./answer-claims.js";
 
 // Autoreply: turns the assist-only copilot into an optional, per-tenant, guardrailed
@@ -588,7 +587,7 @@ async function evaluateForMessage(
   } else if (ctx.channelType === "slack") {
     await routeSlackOutbound({ tenantId, channelType: ctx.channelType, externalChannelId: ctx.externalChannelId }, suggestion.draft).catch(() => {});
   } else if (ctx.channelType === "discord") {
-    await routeOutbound({ channelType: ctx.channelType, externalChannelId: ctx.externalChannelId }, suggestion.draft, getDiscordSender()).catch(() => {});
+    await deliverDiscordReply({ tenantId, ticketId, messageId: sent.messageId, channelId: ctx.externalChannelId }, suggestion.draft).catch(() => {});
   }
 
   await stampGate("auto_sent", "sent");
@@ -679,7 +678,7 @@ export async function listQueue(tenantId: string): Promise<QueueItem[]> {
 }
 
 export type QueueActionResult =
-  | { ok: true; message: { ticketId: string; messageId: string; delivered: boolean } }
+  | { ok: true; message: { ticketId: string; messageId: string; delivered: boolean; queued: boolean } }
   | { ok: false; code: 404 | 409 };
 
 /** Send a pending queue item as an agent reply through the SAME path the auto-sender
@@ -723,6 +722,7 @@ export async function sendQueued(
 
   // Dispatch to the origin channel (same as the auto-sender / /tickets/:id/reply).
   let delivered = true;
+  let queued = false;
   if (item.channel_type === "email") {
     const o = await routeEmailOutbound(
       { tenantId, externalChannelId: item.external_channel_id, ticketId: item.ticket_id }, item.subject, outBody,
@@ -734,10 +734,11 @@ export async function sendQueued(
     ).catch(() => ({ delivered: false as boolean }));
     delivered = o.delivered;
   } else if (item.channel_type === "discord") {
-    const o = await routeOutbound(
-      { channelType: item.channel_type, externalChannelId: item.external_channel_id }, outBody, getDiscordSender(),
-    ).catch(() => ({ delivered: false as boolean }));
+    const o = await deliverDiscordReply(
+      { tenantId, ticketId: item.ticket_id, messageId: sent.messageId, channelId: item.external_channel_id }, outBody,
+    ).catch(() => ({ delivered: false as boolean, queued: false }));
     delivered = o.delivered;
+    queued = o.queued === true;
   }
 
   await withTenant(tenantId, async (c) => {
@@ -747,7 +748,7 @@ export async function sendQueued(
     );
   });
 
-  return { ok: true, message: { ticketId: sent.ticketId, messageId: sent.messageId, delivered } };
+  return { ok: true, message: { ticketId: sent.ticketId, messageId: sent.messageId, delivered, queued } };
 }
 
 export type DismissResult = { ok: true } | { ok: false; code: 404 | 409 };

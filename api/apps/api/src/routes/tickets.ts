@@ -460,7 +460,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     const driver = getChannelDriver(result.channelType);
     const out = driver?.dispatch
       ? await driver.dispatch(
-          { tenantId, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId },
+          { tenantId, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId, messageId: result.messageId },
           dispatchBody,
           // agentName signs the email render ("— Ales"); attachments only when claimed.
           {
@@ -510,6 +510,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
       ticketId: result.ticketId,
       messageId: result.messageId,
       delivered: out.delivered,
+      queued: out.queued === true,
     });
   }));
 

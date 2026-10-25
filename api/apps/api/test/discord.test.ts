@@ -80,6 +80,8 @@ async function main() {
     await superPool.query(`DELETE FROM autoreply_jobs WHERE ticket_id IN (${discTickets})`);
     await superPool.query(`DELETE FROM autoreply_queue WHERE ticket_id IN (${discTickets})`);
     await superPool.query(`DELETE FROM autoreply_decisions WHERE ticket_id IN (${discTickets})`);
+    // Autoreplies queue Discord reply rows that no gateway delivers here, and another suite's drainer must not pick them up.
+    await superPool.query(`DELETE FROM discord_relay_outbox WHERE ticket_id IN (${discTickets})`);
     await superPool.query(`DELETE FROM messages WHERE ticket_id IN (${discTickets})`);
     await superPool.query("DELETE FROM message_attachments WHERE storage_key LIKE 'disctest-%'");
     await superPool.query("DELETE FROM messages WHERE body LIKE 'DISCTEST%'");

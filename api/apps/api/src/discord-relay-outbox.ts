@@ -10,7 +10,7 @@
 // discord-mirror imports enqueueRelay from this module).
 import { relayPool } from "@repo/db";
 
-export type RelayKind = "message" | "note" | "react";
+export type RelayKind = "message" | "note" | "react" | "reply";
 
 export interface RelayRow {
   id: string;
@@ -39,6 +39,8 @@ export interface DeliverResult {
   ok: boolean;
   retriable: boolean;
   error?: string;
+  /** A rate limit's wait. The next attempt waits at least this long. */
+  retryAfterMs?: number;
 }
 
 /** Enqueue an intended Discord-mirror write. Idempotent: the same dedupe_key is a no-op, so a retried
@@ -53,25 +55,27 @@ export async function enqueueRelay(
   ticketId: string,
   dedupeKey: string,
   payload: Record<string, unknown>,
-  opts: { reapply?: boolean } = {},
-): Promise<void> {
+  opts: { reapply?: boolean; maxAttempts?: number } = {},
+): Promise<boolean> {
   const reapply = opts.reapply === true && kind === "react";
   try {
     await relayPool.query(
       reapply
-        ? `INSERT INTO discord_relay_outbox (tenant_id, ticket_id, kind, dedupe_key, payload)
-           VALUES ($1, $2, $3, $4, $5::jsonb)
+        ? `INSERT INTO discord_relay_outbox (tenant_id, ticket_id, kind, dedupe_key, payload, max_attempts)
+           VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6, 10))
            ON CONFLICT (dedupe_key) DO UPDATE
              SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL,
                  payload = EXCLUDED.payload, updated_at = now()
            WHERE discord_relay_outbox.status <> 'pending'`
-        : `INSERT INTO discord_relay_outbox (tenant_id, ticket_id, kind, dedupe_key, payload)
-           VALUES ($1, $2, $3, $4, $5::jsonb)
+        : `INSERT INTO discord_relay_outbox (tenant_id, ticket_id, kind, dedupe_key, payload, max_attempts)
+           VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6, 10))
            ON CONFLICT (dedupe_key) DO NOTHING`,
-      [tenantId, ticketId, kind, dedupeKey, JSON.stringify(payload)],
+      [tenantId, ticketId, kind, dedupeKey, JSON.stringify(payload), opts.maxAttempts ?? null],
     );
+    return true;
   } catch (e) {
     try { console.warn(`[discord-relay] enqueue failed (${kind} ${dedupeKey}): ${(e as Error)?.message ?? String(e)}`); } catch { /* noop */ }
+    return false;
   }
 }
 
@@ -149,18 +153,83 @@ async function deliverClaimedRow(deliver: (row: RelayRow) => Promise<DeliverResu
     try {
       console.error(`[discord-relay] gave up on ${row.kind} for ticket ${row.ticket_id} after ${row.attempts} attempt(s): ${res.error ?? "unknown"}`);
     } catch { /* noop */ }
+    if (row.kind === "reply") {
+      const { markReplyDelivery } = await import("./discord.js");
+      await markReplyDelivery(row, "failed").catch(() => {});
+    }
     return;
   }
 
-  // Retriable: exponential backoff (5s·2^attempts, capped at 15 min), keep it pending.
+  // Retriable: exponential backoff (5s·2^attempts, capped at 15 min), keep it pending. A rate limit's wait
+  // overrides a shorter backoff.
   await relayPool
     .query(
       `UPDATE discord_relay_outbox
-          SET next_attempt_at = now() + LEAST(interval '5 seconds' * pow(2, attempts), interval '15 minutes'),
+          SET next_attempt_at = now() + GREATEST(
+                LEAST(interval '5 seconds' * pow(2, attempts), interval '15 minutes'),
+                make_interval(secs => $4::double precision / 1000)),
               last_error = $2,
               updated_at = now()
         WHERE id = $1 AND lease_token = $3`,
-      [row.id, res.error ?? null, row.lease_token],
+      [row.id, res.error ?? null, row.lease_token, Math.min(res.retryAfterMs ?? 0, 60 * 60_000)],
+    )
+    .catch(() => {});
+}
+
+/**
+ * Deliver one row now instead of at the drainer's next tick, waiting at most `waitMs` for the outcome.
+ * 'pending' means it's still queued: the attempt is still running, or it failed and will retry.
+ */
+export async function deliverRelayNow(dedupeKey: string, waitMs: number): Promise<"delivered" | "failed" | "pending"> {
+  const claimed = await relayPool
+    .query(
+      `UPDATE discord_relay_outbox
+          SET attempts = attempts + 1, lease_token = gen_random_uuid(),
+              next_attempt_at = now() + ($2 || ' seconds')::interval, updated_at = now()
+        WHERE dedupe_key = $1 AND status = 'pending' AND next_attempt_at <= now()
+      RETURNING id, tenant_id, ticket_id, kind, payload, attempts, max_attempts, lease_token`,
+      [dedupeKey, String(LEASE_SECONDS)],
+    )
+    .catch(() => null);
+  const deadline = Date.now() + waitMs;
+  if (claimed?.rowCount) {
+    const dm = await import("./discord-mirror.js");
+    const attempt = deliverClaimedRow(dm.deliverRelayRow, claimed.rows[0] as RelayRow);
+    await Promise.race([attempt, new Promise((r) => setTimeout(r, waitMs).unref?.())]);
+    return relayStatus(dedupeKey);
+  }
+  // Another drainer claimed the row first, so wait for its attempt within the same budget.
+  for (;;) {
+    const status = await relayStatus(dedupeKey);
+    if (status !== "pending" || Date.now() >= deadline) return status;
+    await new Promise((r) => setTimeout(r, RELAY_STATUS_POLL_MS));
+  }
+}
+
+const RELAY_STATUS_POLL_MS = 150;
+
+async function relayStatus(dedupeKey: string): Promise<"delivered" | "failed" | "pending"> {
+  const r = await relayPool
+    .query<{ status: string }>("SELECT status FROM discord_relay_outbox WHERE dedupe_key = $1", [dedupeKey])
+    .catch(() => null);
+  const status = r?.rows[0]?.status;
+  return status === "delivered" || status === "failed" ? status : "pending";
+}
+
+// In a rolling deploy, a container on older code drains this table too. That code doesn't know the 'reply'
+// kind and dead-letters such a row, so those rows go back to pending for this code to deliver.
+const REQUEUE_EVERY_MS = 60_000;
+let lastRequeueAt = 0;
+
+export async function requeueRepliesRefusedByOlderCode(opts: { now?: boolean } = {}): Promise<void> {
+  if (!opts.now && Date.now() - lastRequeueAt < REQUEUE_EVERY_MS) return;
+  lastRequeueAt = Date.now();
+  await relayPool
+    .query(
+      `UPDATE discord_relay_outbox
+          SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL, updated_at = now()
+        WHERE kind = 'reply' AND status = 'failed' AND last_error LIKE 'unknown relay kind%'
+          AND updated_at > now() - interval '1 day'`,
     )
     .catch(() => {});
 }
@@ -177,6 +246,7 @@ export async function drainDiscordRelay(): Promise<void> {
   if (draining) return;
   draining = true;
   try {
+    await requeueRepliesRefusedByOlderCode();
     // Lease the batch in one short transaction: push next_attempt_at forward + bump attempts so a
     // concurrent drainer (or a re-tick) skips these while we do the slow Discord I/O unlocked.
     const claimed = await relayPool.query(

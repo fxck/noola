@@ -385,7 +385,7 @@ export function Composer({
       const clientMessageId = crypto.randomUUID();
       try {
         const emailCc = activeChannel === "email" ? cc : undefined;
-        const { delivered } = await sendReply(ticket.id, text, attachments.map((a) => a.id), activeChannel, emailCc, clientMessageId);
+        const { delivered, queued } = await sendReply(ticket.id, text, attachments.map((a) => a.id), activeChannel, emailCc, clientMessageId);
         setBody("");
         setReplyReset((n) => n + 1);
         setAttachments([]);
@@ -401,7 +401,9 @@ export function Composer({
           setNote(
             delivered
               ? { kind: "ok", text: "Sent — delivered to Discord." }
-              : { kind: "warn", text: "Saved, but Discord delivery failed." },
+              : queued
+                ? { kind: "warn", text: "Saved — Discord delivery is queued and will retry." }
+                : { kind: "warn", text: "Saved, but Discord delivery failed." },
           );
         }
         replyRef.current?.focus();
