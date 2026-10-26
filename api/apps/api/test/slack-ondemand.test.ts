@@ -25,13 +25,32 @@ function check(name: string, cond: boolean) {
 }
 
 async function main() {
-  // Mock the Slack HTTP seam so routeSlackOutbound "delivers" without a live workspace.
-  __setSlackFetch((async () => ({ ok: true, json: async () => ({ ok: true }) })) as unknown as typeof fetch);
-
   const superPool = new pg.Pool({
     host: process.env.DB_HOST, port: Number(process.env.DB_PORT ?? 5432),
     database: process.env.DB_NAME, user: process.env.DB_SUPER_USER, password: process.env.DB_SUPER_PASSWORD, max: 2,
   });
+  const agent = await superPool.query("SELECT id, email FROM users WHERE tenant_id = $1 AND email IS NOT NULL ORDER BY created_at ASC LIMIT 1", [A]);
+  const agentId = agent.rows[0].id as string;
+  const agentEmail = agent.rows[0].email as string;
+
+  // Mock the Slack HTTP seam so routeSlackOutbound "delivers" without a live workspace. users.info maps
+  // the teammate to the seeded agent's email and the outsider to an email no Noola user has.
+  const TEAMMATE = "slacktest-agent";
+  const OUTSIDER = "slacktest-outsider";
+  const FLAKY = "slacktest-flaky";
+  let flakyDown = true;
+  const userInfoCalls: string[] = [];
+  __setSlackFetch((async (url: string) => {
+    const u = new URL(String(url));
+    if (u.pathname.endsWith("users.info")) {
+      const who = u.searchParams.get("user") ?? "";
+      userInfoCalls.push(who);
+      if (who === FLAKY && flakyDown) throw new Error("network down");
+      const email = who === OUTSIDER ? "slacktest-outsider@example.test" : agentEmail;
+      return { ok: true, json: async () => ({ ok: true, user: { profile: { email } } }) } as unknown as Response;
+    }
+    return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+  }) as unknown as typeof fetch);
   const clean = async () => {
     const t = "(SELECT id FROM tickets WHERE external_channel_id LIKE 'SLACKTEST-%')";
     await superPool.query(`DELETE FROM answer_claims WHERE message_id IN (SELECT id FROM messages WHERE ticket_id IN ${t})`);
@@ -105,7 +124,29 @@ async function main() {
     const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1", [draftTicket]);
     return r.rows[0].n as number;
   });
-  const draft = await handleSlackDraftCommand({ teamId: TEAM, channelId: draftCh, text: "how to resize" });
+  const agentMsgCount = async () => withTenant(A, async (c) => {
+    const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1 AND author_type = 'agent'", [draftTicket]);
+    return r.rows[0].n as number;
+  });
+
+  // ── a non-teammate can neither draft nor Post ──
+  const outsiderDraft = await handleSlackDraftCommand({ teamId: TEAM, channelId: draftCh, userId: OUTSIDER, text: "SLACKTEST how to resize" });
+  check("/draft by a non-teammate → forbidden, no draft text", outsiderDraft.status === "forbidden" && outsiderDraft.text === null);
+  const outsiderPost = await slackPostDraft({
+    teamId: TEAM, channelId: draftCh, ticketId: draftTicket, text: "SLACKTEST outsider post", postId: "slacktest-outsider-post", userId: OUTSIDER,
+  });
+  check("Post by a non-teammate → forbidden, not delivered", outsiderPost.forbidden === true && outsiderPost.delivered === false);
+  check("Post by a non-teammate ingests no agent reply", (await agentMsgCount()) === 0);
+  check("a non-teammate miss is cached (users.info called once)", userInfoCalls.filter((x) => x === OUTSIDER).length === 1);
+
+  // ── a failed users.info lookup refuses, and is not cached ──
+  const flakyDraft = await handleSlackDraftCommand({ teamId: TEAM, channelId: draftCh, userId: FLAKY, text: "SLACKTEST how to resize" });
+  check("/draft while users.info fails → forbidden (fail closed)", flakyDraft.status === "forbidden");
+  flakyDown = false;
+  const flakyRetry = await handleSlackDraftCommand({ teamId: TEAM, channelId: draftCh, userId: FLAKY, text: "SLACKTEST how to resize" });
+  check("a failed lookup is not cached - the retry resolves the teammate", flakyRetry.status === "drafted");
+
+  const draft = await handleSlackDraftCommand({ teamId: TEAM, channelId: draftCh, userId: TEAMMATE, text: "SLACKTEST how to resize" });
   check("/draft resolves the channel ticket + returns a draft", draft.status === "drafted" && !!draft.text && draft.ticketId === draftTicket);
   const msgsAfterDraft = await withTenant(A, async (c) => {
     const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1", [draftTicket]);
@@ -116,13 +157,15 @@ async function main() {
   // stash + Post (idempotent)
   const token = stashSlackDraft({ teamId: TEAM, channelId: draftCh, ticketId: draftTicket, text: draft.text! });
   check("stashSlackDraft round-trips", getSlackDraft(token)?.text === draft.text);
-  await slackPostDraft({ teamId: TEAM, channelId: draftCh, ticketId: draftTicket, text: draft.text!, postId: token });
-  await slackPostDraft({ teamId: TEAM, channelId: draftCh, ticketId: draftTicket, text: draft.text!, postId: token });
-  const agentMsgs = await withTenant(A, async (c) => {
-    const r = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1 AND author_type = 'agent'", [draftTicket]);
-    return r.rows[0].n as number;
+  const posted = await slackPostDraft({ teamId: TEAM, channelId: draftCh, ticketId: draftTicket, text: draft.text!, postId: token, userId: TEAMMATE });
+  await slackPostDraft({ teamId: TEAM, channelId: draftCh, ticketId: draftTicket, text: draft.text!, postId: token, userId: TEAMMATE });
+  check("Post by a teammate delivers", posted.delivered === true && !posted.forbidden);
+  check("Post ingests exactly one agent reply (idempotent on postId)", (await agentMsgCount()) === 1);
+  const author = await withTenant(A, async (c) => {
+    const r = await c.query("SELECT author_id FROM messages WHERE ticket_id = $1 AND author_type = 'agent'", [draftTicket]);
+    return r.rows[0]?.author_id as string | undefined;
   });
-  check("Post ingests exactly one agent reply (idempotent on postId)", agentMsgs === 1);
+  check("Post attributes the agent reply to the resolved teammate", author === agentId);
 
   await putPolicy(A, { mode: saved.mode }, { sweep: false });
   await clean();

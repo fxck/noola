@@ -10,6 +10,7 @@ import { answerOnDemand } from "./autoreply.js";
 import { suggestForQuery } from "./copilot.js";
 import { resolveTenantByTeam, routeSlackOutbound } from "./slack.js";
 import { emitDomainEvent } from "./automations.js";
+import { resolveSlackTeammate } from "./slack-triage.js";
 
 /** Slack ticket external id: `${team_id}:${channel_id}` (matches the Slack ingest seam). */
 const ext = (teamId: string, channelId: string): string => `${teamId}:${channelId}`;
@@ -84,10 +85,11 @@ export function heldNotice(reason: string): string {
 export interface SlackDraftInput {
   teamId: string;
   channelId: string;
+  userId: string;
   text: string;
 }
 export interface SlackDraftResult {
-  status: "drafted" | "no_ticket" | "not_connected" | "empty";
+  status: "drafted" | "no_ticket" | "not_connected" | "empty" | "forbidden";
   text: string | null;
   ticketId: string | null;
 }
@@ -95,11 +97,13 @@ export interface SlackDraftResult {
 /**
  * Staff /draft on Slack: a private, agent-audience draft the teammate reviews before Post. Resolves
  * the channel's open ticket and runs FULL retrieval. Ingests NOTHING (a staff question is not a
- * customer turn); only Post (slackPostDraft) ingests the answer as an agent reply.
+ * customer turn); only Post (slackPostDraft) ingests the answer as an agent reply. Teammates only -
+ * the agent audience includes other customers' resolved threads.
  */
 export async function handleSlackDraftCommand(input: SlackDraftInput): Promise<SlackDraftResult> {
   const tenantId = await resolveTenantByTeam(input.teamId);
   if (!tenantId) return { status: "not_connected", text: null, ticketId: null };
+  if (!(await resolveSlackTeammate(tenantId, input.teamId, input.userId))) return { status: "forbidden", text: null, ticketId: null };
   const query = (input.text ?? "").trim();
   if (!query) return { status: "empty", text: null, ticketId: null };
   const ticketId = await resolveChannelTicket(tenantId, ext(input.teamId, input.channelId));
@@ -115,15 +119,19 @@ export interface SlackPostDraftInput {
   text: string;
   /** Idempotency anchor (the draft token) so a double Post ingests + sends once. */
   postId: string;
+  /** The Slack user who clicked Post. */
+  userId: string;
 }
 
-/** Post a reviewed /draft: record it as an agent reply on the ticket, then dispatch to the channel
- *  via the Slack bot token. Idempotent on postId. */
-export async function slackPostDraft(input: SlackPostDraftInput): Promise<{ delivered: boolean }> {
+/** Post a reviewed /draft: record it as the clicking teammate's agent reply on the ticket, then dispatch
+ *  to the channel via the Slack bot token. Idempotent on postId. */
+export async function slackPostDraft(input: SlackPostDraftInput): Promise<{ delivered: boolean; forbidden?: boolean }> {
   const tenantId = await resolveTenantByTeam(input.teamId);
   if (!tenantId) return { delivered: false };
+  const authorId = await resolveSlackTeammate(tenantId, input.teamId, input.userId);
+  if (!authorId) return { delivered: false, forbidden: true };
   const ingested = await ingestInbound({
-    tenantId, body: input.text, authorType: "agent", ticketId: input.ticketId,
+    tenantId, body: input.text, authorType: "agent", authorId, ticketId: input.ticketId,
     idempotencyKey: `slack-postdraft:${input.postId}`,
     channelType: "slack", externalChannelId: ext(input.teamId, input.channelId),
   });

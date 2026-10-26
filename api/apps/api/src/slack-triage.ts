@@ -26,14 +26,52 @@ async function channelTicket(tenantId: string, external: string): Promise<string
   });
 }
 
-/** Map a Slack actor to a Noola agent by shared email (users.info → users.email). Best-effort. */
-async function resolveAgentByEmail(tenantId: string, teamId: string, slackUserId: string): Promise<string | null> {
+/** Map a Slack actor to a Noola agent by shared email (users.info → users.email). Undefined when the users.info lookup failed. */
+async function resolveAgentByEmail(tenantId: string, teamId: string, slackUserId: string): Promise<string | null | undefined> {
   const email = await resolveSlackUserEmail(tenantId, teamId, slackUserId);
-  if (!email) return null;
+  if (!email) return email;
   return withTenant(tenantId, async (c) => {
     const r = await c.query("SELECT id FROM users WHERE tenant_id = current_tenant() AND lower(email) = lower($1) LIMIT 1", [email]);
     return r.rowCount ? (r.rows[0].id as string) : null;
   });
+}
+
+const TEAMMATE_TTL_MS = 10 * 60_000;
+const TEAMMATE_CAP = 1000;
+const teammateCache = new Map<string, { userId: string | null; at: number }>();
+
+/** The Noola user who linked this Slack member ID in their profile. */
+async function resolveLinkedSlackUser(tenantId: string, slackUserId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      "SELECT user_id FROM agent_channel_identities WHERE channel_type = 'slack' AND lower(external_id) = lower($1) LIMIT 1",
+      [slackUserId],
+    );
+    return r.rowCount ? (r.rows[0].user_id as string) : null;
+  });
+}
+
+/**
+ * The Noola user behind a Slack user, or null for anyone else.
+ * Slack channels can hold customers, so every staff command and triage action gates on this.
+ * A linked member ID wins, then a matching e-mail.
+ * Misses are cached too, so a customer's burst of reactions calls users.info once.
+ * A failed users.info lookup refuses the caller and is not cached.
+ */
+export async function resolveSlackTeammate(tenantId: string, teamId: string, slackUserId: string): Promise<string | null> {
+  if (!slackUserId) return null;
+  const key = `${tenantId}:${teamId}:${slackUserId}`;
+  const hit = teammateCache.get(key);
+  if (hit && Date.now() - hit.at < TEAMMATE_TTL_MS) return hit.userId;
+  const userId = (await resolveLinkedSlackUser(tenantId, slackUserId)) ?? (await resolveAgentByEmail(tenantId, teamId, slackUserId));
+  if (userId === undefined) return null;
+  teammateCache.delete(key);
+  teammateCache.set(key, { userId, at: Date.now() });
+  if (teammateCache.size > TEAMMATE_CAP) {
+    const oldest = teammateCache.keys().next().value;
+    if (oldest) teammateCache.delete(oldest);
+  }
+  return userId;
 }
 
 function snoozeUntilIso(v?: string): string {
@@ -68,12 +106,14 @@ export interface SlackActionResult {
 
 /**
  * Apply a triage action to the channel's open ticket, reusing the core mutation engine, then refresh
- * the status card so Slack reflects the change immediately. Assignment maps the Slack actor to a
- * Noola agent by email (no config table). Returns a short human message for the ephemeral ack.
+ * the status card so Slack reflects the change immediately. Every kind requires the Slack actor to map
+ * to a Noola agent by email (no config table). Returns a short human message for the ephemeral ack.
  */
 export async function applySlackAction(input: SlackActionInput): Promise<SlackActionResult> {
   const tenantId = await resolveTenantByTeam(input.teamId);
   if (!tenantId) return { ok: false, ticketId: null, message: "This workspace isn't connected." };
+  const actorUserId = await resolveSlackTeammate(tenantId, input.teamId, input.actorId);
+  if (!actorUserId) return { ok: false, ticketId: null, message: "Only teammates can do that. If you are one, add your Slack member ID to your Noola profile." };
   const ticketId = await channelTicket(tenantId, ext(input.teamId, input.channelId));
   if (!ticketId) return { ok: false, ticketId: null, message: "No open ticket in this channel." };
 
@@ -100,17 +140,14 @@ export async function applySlackAction(input: SlackActionInput): Promise<SlackAc
     case "note": {
       const body = (input.value ?? "").trim();
       if (!body) return { ok: false, ticketId, message: "Please include the note text." };
-      await addNote(tenantId, ticketId, { authorName: input.actorName ?? "Slack", body });
+      await addNote(tenantId, ticketId, { authorId: actorUserId, authorName: input.actorName ?? "Slack", body });
       message = "Internal note added.";
       break;
     }
-    case "assign_me": {
-      const agentId = await resolveAgentByEmail(tenantId, input.teamId, input.actorId);
-      if (!agentId) return { ok: false, ticketId, message: "Couldn't match you to a teammate — is your Slack email shared and registered here?" };
-      await assignTicket(tenantId, ticketId, agentId);
+    case "assign_me":
+      await assignTicket(tenantId, ticketId, actorUserId);
       message = "Assigned to you.";
       break;
-    }
     case "unassign":
       await assignTicket(tenantId, ticketId, null);
       message = "Unassigned.";

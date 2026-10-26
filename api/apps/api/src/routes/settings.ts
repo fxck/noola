@@ -858,13 +858,14 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
           await postResponse(responseUrl, { response_type: "ephemeral", replace_original: true, text: notice });
         }
       } else if (command === "/draft") {
-        const res = await handleSlackDraftCommand({ teamId, channelId, text });
+        const res = await handleSlackDraftCommand({ teamId, channelId, userId, text });
         if (res.status === "drafted" && res.text && res.ticketId) {
           const token = stashSlackDraft({ teamId, channelId, ticketId: res.ticketId, text: res.text });
           await postResponse(responseUrl, { response_type: "ephemeral", blocks: draftBlocks(res.text, token) });
         } else {
           const notice =
             res.status === "no_ticket" ? "No open ticket in this channel yet — reply in the channel first."
+            : res.status === "forbidden" ? "Only teammates can use /draft. If you are one, add your Slack member ID to your Noola profile."
             : res.status === "not_connected" ? "This workspace isn't connected to the assistant."
             : res.status === "empty" ? "Please include what the reply should address."
             : "Something went wrong.";
@@ -921,8 +922,20 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
         void postResponse(payload.response_url ?? "", { replace_original: true, text: "This draft expired — run /draft again." });
         return reply.code(200).send();
       }
+      const forbidden = () => postResponse(payload.response_url ?? "", {
+        response_type: "ephemeral",
+        text: "Only teammates can post this draft. If you are one, add your Slack member ID to your Noola profile.",
+      });
+      if (teamId !== draft.teamId) {
+        void forbidden();
+        return reply.code(200).send();
+      }
       void (async () => {
-        const r = await slackPostDraft({ teamId: draft.teamId, channelId: draft.channelId, ticketId: draft.ticketId, text: draft.text, postId: token });
+        const r = await slackPostDraft({ teamId: draft.teamId, channelId: draft.channelId, ticketId: draft.ticketId, text: draft.text, postId: token, userId });
+        if (r.forbidden) {
+          await forbidden();
+          return;
+        }
         deleteSlackDraft(token);
         await postResponse(payload.response_url ?? "", {
           replace_original: true,
