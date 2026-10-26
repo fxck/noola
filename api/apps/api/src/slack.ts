@@ -384,10 +384,10 @@ export async function updateSlackMessage(
 }
 
 /** Resolve a Slack user's email (users.info) — the bridge from a Slack actor to a Noola agent (match
- *  by email). Best-effort; null when the scope is missing / the user has no shared email. */
-export async function resolveSlackUserEmail(tenantId: string, teamId: string, userId: string): Promise<string | null> {
+ *  by email). Null when Slack answers but shares no email, undefined when the lookup itself fails. */
+export async function resolveSlackUserEmail(tenantId: string, teamId: string, userId: string): Promise<string | null | undefined> {
   const token = await botTokenFor(tenantId, teamId);
-  if (!token || !userId) return null;
+  if (!token || !userId) return undefined;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), POST_TIMEOUT_MS);
   try {
@@ -397,9 +397,9 @@ export async function resolveSlackUserEmail(tenantId: string, teamId: string, us
       signal: ctrl.signal,
     });
     const j = (await res.json().catch(() => ({}))) as { ok?: boolean; user?: { profile?: { email?: string } } };
-    return j.ok ? (j.user?.profile?.email ?? null) : null;
+    return j.ok ? (j.user?.profile?.email || null) : undefined;
   } catch {
-    return null;
+    return undefined;
   } finally {
     clearTimeout(t);
   }
