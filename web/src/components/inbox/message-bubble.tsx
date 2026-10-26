@@ -252,6 +252,7 @@ export function MessageBubble({
           )}
         >
           <span>{relativeTime(message.created_at)}</span>
+          {!isAgent && message.meta?.to && <span title="The address this e-mail was sent to">to {message.meta.to}</span>}
           {message.auto && (
             <span
               className="inline-flex items-center gap-0.5 font-medium text-primary"

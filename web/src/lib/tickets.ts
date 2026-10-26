@@ -186,6 +186,8 @@ export interface MessageMeta {
   traceId?: string | null;
   /** Auto-translation, independent of the autoreply fields above. */
   translation?: MessageTranslation | null;
+  /** The support address an inbound e-mail was sent to. */
+  to?: string;
 }
 
 /** A file attached to a message (agent reply attachments). Bytes stream through an authed download. */

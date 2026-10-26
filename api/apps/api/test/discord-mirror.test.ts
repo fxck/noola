@@ -112,7 +112,7 @@ async function main() {
     await superPool.query(`DELETE FROM ticket_notes WHERE ticket_id IN (${t})`);
     await superPool.query(`DELETE FROM answer_claims WHERE message_id IN (SELECT id FROM messages WHERE ticket_id IN (${t}))`);
     await superPool.query(`DELETE FROM messages WHERE ticket_id IN (${t})`);
-    await superPool.query(`DELETE FROM contacts WHERE tenant_id = $1 AND name LIKE 'Mir Tester%'`, [A]);
+    await superPool.query(`DELETE FROM contacts WHERE tenant_id = $1 AND (name LIKE 'Mir Tester%' OR name IN ('Mir Discord', 'Mir Mail'))`, [A]);
     await superPool.query("DELETE FROM agent_channel_identities WHERE external_id LIKE 'mirtest-%'");
     // ✅-triage emits ticket.closed → the seeded survey flow may mint rows; best-effort sweep.
     for (const q of [
@@ -322,6 +322,47 @@ async function main() {
   check("ledger stamped promoted", ledger.rows[0].promoted_at !== null && ledger.rows[0].promoted_message_id !== null);
   const doublePromo = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-1", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
   check("second 📤 is a no-op (exactly-once)", !doublePromo.promoted && doublePromo.reason === "not_promotable");
+
+  // A Discord emoji in a mirror note reads as :name: in Noola. The ledger keeps the token for a promote back to Discord.
+  const emojiText = "MIRTEST thinking <:kermitThink:1333183279481749545>";
+  await handleMirrorPostMessage({
+    guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-emoji",
+    authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: emojiText, roleIds: [ROLE], isBotOrWebhook: false,
+  });
+  const emojiNote = await withTenant(A, (c) => c.query("SELECT body FROM ticket_notes WHERE ticket_id = $1 AND body LIKE 'MIRTEST thinking%'", [t1]));
+  check("a mirror note shows a Discord emoji as :name:", emojiNote.rows[0]?.body === "MIRTEST thinking :kermitThink:", emojiNote.rows[0]?.body);
+  const emojiLedger = await relayPool.query("SELECT body FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-emoji'");
+  check("the promotion ledger keeps the emoji token", emojiLedger.rows[0]?.body === emojiText, emojiLedger.rows[0]?.body);
+  await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-emoji", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+  const emojiReply = await withTenant(A, (c) => c.query("SELECT body FROM messages WHERE ticket_id = $1 AND author_type = 'agent' AND body LIKE 'MIRTEST thinking%'", [t1]));
+  check("a promoted note is stored readable", emojiReply.rows[0]?.body === "MIRTEST thinking :kermitThink:", emojiReply.rows[0]?.body);
+
+  // On a Discord ticket the promote sends the token as written, so Discord renders the emoji.
+  const dcTicket = await ingestInbound({
+    tenantId: A, body: "MIRTEST discord question", authorType: "customer", channelType: "discord",
+    externalChannelId: "mirtest-dc-channel", identity: { externalId: "mirtest-dc-cust", name: "Mir Discord" },
+    idempotencyKey: "mirtest:dc:1", skipAutoreply: true,
+  });
+  const dcMirror = (await pushTicketToDiscord(A, dcTicket.ticketId)).mirror;
+  await handleMirrorPostMessage({
+    guildId: GUILD, threadId: dcMirror!.post_thread_id, discordMessageId: "mirtest-dm-dc-emoji",
+    authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: emojiText, roleIds: [ROLE], isBotOrWebhook: false,
+  });
+  await handleMirrorReaction({ guildId: GUILD, threadId: dcMirror!.post_thread_id, discordMessageId: "mirtest-dm-dc-emoji", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+  const dcReply = await relayPool.query("SELECT payload->>'body' AS body FROM discord_relay_outbox WHERE kind = 'reply' AND ticket_id = $1", [dcTicket.ticketId]);
+  check("a promote to a Discord customer keeps the emoji token", dcReply.rows[0]?.body === emojiText, dcReply.rows[0]?.body);
+  await relayPool.query("DELETE FROM discord_relay_outbox WHERE ticket_id = $1", [dcTicket.ticketId]);
+
+  // An e-mail ticket's post says which support address it was sent to.
+  calls.length = 0;
+  const mailTicket = await ingestInbound({
+    tenantId: A, body: "MIRTEST mail question", authorType: "customer", channelType: "email",
+    externalChannelId: "mirtest-mail@example.com", identity: { email: "mirtest-mail@example.com", name: "Mir Mail" },
+    idempotencyKey: "mirtest:mail:1", skipAutoreply: true, meta: { to: "support@mirtest.example" },
+  });
+  await pushTicketToDiscord(A, mailTicket.ticketId);
+  const mailPost = String(calls.find((c) => c.fn === "createForumPost")?.args[2] ?? "");
+  check("an e-mail ticket's post names the address it was sent to", mailPost.includes("via e-mail to support@mirtest.example"), mailPost.split("\n")[1]);
   await sleep(300); // let the fire-and-forget relay hooks settle
   check("promoted reply NOT echoed back into the post", !calls.some((c) => c.fn === "postToThread" && String(c.args[1]).includes("MIRTEST internal thought from Bob")));
 

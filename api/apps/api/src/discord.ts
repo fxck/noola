@@ -132,12 +132,17 @@ export interface InboundDiscordMessage {
   poll?: string | null;
 }
 
+/** Readable lines for a message's poll and stickers. */
+function bodyExtras(m: { poll?: string | null; stickers?: string[] }): string {
+  return [m.poll ? `[poll: ${m.poll}]` : null, ...(m.stickers ?? []).map((n) => `[sticker: ${n}]`)].filter(Boolean).join("\n");
+}
+
 /** Content union (§5.4): the message body is the text, else the forum-post title, else an
  *  attachment/embed-derived placeholder — so attachment-only / embed-only / title-only inbound is
  *  no longer silently dropped. Returns "" only when there is genuinely nothing. */
 function composeBody(m: InboundDiscordMessage): string {
   const text = (m.content ?? "").trim();
-  const extras = [m.poll ? `[poll: ${m.poll}]` : null, ...(m.stickers ?? []).map((n) => `[sticker: ${n}]`)].filter(Boolean).join("\n");
+  const extras = bodyExtras(m);
   // Discord quotes are per-line `>` with no blank line before the answer text; normalize so the stored
   // body renders as separate quote/text blocks everywhere instead of folding into one big blockquote.
   if (text) return extras ? `${normalizeBlockquotes(m.content)}\n\n${extras}` : normalizeBlockquotes(m.content);
@@ -462,6 +467,8 @@ export interface MessageUpdateInput {
   messageId: string;
   newContent: string;
   attachments?: DiscordAttachment[];
+  stickers?: string[];
+  poll?: string | null;
 }
 
 /** MessageUpdate (§5.6) — re-ingest an edit IN PLACE by matching the existing discord:<id> row and
@@ -471,7 +478,9 @@ export async function handleMessageUpdate(u: MessageUpdateInput): Promise<boolea
   if (!u.newContent.trim()) return false;
   const tenantId = await resolveTenant(u.guildId);
   if (!tenantId) return false;
-  const body = normalizeBlockquotes(discordTokensToText(u.newContent));
+  const extras = bodyExtras(u);
+  const text = normalizeBlockquotes(discordTokensToText(u.newContent));
+  const body = extras ? `${text}\n\n${extras}` : text;
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       "UPDATE messages SET body = $2 WHERE idempotency_key = $1 RETURNING id",

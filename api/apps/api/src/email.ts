@@ -365,6 +365,7 @@ export async function handleInboundEmail(
         externalChannelId: m.from.toLowerCase(),
         identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
         deferMirror: !!m.attachments?.length,
+        meta: { to: parsed.base },
       });
       if (!result.replay) await finishInboundEmail(result, m, quoted);
       return result;
@@ -382,6 +383,7 @@ export async function handleInboundEmail(
     // The From address is both the reply target and the cross-channel identity (email unifies).
     identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
     deferMirror: !!m.attachments?.length,
+    meta: { to: parsed.base },
   });
   // A replayed (idempotency-deduped) message already carried its files/cc/quote the first time.
   if (!result.replay) await finishInboundEmail(result, m, quoted);
