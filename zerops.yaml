@@ -31,7 +31,7 @@ zerops:
     build:
       base:
         - nodejs@24
-        - bun@1.3.9
+        - bun@1.4
       buildCommands:
         - cd api && bun install
       deployFiles:
@@ -90,7 +90,7 @@ zerops:
     build:
       base:
         - nodejs@24
-        - bun@1.3.9
+        - bun@1.4
       buildCommands:
         # Typecheck gate — tsc across the project references. Bundlers strip types
         # without checking them, so this is the only step that catches type errors.
