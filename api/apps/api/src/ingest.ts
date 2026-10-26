@@ -62,6 +62,8 @@ export interface IngestInput {
    *  the message before its files exist). The caller must call relayTicketMessage() itself once the
    *  attachments are on the message. Only set by paths that attach files (email/widget inbound). */
   deferMirror?: boolean;
+  /** Stored on the new message, e.g. the support address an inbound e-mail was sent to. */
+  meta?: Record<string, unknown>;
 }
 
 export interface IngestResult {
@@ -242,15 +244,16 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
     try {
       const m = await c.query(
         `INSERT INTO messages (tenant_id, ticket_id, author_type, body, idempotency_key, channel_type,
-             external_channel_id, author_id, author_kind, author_contact_id, author_external_name, author_external_avatar_url, author_external_id)
-         VALUES (current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+             external_channel_id, author_id, author_kind, author_contact_id, author_external_name, author_external_avatar_url, author_external_id, meta)
+         VALUES (current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb) RETURNING id`,
         [ticketId, input.authorType, input.body, input.idempotencyKey ?? null, msgChannelType, msgExternal,
          input.authorId ?? null,
          input.authorKind ?? (isCustomer ? "customer" : "agent"),
          isCustomer ? contactId : null,
          input.authorExternalName ?? null,
          input.authorExternalAvatarUrl ?? null,
-         input.authorExternalId ?? null],
+         input.authorExternalId ?? null,
+         input.meta ? JSON.stringify(input.meta) : null],
       );
       messageId = m.rows[0].id;
     } catch (e) {

@@ -941,7 +941,13 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     try {
       // A partial update has no content, and storing it would blank the message.
       if (!msg.guildId || msg.partial) return;
-      await handleMessageUpdate({ guildId: msg.guildId, messageId: msg.id, newContent: resolveMentions(msg) });
+      await handleMessageUpdate({
+        guildId: msg.guildId,
+        messageId: msg.id,
+        newContent: resolveMentions(msg),
+        stickers: [...msg.stickers.values()].map((st) => st.name),
+        poll: msg.poll?.question.text ?? null,
+      });
     } catch (err) {
       log.error({ err }, "discord MessageUpdate failed");
     }

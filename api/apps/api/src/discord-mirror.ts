@@ -13,7 +13,7 @@ import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
-import { mdToDiscord, plainThreadName } from "./channels/format.js";
+import { discordTokensToText, mdToDiscord, plainThreadName } from "./channels/format.js";
 import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
@@ -235,11 +235,12 @@ function fillLink(url: string, t: TicketBrief): string | null {
   return missing ? null : filled;
 }
 
-function postHeader(t: TicketBrief, quotedBody: string | null, quickLinks: QuickLink[] = []): string {
+function postHeader(t: TicketBrief, quotedBody: string | null, quickLinks: QuickLink[] = [], toAddress: string | null = null): string {
   const who = t.contact_name || t.contact_email || "Unknown contact";
+  const via = t.channel_type === "email" ? `e-mail${toAddress ? ` to ${toAddress}` : ""}` : t.channel_type;
   const lines = [
     `**${t.subject || "Support ticket"}**`,
-    `From **${who}** · via ${t.channel_type} · priority **${t.priority}**`,
+    `From **${who}** · via ${via} · priority **${t.priority}**`,
   ];
   // Contact metadata — only the parts we actually have, and email only when it isn't already the
   // "who", so we never print a bare or duplicated field.
@@ -338,11 +339,11 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
   // Latest customer message seeds the post body (best-effort).
   const latest = await withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT id, body FROM messages WHERE ticket_id = $1 AND author_type = 'customer' AND deleted_at IS NULL
+      `SELECT id, body, meta->>'to' AS to_address FROM messages WHERE ticket_id = $1 AND author_type = 'customer' AND deleted_at IS NULL
         ORDER BY created_at DESC LIMIT 1`,
       [ticketId],
     );
-    return r.rowCount ? (r.rows[0] as { id: string; body: string }) : null;
+    return r.rowCount ? (r.rows[0] as { id: string; body: string; to_address: string | null }) : null;
   });
 
   // Attach that seeding message's files to the initial forum post, so a ticket opened with a
@@ -352,7 +353,7 @@ export async function mirrorTicket(tenantId: string, ticketId: string, binding: 
   const created = await tp
     .createForumPost(
       binding.forum_channel_id, postTitle(t),
-      postHeader(t, seedQuote?.quoted ?? null, binding.quick_links) + droppedNote(seed.dropped),
+      postHeader(t, seedQuote?.quoted ?? null, binding.quick_links, latest?.to_address ?? null) + droppedNote(seed.dropped),
       mirrorTagNames(t), seedQuote?.files ?? seed.files,
     )
     .catch(() => null);
@@ -992,7 +993,10 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
   if (seen.rowCount) return { handled: true };
   // An attachment-only message (screenshot, no text) still becomes a note — label it with the file
   // name(s) so the note isn't blank; the file itself attaches below.
-  const noteBody = body || attachments.map((a) => a.filename).join(", ") || "(attachment)";
+  const fileLabel = attachments.map((a) => a.filename).join(", ") || "(attachment)";
+  // The ledger keeps the Discord text as written, because a 📤 promote may send it back to a Discord customer.
+  const ledgerBody = body || fileLabel;
+  const noteBody = discordTokensToText(body) || fileLabel;
 
   const binding = mirror.binding_id ? await loadBinding(mirror.binding_id) : null;
   // Resolve the Discord author to a Noola seat ONCE — reused to attribute the note AND gate promotion.
@@ -1024,7 +1028,7 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
        (discord_message_id, tenant_id, ticket_id, post_thread_id, author_discord_id, author_display_name, is_responder, body, note_id, author_user_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (discord_message_id) DO NOTHING`,
-    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, noteBody, note?.id ?? null, agentId ?? null],
+    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, ledgerBody, note?.id ?? null, agentId ?? null],
   );
   return { handled: true, noteId: note?.id };
 }
@@ -1104,10 +1108,11 @@ export async function handleMirrorReaction(
       ? seatName ?? row.author_display_name
       : binding?.attribution_name ?? seatName ?? null;
 
+  const readable = discordTokensToText(row.body);
   const result = await ingestInbound({
     tenantId: row.tenant_id,
     ticketId: row.ticket_id,
-    body: row.body,
+    body: readable,
     authorType: "agent",
     authorKind: seatId ? "agent" : "community",
     authorId: seatId ?? null,
@@ -1145,7 +1150,9 @@ export async function handleMirrorReaction(
     await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
   }).catch(() => {});
 
-  const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, row.body);
+  // Only Discord renders the custom emoji and timestamp tokens as written.
+  const outbound = result.channelType === "discord" ? row.body : readable;
+  const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, outbound);
   if (meta) void stampOutboundTranslation(row.tenant_id, result.messageId, meta);
 
   const driver = getChannelDriver(result.channelType);

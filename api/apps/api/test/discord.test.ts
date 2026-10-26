@@ -203,6 +203,12 @@ async function main() {
       const p = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-poll-1'");
       check("a poll keeps its text and adds its question", !!poll && p.rows[0]?.body === "DISCTEST vote please\n\n[poll: Which plan?]", p.rows[0]?.body);
     });
+    // Adding text to a sticker-only message keeps its sticker line.
+    await handleMessageUpdate({ guildId: GUILD_A, messageId: "disctest-sticker-1", newContent: "DISCTEST hello", stickers: ["wave"] });
+    await withTenant(A, async (c) => {
+      const s = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-sticker-1'");
+      check("an edit keeps the sticker line", s.rows[0]?.body === "DISCTEST hello\n\n[sticker: wave]", s.rows[0]?.body);
+    });
   }
 
   // 8 — MessageDelete tombstones + closes a sole-customer-message ticket
