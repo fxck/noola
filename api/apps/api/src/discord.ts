@@ -666,7 +666,7 @@ export async function deliverReplyRelay(row: RelayRow): Promise<DeliverResult> {
 }
 
 /** Record a reply's final delivery outcome. */
-export async function markReplyDelivery(row: RelayRow, status: "sent" | "failed"): Promise<void> {
+export async function markReplyDelivery(row: Pick<RelayRow, "tenant_id" | "ticket_id" | "payload">, status: "sent" | "failed"): Promise<void> {
   await setDeliveryStatus(row.tenant_id, row.ticket_id, String(row.payload.messageId ?? ""), status);
 }
 

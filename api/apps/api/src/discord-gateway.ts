@@ -1,14 +1,14 @@
 import {
   Client, GatewayIntentBits, Events, ChannelType, Partials, PermissionFlagsBits,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
-  type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
+  type ChatInputCommandInteraction, type ButtonInteraction, type Guild, type GuildMember,
   type ForumChannel, type ThreadChannel, type Message, type RateLimitData, RateLimitError, type GuildTextBasedChannel,
 } from "discord.js";
 import { SimpleShardingStrategy, type WebSocketManager } from "@discordjs/ws";
 import type { Agent as HttpAgent } from "node:http";
 import { relayPool } from "@repo/db";
 import { discordEgress, proxiedMakeRequest } from "./discord-egress.js";
-import { backfillChannels, lastSeenConnected, loadGuildScopes, recordSeenConnected, type BackfillChannel } from "./discord-backfill.js";
+import { backfillChannels, lastSeenConnected, loadGuildScopes, recordSeenConnected, type BackfillChannel, type HeldBack } from "./discord-backfill.js";
 import { isDiscordEventLeader, probeDiscordLeaderNow, startDiscordLeaderElection } from "./discord-leader.js";
 import { discordTokensToText, splitForDiscord } from "./channels/format.js";
 import {
@@ -57,6 +57,8 @@ export function getDiscordSender(botId = "shared"): Sender | null {
 export interface MirrorFile {
   name: string;
   data: Buffer;
+  /** Still sent when Discord refuses the upload as too large, e.g. the full text of a cut message. */
+  keepWhenRefused?: boolean;
 }
 
 export interface MirrorTransport {
@@ -93,6 +95,12 @@ export interface MirrorTransport {
 /** Map our provider-agnostic MirrorFile[] to discord.js's message `files` shape. */
 function toDiscordFiles(files?: MirrorFile[]): { attachment: Buffer; name: string }[] {
   return (files ?? []).map((f) => ({ attachment: f.data, name: f.name }));
+}
+
+/** The files to try again after a too-large refusal, or none when that would repeat the refused upload. */
+function filesKeptWhenRefused(files?: MirrorFile[]): { attachment: Buffer; name: string }[] {
+  const kept = (files ?? []).filter((f) => f.keepWhenRefused);
+  return kept.length < (files ?? []).length ? toDiscordFiles(kept) : [];
 }
 
 const mirrorTransports = new Map<string, MirrorTransport>();
@@ -156,7 +164,7 @@ function filesNotUploadedNote(n: number): string {
   return `_(${n} attachment${n > 1 ? "s were" : " was"} too large to upload to Discord - open the ticket in Noola to see ${n > 1 ? "them" : "it"})_`;
 }
 
-function buildMirrorTransport(client: Client): MirrorTransport {
+export function buildMirrorTransport(client: Client): MirrorTransport {
   const forum = async (id: string): Promise<ForumChannel | null> => {
     const ch = await client.channels.fetch(id).catch(() => null);
     return ch?.type === ChannelType.GuildForum ? (ch as ForumChannel) : null;
@@ -200,18 +208,24 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       if (!f) return null;
       const appliedTags = await resolveForumTagIds(f, tagNames).catch(() => []);
       const df = toDiscordFiles(files);
-      const create = (body: string, withFiles: boolean) => {
+      const kept = filesKeptWhenRefused(files);
+      const create = (body: string, withFiles: { attachment: Buffer; name: string }[]) => {
         const chunks = splitForDiscord(body, 2000);
         return f.threads.create({
           name: name.slice(0, 100) || "Support ticket",
-          message: { content: chunks[0], allowedMentions: { parse: [] }, ...(withFiles && df.length ? { files: df } : {}) },
+          message: { content: chunks[0], allowedMentions: { parse: [] }, ...(withFiles.length ? { files: withFiles } : {}) },
           appliedTags,
         }).then((thread) => ({ thread, chunks }));
       };
+      const withNote = (dropped: number) => `${content}\n${filesNotUploadedNote(dropped)}`;
       // Without the files the post still lands, so a too-large upload doesn't lose the whole mirror.
-      const made = await create(content, true).catch((e: unknown) =>
-        df.length && uploadTooLarge(e) ? create(`${content}\n${filesNotUploadedNote(df.length)}`, false).catch(() => null) : null,
-      );
+      const made = await create(content, df).catch(async (e: unknown) => {
+        if (!df.length || !uploadTooLarge(e)) return null;
+        const withKept = kept.length
+          ? await create(withNote(df.length - kept.length), kept).catch((e2: unknown) => (uploadTooLarge(e2) ? null : Promise.reject(e2)))
+          : null;
+        return withKept ?? create(withNote(df.length), []);
+      }).catch(() => null);
       if (!made) return null;
       const { thread: created, chunks } = made;
       for (let i = 1; i < chunks.length; i++) {
@@ -251,11 +265,18 @@ function buildMirrorTransport(client: Client): MirrorTransport {
           ...(opts?.nonce ? { nonce: `${opts.nonce}.${i}`, enforceNonce: true } : {}),
         };
         if (i === 0 && df.length) {
-          // A refused upload created no message, so the text goes again without the files, under the same nonce.
+          // A refused upload created no message, so the text goes again under the same nonce, with only the kept files.
           await t.send({ ...message, files: df }).catch(async (e: unknown) => {
             if (!uploadTooLarge(e)) throw e;
-            filesNotUploaded = df.length;
-            await t.send(message);
+            const kept = filesKeptWhenRefused(files);
+            const keptSent = kept.length
+              ? await t.send({ ...message, files: kept }).then(
+                  () => true,
+                  (e2: unknown) => (uploadTooLarge(e2) ? false : Promise.reject(e2)),
+                )
+              : false;
+            if (!keptSent) await t.send(message);
+            filesNotUploaded = df.length - (keptSent ? kept.length : 0);
           });
         } else {
           await t.send(message);
@@ -507,15 +528,20 @@ function backfillableChannels(client: Client): GatewayChannel[] {
 
 /** Read back the messages a bot missed since it was last seen connected, then resume its heartbeat.
  *  A retry passes the first attempt's `since`, because the heartbeat may have moved on in between. */
-async function backfillBot(botId: string, log: Log, retry?: { since: number | null | undefined; attempt: number }): Promise<void> {
+async function backfillBot(
+  botId: string,
+  log: Log,
+  retry?: { since: number | null | undefined; attempt: number; heldBack: HeldBack },
+): Promise<void> {
   const client = clients.get(botId);
   if (!client?.isReady() || !isDiscordEventLeader() || backfillsRunning.has(botId)) return;
   backfillsRunning.add(botId);
   heartbeatPaused.add(botId);
   let since: number | null | undefined = retry?.since;
+  let heldBack: HeldBack = retry?.heldBack ?? new Map();
   const retryLater = (delayMs: number) => {
     // An undefined `since` means the heartbeat was never read, so the retry reads it.
-    const t = setTimeout(() => void backfillBot(botId, log, { since, attempt: (retry?.attempt ?? 0) + 1 }), delayMs);
+    const t = setTimeout(() => void backfillBot(botId, log, { since, attempt: (retry?.attempt ?? 0) + 1, heldBack }), delayMs);
     if (typeof t.unref === "function") t.unref();
   };
   try {
@@ -529,14 +555,15 @@ async function backfillBot(botId: string, log: Log, retry?: { since: number | nu
     const { evaluateAutoreply } = await import("./autoreply.js");
     const s = await backfillChannels<Message, GatewayChannel>(backfillableChannels(client), scopes, since, {
       onThreadCreated: async (ch) => {
-        if (ch.raw.isThread()) await ingestGatewayThreadCreate(ch.raw);
+        if (ch.raw.isThread()) await ingestGatewayThreadCreate(ch.raw, { backfill: true });
       },
-      onMessage: (m) => ingestGatewayMessage(m, log, { skipAutoreply: true }),
+      onMessage: (m) => ingestGatewayMessage(m, log, { skipAutoreply: true, backfill: true }),
       onTicketBackfilled: async (tenantId, ticketId, messageId) => {
         await evaluateAutoreply(tenantId, ticketId, messageId, { combineUnanswered: true });
       },
       abortOn: (err) => err instanceof RateLimitError,
-    });
+    }, Date.now(), heldBack);
+    heldBack = s.heldBack;
     log.info(
       `discord: backfill for bot ${botId} covered ${s.gapSeconds}s - read ${s.fetched} of ${s.checked} channel(s), ` +
         `${s.messages} message(s), ${s.failed} channel(s) unreadable, ${s.failedMessages} message(s) failed` +
@@ -715,7 +742,7 @@ export function gatewayStrategy(agent: HttpAgent) {
 async function ingestGatewayMessage(
   msg: Message,
   log: Log,
-  opts: { skipAutoreply?: boolean } = {},
+  opts: { skipAutoreply?: boolean; backfill?: boolean } = {},
 ): Promise<{ tenantId: string; ticketId: string; messageId: string } | null> {
   if (!msg.guildId) return null; // DM — dropped (the seam re-checks; keep the cheap guard here too)
   // §5.10 fetch-on-demand fallback: msg.member can be null (uncached/webhook) OR present with an
@@ -724,7 +751,7 @@ async function ingestGatewayMessage(
   // member's role cache always contains at least @everyone, so size 0 signals an uncached member.)
   let member = msg.member;
   if ((member === null || member.roles.cache.size === 0) && msg.guild) {
-    const fetched = await msg.guild.members.fetch(msg.author.id).catch(() => null);
+    const fetched = await fetchMember(msg.guild, msg.author.id, opts.backfill);
     if (fetched) member = fetched;
   }
   const tax = threadTaxonomy(msg.channel);
@@ -787,13 +814,24 @@ async function ingestGatewayMessage(
   return r.replay ? null : { tenantId: r.tenantId, ticketId: r.ticketId, messageId: r.messageId };
 }
 
+/**
+ * A guild member, or null when the lookup fails. A backfill rethrows a rate limit, which aborts the run and retries the gap later.
+ * A live event has no retry, so it goes on without the member's roles.
+ */
+async function fetchMember(guild: Guild, userId: string, rethrowRateLimit = false): Promise<GuildMember | null> {
+  try {
+    return await guild.members.fetch(userId);
+  } catch (e) {
+    if (rethrowRateLimit && e instanceof RateLimitError) throw e;
+    return null;
+  }
+}
+
 /** A new thread, live or backfilled: seats the owner as the customer of a ticket on the thread. */
-async function ingestGatewayThreadCreate(thread: ThreadChannel): Promise<void> {
+async function ingestGatewayThreadCreate(thread: ThreadChannel, opts: { backfill?: boolean } = {}): Promise<void> {
   if (thread.ownerId && thread.ownerId === thread.client.user?.id) return;
   const parentIsForum = thread.parent?.type === ChannelType.GuildForum;
-  const owner = thread.ownerId
-    ? await thread.guild.members.fetch(thread.ownerId).catch(() => null)
-    : null;
+  const owner = thread.ownerId ? await fetchMember(thread.guild, thread.ownerId, opts.backfill) : null;
   // A bot-owned thread (our VIP thread-per-message anchor) must not pre-seat a ticket with the
   // bot as the customer — the triggering message's ingest already seated it on this thread id.
   if (owner?.user.bot) return;

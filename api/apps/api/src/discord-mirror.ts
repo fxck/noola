@@ -532,7 +532,7 @@ function fitQuote(body: string, files: MirrorFile[]): { quoted: string; files: M
   if (files.length >= MIRROR_ATTACH_MAX_FILES) return { quoted: `${cut}\n_(message continues - open the ticket in Noola for the rest)_`, files };
   return {
     quoted: `${cut}\n_(message continues - the full text is attached as message.txt)_`,
-    files: [...files, { name: "message.txt", data: Buffer.from(body, "utf8") }],
+    files: [...files, { name: "message.txt", data: Buffer.from(body, "utf8"), keepWhenRefused: true }],
   };
 }
 

@@ -21,6 +21,7 @@
     "test:discord-leader": "tsx apps/api/test/discord-leader.test.ts",
     "test:discord-reply-delivery": "tsx apps/api/test/discord-reply-delivery.test.ts",
     "test:discord-backfill": "tsx apps/api/test/discord-backfill.test.ts",
+    "test:discord-transport": "tsx apps/api/test/discord-transport.test.ts",
     "test:slack-triage": "tsx apps/api/test/slack-triage.test.ts",
     "test:operating": "tsx apps/api/test/operating.test.ts",
     "test:auth": "tsx apps/api/test/auth.test.ts",
