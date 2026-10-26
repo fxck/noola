@@ -29,6 +29,9 @@ export interface BackfillHandlers<M extends { id: string }, C> {
   abortOn(err: unknown): boolean;
 }
 
+/** Tickets that a backfill read messages for but didn't hand on, by the channel that still needs reading. */
+export type HeldBack = Map<string, Map<string, { tenantId: string; messageId: string }>>;
+
 export interface BackfillSummary {
   gapSeconds: number;
   checked: number;
@@ -41,6 +44,8 @@ export interface BackfillSummary {
   truncated: boolean;
   /** The error that stopped the run early. */
   abortedBy?: unknown;
+  /** After an abort, the tickets for the retry to hand on once their channel is read to the end. */
+  heldBack: HeldBack;
 }
 
 const DISCORD_EPOCH = 1_420_070_400_000n;
@@ -116,6 +121,7 @@ export function planBackfill<M extends { id: string }, C extends BackfillChannel
 /**
  * Backfill one bot's channels since `gapStartMs`. Channels are read one at a time, a thread created in the gap
  * is seated before its messages, and each ticket that got messages is handed to `onTicketBackfilled` once.
+ * `carried` is the `heldBack` of an aborted run. Its messages are replays now, so they wouldn't hand the ticket on again.
  */
 export async function backfillChannels<M extends { id: string }, C extends BackfillChannel<M>>(
   channels: C[],
@@ -123,6 +129,7 @@ export async function backfillChannels<M extends { id: string }, C extends Backf
   gapStartMs: number,
   handlers: BackfillHandlers<M, C>,
   now = Date.now(),
+  carried: HeldBack = new Map(),
 ): Promise<BackfillSummary> {
   const startMs = Math.max(gapStartMs - GAP_MARGIN_MS, now - MAX_GAP_MS);
   const gapStartId = snowflakeAt(startMs);
@@ -130,13 +137,15 @@ export async function backfillChannels<M extends { id: string }, C extends Backf
   const summary: BackfillSummary = {
     gapSeconds: Math.round((now - startMs) / 1000), checked: channels.length, fetched: 0, messages: 0, failed: 0, failedMessages: 0,
     truncated: plan.length > MAX_CHANNELS_PER_RUN,
+    heldBack: new Map(),
   };
   // Per run, not per channel: a VIP ticket spans its top-level channel and its thread, and gets one autoreply.
   const newest = new Map<string, { tenantId: string; messageId: string }>();
 
-  for (const { channel, createdInGap } of plan.slice(0, MAX_CHANNELS_PER_RUN)) {
+  const toRead = plan.slice(0, MAX_CHANNELS_PER_RUN);
+  for (const [i, { channel, createdInGap }] of toRead.entries()) {
     summary.fetched++;
-    const touched = new Set<string>();
+    const touched = new Map<string, { tenantId: string; messageId: string }>(carried.get(channel.id));
     try {
       if (createdInGap) await handlers.onThreadCreated(channel);
       let after = gapStartId;
@@ -146,10 +155,7 @@ export async function backfillChannels<M extends { id: string }, C extends Backf
           summary.messages++;
           try {
             const landed = await handlers.onMessage(msg);
-            if (landed) {
-              newest.set(landed.ticketId, { tenantId: landed.tenantId, messageId: landed.messageId });
-              touched.add(landed.ticketId);
-            }
+            if (landed) touched.set(landed.ticketId, { tenantId: landed.tenantId, messageId: landed.messageId });
           } catch (err) {
             if (handlers.abortOn(err)) throw err;
             summary.failedMessages++;
@@ -164,11 +170,24 @@ export async function backfillChannels<M extends { id: string }, C extends Backf
       if (handlers.abortOn(err)) {
         summary.abortedBy = err;
         // The retry reads the rest of this channel and hands these tickets on with all their messages.
-        for (const ticketId of touched) newest.delete(ticketId);
+        if (touched.size) summary.heldBack.set(channel.id, touched);
+        for (const { channel: later } of toRead.slice(i + 1)) {
+          const c = carried.get(later.id);
+          if (c) summary.heldBack.set(later.id, c);
+        }
         break;
       }
     }
+    for (const [ticketId, n] of touched) newest.set(ticketId, n);
   }
+  // A carried channel that is no longer planned, e.g. a deleted thread, can't be read to the end, so its tickets go on now.
+  const planned = new Set(toRead.map((p) => p.channel.id));
+  for (const [channelId, tickets] of carried) {
+    if (planned.has(channelId)) continue;
+    for (const [ticketId, n] of tickets) if (!newest.has(ticketId)) newest.set(ticketId, n);
+  }
+  // A ticket still held back for any channel waits for the retry, even if another channel was read to the end.
+  for (const tickets of summary.heldBack.values()) for (const ticketId of tickets.keys()) newest.delete(ticketId);
   for (const [ticketId, n] of newest) await handlers.onTicketBackfilled(n.tenantId, ticketId, n.messageId).catch(() => {});
   return summary;
 }

@@ -3,7 +3,7 @@ import { appPool, relayPool, withTenant } from "@repo/db";
 import { RateLimitError } from "discord.js";
 import { deliverDiscordReply, type Sender } from "../src/discord.js";
 import { setDiscordSenderForTests } from "../src/discord-gateway.js";
-import { deliverRelayNow, drainDiscordRelay, enqueueRelay, relayNonce, requeueRepliesRefusedByOlderCode } from "../src/discord-relay-outbox.js";
+import { deliverRelayNow, drainDiscordRelay, enqueueRelay, purgeFinishedRelays, reconcileReplyStatuses, relayNonce, requeueRepliesRefusedByOlderCode } from "../src/discord-relay-outbox.js";
 import { getChannelDriver } from "../src/channels/registry.js";
 import { ingestInbound } from "../src/ingest.js";
 
@@ -190,6 +190,34 @@ async function main() {
     await requeueRepliesRefusedByOlderCode({ now: true });
     await drainDiscordRelay();
     check("a reply refused by older code is re-queued and delivered", (await relayRow(r.messageId))?.status === "delivered" && sends.length === 1, await relayRow(r.messageId));
+  }
+
+  // ── a reply that reached Discord while its status write failed is reconciled from the outbox ──
+  {
+    mode = "ok"; sends.length = 0;
+    const r = await agentReply();
+    const key = `reply:${r.messageId}`;
+    await enqueueRelay("reply", A, r.ticketId, key, { messageId: r.messageId, channelId: r.channelId, body: "RDTEST answer" });
+    await relayPool.query("UPDATE discord_relay_outbox SET status = 'delivered', delivered_at = now() WHERE dedupe_key = $1", [key]);
+    await withTenant(A, (c) => c.query("UPDATE messages SET delivery_status = 'pending' WHERE id = $1", [r.messageId]));
+    await reconcileReplyStatuses({ now: true });
+    const st = await withTenant(A, (c) => c.query("SELECT delivery_status FROM messages WHERE id = $1", [r.messageId]));
+    check("a delivered reply stuck on pending is marked sent", st.rows[0]?.delivery_status === "sent", st.rows[0]);
+  }
+
+  // ── finished rows are purged after 30 days, newer ones are kept ──
+  {
+    const r = await agentReply();
+    const oldKey = `reply:${r.messageId}`;
+    const recent = await agentReply();
+    const recentKey = `reply:${recent.messageId}`;
+    await enqueueRelay("reply", A, r.ticketId, oldKey, { messageId: r.messageId, channelId: r.channelId, body: "RDTEST old" });
+    await enqueueRelay("reply", A, recent.ticketId, recentKey, { messageId: recent.messageId, channelId: recent.channelId, body: "RDTEST recent" });
+    await relayPool.query("UPDATE discord_relay_outbox SET status = 'delivered', updated_at = now() - interval '31 days' WHERE dedupe_key = $1", [oldKey]);
+    await relayPool.query("UPDATE discord_relay_outbox SET status = 'failed', updated_at = now() - interval '10 days' WHERE dedupe_key = $1", [recentKey]);
+    await purgeFinishedRelays({ now: true });
+    check("a finished row older than 30 days is purged", !(await relayRow(r.messageId)));
+    check("a newer finished row is kept", (await relayRow(recent.messageId))?.status === "failed");
   }
 
   // ── no outbox row, so no retry: the one attempt is a direct send ──
