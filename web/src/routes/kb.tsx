@@ -52,6 +52,7 @@ import { fetchKnowledgeGaps, updateKnowledgeGap, type KnowledgeGap } from "@/lib
 import { CollectionDialog } from "@/components/kb/collection-dialog";
 import { MoveToMenu } from "@/components/kb/move-menu";
 import { CollectionDot, collectionOptions } from "@/components/kb/collection-common";
+import { shortcut } from "@/lib/platform";
 
 // all-MiniLM-L6-v2 — the embedder bakes a fixed 384-dim vector per chunk.
 const EMBED_DIM = 384;
@@ -1364,7 +1365,7 @@ export function ArticleEditor({
     : dirty
       ? "Unsaved changes"
       : initial
-        ? "Saved · ⌘S"
+        ? `Saved · ${shortcut("S")}`
         : "Draft";
 
   const collectionName = collectionId
@@ -1448,7 +1449,7 @@ export function ArticleEditor({
             <p className="text-xs text-muted-foreground">{metaHint}</p>
           </div>
         </Popover>
-        <Button size="sm" className="h-8 text-xs" onClick={() => void save()} disabled={saving || !hasTitle} title="⌘S">
+        <Button size="sm" className="h-8 text-xs" onClick={() => void save()} disabled={saving || !hasTitle} title={shortcut("S")}>
           {saving ? "Saving…" : initial ? "Save" : "Create article"}
         </Button>
       </header>

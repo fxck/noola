@@ -19,6 +19,7 @@ import { NoolaMark } from "@/components/noola-mark";
 import { openCommandPalette } from "@/components/command-palette";
 import { QueueBadge } from "@/components/queue/queue-badge";
 import { cn } from "@/lib/utils";
+import { shortcut } from "@/lib/platform";
 
 // The nav rail sits directly ON the workspace canvas (STRUCTURE.md §1) — no
 // background, no right border. It owns the global utilities the old top bar
@@ -173,7 +174,7 @@ export function NavRailContent({
         <button
           type="button"
           onClick={openCommandPalette}
-          title="Search — ⌘K"
+          title={`Search - ${shortcut("K")}`}
           aria-label="Open command palette"
           className={cn(
             "flex w-full items-center gap-2.5 rounded-md py-1.5 text-small text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
@@ -185,7 +186,7 @@ export function NavRailContent({
             <>
               <span className="flex-1 text-left">Search</span>
               <kbd className="rounded border bg-card px-1 font-sans text-micro font-medium leading-4 text-muted-foreground">
-                ⌘K
+                {shortcut("K")}
               </kbd>
             </>
           )}

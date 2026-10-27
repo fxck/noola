@@ -51,6 +51,7 @@ import { useNerdMode } from "@/lib/nerd-mode";
 import { NerdStats, ScoreBar, CopyId, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { cn } from "@/lib/utils";
 import type { ApiError } from "@/lib/api";
+import { SUBMIT_SHORTCUT } from "@/lib/platform";
 
 // Channel display metadata for the reply channel picker — a label + icon per known channel, so an
 // agent can send the reply on any channel the contact is reachable on. Unknown channels fall back
@@ -869,7 +870,7 @@ export function Composer({
             >
               {note?.kind === "warn" && <AlertTriangle className="size-3.5" />}
               {note?.kind === "ok" && <CheckCircle2 className="size-3.5 text-success" />}
-              {note ? note.text : <span>⌘↵ to {mode === "note" ? "save" : splitSend ? (sendMode === "now" ? "send now" : `send in ${delayLabel}`) : "send"}</span>}
+              {note ? note.text : <span>{SUBMIT_SHORTCUT} to {mode === "note" ? "save" : splitSend ? (sendMode === "now" ? "send now" : `send in ${delayLabel}`) : "send"}</span>}
             </span>
           </div>
           {splitSend ? (
