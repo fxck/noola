@@ -17,6 +17,11 @@ export function hasOutcomeTag(text: string): boolean {
   return TAG_FRAGMENT.test(text);
 }
 
+/** The text with the note block and the no-reply tag taken out, untrimmed so it still starts like the original. */
+export function withoutOutcomeTags(text: string): string {
+  return text.replace(INTERNAL_BLOCK, "").replace(NO_REPLY, "");
+}
+
 export function parseDraftOutcome(text: string): DraftOutcome {
   const notes = [...text.matchAll(INTERNAL_BLOCK)].map((m) => m[1].trim());
   if (notes.length > 1) return { kind: "malformed", problem: "more than one internal note" };

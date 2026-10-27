@@ -208,7 +208,7 @@ export interface SuggestOpts {
    *  for what they showed. Retrieval is unaffected — grounding still comes from the text query — and
    *  the rule baseline ignores them. */
   images?: DraftImage[];
-  /** The ambient autoreply lets a hosted model add a note for the team or decide that no reply is needed. */
+  /** The ambient autoreply and the widget let a hosted model add a note for the team or decide that no reply is needed. */
   outcomes?: boolean;
 }
 

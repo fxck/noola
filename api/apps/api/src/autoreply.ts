@@ -673,6 +673,41 @@ async function evaluateForMessage(
     : null;
 }
 
+export type WidgetAnswer = { kind: "reply"; reply: string } | { kind: "none" } | { kind: "handoff" };
+
+/**
+ * Applies the outcome tags of the widget's own answer, which answers outside the ambient autoreply.
+ * "No reply" hands the turn to the visitor. A note without a reply, or broken tags, means a teammate
+ * should answer, so the caller pauses the AI. A broken draft also waits in the review queue.
+ */
+export async function settleWidgetAnswer(tenantId: string, ticketId: string, messageId: string, s: Suggestion): Promise<WidgetAnswer> {
+  if (!s.outcomes) return { kind: "reply", reply: s.draft };
+  const outcome = parseDraftOutcome(s.draft);
+  const decision = (outcome: DecisionInput["outcome"], reason: string) =>
+    recordDecision(tenantId, {
+      messageId, ticketId, outcome, reason, source: "on_demand",
+      agreement: s.retrieval.agreement, topScore: s.retrieval.topScore, confidence: s.confidence,
+      riskTags: [], sentMessageId: null, traceId: s.traceId,
+    });
+  if (outcome.kind === "malformed") {
+    if (await decision("suppressed", "malformed_output")) {
+      await enqueueSuggestion(tenantId, {
+        ticketId, messageId, draftBody: s.draft, meta: suggestionMeta(s, "suggested"), reason: "malformed_output",
+      });
+    }
+    return { kind: "handoff" };
+  }
+  if (outcome.reply) {
+    if (outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
+    return { kind: "reply", reply: outcome.reply };
+  }
+  const id = await decision(outcome.noReply ? "suppressed" : "assist", outcome.noReply ? "no_reply_needed" : "note_only");
+  if (id && outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
+  if (!outcome.noReply) return { kind: "handoff" };
+  await handTurnToCustomer(tenantId, ticketId);
+  return { kind: "none" };
+}
+
 /** Who writes AI notes in the thread and in the Discord mirror. */
 const AI_NOTE_AUTHOR = "AI assistant";
 
