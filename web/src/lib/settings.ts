@@ -43,7 +43,7 @@ export const PROVIDER_OPTIONS: { value: ModelProvider; label: string }[] = [
 export const MODEL_PLACEHOLDER: Record<ModelProvider, string> = {
   managed: "",
   openai: "gpt-4o-mini",
-  anthropic: "claude-3-5-sonnet-latest",
+  anthropic: "claude-opus-5-5",
   custom: "e.g. llama-3.1-70b-instruct",
 };
 
@@ -54,12 +54,13 @@ export const MODEL_SUGGESTIONS: Record<ModelProvider, string[]> = {
   managed: [],
   openai: ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini", "o4-mini", "o3"],
   anthropic: [
-    "claude-opus-4-8",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
     "claude-sonnet-5",
-    "claude-haiku-4-5",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-3-5-sonnet-latest",
+    "claude-opus-4-8",
   ],
   custom: [],
 };
@@ -79,6 +80,11 @@ export const DEFAULT_SETTINGS: ModelSettings = {
 
 export async function fetchModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>("/settings/model");
+}
+
+/** The models the saved provider serves the saved key. Empty until a key and model are saved, or when the provider doesn't list them. */
+export async function fetchAvailableModels(): Promise<string[]> {
+  return (await api<{ models: string[] }>("/settings/model/available")).models;
 }
 
 export async function saveModelSettings(input: ModelSettingsInput): Promise<ModelSettings> {

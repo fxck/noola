@@ -7,7 +7,7 @@ import {
   TranslationSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
-import { getModelConfig, putModelConfig, testModelConfig } from "../modelconfig.js";
+import { getModelConfig, listAvailableModels, putModelConfig, testModelConfig } from "../modelconfig.js";
 import { getAiOverview } from "../ai-overview.js";
 import {
   getPolicy, putPolicy, listDecisionsForTicket, listQueue, sendQueued, dismissQueued,
@@ -84,6 +84,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
 
   // Live reachability probe for the tenant's saved config (a tiny draft round-trip).
   app.post("/settings/model/test", tenanted(async (tenantId) => testModelConfig(tenantId)));
+  app.get("/settings/model/available", tenanted(async (tenantId) => ({ models: await listAvailableModels(tenantId) })));
 
   // ---- Settings: translation (Wave 4) --------------------------------------
   // The workspace language + the auto-translate master switch. Detection + the language analytics
