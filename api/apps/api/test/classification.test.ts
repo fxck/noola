@@ -8,6 +8,7 @@ import {
   getClassificationConfig,
   replaceClassificationConfig,
   DEFAULT_TOPIC_RULES,
+  DEFAULT_REACTION_MAP,
 } from "../src/classification.js";
 import { ruleTopic } from "../src/topics.js";
 import { classifyRisk, BUILTIN_RISK_TAGS } from "../src/model.js";
@@ -61,7 +62,13 @@ async function main() {
   await ensureClassificationDefaults(B);
   const cfg0 = await getClassificationConfig(B);
   check("seed: topic rules match the built-in count", cfg0.topicRules.length === DEFAULT_TOPIC_RULES.length);
-  check("seed: reaction map has the 6 defaults", cfg0.reactionMap.length === 6);
+  const seededMap = await getReactionMap(B);
+  const expectedMap: Record<string, string> = {
+    white_check_mark: "close", heavy_check_mark: "close", ballot_box_with_check: "close",
+    arrows_counterclockwise: "reopen", eyes: "assign_me", zzz: "snooze", no_entry_sign: "spam",
+  };
+  check("seed: reaction map holds exactly the 7 built-in defaults", JSON.stringify(Object.entries(seededMap).sort()) === JSON.stringify(Object.entries(expectedMap).sort()));
+  check("seed: the seed follows DEFAULT_REACTION_MAP", DEFAULT_REACTION_MAP.length === 7 && DEFAULT_REACTION_MAP.every((d) => seededMap[d.emoji] === d.action));
   check("seed: risk keywords start empty (additive)", cfg0.riskKeywords.length === 0);
   check("seed: white_check_mark → close", (await getReactionMap(B))["white_check_mark"] === "close");
   check("seed: seeded topic rules classify (billing)", ruleTopic("", "invoice overdue", await getTopicRules(B)) === "billing");

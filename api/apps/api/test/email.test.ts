@@ -35,12 +35,17 @@ async function main() {
     max: 1,
   });
 
+  // linkEmailRoute replaces a tenant's route, so the seeded one is put back afterwards.
+  const savedRoutes = (await superPool.query("SELECT address, tenant_id FROM email_routes WHERE tenant_id = ANY($1::uuid[]) AND address NOT LIKE 'emailtest-%'", [[A, B]])).rows;
   const clean = async () => {
     await superPool.query("DELETE FROM messages WHERE body LIKE 'EMAILTEST%'");
     await superPool.query("DELETE FROM messages WHERE idempotency_key LIKE 'email:emailtest-%'");
     await superPool.query("DELETE FROM tickets WHERE external_channel_id LIKE 'emailtest-%'");
     await superPool.query("DELETE FROM outbox WHERE payload->'data'->>'body' LIKE 'EMAILTEST%'");
     await superPool.query("DELETE FROM email_routes WHERE address LIKE 'emailtest-%'");
+    for (const r of savedRoutes) {
+      await superPool.query("INSERT INTO email_routes (address, tenant_id) VALUES ($1, $2) ON CONFLICT (address) DO NOTHING", [r.address, r.tenant_id]);
+    }
   };
   await clean();
 

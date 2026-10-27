@@ -101,15 +101,20 @@ async function main() {
   // ── report engine ───────────────────────────────────────────────────────────
   const allKeys = REPORT_METRICS.map((m) => m.key);
   check("catalog has 14 metrics", allKeys.length === 14);
+  const weekAgo = new Date(Date.now() - 7 * 86_400_000).toISOString();
   const rep = await runReport(A, {
     metrics: ["volume", "closed", "ttfr_avg", "ttfr_p90", "ttr_median", "sla_fr_rate", "csat_avg", "deflection_rate"],
     groupBy: "day",
-    from: new Date(Date.now() - 7 * 86_400_000).toISOString(),
+    from: weekAgo,
     compare: true,
   });
   check("report buckets are daily over 7d", rep.groupBy === "day" && rep.buckets.length >= 7 && rep.buckets.length <= 8);
   const vol = rep.series.find((s) => s.metric === "volume");
-  check("volume total counts the seeded window", (vol?.total ?? 0) >= 3);
+  // Other suites may add TestCo tickets, so the report is compared with a direct count of the same window.
+  const inWindow = await withTenant(A, (c) =>
+    c.query<{ n: number }>("SELECT count(*)::int AS n FROM tickets WHERE created_at >= $1 AND created_at < now() AND merged_into IS NULL", [weekAgo]),
+  );
+  check("volume total counts the seeded window", vol?.total === inWindow.rows[0].n && inWindow.rows[0].n >= 2);
   const ttfr = rep.series.find((s) => s.metric === "ttfr_avg");
   check("ttfr_avg computed with unit hours", ttfr?.unit === "hours" && ttfr?.total !== null && (ttfr?.total ?? 0) > 0);
   const sla = rep.series.find((s) => s.metric === "sla_fr_rate");
