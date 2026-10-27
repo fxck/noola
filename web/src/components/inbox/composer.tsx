@@ -49,6 +49,7 @@ import { fetchSendDelay, formatDelay } from "@/lib/settings";
 import { useNerdMode } from "@/lib/nerd-mode";
 import { NerdStats, ScoreBar, CopyId, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { cn } from "@/lib/utils";
+import type { ApiError } from "@/lib/api";
 
 // Channel display metadata for the reply channel picker — a label + icon per known channel, so an
 // agent can send the reply on any channel the contact is reachable on. Unknown channels fall back
@@ -312,8 +313,13 @@ export function Composer({
       markTyping(false);
       onSent();
       onMutated();
-    } catch {
-      setNote({ kind: "warn", text: "Couldn't send the suggested reply — please try again." });
+    } catch (err) {
+      setNote({
+        kind: "warn",
+        text: (err as ApiError).status === 422
+          ? "Remove the AI's <internal> note and any tags before sending this reply."
+          : "Couldn't send the suggested reply — please try again.",
+      });
       refetchQueue(); // restore the card
     } finally {
       setQueueBusy(false);
@@ -476,7 +482,12 @@ export function Composer({
                 </span>
                 <ReasonChip reason={pending.reason} />
               </div>
-              <p className="mt-2 line-clamp-4 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
+              <p
+                className={cn(
+                  "mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground",
+                  pending.reason !== "malformed_output" && "line-clamp-4",
+                )}
+              >
                 {pending.draft_body}
               </p>
               <DraftReceipt meta={pending.meta} className="mt-2" />
@@ -492,10 +503,13 @@ export function Composer({
                 <Button variant="outline" size="sm" onClick={() => editPending(pending)} disabled={queueBusy}>
                   <Pencil /> Edit
                 </Button>
-                <Button size="sm" onClick={() => void sendPending(pending)} disabled={queueBusy}>
-                  {queueBusy ? <Spinner className="size-4 text-background" /> : <SendHorizonal />}
-                  Send
-                </Button>
+                {/* A malformed draft still holds the AI's note for the team, so it can only be sent after an edit. */}
+                {pending.reason !== "malformed_output" && (
+                  <Button size="sm" onClick={() => void sendPending(pending)} disabled={queueBusy}>
+                    {queueBusy ? <Spinner className="size-4 text-background" /> : <SendHorizonal />}
+                    Send
+                  </Button>
+                )}
               </div>
             </div>
           ))}

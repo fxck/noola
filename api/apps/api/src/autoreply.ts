@@ -9,6 +9,10 @@ import { deliverDiscordReply } from "./discord.js";
 import { routeEmailOutbound } from "./email.js";
 import { routeSlackOutbound } from "./slack.js";
 import { claimAnswer } from "./answer-claims.js";
+import { hasOutcomeTag, parseDraftOutcome, type DraftOutcome } from "./ai-outcome.js";
+import { addNote } from "./notes.js";
+import { relayNoteToMirror } from "./discord-mirror.js";
+import { emitTicketUpdated } from "./ticket-events.js";
 
 // Autoreply: turns the assist-only copilot into an optional, per-tenant, guardrailed
 // AUTO-SEND. Default is off. Auto-send fires ONLY when retrieval corroborates (≥ N
@@ -493,7 +497,7 @@ async function evaluateForMessage(
   }
 
   // Draft + retrieve (records a draft_trace). Needed for both suggest_only and auto.
-  const suggestion = await suggestForQuery(tenantId, ctx.body, { ticketId, messageId, source: "live" });
+  const suggestion = await suggestForQuery(tenantId, ctx.body, { ticketId, messageId, source: "live", outcomes: true });
   const agreement = suggestion.retrieval.agreement;
   const topScore = suggestion.retrieval.topScore;
   const confidence = suggestion.confidence;
@@ -505,17 +509,60 @@ async function evaluateForMessage(
 
   const draftMeta = suggestionMeta(suggestion, "suggested");
 
+  // A hosted model may also leave a note for the team, or decide that the message needs no reply.
+  const outcome: DraftOutcome = suggestion.outcomes
+    ? parseDraftOutcome(suggestion.draft)
+    : { kind: "ok", reply: suggestion.draft, note: null, noReply: false };
+  if (outcome.kind === "malformed") {
+    await stampGate("suppressed", "malformed_output");
+    const id = await recordDecision(tenantId, {
+      messageId, ticketId, outcome: "suppressed", reason: "malformed_output",
+      agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
+    });
+    const queueItemId = await enqueueSuggestion(tenantId, {
+      ticketId, messageId, draftBody: suggestion.draft, meta: draftMeta, reason: "malformed_output",
+    });
+    return id
+      ? { outcome: "suppressed", reason: "malformed_output", decisionId: id, queueItemId: queueItemId ?? undefined, meta: draftMeta }
+      : null;
+  }
+  // The decision is unique per message, so only the evaluation that records it posts the note.
+  const decide = async (d: DecisionInput): Promise<string | null> => {
+    const id = await recordDecision(tenantId, d);
+    if (id && outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
+    return id;
+  };
+
+  if (!outcome.reply) {
+    let reason = outcome.noReply ? "no_reply_suggested" : "note_only";
+    if (outcome.noReply && channelMode === "auto") {
+      if (!(await claimAnswer(tenantId, messageId, "autoreply"))) reason = "claimed_elsewhere";
+      else {
+        await handTurnToCustomer(tenantId, ticketId);
+        reason = "no_reply_needed";
+      }
+    }
+    const decisionOutcome = reason === "note_only" || reason === "no_reply_suggested" ? "assist" : "suppressed";
+    await stampGate(decisionOutcome, reason);
+    const id = await decide({
+      messageId, ticketId, outcome: decisionOutcome, reason,
+      agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
+    });
+    return id ? { outcome: decisionOutcome, reason, decisionId: id } : null;
+  }
+  const replyText = outcome.reply;
+
   // suggest_only never sends — the draft is ready for a human. The CHANNEL mode decides
   // (an explicit per-channel 'auto' upgrades a suggest_only tenant default and vice versa).
   if (channelMode === "suggest_only") {
     await stampGate("assist", "suggest_only");
-    const id = await recordDecision(tenantId, {
+    const id = await decide({
       messageId, ticketId, outcome: "assist", reason: "suggest_only",
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
     });
     // Queue the draft for human review (idempotent on message_id).
     const queueItemId = await enqueueSuggestion(tenantId, {
-      ticketId, messageId, draftBody: suggestion.draft,
+      ticketId, messageId, draftBody: replyText,
       meta: draftMeta, reason: "suggest_only",
     });
     return id
@@ -532,13 +579,13 @@ async function evaluateForMessage(
   if (!gatePass || !confidencePass) {
     const holdReason = !gatePass ? "weak_retrieval" : "low_confidence";
     await stampGate("suppressed", holdReason);
-    const id = await recordDecision(tenantId, {
+    const id = await decide({
       messageId, ticketId, outcome: "suppressed", reason: holdReason,
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
     });
     // The draft exists but was held by the gate — queue it for human review.
     const queueItemId = await enqueueSuggestion(tenantId, {
-      ticketId, messageId, draftBody: suggestion.draft,
+      ticketId, messageId, draftBody: replyText,
       meta: draftMeta, reason: holdReason,
     });
     return id
@@ -568,7 +615,7 @@ async function evaluateForMessage(
   });
   if (capReason) {
     await stampGate("suppressed", capReason);
-    const id = await recordDecision(tenantId, {
+    const id = await decide({
       messageId, ticketId, outcome: "suppressed", reason: capReason,
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
     });
@@ -579,7 +626,7 @@ async function evaluateForMessage(
   // answerer (automations reply / on-demand) already posted this turn ⇒ stand down (do not re-check,
   // do not post). Taken at the LAST moment so a gate-bail never consumes the turn's single claim.
   if (!(await claimAnswer(tenantId, messageId, "autoreply"))) {
-    const id = await recordDecision(tenantId, {
+    const id = await decide({
       messageId, ticketId, outcome: "suppressed", reason: "claimed_elsewhere",
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
     });
@@ -591,7 +638,7 @@ async function evaluateForMessage(
   // decision unique index). Auto-sent messages are author_type='agent', so they can
   // never trigger another autoreply.
   const sent = await ingestInbound({
-    tenantId, body: suggestion.draft, authorType: "agent", ticketId,
+    tenantId, body: replyText, authorType: "agent", ticketId,
     idempotencyKey: `autoreply:${messageId}`,
   });
   // Attach generation stats to the sent AI message so the UI can render them inline.
@@ -607,15 +654,15 @@ async function evaluateForMessage(
   // Dispatch to the origin channel (same as /tickets/:id/reply). Synthetic has no
   // external endpoint — the outbox event still updates the live inbox.
   if (ctx.channelType === "email") {
-    await routeEmailOutbound({ tenantId, externalChannelId: ctx.externalChannelId, ticketId }, ctx.subject, suggestion.draft).catch(() => {});
+    await routeEmailOutbound({ tenantId, externalChannelId: ctx.externalChannelId, ticketId }, ctx.subject, replyText).catch(() => {});
   } else if (ctx.channelType === "slack") {
-    await routeSlackOutbound({ tenantId, channelType: ctx.channelType, externalChannelId: ctx.externalChannelId }, suggestion.draft).catch(() => {});
+    await routeSlackOutbound({ tenantId, channelType: ctx.channelType, externalChannelId: ctx.externalChannelId }, replyText).catch(() => {});
   } else if (ctx.channelType === "discord") {
-    await deliverDiscordReply({ tenantId, ticketId, messageId: sent.messageId, channelId: ctx.externalChannelId }, suggestion.draft).catch(() => {});
+    await deliverDiscordReply({ tenantId, ticketId, messageId: sent.messageId, channelId: ctx.externalChannelId }, replyText).catch(() => {});
   }
 
   await stampGate("auto_sent", "sent");
-  const id = await recordDecision(tenantId, {
+  const id = await decide({
     messageId, ticketId, outcome: "auto_sent", reason: "sent",
     agreement, topScore, confidence, riskTags, sentMessageId: sent.messageId, traceId: suggestion.traceId,
   });
@@ -624,6 +671,22 @@ async function evaluateForMessage(
   return id
     ? { outcome: "auto_sent", reason: "sent", decisionId: id, sentMessageId: sent.messageId, meta }
     : null;
+}
+
+/** Who writes AI notes in the thread and in the Discord mirror. */
+const AI_NOTE_AUTHOR = "AI assistant";
+
+async function postAiNote(tenantId: string, ticketId: string, body: string): Promise<void> {
+  const note = await addNote(tenantId, ticketId, { authorId: null, authorName: AI_NOTE_AUTHOR, body }).catch(() => null);
+  if (note) await relayNoteToMirror(tenantId, ticketId, { authorName: AI_NOTE_AUTHOR, body, dedupeKey: note.id }).catch(() => {});
+}
+
+/** The customer's message needs no answer, so the ticket waits for them and stays open. */
+async function handTurnToCustomer(tenantId: string, ticketId: string): Promise<void> {
+  await withTenant(tenantId, async (c) => {
+    const r = await c.query("UPDATE tickets SET whose_turn = 'customer', updated_at = now() WHERE id = $1 AND whose_turn = 'us'", [ticketId]);
+    if (r.rowCount) await emitTicketUpdated(c, tenantId, ticketId, { whoseTurn: "customer" });
+  });
 }
 
 // ---- Approval queue ------------------------------------------------------
@@ -654,7 +717,7 @@ interface EnqueueInput {
   messageId: string;
   draftBody: string;
   meta: Record<string, unknown>;
-  reason: "suggest_only" | "weak_retrieval" | "low_confidence";
+  reason: "suggest_only" | "weak_retrieval" | "low_confidence" | "malformed_output";
 }
 
 /** Insert a reviewable draft. Idempotent on (tenant_id, message_id) — a re-ingest of
@@ -703,7 +766,7 @@ export async function listQueue(tenantId: string): Promise<QueueItem[]> {
 
 export type QueueActionResult =
   | { ok: true; message: { ticketId: string; messageId: string; delivered: boolean; queued: boolean } }
-  | { ok: false; code: 404 | 409 };
+  | { ok: false; code: 404 | 409 | 422 };
 
 /** Send a pending queue item as an agent reply through the SAME path the auto-sender
  *  uses. `body` overrides the stored draft (Edit+Send). Idempotent on the send via a
@@ -715,7 +778,7 @@ export async function sendQueued(
 ): Promise<QueueActionResult> {
   const item = await withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT q.id, q.ticket_id, q.draft_body, q.meta, q.status,
+      `SELECT q.id, q.ticket_id, q.draft_body, q.meta, q.status, q.reason,
               t.channel_type, t.external_channel_id, t.subject
          FROM autoreply_queue q
          JOIN tickets t ON t.id = q.ticket_id AND t.tenant_id = q.tenant_id
@@ -727,6 +790,8 @@ export async function sendQueued(
   if (!item) return { ok: false, code: 404 };
   if (item.status !== "pending") return { ok: false, code: 409 };
 
+  // A malformed draft holds text meant for the team, so it goes out only as an edited body without the tags.
+  if (item.reason === "malformed_output" && (body === undefined || hasOutcomeTag(body))) return { ok: false, code: 422 };
   const outBody = body ?? (item.draft_body as string);
 
   // Reuse the agent-reply core. The deterministic idempotencyKey dedupes the SEND even

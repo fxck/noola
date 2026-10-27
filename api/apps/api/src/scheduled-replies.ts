@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { relayPool, withTenant } from "@repo/db";
 import { sendAgentReply, type AgentReplyRequest } from "./agent-reply.js";
 import { addNote } from "./notes.js";
+import { emitTicketUpdated } from "./ticket-events.js";
 
 export const MAX_SEND_DELAY_SECONDS = 600;
 const MAX_ATTEMPTS = 5;
@@ -68,15 +68,8 @@ export async function setSendDelay(tenantId: string, seconds: number): Promise<n
 }
 
 /** Tells an open inbox thread to reload, so a scheduled reply appears, counts down and disappears live. */
-async function emitTicketUpdated(c: pg.PoolClient, tenantId: string, ticketId: string, scheduledReplyId: string, status: string): Promise<void> {
-  const envelope = {
-    id: randomUUID(), type: "ticket.updated", tenantId, ticketId,
-    occurredAt: new Date().toISOString(), data: { scheduledReplyId, status },
-  };
-  await c.query(
-    "INSERT INTO outbox (tenant_id, event_type, subject, payload) VALUES (current_tenant(), 'ticket.updated', 'noola.events.' || current_tenant(), $1::jsonb)",
-    [JSON.stringify(envelope)],
-  );
+function emitScheduledUpdate(c: pg.PoolClient, tenantId: string, ticketId: string, scheduledReplyId: string, status: string): Promise<void> {
+  return emitTicketUpdated(c, tenantId, ticketId, { scheduledReplyId, status });
 }
 
 export interface ScheduleInput {
@@ -115,7 +108,7 @@ export async function scheduleReply(tenantId: string, input: ScheduleInput, dela
       ]);
       return { id: first.rows[0].id, sendAt: first.rows[0].send_at.toISOString() };
     }
-    await emitTicketUpdated(c, tenantId, input.ticketId, r.rows[0].id, "scheduled");
+    await emitScheduledUpdate(c, tenantId, input.ticketId, r.rows[0].id, "scheduled");
     return { id: r.rows[0].id, sendAt: r.rows[0].send_at.toISOString() };
   });
 }
@@ -151,7 +144,7 @@ export async function cancelScheduledReply(tenantId: string, id: string): Promis
       "UPDATE scheduled_replies SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'scheduled' RETURNING *",
       [id],
     );
-    if (r.rowCount) await emitTicketUpdated(c, tenantId, r.rows[0].ticket_id, id, "cancelled");
+    if (r.rowCount) await emitScheduledUpdate(c, tenantId, r.rows[0].ticket_id, id, "cancelled");
     return r.rows[0] ?? null;
   });
   if (row) await (await sourceFor(row.source))?.release?.(row).catch(() => {});
@@ -173,7 +166,7 @@ export async function sendScheduledReplyNow(tenantId: string, id: string, log: L
 
 /** Sends a claimed row. A failure retries with backoff, and the last attempt marks the row failed. */
 async function deliverClaimed(row: ScheduledReplyRow, log: Log): Promise<{ messageId: string | null }> {
-  await withTenant(row.tenant_id, (c) => emitTicketUpdated(c, row.tenant_id, row.ticket_id, row.id, "sending")).catch(() => {});
+  await withTenant(row.tenant_id, (c) => emitScheduledUpdate(c, row.tenant_id, row.ticket_id, row.id, "sending")).catch(() => {});
   try {
     const handler = await sourceFor(row.source);
     if (!handler && row.source !== "composer") throw new Error(`no sender for ${row.source}`);
@@ -200,7 +193,7 @@ async function deliverClaimed(row: ScheduledReplyRow, log: Log): Promise<{ messa
         "UPDATE scheduled_replies SET status = 'sent', message_id = $2, last_error = NULL, updated_at = now() WHERE id = $1 AND status = 'sending' AND attempts = $3",
         [row.id, out.messageId, row.attempts],
       );
-      await emitTicketUpdated(c, row.tenant_id, row.ticket_id, row.id, "sent");
+      await emitScheduledUpdate(c, row.tenant_id, row.ticket_id, row.id, "sent");
     });
     return { messageId: out.messageId };
   } catch (err) {
@@ -213,7 +206,7 @@ async function deliverClaimed(row: ScheduledReplyRow, log: Log): Promise<{ messa
           WHERE id = $1 AND status = 'sending' AND attempts = $5`,
         [row.id, failed ? "failed" : "scheduled", String((err as Error)?.message ?? err).slice(0, 500), 30 * row.attempts, row.attempts],
       );
-      if (u.rowCount) await emitTicketUpdated(c, row.tenant_id, row.ticket_id, row.id, failed ? "failed" : "scheduled");
+      if (u.rowCount) await emitScheduledUpdate(c, row.tenant_id, row.ticket_id, row.id, failed ? "failed" : "scheduled");
       return (u.rowCount ?? 0) > 0;
     }).catch(() => false);
     // The pending reply leaves the thread, so a note keeps its text and says it was not sent.

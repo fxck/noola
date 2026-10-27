@@ -151,6 +151,8 @@ export interface Suggestion {
   tokensIn: number | null;
   tokensOut: number | null;
   latencyMs: number;
+  /** The draft may hold the outcome tags of ai-outcome.ts. Only a hosted model asked for them sets it. */
+  outcomes?: boolean;
 }
 
 /** The latest inbound customer message drives retrieval — it's what we're answering. */
@@ -206,6 +208,8 @@ export interface SuggestOpts {
    *  for what they showed. Retrieval is unaffected — grounding still comes from the text query — and
    *  the rule baseline ignores them. */
   images?: DraftImage[];
+  /** The ambient autoreply lets a hosted model add a note for the team or decide that no reply is needed. */
+  outcomes?: boolean;
 }
 
 const EMPTY_RETRIEVAL: RetrievalSummary = { topScore: 0, citedKinds: [], agreement: 0, perCitation: [] };
@@ -305,7 +309,7 @@ export async function* suggestForQueryStream(
     } catch {
       // A stream that fails AFTER emitting text can't be un-sent — keep what the client
       // already has. Only a stream that produced nothing falls through to a fresh draft.
-      if (text) dr = { text, confidence: 0.7 };
+      if (text) dr = { text, confidence: 0.7, outcomes: prep.draftInput.outcomes === true };
     }
   }
   if (!dr && !text) {
@@ -319,7 +323,7 @@ export async function* suggestForQueryStream(
     text = dr.text;
     yield { delta: dr.text };
   } else if (!dr) {
-    dr = { text, confidence: 0.7 };
+    dr = { text, confidence: 0.7, outcomes: prep.draftInput.outcomes === true };
   }
 
   return prep.finalize(dr, model, Date.now() - draftStarted);
@@ -363,7 +367,7 @@ async function prepareDraft(
   started: number,
 ): Promise<{
   driver: ModelServingDriver;
-  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[] };
+  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[]; outcomes?: boolean };
   citations: Citation[];
   retrieval: RetrievalSummary;
   /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model would
@@ -474,7 +478,7 @@ async function prepareDraft(
   const history = ticketId ? await loadHistory(tenantId, ticketId, messageId).catch(() => []) : [];
   // Current-turn images (widget screenshots) ride along to a vision model as image content-blocks —
   // extra context on TOP of the text-driven retrieval, never a substitute for grounding.
-  const draftInput = { customerMessage: query, sources: grounding, persona, history, images: opts.images };
+  const draftInput = { customerMessage: query, sources: grounding, persona, history, images: opts.images, outcomes: opts.outcomes };
 
   // Trace + content-gap + Suggestion assembly, invoked once a DraftResult exists (one-shot
   // or streamed). `latencyMs` is the draft-generation time the caller measured.
@@ -500,6 +504,7 @@ async function prepareDraft(
       draft: result.text, citations, model, basedOn: clip(query, 160),
       retrieval, confidence: result.confidence ?? null, traceId,
       tokensIn: result.tokensIn ?? null, tokensOut: result.tokensOut ?? null, latencyMs,
+      outcomes: result.outcomes === true,
     };
   };
 

@@ -86,7 +86,7 @@ export function DraftReceipt({ meta, className }: { meta: MessageMeta | null; cl
 
 /** The reason a draft is waiting, as a small tone-coded chip. */
 export function ReasonChip({ reason }: { reason: string }) {
-  const weak = reason === "weak_retrieval";
+  const weak = reason === "weak_retrieval" || reason === "malformed_output";
   return (
     <span
       className={cn(
@@ -97,11 +97,13 @@ export function ReasonChip({ reason }: { reason: string }) {
       )}
       title={
         weak
-          ? "Wanted to auto-send, but retrieval didn't corroborate the answer — held for a human."
+          ? reason === "malformed_output"
+            ? "The AI's note or no-reply markers were malformed, so the draft is held as written."
+            : "Wanted to auto-send, but retrieval didn't corroborate the answer — held for a human."
           : "Suggest-only mode: a grounded draft prepared for an agent to review."
       }
     >
-      {weak ? "Held · low corroboration" : "Suggested"}
+      {reason === "malformed_output" ? "Held · malformed" : weak ? "Held · low corroboration" : "Suggested"}
     </span>
   );
 }
