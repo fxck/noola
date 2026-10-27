@@ -79,7 +79,7 @@ func packFlowContext(dir string) ([]byte, string, error) {
 	for _, f := range files {
 		has[f] = true
 	}
-	for _, need := range []string{"Dockerfile", "exec.mts", "package.json", "flow-core/index.ts"} {
+	for _, need := range []string{"Dockerfile", "exec.mts", "package.json", "package-lock.json", "flow-core/index.ts"} {
 		if !has[need] {
 			return nil, "", fmt.Errorf("flow-runner context %s has no %s", dir, need)
 		}

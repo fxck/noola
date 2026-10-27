@@ -313,6 +313,16 @@ func TestFlowContextNeedsTheVendoredCore(t *testing.T) {
 	}
 }
 
+// The base installs from the lockfile (npm ci): without it the context is refused rather than
+// built into a base whose playwright drifted from its Chromium.
+func TestFlowContextNeedsTheLockfile(t *testing.T) {
+	dir := writeFlowDir(t, t.TempDir(), "v1")
+	_ = os.Remove(filepath.Join(dir, "package-lock.json"))
+	if _, _, err := packFlowContext(dir); err == nil || !strings.Contains(err.Error(), "package-lock.json") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 // ── config ───────────────────────────────────────────────────────────────────
 
 func TestSandboxNetworkModeIsInternetOrNothing(t *testing.T) {

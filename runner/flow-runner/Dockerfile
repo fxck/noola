@@ -9,19 +9,20 @@ FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-# JS deps first so this layer caches unless package.json changes.
-COPY package.json ./
-RUN npm install
+# JS deps first, exactly as the lockfile pins them (a bare `npm install` resolves the newest
+# playwright in package.json's range, whose Chromium build is not the one installed below).
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Chromium (matching the installed playwright) + its system libraries, in a fixed path so the run
-# finds it whatever HOME the sandbox gives its process. Build runs as root, so
-# --with-deps' apt works without sudo. ffmpeg encodes the run's frame stream into the .webm
-# replay (0092) — libvpx ships in Debian's ffmpeg.
+# Chromium for the installed playwright (its own CLI, so the two can't drift) + its system
+# libraries, in a fixed path so the run finds it whatever HOME the sandbox gives its process.
+# Build runs as root, so --with-deps' apt works without sudo. ffmpeg encodes the run's frame
+# stream into the .webm replay (0092) — libvpx ships in Debian's ffmpeg.
 # The browser binary download hits the Playwright CDN and occasionally times out (30s socket
 # timeout) — a single blip must NOT fail the whole runner boot, so retry up to 5× before giving up.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN for i in 1 2 3 4 5; do \
-      npx -y playwright@1.61.1 install --with-deps chromium && break; \
+      npx --no-install playwright install --with-deps chromium && break; \
       if [ "$i" = 5 ]; then echo "playwright chromium install failed after 5 attempts" >&2; exit 1; fi; \
       echo "playwright chromium install attempt $i failed — retrying in 10s…" >&2; sleep 10; \
     done \
