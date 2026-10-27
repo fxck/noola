@@ -18,8 +18,8 @@ export interface ScheduledReplyRow {
   author_name: string | null;
   author_email: string | null;
   body: string;
-  request: { attachmentIds?: string[]; channel?: string | null; cc?: string[]; attribution?: string | null };
-  source: "composer" | "discord_promote";
+  request: { attachmentIds?: string[]; channel?: string | null; cc?: string[]; attribution?: string | null; noteId?: string };
+  source: "composer" | "discord_promote" | "note";
   discord_message_id: string | null;
   send_at: Date;
   status: "scheduled" | "sending" | "sent" | "cancelled" | "failed";
@@ -47,6 +47,7 @@ async function sourceFor(source: ScheduledReplyRow["source"]): Promise<Scheduled
   if (override) return override;
   // Imported on use, because the mirror imports this module.
   if (source === "discord_promote") return (await import("./discord-mirror.js")).promoteSource;
+  if (source === "note") return (await import("./note-actions.js")).noteSource;
   return null;
 }
 
@@ -93,20 +94,38 @@ export interface ScheduleInput {
  * A reply that is cancelled or fails switches it back on (see `unmuteIfUnsent`).
  */
 export async function scheduleReply(tenantId: string, input: ScheduleInput, delaySeconds: number): Promise<{ id: string; sendAt: string }> {
+  return insertReply(tenantId, input, delaySeconds, false);
+}
+
+/**
+ * Records a reply as already claimed and sends it at once, so the worker of another process can't take it first.
+ * The row still dedupes a second send of the same source.
+ */
+export async function sendReplyNow(tenantId: string, input: ScheduleInput, log: Log): Promise<{ messageId: string | null; retrying: boolean }> {
+  const { id } = await insertReply(tenantId, input, 0, true);
+  const r = await withTenant(tenantId, (c) => c.query<ScheduledReplyRow>("SELECT * FROM scheduled_replies WHERE id = $1", [id]));
+  // A failed send is already set to retry, and it waits in the thread like any held reply.
+  return deliverClaimed(r.rows[0], log).then(
+    (out) => ({ messageId: out.messageId, retrying: false }),
+    () => ({ messageId: null, retrying: true }),
+  );
+}
+
+async function insertReply(tenantId: string, input: ScheduleInput, delaySeconds: number, claimed: boolean): Promise<{ id: string; sendAt: string }> {
   return withTenant(tenantId, async (c) => {
     const muted = await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [input.ticketId]);
     const r = await c.query<{ id: string; send_at: Date }>(
       `INSERT INTO scheduled_replies
          (tenant_id, ticket_id, author_id, author_name, author_email, body, request, source, discord_message_id, client_message_id, send_at,
-          assistant_muted_at)
+          assistant_muted_at, status, attempts)
        VALUES (current_tenant(), $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, now() + make_interval(secs => $10),
-               CASE WHEN $11::boolean THEN now() END)
+               CASE WHEN $11::boolean THEN now() END, CASE WHEN $12::boolean THEN 'sending' ELSE 'scheduled' END, CASE WHEN $12::boolean THEN 1 ELSE 0 END)
        ON CONFLICT (tenant_id, client_message_id) WHERE client_message_id IS NOT NULL DO NOTHING
        RETURNING id, send_at`,
       [
         input.ticketId, input.author.userId, input.author.name, input.author.email, input.body,
         JSON.stringify(input.request ?? {}), input.source ?? "composer", input.discordMessageId ?? null,
-        input.clientMessageId ?? null, delaySeconds, (muted.rowCount ?? 0) > 0,
+        input.clientMessageId ?? null, delaySeconds, (muted.rowCount ?? 0) > 0, claimed,
       ],
     );
     if (!r.rowCount) {
@@ -115,7 +134,7 @@ export async function scheduleReply(tenantId: string, input: ScheduleInput, dela
       ]);
       return { id: first.rows[0].id, sendAt: first.rows[0].send_at.toISOString() };
     }
-    await emitScheduledUpdate(c, tenantId, input.ticketId, r.rows[0].id, "scheduled");
+    if (!claimed) await emitScheduledUpdate(c, tenantId, input.ticketId, r.rows[0].id, "scheduled");
     return { id: r.rows[0].id, sendAt: r.rows[0].send_at.toISOString() };
   });
 }
@@ -271,9 +290,10 @@ async function settleStuckRows(log: Log): Promise<void> {
        SELECT s.tenant_id, s.id,
               (SELECT m.id FROM messages m
                 WHERE m.tenant_id = s.tenant_id
-                  AND m.idempotency_key = CASE WHEN s.source = 'discord_promote'
-                                               THEN 'discord-mirror-promote:' || s.discord_message_id
-                                               ELSE 'scheduled:' || s.id END) AS found_message_id
+                  AND m.idempotency_key = CASE s.source
+                                            WHEN 'discord_promote' THEN 'discord-mirror-promote:' || s.discord_message_id
+                                            WHEN 'note' THEN 'note:' || (s.request->>'noteId')
+                                            ELSE 'scheduled:' || s.id END) AS found_message_id
          FROM scheduled_replies s
         WHERE s.status = 'sending' AND s.updated_at < now() - make_interval(secs => $1)
         FOR UPDATE SKIP LOCKED)

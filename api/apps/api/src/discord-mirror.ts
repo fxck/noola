@@ -1,7 +1,7 @@
 import { RateLimitError } from "discord.js";
 import { relayPool, withTenant } from "@repo/db";
 import { addNote } from "./notes.js";
-import { persistInboundNoteAttachments, attachmentStorageForMessage } from "./attachments.js";
+import { persistInboundNoteAttachments, attachmentStorageForMessage, attachmentStorageForNote, type AttachmentStorage } from "./attachments.js";
 import { getObject } from "./storage.js";
 import { ingestInbound } from "./ingest.js";
 import { notifyContactByEmailIfAway } from "./email.js";
@@ -13,7 +13,8 @@ import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
 import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
-import { discordTokensToText, mdToDiscord, plainThreadName } from "./channels/format.js";
+import { discordTokensToText, mdToDiscord, plainThreadName, splitForDiscord } from "./channels/format.js";
+import { emitTicketUpdated } from "./ticket-events.js";
 import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
 import { cancelScheduledReply, getSendDelay, scheduleReply, type ScheduledSource } from "./scheduled-replies.js";
 
@@ -483,7 +484,10 @@ const MIRROR_ATTACH_MAX_FILES = 10;
  *  storage), applying the size/count caps. `dropped` counts anything skipped so the caller can note
  *  it in the mirrored text rather than silently losing it. */
 async function loadMirrorFiles(tenantId: string, messageId: string): Promise<{ files: MirrorFile[]; dropped: number }> {
-  const rows = await attachmentStorageForMessage(tenantId, messageId).catch(() => []);
+  return loadFiles(await attachmentStorageForMessage(tenantId, messageId).catch(() => []));
+}
+
+async function loadFiles(rows: AttachmentStorage[]): Promise<{ files: MirrorFile[]; dropped: number }> {
   const files: MirrorFile[] = [];
   let dropped = 0;
   for (const a of rows) {
@@ -578,16 +582,68 @@ export async function relayTicketMessage(tenantId: string, ticketId: string, mes
  * be a stable id (the note id) so a retried enqueue doesn't double-post; call only from the Noola-side
  * note path.
  */
-export async function relayNoteToMirror(
-  tenantId: string,
-  ticketId: string,
-  note: { authorName?: string | null; body: string; dedupeKey: string },
-): Promise<void> {
+export async function relayNoteToMirror(tenantId: string, ticketId: string, noteId: string): Promise<void> {
   if (!(await ticketHasMirrorRow(tenantId, ticketId))) return;
-  await enqueueRelay("note", tenantId, ticketId, `note:${note.dedupeKey}`, {
-    authorName: note.authorName ?? null,
-    body: note.body,
+  // The deliverer reads the note's current text and files, so an edit before it posts is not lost.
+  await enqueueRelay("note", tenantId, ticketId, `note:${noteId}`, { noteId });
+}
+
+/**
+ * Brings the bot's copy of an edited Noola note in line with it. Each edit is its own row, so an edit made
+ * while an earlier one is being delivered still reaches Discord, and a repost never reuses an earlier one's nonce.
+ */
+export async function relayNoteEditToMirror(tenantId: string, ticketId: string, noteId: string, editedAt: Date): Promise<void> {
+  if (!(await ticketHasMirrorRow(tenantId, ticketId))) return;
+  await enqueueRelay("note_edit", tenantId, ticketId, `note_edit:${noteId}:${editedAt.getTime()}`, { noteId });
+}
+
+/**
+ * Forgets the bot's copy of a note and queues the deletion of its Discord messages.
+ * The rows go first, so the deletion that Discord reports back finds no note to delete.
+ */
+export async function removeNoteCopies(tenantId: string, ticketId: string, noteId: string): Promise<void> {
+  const gone = await relayPool.query<{ discord_message_id: string; thread_id: string }>(
+    "DELETE FROM note_mirror_posts WHERE tenant_id = $1 AND note_id = $2 RETURNING discord_message_id, thread_id",
+    [tenantId, noteId],
+  );
+  if (!gone.rowCount) return;
+  await enqueueRelay("note_delete", tenantId, ticketId, `note_delete:${gone.rows[0].discord_message_id}`, {
+    threadId: gone.rows[0].thread_id,
+    messageIds: gone.rows.map((r) => r.discord_message_id),
   });
+}
+
+/** Where each note came from in the mirror thread, for notes a teammate wrote in Discord. */
+export async function discordNoteOrigins(noteIds: string[]): Promise<Map<string, { discordMessageId: string; threadId: string }>> {
+  const out = new Map<string, { discordMessageId: string; threadId: string }>();
+  if (noteIds.length === 0) return out;
+  const r = await relayPool.query<{ note_id: string; discord_message_id: string; post_thread_id: string }>(
+    "SELECT note_id, discord_message_id, post_thread_id FROM ticket_mirror_messages WHERE note_id = ANY($1::uuid[]) AND promoted_message_id IS NULL",
+    [noteIds],
+  );
+  for (const row of r.rows) out.set(row.note_id, { discordMessageId: row.discord_message_id, threadId: row.post_thread_id });
+  return out;
+}
+
+/** The notes among these that a teammate wrote in Discord, and whether a 📤 promote of each is waiting. */
+export async function discordNoteStates(noteIds: string[]): Promise<Map<string, { promoting: boolean }>> {
+  const out = new Map<string, { promoting: boolean }>();
+  if (noteIds.length === 0) return out;
+  const r = await relayPool.query<{ note_id: string; promoting: boolean }>(
+    `SELECT note_id, promoted_at IS NOT NULL AS promoting FROM ticket_mirror_messages
+      WHERE note_id = ANY($1::uuid[]) AND promoted_message_id IS NULL`,
+    [noteIds],
+  );
+  for (const row of r.rows) out.set(row.note_id, { promoting: row.promoting });
+  return out;
+}
+
+/** Deletes the teammate's Discord message that a note came from. Needs Manage Messages in the thread. */
+export async function deleteDiscordNoteMessage(origin: { discordMessageId: string; threadId: string }): Promise<"deleted" | "forbidden" | "unavailable"> {
+  const tp = transport();
+  if (!tp?.deleteInThread) return "unavailable";
+  const r = await tp.deleteInThread(origin.threadId, origin.discordMessageId);
+  return r === "failed" ? "unavailable" : r;
 }
 
 // ── relay outbox delivery (called by the drainer in discord-relay-outbox.ts) ─────────────────────────
@@ -602,6 +658,8 @@ export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
   }
   const tp = transport();
   if (!tp) return { ok: false, retriable: true, error: "no live discord transport" };
+  // The messages to delete carry their thread, and a closed or removed mirror doesn't keep them.
+  if (row.kind === "note_delete") return deliverNoteDeleteRelay(tp, row);
   const mirror = await getTicketMirror(row.tenant_id, row.ticket_id);
   if (!mirror) return { ok: false, retriable: true, error: "mirror post not ready" };
 
@@ -610,9 +668,8 @@ export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
     if (!messageId) return { ok: false, retriable: false, error: "missing messageId" };
     return deliverMessageRelay(tp, mirror, row.tenant_id, row.ticket_id, messageId, relayNonce(row.id));
   }
-  if (row.kind === "note") {
-    return deliverNoteRelay(tp, mirror, (row.payload.authorName as string | null) ?? null, String(row.payload.body ?? ""), relayNonce(row.id));
-  }
+  if (row.kind === "note") return deliverNoteRelay(tp, mirror, row);
+  if (row.kind === "note_edit") return deliverNoteEditRelay(tp, mirror, row);
   if (row.kind === "react") {
     return deliverReactRelay(tp, String(row.payload.threadId ?? ""), String(row.payload.discordMessageId ?? ""), String(row.payload.emoji ?? ""), row.payload.remove === true);
   }
@@ -665,15 +722,116 @@ async function deliverMessageRelay(
   return { ok: true, retriable: false };
 }
 
-async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorName: string | null, body: string, nonce: string): Promise<DeliverResult> {
-  const name = authorName?.trim() || "Agent";
-  const label = `📝 **${name}** _(internal note)_:`;
+interface NoteForMirror {
+  body: string;
+  author_name: string | null;
+  edited_at: Date | null;
+}
+
+async function noteForMirror(noteId: string): Promise<NoteForMirror | null> {
+  const r = await relayPool.query<NoteForMirror>("SELECT body, author_name, edited_at FROM ticket_notes WHERE id = $1", [noteId]);
+  return r.rows[0] ?? null;
+}
+
+/** The bot's post of a note: a labelled quote, with the note's files when it has any. */
+function noteMirrorPost(note: NoteForMirror, files: MirrorFile[], dropped: number): { content: string; files: MirrorFile[] } {
+  const name = note.author_name?.trim() || "Agent";
+  const label = `📝 **${name}** _(internal note${note.edited_at ? ", edited" : ""})_:`;
+  const fitted = fitQuote(mdToDiscord(note.body), files);
+  return { content: `${MIRROR_DIVIDER}\n${label}\n${fitted.quoted}${droppedNote(dropped)}`, files: fitted.files };
+}
+
+/** Posts a note and records the messages it became, so a later edit or deletion can reach them. */
+async function postNoteCopy(tp: MirrorTransport, mirror: MirrorRef, tenantId: string, noteId: string, note: NoteForMirror, nonce: string): Promise<string[]> {
+  const loaded = await loadFiles(await attachmentStorageForNote(tenantId, noteId).catch(() => []));
+  const post = noteMirrorPost(note, loaded.files, loaded.dropped);
+  let ids: string[] = [];
+  const posted = await tp.postToThread(mirror.post_thread_id, post.content, post.files.length ? post.files : undefined, undefined, {
+    nonce,
+    onPosted: (messageIds) => (ids = messageIds),
+  });
+  if (!posted) throw new Error("thread unreachable");
+  return ids;
+}
+
+async function recordNoteCopy(tenantId: string, ticketId: string, noteId: string, threadId: string, ids: string[]): Promise<void> {
+  for (const [position, id] of ids.entries()) {
+    await relayPool.query(
+      `INSERT INTO note_mirror_posts (discord_message_id, tenant_id, ticket_id, note_id, thread_id, position)
+       VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (discord_message_id) DO NOTHING`,
+      [id, tenantId, ticketId, noteId, threadId, position],
+    );
+  }
+  // A note deleted while its copy was being posted leaves no copy behind.
+  if (!(await noteForMirror(noteId))) await removeNoteCopies(tenantId, ticketId, noteId);
+}
+
+async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, row: RelayRow): Promise<DeliverResult> {
+  const noteId = typeof row.payload.noteId === "string" ? row.payload.noteId : null;
   try {
-    const { quoted, files } = fitQuote(mdToDiscord(body), []);
-    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoted}`, files.length ? files : undefined, undefined, { nonce });
-    if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
+    if (!noteId) {
+      // A row without a noteId carries its text.
+      const legacy = { body: String(row.payload.body ?? ""), author_name: (row.payload.authorName as string | null) ?? null, edited_at: null };
+      const post = noteMirrorPost(legacy, [], 0);
+      const posted = await tp.postToThread(mirror.post_thread_id, post.content, post.files.length ? post.files : undefined, undefined, { nonce: relayNonce(row.id) });
+      return posted ? { ok: true, retriable: false } : { ok: false, retriable: true, error: "thread unreachable" };
+    }
+    const note = await noteForMirror(noteId);
+    if (!note) return { ok: true, retriable: false };
+    const ids = await postNoteCopy(tp, mirror, row.tenant_id, noteId, note, relayNonce(row.id));
+    await recordNoteCopy(row.tenant_id, row.ticket_id, noteId, mirror.post_thread_id, ids);
   } catch (e) {
     return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
+  return { ok: true, retriable: false };
+}
+
+/**
+ * Edits the bot's copy in place when the new text fits the same messages.
+ * Otherwise it posts the note again and deletes the old copy.
+ */
+async function deliverNoteEditRelay(tp: MirrorTransport, mirror: MirrorRef, row: RelayRow): Promise<DeliverResult> {
+  const noteId = String(row.payload.noteId ?? "");
+  const note = await noteForMirror(noteId);
+  if (!note) return { ok: true, retriable: false };
+  const copy = await relayPool.query<{ discord_message_id: string; thread_id: string }>(
+    "SELECT discord_message_id, thread_id FROM note_mirror_posts WHERE tenant_id = $1 AND note_id = $2 ORDER BY position",
+    [row.tenant_id, noteId],
+  );
+  if (!copy.rowCount) {
+    // While the note's own post is still on its way, this edit waits for its copy. Without a post coming, the note was never mirrored.
+    const posting = await relayPool.query("SELECT 1 FROM discord_relay_outbox WHERE dedupe_key = $1 AND status = 'pending'", [`note:${noteId}`]);
+    return posting.rowCount ? { ok: false, retriable: true, error: "note copy not posted yet" } : { ok: true, retriable: false };
+  }
+  try {
+    const text = noteMirrorPost(note, [], 0);
+    const chunks = splitForDiscord(text.content, 2000);
+    let inPlace = text.files.length === 0 && chunks.length === copy.rowCount && Boolean(tp.editInThread);
+    for (let i = 0; inPlace && i < chunks.length; i++) {
+      const r = await tp.editInThread!(copy.rows[i].thread_id, copy.rows[i].discord_message_id, chunks[i]);
+      if (r === "failed") return { ok: false, retriable: true, error: "edit not applied" };
+      if (r === "gone") inPlace = false;
+    }
+    if (inPlace) return { ok: true, retriable: false };
+    const ids = await postNoteCopy(tp, mirror, row.tenant_id, noteId, note, relayNonce(row.id));
+    const old = copy.rows.map((r) => r.discord_message_id);
+    await relayPool.query("DELETE FROM note_mirror_posts WHERE discord_message_id = ANY($1::text[])", [old]);
+    await recordNoteCopy(row.tenant_id, row.ticket_id, noteId, mirror.post_thread_id, ids);
+    await enqueueRelay("note_delete", row.tenant_id, row.ticket_id, `note_delete:${old[0]}`, { threadId: copy.rows[0].thread_id, messageIds: old });
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
+  return { ok: true, retriable: false };
+}
+
+async function deliverNoteDeleteRelay(tp: MirrorTransport, row: RelayRow): Promise<DeliverResult> {
+  const threadId = String(row.payload.threadId ?? "");
+  const ids = Array.isArray(row.payload.messageIds) ? (row.payload.messageIds as string[]) : [];
+  if (!tp.deleteInThread) return { ok: false, retriable: true, error: "transport can't delete" };
+  for (const id of ids) {
+    const r = await tp.deleteInThread(threadId, id);
+    if (r === "forbidden") return { ok: false, retriable: false, error: "not allowed to delete the note copy" };
+    if (r === "failed") return { ok: false, retriable: true, error: "delete not applied" };
   }
   return { ok: true, retriable: false };
 }
@@ -1084,14 +1242,61 @@ export async function handleMirrorReaction(
     return applyMirrorTriage(mirror, r, agentId);
   }
 
+  // 📤 on the bot's copy of a Noola note, an AI note among them, sends that note.
+  const copy = await relayPool.query<{ tenant_id: string; note_id: string }>(
+    "SELECT tenant_id, note_id FROM note_mirror_posts WHERE discord_message_id = $1",
+    [r.discordMessageId],
+  );
+  if (copy.rowCount) {
+    const { sendNoteToCustomer } = await import("./note-actions.js");
+    const c = copy.rows[0];
+    const name = (agentId ? await teammateName(c.tenant_id, agentId) : null) ?? binding?.attribution_name ?? "Support";
+    const out = await sendNoteToCustomer(c.tenant_id, c.note_id, { userId: agentId, name, email: null }, {
+      discordCopy: { threadId: r.threadId, discordMessageId: r.discordMessageId },
+    });
+    return out.status === "sent" ? { promoted: true } : { promoted: false, reason: out.status };
+  }
+
+  const out = await promoteClaim(r, binding, agentId, { requireResponder: true, sendNow: false });
+  return out === "sent" ? { promoted: true } : { promoted: false, reason: out };
+}
+
+/** Sends a note that a teammate wrote in Discord, as the 📤 on their message would. */
+export async function promoteMirrorNote(
+  tenantId: string, noteId: string, actorSeatId: string | null, sendNow: boolean,
+): Promise<"sent" | "scheduled" | "not_promotable"> {
+  const led = await relayPool.query<{ discord_message_id: string; post_thread_id: string }>(
+    "SELECT discord_message_id, post_thread_id FROM ticket_mirror_messages WHERE tenant_id = $1 AND note_id = $2",
+    [tenantId, noteId],
+  );
+  if (!led.rowCount) return "not_promotable";
+  const mirror = await mirrorByThread(led.rows[0].post_thread_id);
+  const binding = mirror?.binding_id ? await loadBinding(mirror.binding_id) : null;
+  // An agent who acts in Noola is already allowed to answer, whatever the Discord author's role.
+  return promoteClaim(
+    { threadId: led.rows[0].post_thread_id, discordMessageId: led.rows[0].discord_message_id },
+    binding, actorSeatId, { requireResponder: false, sendNow },
+  );
+}
+
+/**
+ * Claims a mirror message for promotion and sends it, or holds it for the send delay.
+ * The claim is atomic, so a second 📤 or click finds it taken.
+ */
+async function promoteClaim(
+  r: { threadId: string; discordMessageId: string },
+  binding: MirrorBinding | null,
+  agentId: string | null,
+  opts: { requireResponder: boolean; sendNow: boolean },
+): Promise<"sent" | "scheduled" | "not_promotable"> {
   // Atomic promote claim — WHERE promoted_at IS NULL makes the double-react / two-reactors race safe.
   const claim = await relayPool.query(
     `UPDATE ticket_mirror_messages SET promoted_at = now()
-      WHERE discord_message_id = $1 AND is_responder AND promoted_at IS NULL
+      WHERE discord_message_id = $1 AND (is_responder OR NOT $2) AND promoted_at IS NULL
       RETURNING tenant_id, ticket_id, body, note_id, author_display_name, author_discord_id, author_user_id`,
-    [r.discordMessageId],
+    [r.discordMessageId, opts.requireResponder],
   );
-  if (!claim.rowCount) return { promoted: false, reason: "not_promotable" };
+  if (!claim.rowCount) return "not_promotable";
   const row = claim.rows[0] as {
     tenant_id: string; ticket_id: string; body: string; note_id: string | null;
     author_display_name: string | null; author_discord_id: string | null; author_user_id: string | null;
@@ -1110,7 +1315,7 @@ export async function handleMirrorReaction(
       ? seatName ?? row.author_display_name
       : binding?.attribution_name ?? seatName ?? null;
 
-  const delay = await getSendDelay(row.tenant_id);
+  const delay = opts.sendNow ? 0 : await getSendDelay(row.tenant_id);
   if (delay > 0) {
     await scheduleReply(
       row.tenant_id,
@@ -1124,18 +1329,14 @@ export async function handleMirrorReaction(
       },
       delay,
     );
-    await enqueueRelay("react", row.tenant_id, row.ticket_id, `react:${r.discordMessageId}:${PENDING_EMOJI}`, {
-      threadId: r.threadId,
-      discordMessageId: r.discordMessageId,
-      emoji: PENDING_EMOJI,
-    }, { reapply: true });
-    return { promoted: false, reason: "scheduled" };
+    await setPendingReaction(row.tenant_id, row.ticket_id, r, true);
+    return "scheduled";
   }
-  const sent = await sendPromotedMessage({
+  await sendPromotedMessage({
     tenantId: row.tenant_id, ticketId: row.ticket_id, discordMessageId: r.discordMessageId, threadId: r.threadId,
     body: row.body, noteId: row.note_id, seatId, attribution, authorDisplayName: row.author_display_name,
   });
-  return { promoted: true, reason: sent.delivered ? undefined : sent.reason };
+  return "sent";
 }
 
 interface PromotedMessage {
@@ -1281,16 +1482,34 @@ export const promoteSource: ScheduledSource = {
 };
 
 async function removePendingReaction(tenantId: string, ticketId: string, discordMessageId: string, threadId: string): Promise<void> {
-  await enqueueRelay("react", tenantId, ticketId, `unreact:${discordMessageId}:${PENDING_EMOJI}`, {
-    threadId, discordMessageId, emoji: PENDING_EMOJI, remove: true,
+  await setPendingReaction(tenantId, ticketId, { threadId, discordMessageId }, false);
+}
+
+/** Puts ⏳ on a Discord message while its send waits, or takes it off. */
+export async function setPendingReaction(
+  tenantId: string, ticketId: string, m: { threadId: string; discordMessageId: string }, on: boolean,
+): Promise<void> {
+  const key = `${on ? "react" : "unreact"}:${m.discordMessageId}:${PENDING_EMOJI}`;
+  await enqueueRelay("react", tenantId, ticketId, key, {
+    threadId: m.threadId, discordMessageId: m.discordMessageId, emoji: PENDING_EMOJI, ...(on ? {} : { remove: true }),
   }, { reapply: true });
+}
+
+/** The thread that holds the bot's copy of a note, or null once the copy is gone. */
+export async function threadOfNoteCopy(discordMessageId: string): Promise<string | null> {
+  const r = await relayPool.query<{ thread_id: string }>("SELECT thread_id FROM note_mirror_posts WHERE discord_message_id = $1", [discordMessageId]);
+  return r.rows[0]?.thread_id ?? null;
 }
 
 /** Cancels a waiting 📤 promote when the last 📤 is removed from the message. */
 export async function cancelPromoteOnUnreact(discordMessageId: string, emoji: string, remaining: number): Promise<boolean> {
   if (canonicalEmojiName(emoji) !== "outbox_tray" || remaining > 0) return false;
+  // A teammate's promoted message, or the bot's copy of a Noola note that 📤 asked to send.
   const led = await relayPool.query<{ tenant_id: string }>(
-    "SELECT tenant_id FROM ticket_mirror_messages WHERE discord_message_id = $1 AND promoted_at IS NOT NULL AND promoted_message_id IS NULL",
+    `SELECT tenant_id FROM ticket_mirror_messages WHERE discord_message_id = $1 AND promoted_at IS NOT NULL AND promoted_message_id IS NULL
+     UNION ALL
+     SELECT tenant_id FROM note_mirror_posts WHERE discord_message_id = $1
+     LIMIT 1`,
     [discordMessageId],
   );
   if (!led.rowCount) return false;
@@ -1300,6 +1519,57 @@ export async function cancelPromoteOnUnreact(discordMessageId: string, emoji: st
   );
   if (!open.rowCount) return false;
   return (await cancelScheduledReply(tenantId, open.rows[0].id)) !== null;
+}
+
+/**
+ * Applies a Discord edit to the note that a teammate's message became. A message already sent to the
+ * customer keeps the reply as it was sent.
+ */
+export async function syncMirrorEdit(discordMessageId: string, content: string): Promise<boolean> {
+  const text = content.trim();
+  if (!text) return false;
+  // Discord also reports an update when it adds a link preview, and the text is then unchanged.
+  const led = await relayPool.query<{ tenant_id: string; ticket_id: string; note_id: string }>(
+    `UPDATE ticket_mirror_messages SET body = $2
+      WHERE discord_message_id = $1 AND note_id IS NOT NULL AND promoted_message_id IS NULL AND body IS DISTINCT FROM $2
+      RETURNING tenant_id, ticket_id, note_id`,
+    [discordMessageId, text],
+  );
+  if (!led.rowCount) return false;
+  const { tenant_id: tenantId, ticket_id: ticketId, note_id: noteId } = led.rows[0];
+  await withTenant(tenantId, async (c) => {
+    const r = await c.query("UPDATE ticket_notes SET body = $2, edited_at = now() WHERE id = $1", [noteId, discordTokensToText(text)]);
+    if (r.rowCount) await emitTicketUpdated(c, tenantId, ticketId, { noteId, change: "edited" });
+  });
+  return true;
+}
+
+/**
+ * Applies a Discord deletion. A teammate's message takes its note with it, and so does the bot's copy
+ * of a Noola note. A message already sent to the customer leaves the reply alone.
+ */
+export async function syncMirrorDelete(discordMessageId: string): Promise<boolean> {
+  const { purgeNote } = await import("./note-actions.js");
+  const led = await relayPool.query<{ tenant_id: string; ticket_id: string; note_id: string | null }>(
+    "DELETE FROM ticket_mirror_messages WHERE discord_message_id = $1 AND promoted_message_id IS NULL RETURNING tenant_id, ticket_id, note_id",
+    [discordMessageId],
+  );
+  if (led.rowCount) {
+    const { tenant_id: tenantId, ticket_id: ticketId, note_id: noteId } = led.rows[0];
+    const waiting = await withTenant(tenantId, (c) =>
+      c.query<{ id: string }>("SELECT id FROM scheduled_replies WHERE discord_message_id = $1 AND status = 'scheduled'", [discordMessageId]),
+    );
+    if (waiting.rowCount) await cancelScheduledReply(tenantId, waiting.rows[0].id);
+    if (noteId) await purgeNote(tenantId, ticketId, noteId);
+    return true;
+  }
+  const copy = await relayPool.query<{ tenant_id: string; ticket_id: string; note_id: string }>(
+    "SELECT tenant_id, ticket_id, note_id FROM note_mirror_posts WHERE discord_message_id = $1",
+    [discordMessageId],
+  );
+  if (!copy.rowCount) return false;
+  await purgeNote(copy.rows[0].tenant_id, copy.rows[0].ticket_id, copy.rows[0].note_id);
+  return true;
 }
 
 /** Default snooze horizon for a reaction (no duration channel on an emoji): 1 day. */

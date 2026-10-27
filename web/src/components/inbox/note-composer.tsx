@@ -16,6 +16,7 @@ import {
 } from "lexical";
 import { MentionNode } from "./lexical/mention-node";
 import { MentionsPlugin, type MentionCandidate } from "./lexical/mentions-plugin";
+import { PasteFilesPlugin } from "./chat-composer";
 import { cn } from "@/lib/utils";
 
 export interface NoteDraft {
@@ -62,12 +63,14 @@ export function NoteComposer({
   placeholder,
   onChange,
   onSubmit,
+  onFiles,
 }: {
   members: MentionCandidate[];
   resetKey: string | number;
   placeholder: string;
   onChange: (draft: NoteDraft) => void;
   onSubmit: () => void;
+  onFiles: (files: File[]) => void;
 }) {
   function handleChange(state: EditorState) {
     state.read(() => {
@@ -115,6 +118,7 @@ export function NoteComposer({
         <MentionsPlugin members={members} />
         <SubmitPlugin onSubmit={onSubmit} />
         <ResetPlugin resetKey={resetKey} />
+        <PasteFilesPlugin onFiles={onFiles} />
       </div>
     </LexicalComposer>
   );

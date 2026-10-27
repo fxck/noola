@@ -234,8 +234,17 @@ export const NoteInput = z.object({
   body: z.string().min(1).max(8000),
   // Member ids from the composer's mention chips — authoritative loop-in list when present.
   mentionIds: z.array(z.guid()).max(50).optional(),
+  /** Files uploaded for this note. They are shown on it and on its copy in the Discord mirror. */
+  attachmentIds: z.array(z.guid()).max(10).optional(),
 });
 export type NoteInput = z.infer<typeof NoteInput>;
+
+export const NoteEditInput = z.object({ body: z.string().min(1).max(8000) });
+
+export const NoteSendInput = z.object({
+  /** Skip the workspace's send delay and send at once. */
+  sendNow: z.boolean().optional(),
+});
 
 // --- Public tickets API (Wave A) ---
 export const PublicTicketInput = z.object({

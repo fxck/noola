@@ -10,7 +10,7 @@
 // discord-mirror imports enqueueRelay from this module).
 import { relayPool } from "@repo/db";
 
-export type RelayKind = "message" | "note" | "react" | "reply";
+export type RelayKind = "message" | "note" | "react" | "reply" | "note_edit" | "note_delete";
 
 export interface RelayRow {
   id: string;

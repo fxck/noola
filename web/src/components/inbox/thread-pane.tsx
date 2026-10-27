@@ -18,7 +18,9 @@ import {
 import { toast } from "@/components/ui/toaster";
 import type { ApiError } from "@/lib/api";
 import { useQueue } from "@/lib/queue-context";
-import { type Note, fetchNotes } from "@/lib/notes";
+import { type Note, fetchNotes, editNote, deleteNote, sendNoteToCustomer, noteErrorMessage } from "@/lib/notes";
+import { fetchSendDelay } from "@/lib/settings";
+import { useAuth } from "@/auth/auth";
 import { ContextRail } from "@/components/inbox/context-rail";
 import { ThreadActions } from "@/components/inbox/thread-actions";
 import { AssigneePicker } from "@/components/inbox/assignee-picker";
@@ -99,6 +101,7 @@ export function ThreadPane({
   focused?: boolean;
 }) {
   const { setPresence } = useRealtime();
+  const { user } = useAuth();
   const { nerd } = useNerdMode();
   const { items: queueItems } = useQueue();
   const reduce = usePrefersReducedMotion();
@@ -112,6 +115,8 @@ export function ThreadPane({
   const [emailCc, setEmailCc] = useState<string[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
   const [scheduled, setScheduled] = useState<ScheduledReply[]>([]);
+  // The workspace's send delay in seconds, for the composer and for sending a note.
+  const [sendDelay, setSendDelay] = useState(0);
   const [loadErr, setLoadErr] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   // Details-rail visibility — an operator preference that sticks (Intercom's
@@ -120,15 +125,24 @@ export function ThreadPane({
   const prevTicketId = useRef<string | null>(null);
   const composerRef = useRef<ComposerHandle>(null);
 
+  // A response for a ticket the agent has already left is dropped.
   const reloadNotes = useRef((id: string) => {
     fetchNotes(id)
-      .then(setNotes)
-      .catch(() => setNotes([]));
+      .then((notes) => {
+        if (prevTicketId.current === id) setNotes(notes);
+      })
+      .catch(() => {
+        if (prevTicketId.current === id) setNotes([]);
+      });
   }).current;
 
   const isClosed = ticket.status === "closed";
   const isSpam = !!ticket.spam_at;
   const isDiscord = ticket.channel_type === "discord";
+
+  useEffect(() => {
+    fetchSendDelay().then(setSendDelay).catch(() => setSendDelay(0));
+  }, []);
 
   // Presence: broadcast that we're viewing this ticket; clear on leave/switch.
   useEffect(() => {
@@ -207,7 +221,9 @@ export function ThreadPane({
 
   // The agent may switch tickets while a request runs, and then the pane must not load the old one.
   function reloadIfStillOn(ticketId: string) {
-    if (prevTicketId.current === ticketId) void loadMessages();
+    if (prevTicketId.current !== ticketId) return;
+    void loadMessages();
+    reloadNotes(ticketId);
   }
 
   async function cancelPending(r: ScheduledReply) {
@@ -238,6 +254,41 @@ export function ThreadPane({
             ? "Couldn't send it now. It will be retried."
             : "Couldn't send the reply.",
       );
+    }
+    reloadIfStillOn(ticketId);
+  }
+
+  const isAdmin = user?.role === "admin" || user?.role === "owner";
+
+  async function sendNote(note: Note, sendNow: boolean) {
+    const ticketId = ticket.id;
+    try {
+      await sendNoteToCustomer(ticketId, note.id, sendNow);
+    } catch (err) {
+      toast.error(noteErrorMessage(err, "Couldn't send the note."));
+    }
+    reloadIfStillOn(ticketId);
+  }
+
+  async function saveNote(note: Note, body: string): Promise<boolean> {
+    const ticketId = ticket.id;
+    try {
+      await editNote(ticketId, note.id, body);
+      return true;
+    } catch (err) {
+      toast.error(noteErrorMessage(err, "Couldn't save the note."));
+      return false;
+    } finally {
+      reloadIfStillOn(ticketId);
+    }
+  }
+
+  async function removeNote(note: Note) {
+    const ticketId = ticket.id;
+    try {
+      await deleteNote(ticketId, note.id);
+    } catch (err) {
+      toast.error(noteErrorMessage(err, "Couldn't delete the note."));
     }
     reloadIfStillOn(ticketId);
   }
@@ -361,7 +412,15 @@ export function ThreadPane({
                   <Fragment key={key}>
                     {newDay && <DaySeparator label={dayLabel(item.created_at)} />}
                     {item._note ? (
-                      <NoteBubble note={item} />
+                      <NoteBubble
+                        note={item}
+                        canEdit={!!user && item.author_id === user.id && item.origin === "noola" && !item.sending}
+                        canDelete={!!user && (item.author_id === user.id || isAdmin)}
+                        sendDelay={sendDelay}
+                        onSend={isClosed || isSpam ? undefined : (sendNow) => sendNote(item, sendNow)}
+                        onEdit={(body) => saveNote(item, body)}
+                        onDelete={() => removeNote(item)}
+                      />
                     ) : (
                       <MessageBubble
                         message={item}
@@ -437,6 +496,7 @@ export function ThreadPane({
           isDiscord={isDiscord}
           replyChannels={replyChannels}
           defaultCc={emailCc}
+          sendDelay={sendDelay}
           pending={pending}
           onSent={() => void loadMessages()}
           onMutated={onMutated}

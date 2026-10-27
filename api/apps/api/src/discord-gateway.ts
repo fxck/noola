@@ -79,7 +79,14 @@ export interface MirrorTransport {
   /** Post into a thread; optional `files` upload as Discord attachments (on the first content chunk).
    *  `opts.nonce` (<= 21 chars) is sent per chunk with enforce_nonce, so a retried write whose earlier
    *  attempt already landed is collapsed by Discord instead of posting a second copy. */
-  postToThread(threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[], opts?: { nonce?: string }): Promise<boolean>;
+  postToThread(
+    threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[],
+    opts?: { nonce?: string; onPosted?: (messageIds: string[]) => void },
+  ): Promise<boolean>;
+  /** Replaces the text of a message in a thread. "gone" when the message no longer exists. */
+  editInThread?(threadId: string, messageId: string, content: string): Promise<"edited" | "gone" | "failed">;
+  /** "forbidden" when the bot may not delete it, e.g. a teammate's message without Manage Messages. */
+  deleteInThread?(threadId: string, messageId: string): Promise<"deleted" | "forbidden" | "failed">;
   setArchived(threadId: string, archived: boolean): Promise<boolean>;
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
   /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
@@ -260,6 +267,7 @@ export function buildMirrorTransport(client: Client): MirrorTransport {
       // wants to ping (assignee / participant notifications) — @everyone/@here and stray pings never fire.
       const allow = mentionUserIds?.length ? { users: mentionUserIds, parse: [] as never[] } : { parse: [] as never[] };
       let filesNotUploaded = 0;
+      const posted: string[] = [];
       for (let i = 0; i < chunks.length; i++) {
         // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads. The ping
         // rides the first chunk (where the <@id> mention text is).
@@ -271,20 +279,18 @@ export function buildMirrorTransport(client: Client): MirrorTransport {
         };
         if (i === 0 && df.length) {
           // A refused upload created no message, so the text goes again under the same nonce, with only the kept files.
-          await t.send({ ...message, files: df }).catch(async (e: unknown) => {
+          const first = await t.send({ ...message, files: df }).catch(async (e: unknown) => {
             if (!uploadTooLarge(e)) throw e;
             const kept = filesKeptWhenRefused(files);
             const keptSent = kept.length
-              ? await t.send({ ...message, files: kept }).then(
-                  () => true,
-                  (e2: unknown) => (uploadTooLarge(e2) ? false : Promise.reject(e2)),
-                )
-              : false;
-            if (!keptSent) await t.send(message);
+              ? await t.send({ ...message, files: kept }).catch((e2: unknown) => (uploadTooLarge(e2) ? null : Promise.reject(e2)))
+              : null;
             filesNotUploaded = df.length - (keptSent ? kept.length : 0);
+            return keptSent ?? (await t.send(message));
           });
+          posted.push(first.id);
         } else {
-          await t.send(message);
+          posted.push((await t.send(message)).id);
         }
       }
       if (filesNotUploaded) {
@@ -294,7 +300,56 @@ export function buildMirrorTransport(client: Client): MirrorTransport {
           ...(opts?.nonce ? { nonce: `${opts.nonce}.f`, enforceNonce: true } : {}),
         });
       }
+      opts?.onPosted?.(posted);
       return true;
+    },
+    async editInThread(threadId, messageId, content) {
+      const patch = () => client.rest.patch(Routes.channelMessage(threadId, messageId), { body: { content, allowed_mentions: { parse: [] } } });
+      try {
+        await patch();
+        return "edited";
+      } catch (e) {
+        const code = (e as { code?: number }).code;
+        if (code === 10008) return "gone"; // Unknown Message
+        // 50083: an archived thread refuses edits until it is unarchived.
+        if (code !== 50083) return "failed";
+        const t = await thread(threadId);
+        if (!t) return "failed";
+        await t.setArchived(false).catch(() => {});
+        try {
+          await patch();
+          return "edited";
+        } catch {
+          return "failed";
+        } finally {
+          await t.setArchived(true).catch(() => {});
+        }
+      }
+    },
+    async deleteInThread(threadId, messageId) {
+      const del = async (): Promise<"deleted" | "forbidden" | "failed" | "archived"> => {
+        try {
+          await client.rest.delete(Routes.channelMessage(threadId, messageId));
+          return "deleted";
+        } catch (e) {
+          const code = (e as { code?: number }).code;
+          if (code === 10008) return "deleted"; // Unknown Message: nothing is left to delete
+          if (code === 50083) return "archived";
+          return code === 50013 ? "forbidden" : "failed"; // 50013 Missing Permissions
+        }
+      };
+      const first = await del();
+      if (first !== "archived") return first;
+      // An archived thread refuses changes until it is unarchived.
+      const t = await thread(threadId);
+      if (!t) return "failed";
+      await t.setArchived(false).catch(() => {});
+      try {
+        const again = await del();
+        return again === "archived" ? "failed" : again;
+      } finally {
+        await t.setArchived(true).catch(() => {});
+      }
     },
     async setArchived(threadId, archived) {
       const t = await thread(threadId, true);
@@ -1039,6 +1094,8 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
         });
         // Discord adds a link's preview, e.g. a /gif GIF, in an update shortly after the message is sent.
         await handleMessageEmbeds(guildId, msg.id, embedMedia(msg.embeds));
+        const { syncMirrorEdit } = await import("./discord-mirror.js");
+        await syncMirrorEdit(msg.id, resolveMentions(msg));
       });
     } catch (err) {
       log.error({ err }, "discord MessageUpdate failed");
@@ -1050,6 +1107,8 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     try {
       if (!msg.guildId) return;
       await handleMessageDelete({ guildId: msg.guildId, messageId: msg.id });
+      const { syncMirrorDelete } = await import("./discord-mirror.js");
+      await syncMirrorDelete(msg.id);
     } catch (err) {
       log.error({ err }, "discord MessageDelete failed");
     }

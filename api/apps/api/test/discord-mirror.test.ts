@@ -15,7 +15,12 @@ import { ingestInbound } from "../src/ingest.js";
 import { persistBufferAttachments } from "../src/attachments.js";
 import { splitForDiscord } from "../src/channels/format.js";
 import { handleMessageEmbeds } from "../src/discord.js";
-import { drainScheduledReplies, getSendDelay, sendScheduledReplyNow, setSendDelay } from "../src/scheduled-replies.js";
+import { cancelScheduledReply, drainScheduledReplies, getSendDelay, sendScheduledReplyNow, setSendDelay } from "../src/scheduled-replies.js";
+import { addNote, listNotes } from "../src/notes.js";
+import { editNote, removeNote, sendNoteToCustomer } from "../src/note-actions.js";
+import { createAttachment, claimNoteAttachments } from "../src/attachments.js";
+import { putBuffer } from "../src/storage.js";
+import { relayNoteToMirror, syncMirrorDelete, syncMirrorEdit } from "../src/discord-mirror.js";
 
 // Discord forum ops-mirror gate (PILOT-AND-DISCORD-PLAN D1-D4): binding filter → forum post,
 // manual push, timeline relay into the post, note-by-default responder messages, 📤 promote-to-
@@ -39,6 +44,8 @@ const calls: Call[] = [];
 let threadSeq = 0;
 const archived = new Map<string, boolean>();
 const appliedTags = new Map<string, string[]>();
+let copySeq = 0;
+let deleteResult: "deleted" | "forbidden" | "failed" = "deleted";
 const mock: MirrorTransport = {
   async listForums() { return [{ id: FORUM, name: "support-tickets" }]; },
   async listRoles() { return [{ id: ROLE, name: "Noola Responder" }]; },
@@ -50,9 +57,18 @@ const mock: MirrorTransport = {
     appliedTags.set(threadId, tagNames);
     return { threadId };
   },
-  async postToThread(threadId, content, files) {
+  async postToThread(threadId, content, files, _mentions, opts) {
     calls.push({ fn: "postToThread", args: [threadId, content, files] });
+    opts?.onPosted?.(splitForDiscord(content, 2000).map(() => `mirtest-copy-${++copySeq}`));
     return true;
+  },
+  async editInThread(threadId, messageId, content) {
+    calls.push({ fn: "editInThread", args: [threadId, messageId, content] });
+    return "edited";
+  },
+  async deleteInThread(threadId, messageId) {
+    calls.push({ fn: "deleteInThread", args: [threadId, messageId] });
+    return deleteResult;
   },
   async setArchived(threadId, a) {
     calls.push({ fn: "setArchived", args: [threadId, a] });
@@ -111,6 +127,7 @@ async function main() {
 
   const clean = async () => {
     await superPool.query("DELETE FROM ticket_mirror_messages WHERE discord_message_id LIKE 'mirtest-%'");
+    await superPool.query("DELETE FROM note_mirror_posts WHERE discord_message_id LIKE 'mirtest-%'");
     await superPool.query(`DELETE FROM discord_relay_outbox WHERE ticket_id IN (SELECT id FROM tickets WHERE external_channel_id LIKE 'mirtest-%')`).catch(() => {});
     await superPool.query("DELETE FROM ticket_mirror WHERE guild_id = $1", [GUILD]);
     await superPool.query("DELETE FROM discord_mirror_bindings WHERE guild_id = $1", [GUILD]);
@@ -409,6 +426,153 @@ async function main() {
       && calls.some((c) => c.fn === "unreact" && c.args[1] === "mirtest-dm-recover" && c.args[2] === "⏳"));
   } finally {
     await setSendDelay(A, delayBefore);
+  }
+
+  // ── Notes stay in step with the mirror ──────────────────────────────────────
+  {
+    const TESS = { userId: "c0000000-0000-0000-0000-000000000001", name: "Tess", email: null, role: "agent" };
+    const TOM = { userId: "c0000000-0000-0000-0000-000000000002", name: "Tom", email: null, role: "owner" };
+    const copiesOf = async (noteId: string) =>
+      (await relayPool.query<{ discord_message_id: string }>("SELECT discord_message_id FROM note_mirror_posts WHERE note_id = $1 ORDER BY position", [noteId])).rows.map((r) => r.discord_message_id);
+    const noteExists = async (noteId: string) => (await withTenant(A, (c) => c.query("SELECT 1 FROM ticket_notes WHERE id = $1", [noteId]))).rowCount === 1;
+    const callsFor = (fn: string, id: string) => calls.filter((c) => c.fn === fn && c.args[1] === id);
+    const writeNote = async (body: string, file?: boolean) => {
+      const note = (await addNote(A, t1, { authorId: TESS.userId, authorName: "Tess", body }))!;
+      if (file) {
+        const key = `attachments/${A}/mirtest-note-${note.id}.txt`;
+        await putBuffer(key, Buffer.from("log line"), "text/plain");
+        const a = await createAttachment(A, { ticketId: t1, uploadedBy: TESS.userId, filename: "mirtest.log", contentType: "text/plain", sizeBytes: 8, storageKey: key });
+        await claimNoteAttachments(A, t1, note.id, [a.id]);
+      }
+      await relayNoteToMirror(A, t1, note.id);
+      await drainDiscordRelay();
+      return note.id;
+    };
+
+    // A Noola note reaches Discord with its file, and the bot's copy is recorded.
+    const noted = await writeNote("MIRTEST note with a file", true);
+    const [copy] = await copiesOf(noted);
+    const posted = calls.filter((c) => c.fn === "postToThread" && String(c.args[1]).includes("MIRTEST note with a file")).at(-1);
+    check("a Noola note is mirrored with its file", !!copy && (posted?.args[2] as { name: string }[] | undefined)?.some((f) => f.name === "mirtest.log") === true, posted?.args[2]);
+
+    // Only the author edits, and the bot's copy follows.
+    const byOther = await editNote(A, noted, TOM, "MIRTEST edited by someone else");
+    check("only the author can edit a note", !byOther.ok && byOther.code === 403);
+    const byAuthor = await editNote(A, noted, TESS, "MIRTEST note, edited");
+    await drainDiscordRelay();
+    const edited = callsFor("editInThread", copy).at(-1);
+    check("an edit reaches the bot's copy", byAuthor.ok && String(edited?.args[2]).includes("MIRTEST note, edited") && String(edited?.args[2]).includes("edited)"), edited?.args);
+    await editNote(A, noted, TESS, "MIRTEST note, edited for @Tom");
+    await editNote(A, noted, TESS, "MIRTEST note, edited");
+    await drainDiscordRelay();
+    const lastEdit = callsFor("editInThread", copy).at(-1);
+    const mentions = await withTenant(A, (c) => c.query("SELECT mentioned_ids FROM ticket_notes WHERE id = $1", [noted]));
+    check("a second quick edit reaches the copy too", String(lastEdit?.args[2]).includes("MIRTEST note, edited") && !String(lastEdit?.args[2]).includes("@Tom"), lastEdit?.args);
+    check("an edit updates who the note mentions", (mentions.rows[0].mentioned_ids as string[]).length === 0, mentions.rows[0]);
+
+    // While a send waits, the note can't change, and cancelling the send keeps it.
+    await setSendDelay(A, 30);
+    try {
+      const held = await sendNoteToCustomer(A, noted, TESS);
+      const listed = (await listNotes(A, t1)).find((n) => n.id === noted);
+      const blocked = await editNote(A, noted, TESS, "MIRTEST edit while waiting");
+      const again = await sendNoteToCustomer(A, noted, TESS);
+      check("a note waits for the send delay and shows as sending", held.status === "scheduled" && listed?.sending === true, { held, sending: listed?.sending });
+      check("a waiting note can't be edited or sent twice", !blocked.ok && blocked.code === 409 && again.status === "already_sending");
+      const waiting = await withTenant(A, (c) => c.query("SELECT id FROM scheduled_replies WHERE request->>'noteId' = $1 AND status = 'scheduled'", [noted]));
+      await cancelScheduledReply(A, waiting.rows[0].id);
+      check("cancelling a note's send keeps the note", await noteExists(noted));
+    } finally {
+      await setSendDelay(A, 0);
+    }
+
+    // Sent to the customer, the note becomes a reply with its file, and its Discord copy is removed.
+    const sent = await sendNoteToCustomer(A, noted, TESS);
+    await drainDiscordRelay();
+    const reply = await withTenant(A, (c) =>
+      c.query("SELECT m.id, (SELECT count(*)::int FROM message_attachments a WHERE a.message_id = m.id) AS files FROM messages m WHERE m.ticket_id = $1 AND m.body = 'MIRTEST note, edited'", [t1]),
+    );
+    check("a sent note becomes a reply with its file", sent.status === "sent" && reply.rows[0]?.files === 1, reply.rows);
+    check("a sent note is removed with its Discord copy", !(await noteExists(noted)) && callsFor("deleteInThread", copy).length === 1 && (await copiesOf(noted)).length === 0);
+
+    // 📤 on the bot's copy of a note, an AI note among them, sends it.
+    const aiNote = await writeNote("MIRTEST the AI's note");
+    const [aiCopy] = await copiesOf(aiNote);
+    const fromDiscord = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: aiCopy, reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+    const aiReply = await withTenant(A, (c) => c.query("SELECT 1 FROM messages WHERE ticket_id = $1 AND body = 'MIRTEST the AI''s note'", [t1]));
+    check("📤 on the bot's copy of a note sends it", fromDiscord.promoted && aiReply.rowCount === 1 && !(await noteExists(aiNote)), fromDiscord);
+
+    // Deleting: the author or an admin, and the copy goes too.
+    const toDelete = await writeNote("MIRTEST note to delete");
+    const [deleteCopy] = await copiesOf(toDelete);
+    const stranger = await removeNote(A, toDelete, { userId: "c0000000-0000-0000-0000-000000000009", name: "X", email: null, role: "agent" });
+    check("an agent who didn't write a note can't delete it", !stranger.ok && stranger.code === 403);
+    const byAdmin = await removeNote(A, toDelete, TOM);
+    await drainDiscordRelay();
+    check("an admin deletes a note and its Discord copy", byAdmin.ok && !(await noteExists(toDelete)) && callsFor("deleteInThread", deleteCopy).length === 1);
+
+    // Deleting the bot's copy in Discord deletes the Noola note.
+    const copyDeleted = await writeNote("MIRTEST copy deleted in Discord");
+    const [deletedInDiscord] = await copiesOf(copyDeleted);
+    await syncMirrorDelete(deletedInDiscord);
+    check("deleting the bot's copy in Discord deletes the note", !(await noteExists(copyDeleted)));
+
+    // A teammate's message: Discord edits reach its note, and Noola deletes it only when the bot may.
+    await handleMirrorPostMessage({
+      guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-sync",
+      authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: "MIRTEST written in Discord", roleIds: [ROLE], isBotOrWebhook: false,
+    });
+    const ledger = await relayPool.query("SELECT note_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-sync'");
+    const discordNote = ledger.rows[0].note_id as string;
+    await syncMirrorEdit("mirtest-dm-sync", "MIRTEST written in Discord <:kermitThink:1333183279481749545>");
+    const afterEdit = (await listNotes(A, t1)).find((n) => n.id === discordNote);
+    check("a Discord edit updates its note", afterEdit?.body === "MIRTEST written in Discord :kermitThink:" && !!afterEdit?.edited_at && afterEdit?.origin === "discord", afterEdit);
+    await withTenant(A, (c) => c.query("UPDATE ticket_notes SET edited_at = NULL WHERE id = $1", [discordNote]));
+    await syncMirrorEdit("mirtest-dm-sync", "MIRTEST written in Discord <:kermitThink:1333183279481749545>");
+    const unchanged = (await listNotes(A, t1)).find((n) => n.id === discordNote);
+    check("a Discord update with the same text, e.g. a link preview, isn't an edit", unchanged?.edited_at === null, unchanged?.edited_at);
+    await setSendDelay(A, 30);
+    try {
+      const waitingPromote = await sendNoteToCustomer(A, discordNote, TESS);
+      deleteResult = "deleted";
+      await removeNote(A, discordNote, TOM);
+      const promoteRow = await withTenant(A, (c) => c.query("SELECT status FROM scheduled_replies WHERE discord_message_id = 'mirtest-dm-sync'"));
+      check("deleting a Discord note cancels its waiting promote", waitingPromote.status === "scheduled" && promoteRow.rows[0]?.status === "cancelled", promoteRow.rows);
+    } finally {
+      await setSendDelay(A, 0);
+    }
+    await handleMirrorPostMessage({
+      guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-sync2",
+      authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: "MIRTEST written in Discord again", roleIds: [ROLE], isBotOrWebhook: false,
+    });
+    const discordNote2 = (await relayPool.query("SELECT note_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-sync2'")).rows[0].note_id as string;
+    const noEdit = await editNote(A, discordNote2, { ...TOM, userId: afterEdit?.author_id ?? TOM.userId }, "MIRTEST changed in Noola");
+    check("a note written in Discord can't be edited in Noola", !noEdit.ok && noEdit.code !== 404, noEdit);
+    deleteResult = "forbidden";
+    const refused = await removeNote(A, discordNote2, TOM);
+    check("without Manage Messages the note is kept", !refused.ok && refused.code === 409 && (await noteExists(discordNote2)), refused);
+    deleteResult = "deleted";
+    const removed = await removeNote(A, discordNote2, TOM);
+    check("with it, the note and the Discord message go", removed.ok && !(await noteExists(discordNote2)) && callsFor("deleteInThread", "mirtest-dm-sync2").length === 2);
+
+    // A teammate deleting their message in Discord deletes its note.
+    await handleMirrorPostMessage({
+      guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-gone",
+      authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: "MIRTEST soon deleted", roleIds: [ROLE], isBotOrWebhook: false,
+    });
+    const goneNote = (await relayPool.query("SELECT note_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-gone'")).rows[0].note_id as string;
+    await syncMirrorDelete("mirtest-dm-gone");
+    check("deleting a teammate's message in Discord deletes its note", !(await noteExists(goneNote)));
+
+    // Sending a note that a teammate wrote in Discord runs the 📤 promote.
+    await handleMirrorPostMessage({
+      guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-noola-send",
+      authorId: "mirtest-user-eve", authorDisplayName: "Eve", content: "MIRTEST sent from Noola", roleIds: [], isBotOrWebhook: false,
+    });
+    const eveNote = (await relayPool.query("SELECT note_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-noola-send'")).rows[0].note_id as string;
+    const promotedFromNoola = await sendNoteToCustomer(A, eveNote, TESS);
+    await drainDiscordRelay();
+    check("sending a Discord note from Noola promotes it with ✅", promotedFromNoola.status === "sent" && callsFor("react", "mirtest-dm-noola-send").some((c) => c.args[2] === "✅"), promotedFromNoola);
   }
 
   // A preview that arrives after a message was promoted lands on the reply, which replaced the note.
