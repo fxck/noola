@@ -217,7 +217,7 @@ export async function claimAttachments(
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `UPDATE message_attachments
-          SET message_id = $2
+          SET message_id = $2, note_id = NULL
         WHERE id = ANY($3::uuid[]) AND ticket_id = $1 AND message_id IS NULL
         RETURNING storage_key, filename, content_type`,
       [ticketId, messageId, ids],
@@ -290,6 +290,31 @@ export async function attachmentStorageForMessage(tenantId: string, messageId: s
       [messageId],
     );
     return r.rows as AttachmentStorage[];
+  });
+}
+
+/** Storage info for a note's files, oldest first. */
+export async function attachmentStorageForNote(tenantId: string, noteId: string): Promise<AttachmentStorage[]> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, filename, content_type, size_bytes, storage_key
+         FROM message_attachments WHERE note_id = $1 ORDER BY created_at ASC`,
+      [noteId],
+    );
+    return r.rows as AttachmentStorage[];
+  });
+}
+
+/** Moves uploads that are still waiting onto a note. Returns how many were attached. */
+export async function claimNoteAttachments(tenantId: string, ticketId: string, noteId: string, ids: string[]): Promise<number> {
+  if (ids.length === 0) return 0;
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `UPDATE message_attachments SET note_id = $2
+        WHERE id = ANY($3::uuid[]) AND ticket_id = $1 AND message_id IS NULL AND note_id IS NULL`,
+      [ticketId, noteId, ids],
+    );
+    return r.rowCount ?? 0;
   });
 }
 

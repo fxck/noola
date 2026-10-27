@@ -46,7 +46,7 @@ import { Menu, MenuItem } from "@/components/ui/menu";
 import { Spinner } from "@/components/ui/spinner";
 import { useRealtime } from "@/lib/realtime-context";
 import { usePreferences } from "@/lib/preferences";
-import { fetchSendDelay, formatDelay } from "@/lib/settings";
+import { formatDelay } from "@/lib/settings";
 import { useNerdMode } from "@/lib/nerd-mode";
 import { NerdStats, ScoreBar, CopyId, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { cn } from "@/lib/utils";
@@ -86,6 +86,7 @@ export function Composer({
   isDiscord,
   replyChannels,
   defaultCc,
+  sendDelay,
   pending,
   onSent,
   onMutated,
@@ -98,6 +99,8 @@ export function Composer({
   replyChannels: ReplyChannels | null;
   /** The other recipients on the customer's latest email — the reply-all default (email only). */
   defaultCc?: string[];
+  /** The workspace's send delay in seconds. Above 0, Send becomes a split button. */
+  sendDelay: number;
   pending: QueueItem | null;
   onSent: () => void;
   onMutated: () => void;
@@ -107,8 +110,6 @@ export function Composer({
   const { setPresence } = useRealtime();
   const { nerd } = useNerdMode();
   const { sendMode } = usePreferences();
-  // The workspace's send delay in seconds. Above 0, Send becomes a split button.
-  const [sendDelay, setSendDelay] = useState(0);
   const { removeItem, refetch: refetchQueue } = useQueue();
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
@@ -144,7 +145,7 @@ export function Composer({
   // Approval-queue draft acting: which pending id (if any) we're editing, and a busy flag.
   const [queueBusy, setQueueBusy] = useState(false);
   const [editingPending, setEditingPending] = useState<string | null>(null);
-  // Reply attachments: uploaded eagerly on pick/paste (pending rows), claimed onto the message on send.
+  // Attachments: uploaded eagerly on pick/paste (pending rows), claimed onto the reply or note on send.
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   // Local image previews for pending attachments, keyed by attachment id — object URLs from
   // the picked File (the server copy is auth-gated), revoked on remove/clear/unmount.
@@ -191,10 +192,6 @@ export function Composer({
       return {};
     });
   }
-
-  useEffect(() => {
-    fetchSendDelay().then(setSendDelay).catch(() => setSendDelay(0));
-  }, []);
 
   useImperativeHandle(ref, () => ({
     restoreDraft(ticketId, reply) {
@@ -395,7 +392,8 @@ export function Composer({
 
   async function send(sendNow = sendMode === "now") {
     const text = body.trim();
-    if (!text || sending || queueBusy || sendingRef.current) return;
+    // ⌘↵ skips the disabled button, so a file still uploading would miss this message and ride the next one.
+    if (!text || sending || queueBusy || uploading > 0 || sendingRef.current) return;
     sendingRef.current = true;
     try {
       // Internal note mode: save an agent-only note (never dispatched to a channel).
@@ -403,10 +401,12 @@ export function Composer({
         setSending(true);
         setNote(null);
         try {
-          await addNote(ticket.id, text, mentionIds);
+          await addNote(ticket.id, text, mentionIds, attachments.map((a) => a.id));
           setBody("");
           setMentionIds([]);
           setNoteReset((n) => n + 1);
+          setAttachments([]);
+          clearPreviews();
           if (typingTimer.current) clearTimeout(typingTimer.current);
           markTyping(false);
           onNoteAdded();
@@ -548,11 +548,9 @@ export function Composer({
           </button>
         </div>
 
-        {/* Pending attachments — uploaded, waiting to ride the next reply. Images show as
-            real thumbnails (local object URL — the server copy is auth-gated); other files
-            keep the compact chip. Above the input so the draft reads top-to-bottom. Shown in
-            BOTH modes: they persist across the Reply/Note toggle anyway, and hiding the row
-            in note mode made the composer jump heights when switching. */}
+        {/* Pending attachments - uploaded, waiting to ride the next reply or note. Images show as
+            real thumbnails (local object URL - the server copy is auth-gated), other files
+            keep the compact chip. Above the input so the draft reads top-to-bottom. */}
         {(attachments.length > 0 || uploading > 0) && (
           <div className="flex flex-wrap items-center gap-2 px-1 pt-1">
             {attachments.map((a) =>
@@ -657,6 +655,7 @@ export function Composer({
               pingTyping(text);
             }}
             onSubmit={() => void send()}
+            onFiles={(files) => void addFiles(files)}
           />
         ) : (
           // Rich reply editor at the plain textarea's exact rest footprint (3.75rem —
@@ -788,32 +787,27 @@ export function Composer({
               </Button>
             )}
 
-            {/* Attach a file to the reply */}
-            {mode === "reply" && (
-              <>
-                <input
-                  ref={fileRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => {
-                    void addFiles(Array.from(e.target.files ?? []));
-                    e.target.value = ""; // allow re-picking the same file
-                  }}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-8 text-muted-foreground hover:text-foreground"
-                  onClick={() => fileRef.current?.click()}
-                  disabled={sending}
-                  title="Attach a file"
-                  aria-label="Attach a file"
-                >
-                  <Paperclip />
-                </Button>
-              </>
-            )}
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void addFiles(Array.from(e.target.files ?? []));
+                e.target.value = ""; // allow re-picking the same file
+              }}
+            />
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 text-muted-foreground hover:text-foreground"
+              onClick={() => fileRef.current?.click()}
+              disabled={sending}
+              title="Attach a file"
+              aria-label="Attach a file"
+            >
+              <Paperclip />
+            </Button>
 
             {/* Macros — insert a saved canned response into the reply composer */}
             {mode === "reply" && (

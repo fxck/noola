@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS scheduled_replies (
   body               text NOT NULL,
   -- The rest of the reply request: attachmentIds, channel, cc.
   request            jsonb NOT NULL DEFAULT '{}'::jsonb,
-  source             text NOT NULL DEFAULT 'composer' CHECK (source IN ('composer', 'discord_promote')),
+  -- 'note': an internal note sent to the customer, which stays a note if the send is cancelled.
+  source             text NOT NULL DEFAULT 'composer' CHECK (source IN ('composer', 'discord_promote', 'note')),
   discord_message_id text,
   send_at            timestamptz NOT NULL,
   status             text NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'sending', 'sent', 'cancelled', 'failed')),

@@ -678,7 +678,7 @@ const AI_NOTE_AUTHOR = "AI assistant";
 
 async function postAiNote(tenantId: string, ticketId: string, body: string): Promise<void> {
   const note = await addNote(tenantId, ticketId, { authorId: null, authorName: AI_NOTE_AUTHOR, body }).catch(() => null);
-  if (note) await relayNoteToMirror(tenantId, ticketId, { authorName: AI_NOTE_AUTHOR, body, dedupeKey: note.id }).catch(() => {});
+  if (note) await relayNoteToMirror(tenantId, ticketId, note.id).catch(() => {});
 }
 
 /** The customer's message needs no answer, so the ticket waits for them and stays open. */

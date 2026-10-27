@@ -1,12 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import {
-  MacroInput, NoteInput, CustomFieldDefInput, CustomFieldDefPatch, CustomFieldValueInput,
+  MacroInput, NoteInput, NoteEditInput, NoteSendInput, CustomFieldDefInput, CustomFieldDefPatch, CustomFieldValueInput,
   AgentRunInput, TicketTypeInput, TicketTypePatch, BulkTicketInput,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { roleAtLeast } from "../rbac.js";
 import { listMacros, createMacro, updateMacro, deleteMacro } from "../macros.js";
-import { listNotes, addNote, deleteNote } from "../notes.js";
+import { listNotes, addNote } from "../notes.js";
+import { editNote, removeNote, sendNoteToCustomer, type NoteActor } from "../note-actions.js";
+import { claimNoteAttachments } from "../attachments.js";
 import { relayNoteToMirror } from "../discord-mirror.js";
 import { getTicketCsat } from "../csat.js";
 import { listFieldDefs, createFieldDef, updateFieldDef, deleteFieldDef, getTicketValues, setTicketValue } from "../customfields.js";
@@ -61,18 +63,49 @@ export default async function inboxOpsRoutes(app: FastifyInstance): Promise<void
       mentionIds: parsed.data.mentionIds,
     });
     if (!note) return reply.code(404).send({ error: "ticket not found" });
+    // The files are on the note before it is mirrored, so its Discord copy carries them.
+    await claimNoteAttachments(tenantId, ticketId, note.id, parsed.data.attachmentIds ?? [])
+      .catch((err) => app.log.warn({ err, ticketId }, "note attachment claim failed"));
     // Domain event (L0-F3): an internal note was added — automatable (e.g. @mention → notify).
     emitDomainEvent(tenantId, "note.added", { ticketId, mentionIds: parsed.data.mentionIds });
     // Mirror the note into the ticket's Discord thread (best-effort). Only Noola-authored notes reach
     // this route; Discord-origin notes come in via the gateway seam, so there's no echo.
-    void relayNoteToMirror(tenantId, ticketId, { authorName: req.session?.name ?? null, body: parsed.data.body, dedupeKey: note.id });
+    void relayNoteToMirror(tenantId, ticketId, note.id);
     return reply.code(201).send({ note });
   }));
 
-  app.delete("/tickets/:id/notes/:noteId", tenanted(async (tenantId, req, reply) => {
-    const gone = await deleteNote(tenantId, (req.params as { noteId: string }).noteId);
-    if (!gone) return reply.code(404).send({ error: "not found" });
+  const actorOf = (req: { session?: { userId: string; name: string; email: string; role: string } | null }): NoteActor => ({
+    userId: req.session?.userId ?? null,
+    name: req.session?.name ?? null,
+    email: req.session?.email ?? null,
+    role: req.session?.role ?? null,
+  });
+
+  app.patch("/tickets/:id/notes/:noteId", tenanted(async (tenantId, req, reply) => {
+    const parsed = NoteEditInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const out = await editNote(tenantId, (req.params as { noteId: string }).noteId, actorOf(req), parsed.data.body);
+    if (!out.ok) return reply.code(out.code).send({ error: out.error, detail: out.detail });
     return { ok: true };
+  }));
+
+  app.delete("/tickets/:id/notes/:noteId", tenanted(async (tenantId, req, reply) => {
+    const out = await removeNote(tenantId, (req.params as { noteId: string }).noteId, actorOf(req));
+    if (!out.ok) return reply.code(out.code).send({ error: out.error, detail: out.detail });
+    return { ok: true };
+  }));
+
+  app.post("/tickets/:id/notes/:noteId/send", tenanted(async (tenantId, req, reply) => {
+    const parsed = NoteSendInput.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const out = await sendNoteToCustomer(tenantId, (req.params as { noteId: string }).noteId, actorOf(req), {
+      sendNow: parsed.data.sendNow, log: app.log,
+    });
+    if (out.status === "not_found") return reply.code(404).send({ error: "not_found", detail: "This note no longer exists." });
+    if (out.status === "already_sending" || out.status === "not_promotable") {
+      return reply.code(409).send({ error: out.status, detail: "This note is already being sent." });
+    }
+    return reply.code(out.status === "scheduled" ? 202 : 201).send({ status: out.status });
   }));
 
   // ---- CSAT (read side) ----------------------------------------------------

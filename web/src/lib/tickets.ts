@@ -347,7 +347,7 @@ export interface ScheduledReply {
   body: string;
   sendAt: string;
   status: "scheduled" | "sending";
-  source: "composer" | "discord_promote";
+  source: "composer" | "discord_promote" | "note";
   authorId: string | null;
   authorName: string | null;
 }

@@ -1,5 +1,8 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound, Check, CheckCheck, Eye, TriangleAlert, Clock } from "lucide-react";
+import {
+  StickyNote, Bot, Sparkles, Languages, Paperclip, Download, ImageIcon, UserRound, Check, CheckCheck, Eye, TriangleAlert, Clock,
+  MoreHorizontal, SendHorizonal, Pencil, Trash2,
+} from "lucide-react";
 import {
   type Message,
   type MessageMeta,
@@ -19,8 +22,12 @@ import { usePreferences } from "@/lib/preferences";
 import { NoolaMark } from "@/components/noola-mark";
 import { Avatar } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
 import { avatarSrc } from "@/lib/avatar-upload";
-import { localeName } from "@/lib/settings";
+import { formatDelay, localeName } from "@/lib/settings";
 import { HoverPopover } from "@/components/live/hover-popover";
 import { NerdStats, CopyId, compactNum, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { estimateCost, fmtCost, isLocalModel, shortModel } from "@/lib/model-cost";
@@ -97,15 +104,67 @@ function DeliveryBadge({
 
 /** Internal note in the thread — agent-only, visually distinct from customer/agent
  *  messages (never dispatched to a channel). Full-width, warning-tinted card. */
-export function NoteBubble({ note }: { note: Note }) {
+export function NoteBubble({
+  note,
+  canEdit,
+  canDelete,
+  sendDelay,
+  onSend,
+  onEdit,
+  onDelete,
+}: {
+  note: Note;
+  canEdit: boolean;
+  canDelete: boolean;
+  /** The workspace's send delay in seconds. */
+  sendDelay: number;
+  /** Absent when the ticket can't take a reply, e.g. while it is closed or marked spam. */
+  onSend?: (sendNow: boolean) => Promise<void>;
+  /** Resolves true when the new text is saved. */
+  onEdit: (body: string) => Promise<boolean>;
+  onDelete: () => Promise<void>;
+}) {
   // Notes can carry files too (e.g. a screenshot posted in a Discord mirror thread) — same inline
   // image / file-chip treatment as a message.
   const atts = note.attachments ?? [];
-  const { linkPreviews } = usePreferences();
+  const { linkPreviews, sendMode } = usePreferences();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
   const embedAtts = atts.filter((a) => a.embed_url);
   const imageAtts = atts.filter((a) => !a.embed_url && isImageAttachment(a));
   const fileAtts = atts.filter((a) => !a.embed_url && !isImageAttachment(a));
   const hideBody = linkPreviews && onlyPreviewedLinks(note.body, embedAtts);
+  const canSend = !!onSend && !note.sending;
+  const delayLabel = formatDelay(sendDelay);
+
+  async function run(action: () => Promise<void>) {
+    setBusy(true);
+    try {
+      await action();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startEdit() {
+    setDraft(note.body);
+    setEditing(true);
+  }
+
+  function saveEdit() {
+    const body = draft.trim();
+    if (!body || busy) return;
+    if (body === note.body) {
+      setEditing(false);
+      return;
+    }
+    void run(async () => {
+      if (await onEdit(body)) setEditing(false);
+    });
+  }
+
   return (
     <li>
       <div className="rounded-xl border border-warning/30 bg-warning/5 px-3.5 py-2.5">
@@ -117,8 +176,89 @@ export function NoteBubble({ note }: { note: Note }) {
           <span className="font-normal normal-case text-muted-foreground">
             · {relativeTime(note.created_at)}
           </span>
+          {note.edited_at && (
+            <span className="font-normal normal-case text-muted-foreground" title={new Date(note.edited_at).toLocaleString()}>
+              · edited
+            </span>
+          )}
+          {note.sending && (
+            <span className="inline-flex items-center gap-1 font-normal normal-case text-muted-foreground">
+              · <Clock className="size-3" /> Sending…
+            </span>
+          )}
+          {!editing && (canSend || canEdit || canDelete) && (
+            <div className="-my-1 ml-auto">
+              <Menu
+                width={208}
+                trigger={(open, toggle) => (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn("size-6 text-muted-foreground hover:text-foreground [&_svg]:size-3.5", open && "bg-muted text-foreground")}
+                    onClick={toggle}
+                    disabled={busy}
+                    title="Note actions"
+                    aria-label="Note actions"
+                    aria-haspopup="menu"
+                    aria-expanded={open}
+                  >
+                    <MoreHorizontal />
+                  </Button>
+                )}
+              >
+                {canSend && (
+                  <MenuItem
+                    icon={SendHorizonal}
+                    label={sendDelay > 0 && sendMode === "delayed" ? `Send to customer in ${delayLabel}` : "Send to customer"}
+                    onSelect={() => void run(() => onSend!(sendMode === "now"))}
+                  />
+                )}
+                {canSend && sendDelay > 0 && (
+                  sendMode === "now" ? (
+                    <MenuItem icon={Clock} label={`Send in ${delayLabel}`} onSelect={() => void run(() => onSend!(false))} />
+                  ) : (
+                    <MenuItem icon={SendHorizonal} label="Send now" onSelect={() => void run(() => onSend!(true))} />
+                  )
+                )}
+                {canSend && (canEdit || canDelete) && <MenuSeparator />}
+                {canEdit && <MenuItem icon={Pencil} label="Edit" onSelect={startEdit} />}
+                {canDelete && <MenuItem icon={Trash2} label="Delete" destructive onSelect={() => setConfirmDelete(true)} />}
+              </Menu>
+            </div>
+          )}
         </div>
-        {!hideBody && <ArticleBody markdown={note.body} className={cn(BUBBLE_MD, "break-words")} messageLinks />}
+        {editing ? (
+          <div className="flex flex-col gap-2">
+            <Textarea
+              autoFocus
+              autoGrow
+              aria-label="Edit note"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  saveEdit();
+                } else if (e.key === "Escape") {
+                  setEditing(false);
+                }
+              }}
+              disabled={busy}
+              className="bg-background"
+            />
+            <div className="flex items-center justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setEditing(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button size="sm" onClick={saveEdit} disabled={busy || !draft.trim()}>
+                {busy && <Spinner className="size-4 text-background" />}
+                Save
+              </Button>
+            </div>
+          </div>
+        ) : (
+          !hideBody && <ArticleBody markdown={note.body} className={cn(BUBBLE_MD, "break-words")} messageLinks />
+        )}
         {embedAtts.length > 0 && <LinkPreviews atts={embedAtts} className="mt-2" />}
         {note.mentioned_names.length > 0 && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1 text-micro text-muted-foreground">
@@ -139,6 +279,25 @@ export function NoteBubble({ note }: { note: Note }) {
           </div>
         )}
       </div>
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Delete this note?"
+        message={
+          note.origin === "discord"
+            ? "The message in the Discord thread is deleted too. This can't be undone."
+            : "This can't be undone."
+        }
+        confirmLabel="Delete"
+        destructive
+        busy={busy}
+        onConfirm={() =>
+          void run(async () => {
+            await onDelete();
+            setConfirmDelete(false);
+          })
+        }
+        onCancel={() => setConfirmDelete(false)}
+      />
     </li>
   );
 }
@@ -413,6 +572,11 @@ export function PendingReplyBubble({
           {reply.source === "discord_promote" && (
             <span className="rounded-full border px-1.5 py-px font-medium" title="Promoted from the Discord mirror thread">
               from Discord
+            </span>
+          )}
+          {reply.source === "note" && (
+            <span className="rounded-full border px-1.5 py-px font-medium" title="From an internal note on this ticket">
+              from a note
             </span>
           )}
           <Button
