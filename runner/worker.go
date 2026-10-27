@@ -946,6 +946,12 @@ func main() {
 	jobsMu.Unlock()
 	cc.Stop()
 	jobs.Wait()
-	_ = nc.Drain()
+	// The requeues (Naks) just written sit in the connection's buffer. Drain would close it in the
+	// background and the process would exit first, losing them: the jobs would then wait out
+	// AckWait before another runner got them. Flush, then close.
+	if err := nc.FlushTimeout(5 * time.Second); err != nil {
+		logf("flushing NATS before exit: %v", err)
+	}
+	nc.Close()
 	logf("stopped")
 }
