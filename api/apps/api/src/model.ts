@@ -10,6 +10,7 @@
 // an agent's "let me look into it" keeps the ball on our side.
 
 import { requireEnv } from "./env.js";
+import { DRAFT_OUTCOMES_SYSTEM } from "./ai-outcome.js";
 
 export type WhoseTurn = "us" | "customer";
 
@@ -59,12 +60,16 @@ export interface DraftReplyInput {
   // hosted model answers in the team's configured tone/signature. The extractive rule baseline
   // ignores it — it can't paraphrase, so it stays honest regardless of persona.
   persona?: string;
+  /** Lets the draft carry a note for the team or say that no reply is needed (ai-outcome.ts). The rule baseline ignores it. */
+  outcomes?: boolean;
 }
 
 /** A drafted reply plus the signals the autoreply gate + trace store need: how
  *  confident the model is (0..1) and token usage when the driver reports it. */
 export interface DraftResult {
   text: string;
+  /** The model was told about the outcome tags, so its text must be parsed for them. */
+  outcomes?: boolean;
   confidence?: number;
   tokensIn?: number;
   tokensOut?: number;
@@ -306,7 +311,8 @@ function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.
   const persona = input.persona?.trim();
-  const base = persona ? `${persona}\n\n${DRAFT_SYSTEM}` : DRAFT_SYSTEM;
+  const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${DRAFT_OUTCOMES_SYSTEM}` : DRAFT_SYSTEM;
+  const base = persona ? `${persona}\n\n${rules}` : rules;
   const system = sources ? `${base}\n\nSources:\n${sources}` : base;
   const latest = input.customerMessage || "(the customer has not written anything yet)";
   // Render prior turns as a labeled transcript so the model can see the conversation — without it a
@@ -371,7 +377,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       if (!text) throw new Error("empty completion");
       // A hosted model is more trustworthy than the extractive baseline, but not
       // blindly — 0.7 is a sane default until real per-tenant eval data tunes it.
-      return { text, confidence: 0.7, tokensIn: r.tokensIn, tokensOut: r.tokensOut };
+      return { text, confidence: 0.7, tokensIn: r.tokensIn, tokensOut: r.tokensOut, outcomes: input.outcomes === true };
     } finally {
       clearTimeout(timer);
     }
@@ -403,7 +409,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       }
       text = text.trim();
       if (!text) throw new Error("empty completion");
-      yield { done: { text, confidence: 0.7, tokensIn, tokensOut } };
+      yield { done: { text, confidence: 0.7, tokensIn, tokensOut, outcomes: input.outcomes === true } };
     } finally {
       clearTimeout(timer);
     }

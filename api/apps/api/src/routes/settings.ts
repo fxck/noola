@@ -260,7 +260,10 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const { id } = req.params as { id: string };
     const body = (req.body as { body?: string } | undefined)?.body;
     const out = await sendQueued(tenantId, id, body);
-    if (!out.ok) return reply.code(out.code).send({ error: out.code === 404 ? "not found" : "not pending" });
+    if (!out.ok) {
+      const error = out.code === 404 ? "not found" : out.code === 422 ? "edit_required" : "not pending";
+      return reply.code(out.code).send({ error });
+    }
     return { message: out.message };
   }));
 

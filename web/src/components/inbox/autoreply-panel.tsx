@@ -51,6 +51,10 @@ function describeDecision(d: AutoreplyDecision): { text: string; held: boolean }
   const outcome = String(d.outcome ?? "").toLowerCase();
   if (outcome === "sent") return { text: "AI replied automatically", held: false };
   const reason = d.reason ?? "";
+  if (reason === "no_reply_needed") return { text: "AI decided no reply is needed", held: false };
+  if (reason === "no_reply_suggested") return { text: "AI suggests no reply is needed", held: true };
+  if (reason === "note_only") return { text: "AI left a note for the team instead of replying", held: true };
+  if (reason === "malformed_output") return { text: "AI held: its answer was malformed", held: true };
   if (reason.startsWith("guardrail")) {
     const topic = reason.split(":")[1];
     return { text: `AI held: guardrail${topic ? ` (${topic})` : ""}`, held: true };
