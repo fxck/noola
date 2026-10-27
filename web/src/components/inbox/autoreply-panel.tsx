@@ -54,6 +54,7 @@ function describeDecision(d: AutoreplyDecision): { text: string; held: boolean }
   if (reason === "no_reply_needed") return { text: "AI decided no reply is needed", held: false };
   if (reason === "no_reply_suggested") return { text: "AI suggests no reply is needed", held: true };
   if (reason === "note_only") return { text: "AI left a note for the team instead of replying", held: true };
+  if (reason === "handoff") return { text: "AI handed the conversation to a teammate", held: true };
   if (reason === "malformed_output") return { text: "AI held: its answer was malformed", held: true };
   if (reason.startsWith("guardrail")) {
     const topic = reason.split(":")[1];

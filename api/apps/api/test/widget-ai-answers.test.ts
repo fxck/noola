@@ -103,6 +103,10 @@ async function main() {
     check("a note alone hands the visitor to a teammate", handoff.done.handoff === true && handoff.ticket.assistant_enabled === false && handoff.replies.length === 0 && handoff.notes.length === 1, handoff);
     check("a handoff puts the conversation in the needs-reply queue", handoff.ticket.whose_turn === "us", handoff.ticket);
 
+    const handing = await ask(["A teammate will ", "take it from here. <hand", "off/>"]);
+    check("a reply that hands off is shown and sent", handing.shown.trim() === "A teammate will take it from here." && handing.replies[0] === "A teammate will take it from here." && !!handing.done.messageId, handing.shown);
+    check("then the AI is paused and the conversation waits for a teammate", handing.ticket.assistant_enabled === false && handing.ticket.whose_turn === "us", handing.ticket);
+
     const broken = await ask(["Sure, ", "here it is <internal>the secret plan"]);
     check("a broken answer never shows the hidden part", !broken.shown.includes("secret") && !broken.shown.includes("<"), broken.shown);
     check("a broken answer hands off and waits for review", broken.done.handoff === true && broken.ticket.assistant_enabled === false && broken.replies.length === 0 && broken.queued[0] === "malformed_output", broken);

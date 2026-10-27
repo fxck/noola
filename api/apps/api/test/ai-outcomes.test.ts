@@ -4,6 +4,8 @@ import { parseDraftOutcome } from "../src/ai-outcome.js";
 import { ingestInbound } from "../src/ingest.js";
 import { evaluateAutoreply, getPolicy, putPolicy, sendQueued } from "../src/autoreply.js";
 import { getModelConfig, putModelConfig } from "../src/modelconfig.js";
+import { createArticle } from "../src/kb.js";
+import { ensureChunksCollection, ensureKbCollection } from "../src/search.js";
 
 // A hosted model's draft may hold a note for the team or say that no reply is needed.
 // The model sits behind a stubbed endpoint. AIOUT-prefixed data on the shared dev DB, removed at the end.
@@ -29,6 +31,12 @@ function parserChecks() {
   check("no_reply alone", none.kind === "ok" && none.noReply && none.reply === "" && none.note === null, none);
   const noneNote = ok("<no_reply />\n<internal>They confirmed the fix.</internal>");
   check("no_reply with a note", noneNote.kind === "ok" && noneNote.noReply && noneNote.note === "They confirmed the fix.", noneNote);
+  const handing = ok("A teammate will take it from here.\n<handoff/>");
+  check("a reply with a handoff", handing.kind === "ok" && handing.handoff && handing.reply === "A teammate will take it from here.", handing);
+  const handingNoted = ok("I'll pass this on.<internal>Wants a refund.</internal><handoff />");
+  check("a reply with a note and a handoff", handingNoted.kind === "ok" && handingNoted.handoff && handingNoted.note === "Wants a refund.", handingNoted);
+  const handoffAlone = ok("<handoff/>");
+  check("a handoff alone", handoffAlone.kind === "ok" && handoffAlone.handoff && handoffAlone.reply === "", handoffAlone);
   const noteFirst = ok("<internal>The customer was rude, no action needed.</internal><no_reply/>");
   check("a note before no_reply sends nothing and keeps the note", noteFirst.kind === "ok" && noteFirst.noReply && noteFirst.reply === "" && noteFirst.note === "The customer was rude, no action needed.", noteFirst);
   for (const [name, text] of [
@@ -43,6 +51,9 @@ function parserChecks() {
     ["a closing no_reply tag", "<no_reply></no_reply>"],
     ["an empty draft", "   "],
     ["a reply without words", "<internal>x</internal>."],
+    ["no_reply with a handoff", "<no_reply/><handoff/>"],
+    ["two handoffs", "Bye.<handoff/><handoff/>"],
+    ["a broken handoff tag", "Bye. <handoff>"],
   ]) check(`malformed: ${name}`, ok(text).kind === "malformed", ok(text));
 }
 
@@ -62,6 +73,7 @@ async function main() {
     await superPool.query(`DELETE FROM messages WHERE ticket_id IN (${t})`);
     await superPool.query(`DELETE FROM tickets WHERE external_channel_id LIKE 'aiout-%'`);
     await superPool.query(`DELETE FROM contacts WHERE tenant_id = $1 AND external_id LIKE 'aiout-%'`, [A]);
+    await superPool.query("DELETE FROM kb_articles WHERE tenant_id = $1 AND title LIKE 'AIOUT%'", [A]);
   };
   if ((await getModelConfig(A)).provider !== "managed") throw new Error("TestCo has a hosted model, which this test would overwrite");
   await clean();
@@ -122,6 +134,17 @@ async function main() {
     const edited = await sendQueued(A, queueId, "Sure, here you go.");
     check("a malformed draft goes out once it is edited", edited.ok);
 
+    // A reply that hands off is sent, then the AI is paused. The reply has to pass the corroboration gate to be sent.
+    await ensureChunksCollection();
+    await ensureKbCollection();
+    await createArticle(A, "AIOUT restart guide", "AIOUT after you restarted the service, it reconnects on its own within a minute.");
+    await putPolicy(A, { mode: "auto", channel_modes: { synthetic: "auto" }, min_agreement: 0, min_top_score: 0 }, { sweep: false });
+    const handedOver = await turn("A teammate will take this from here.\n<handoff/>");
+    const pausedAfter = (await superPool.query("SELECT assistant_enabled, whose_turn FROM tickets WHERE id = $1", [handedOver.m.ticketId])).rows[0];
+    check("a reply that hands off is sent", handedOver.replies.length === 1 && handedOver.replies[0].body === "A teammate will take this from here.", handedOver.res);
+    check("then the AI is paused and a teammate is due", pausedAfter.assistant_enabled === false && pausedAfter.whose_turn === "us", pausedAfter);
+    await putPolicy(A, { mode: "auto", channel_modes: { synthetic: "auto" }, min_agreement: policyBefore.min_agreement, min_top_score: policyBefore.min_top_score }, { sweep: false });
+
     const answered = await turn("Version 2.1 fixes this.\n<internal>Known upgrade bug.</internal>");
     const outgoing = [...answered.replies.map((r) => r.body), ...answered.queued.map((q) => q.draft_body)];
     check("a reply with a note: the note is posted", answered.notes.length === 1 && answered.notes[0].body === "Known upgrade bug.", answered.notes);
@@ -129,6 +152,14 @@ async function main() {
 
     await putPolicy(A, { mode: "suggest_only", channel_modes: { synthetic: "suggest_only" } }, { sweep: false });
     const suggested = await turn("<no_reply/>");
+
+    // A held reply that hands off pauses the AI once a teammate sends it from the queue.
+    const heldHandoff = await turn("A teammate will take this from here.\n<handoff/>");
+    const heldItem = (await superPool.query("SELECT id FROM autoreply_queue WHERE ticket_id = $1", [heldHandoff.m.ticketId])).rows[0].id as string;
+    const beforeSend = (await superPool.query("SELECT assistant_enabled FROM tickets WHERE id = $1", [heldHandoff.m.ticketId])).rows[0].assistant_enabled;
+    await sendQueued(A, heldItem);
+    const afterSend = (await superPool.query("SELECT assistant_enabled, whose_turn FROM tickets WHERE id = $1", [heldHandoff.m.ticketId])).rows[0];
+    check("a held reply that hands off pauses the AI when it is sent", beforeSend === true && afterSend.assistant_enabled === false && afterSend.whose_turn === "us", { beforeSend, afterSend });
     check("suggest only: no reply is a suggestion and the turn stays with us", suggested.res?.reason === "no_reply_suggested" && suggested.ticket.whose_turn === "us", suggested);
   } finally {
     globalThis.fetch = realFetch;

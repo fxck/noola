@@ -354,6 +354,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           JSON.stringify(suggestionMeta(s, "widget")),
         ]);
       }).catch(() => {});
+      if (answer.handoff) await awaitHuman(wk.tenantId, inbound.ticketId);
       return {
         answer: answer.reply,
         citations: s.citations.map((c) => ({ title: c.title, snippet: c.snippet })),
@@ -519,6 +520,8 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           JSON.stringify(suggestionMeta(suggestion, "widget")),
         ]);
       }).catch(() => {});
+      // Paused before "done", so the widget's reload shows the human queue under the reply.
+      if (answer.handoff) await awaitHuman(wk.tenantId, inbound.ticketId);
       send("done", {
         messageId: answerMsg.messageId,
         conversationId: inbound.ticketId,
