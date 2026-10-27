@@ -3,6 +3,7 @@ import {
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
   type ChatInputCommandInteraction, type ButtonInteraction, type Guild, type GuildMember,
   type ForumChannel, type ThreadChannel, type Message, type RateLimitData, RateLimitError, type GuildTextBasedChannel,
+  type Embed, EmbedType,
 } from "discord.js";
 import { SimpleShardingStrategy, type WebSocketManager } from "@discordjs/ws";
 import type { Agent as HttpAgent } from "node:http";
@@ -17,6 +18,8 @@ import {
   handleThreadUpdate,
   handleThreadDelete,
   handleMessageUpdate,
+  handleMessageEmbeds,
+  type DiscordAttachment,
   handleMessageDelete,
   type Sender,
 } from "./discord.js";
@@ -760,12 +763,15 @@ async function ingestGatewayMessage(
   const resolvedContent = resolveMentions(msg);
   // Discord CDN attachments (screenshots/files). Built up-front so BOTH seams can persist them —
   // previously this ran AFTER the mirror-seam early-return, so internal notes lost every file.
-  const attachments = [...msg.attachments.values()].map((a) => ({
-    url: a.url,
-    filename: a.name ?? "file",
-    contentType: a.contentType ?? "application/octet-stream",
-    size: a.size ?? 0,
-  }));
+  const attachments = [
+    ...[...msg.attachments.values()].map((a) => ({
+      url: a.url,
+      filename: a.name ?? "file",
+      contentType: a.contentType ?? "application/octet-stream",
+      size: a.size ?? 0,
+    })),
+    ...embedMedia(msg.embeds),
+  ];
 
   // Ops-mirror seam: a message inside a mirror forum post is team collaboration on the mirrored
   // ticket (note by default, 📤 promotes) — it must NEVER fall through to customer ingest. The
@@ -812,6 +818,35 @@ async function ingestGatewayMessage(
     return null;
   }
   return r.replay ? null : { tenantId: r.tenantId, ticketId: r.ticketId, messageId: r.messageId };
+}
+
+// Gateway events for one message run in order. An edit or a link preview that arrives while the message is
+// still being stored then waits for it, instead of finding no message to update.
+const messageWork = new Map<string, Promise<void>>();
+export function inMessageOrder(messageId: string, work: () => Promise<void>): Promise<void> {
+  const next = (messageWork.get(messageId) ?? Promise.resolve()).then(work, work);
+  const settled = next.catch(() => {});
+  messageWork.set(messageId, settled);
+  void settled.then(() => {
+    if (messageWork.get(messageId) === settled) messageWork.delete(messageId);
+  });
+  return next;
+}
+
+/** The media of GIF and image link previews, as files to copy. Video and page previews keep only their text. */
+export function embedMedia(embeds: readonly Embed[]): DiscordAttachment[] {
+  const out: DiscordAttachment[] = [];
+  for (const e of embeds) {
+    if (!e.url) continue;
+    if (e.data.type === EmbedType.GIFV) {
+      const src = e.video?.proxyURL ?? e.video?.url;
+      if (src) out.push({ url: src, filename: "gif.mp4", contentType: "video/mp4", size: 0, embedUrl: e.url });
+    } else if (e.data.type === EmbedType.Image) {
+      const src = e.thumbnail?.proxyURL ?? e.thumbnail?.url ?? e.image?.proxyURL ?? e.image?.url;
+      if (src) out.push({ url: src, filename: "image", contentType: "", size: 0, embedUrl: e.url });
+    }
+  }
+  return out;
 }
 
 /**
@@ -929,7 +964,9 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   client.on(Events.MessageCreate, async (msg) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
-      await ingestGatewayMessage(msg, log);
+      await inMessageOrder(msg.id, async () => {
+        await ingestGatewayMessage(msg, log);
+      });
     } catch (err) {
       log.error({ err }, "discord inbound ingest failed");
     }
@@ -979,12 +1016,17 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     try {
       // A partial update has no content, and storing it would blank the message.
       if (!msg.guildId || msg.partial) return;
-      await handleMessageUpdate({
-        guildId: msg.guildId,
-        messageId: msg.id,
-        newContent: resolveMentions(msg),
-        stickers: [...msg.stickers.values()].map((st) => st.name),
-        poll: msg.poll?.question.text ?? null,
+      const guildId = msg.guildId;
+      await inMessageOrder(msg.id, async () => {
+        await handleMessageUpdate({
+          guildId,
+          messageId: msg.id,
+          newContent: resolveMentions(msg),
+          stickers: [...msg.stickers.values()].map((st) => st.name),
+          poll: msg.poll?.question.text ?? null,
+        });
+        // Discord adds a link's preview, e.g. a /gif GIF, in an update shortly after the message is sent.
+        await handleMessageEmbeds(guildId, msg.id, embedMedia(msg.embeds));
       });
     } catch (err) {
       log.error({ err }, "discord MessageUpdate failed");

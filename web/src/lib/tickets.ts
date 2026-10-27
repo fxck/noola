@@ -196,6 +196,8 @@ export interface Attachment {
   filename: string;
   content_type: string;
   size_bytes: number;
+  /** The page a link preview came from, e.g. a Tenor GIF. Null for an uploaded file. */
+  embed_url?: string | null;
 }
 
 export interface Message {

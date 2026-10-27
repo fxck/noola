@@ -14,6 +14,7 @@ import { type Note } from "@/lib/notes";
 import { ChannelIcon } from "@/components/inbox/badges";
 import { ArticleBody } from "@/components/editor/article-body";
 import { slackToMarkdown, splitLinks } from "@/lib/markdown";
+import { usePreferences } from "@/lib/preferences";
 import { NoolaMark } from "@/components/noola-mark";
 import { Avatar } from "@/components/ui/avatar";
 import { avatarSrc } from "@/lib/avatar-upload";
@@ -98,8 +99,11 @@ export function NoteBubble({ note }: { note: Note }) {
   // Notes can carry files too (e.g. a screenshot posted in a Discord mirror thread) — same inline
   // image / file-chip treatment as a message.
   const atts = note.attachments ?? [];
-  const imageAtts = atts.filter(isImageAttachment);
-  const fileAtts = atts.filter((a) => !isImageAttachment(a));
+  const { linkPreviews } = usePreferences();
+  const embedAtts = atts.filter((a) => a.embed_url);
+  const imageAtts = atts.filter((a) => !a.embed_url && isImageAttachment(a));
+  const fileAtts = atts.filter((a) => !a.embed_url && !isImageAttachment(a));
+  const hideBody = linkPreviews && onlyPreviewedLinks(note.body, embedAtts);
   return (
     <li>
       <div className="rounded-xl border border-warning/30 bg-warning/5 px-3.5 py-2.5">
@@ -112,7 +116,8 @@ export function NoteBubble({ note }: { note: Note }) {
             · {relativeTime(note.created_at)}
           </span>
         </div>
-        <ArticleBody markdown={note.body} className={cn(BUBBLE_MD, "break-words")} messageLinks />
+        {!hideBody && <ArticleBody markdown={note.body} className={cn(BUBBLE_MD, "break-words")} messageLinks />}
+        {embedAtts.length > 0 && <LinkPreviews atts={embedAtts} className="mt-2" />}
         {note.mentioned_names.length > 0 && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1 text-micro text-muted-foreground">
             <span>Looped in:</span>
@@ -211,8 +216,11 @@ export function MessageBubble({
 
   // Attachments: images render inline as thumbnails; everything else keeps the quiet file chip.
   const atts = message.attachments ?? [];
-  const imageAtts = atts.filter(isImageAttachment);
-  const fileAtts = atts.filter((a) => !isImageAttachment(a));
+  const { linkPreviews } = usePreferences();
+  const embedAtts = atts.filter((a) => a.embed_url);
+  const imageAtts = atts.filter((a) => !a.embed_url && isImageAttachment(a));
+  const fileAtts = atts.filter((a) => !a.embed_url && !isImageAttachment(a));
+  const hideBody = linkPreviews && onlyPreviewedLinks(shownText, embedAtts);
 
   return (
     <li className={cn("flex gap-3", isAgent && "flex-row-reverse")}>
@@ -251,16 +259,19 @@ export function MessageBubble({
         </span>
       )}
       <div className={cn("flex min-w-0 max-w-[82%] flex-col gap-1", isAgent && "items-end")}>
-        <div
-          className={cn(
-            "break-words rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed",
-            isAgent
-              ? "rounded-tr-md bg-accent text-foreground"
-              : "rounded-tl-md bg-muted/60 text-foreground",
-          )}
-        >
-          <MessageText text={shownText} isAgent={isAgent} channel={message.channel_type} />
-        </div>
+        {!hideBody && (
+          <div
+            className={cn(
+              "break-words rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed",
+              isAgent
+                ? "rounded-tr-md bg-accent text-foreground"
+                : "rounded-tl-md bg-muted/60 text-foreground",
+            )}
+          >
+            <MessageText text={shownText} isAgent={isAgent} channel={message.channel_type} />
+          </div>
+        )}
+        {embedAtts.length > 0 && <LinkPreviews atts={embedAtts} className={cn(isAgent && "justify-end")} />}
         {/* one quiet meta line UNDER the bubble — time, plus the Auto marker for
             AI-sent replies and a channel glyph only when the conversation spans
             channels (the omnichannel case is Noola's own thing worth marking) */}
@@ -344,6 +355,91 @@ export function MessageBubble({
         {isAi && <AiReceipt message={message} align={isAgent ? "end" : "start"} />}
       </div>
     </li>
+  );
+}
+
+/** True when the text is only links whose previews are shown, as with a GIF from Discord's /gif. */
+function onlyPreviewedLinks(text: string, embeds: Attachment[]): boolean {
+  if (!embeds.length) return false;
+  const previewed = new Set(embeds.map((a) => a.embed_url));
+  return text.split(/\s+/).filter(Boolean).every((word) => previewed.has(word.replace(/^<|>$/g, "")));
+}
+
+/** GIFs and images that a message links to, or the links themselves when the member turned previews off. */
+function LinkPreviews({ atts, className }: { atts: Attachment[]; className?: string }) {
+  const { linkPreviews } = usePreferences();
+  const images = linkPreviews ? atts.filter(isImageAttachment) : [];
+  const videos = linkPreviews ? atts.filter((a) => a.content_type.startsWith("video/")) : [];
+  const links = atts.filter((a) => !images.includes(a) && !videos.includes(a));
+  return (
+    <>
+      {images.length > 0 && <ImageAttachments atts={images} className={className} />}
+      {videos.length > 0 && (
+        <div className={cn("flex flex-wrap gap-2", className)}>
+          {videos.map((a) => (
+            <PreviewVideo key={a.id} a={a} />
+          ))}
+        </div>
+      )}
+      {links.length > 0 && (
+        <div className={cn("flex flex-wrap gap-1.5", className)}>
+          {links.map((a) => (
+            <PreviewLink key={a.id} url={a.embed_url!} />
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** A GIF, which Discord serves as a short silent video, playing on a loop like it does in Discord. */
+function PreviewVideo({ a }: { a: Attachment }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    fetchAttachmentBlob(a.id)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [a.id]);
+  if (failed) return <PreviewLink url={a.embed_url!} />;
+  if (!url) return <div className="h-40 w-56 rounded-lg border border-border/60 bg-muted/40 motion-safe:animate-pulse" aria-hidden />;
+  return (
+    <video
+      src={url}
+      autoPlay
+      loop
+      muted
+      playsInline
+      title={a.embed_url ?? a.filename}
+      onError={() => setFailed(true)}
+      className="block max-h-72 max-w-full rounded-lg border border-border/60"
+    />
+  );
+}
+
+function PreviewLink({ url }: { url: string }) {
+  if (!/^https?:\/\//i.test(url)) return <span className="text-micro text-muted-foreground">{url}</span>;
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-border/60 bg-muted/40 px-2 py-1 text-micro text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+    >
+      {url}
+    </a>
   );
 }
 
