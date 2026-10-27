@@ -17,12 +17,16 @@ interface PriceRow {
   test: (m: string) => boolean;
 }
 
-// Order matters: more specific families first (opus/sonnet/haiku are disjoint;
-// gpt-4o-mini must beat gpt-4o).
+// Order matters: a more specific row comes first (opus-5-5 before opus, gpt-4o-mini before gpt-4o).
+// Claude rows follow Anthropic's model price table as of October 2026.
 const TABLE: PriceRow[] = [
-  { id: "claude-opus-4", in: 15, out: 75, test: (m) => m.includes("opus") },
+  { id: "claude-fable", in: 10, out: 50, test: (m) => m.includes("fable") || m.includes("mythos") },
+  { id: "claude-opus-5-5", in: 4, out: 20, test: (m) => m.includes("opus-5-5") },
+  { id: "claude-opus", in: 5, out: 25, test: (m) => m.includes("opus") },
+  { id: "claude-sonnet-5", in: 2, out: 10, test: (m) => m.includes("sonnet-5") },
   { id: "claude-sonnet", in: 3, out: 15, test: (m) => m.includes("sonnet") },
-  { id: "claude-haiku", in: 0.8, out: 4, test: (m) => m.includes("haiku") },
+  { id: "claude-haiku-5", in: 0.1, out: 0.5, test: (m) => m.includes("haiku-5") }, // prompts up to 100K tokens
+  { id: "claude-haiku", in: 1, out: 5, test: (m) => m.includes("haiku") },
   { id: "gpt-4o-mini", in: 0.15, out: 0.6, test: (m) => m.includes("4o-mini") },
   { id: "gpt-4o", in: 2.5, out: 10, test: (m) => m.includes("gpt-4o") || m.includes("4o") },
   { id: "rule", in: 0, out: 0, local: true, test: (m) => m === "rule" || m.startsWith("rule") },

@@ -293,6 +293,11 @@ const DRAFT_SYSTEM =
 // tokenize ~2-3x heavier than English, so a normal-length answer hit the cap and was sent truncated
 // mid-word. 1500 gives a full support reply headroom while still bounding a runaway generation.
 const DRAFT_MAX_TOKENS = 1500;
+// Current Claude models think before they answer, and the thinking counts against max_tokens.
+// The ceiling itself costs nothing, only the tokens the model produces, thinking included.
+const ANTHROPIC_DRAFT_MAX_TOKENS = 8000;
+// An OpenAI account also lists embedding, audio and image models, which can't draft a reply.
+const NOT_A_CHAT_MODEL = /embedding|whisper|tts|audio|realtime|transcribe|dall-e|image|moderation|davinci|babbage/i;
 
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const sources = input.sources
@@ -420,6 +425,29 @@ export class HttpChatModelDriver implements ModelServingDriver {
     }
   }
 
+  /** The model ids the provider serves this key, newest first where the provider orders them. Empty when the list can't be read. */
+  async listModels(): Promise<string[]> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const anthropic = this.opts.provider === "anthropic";
+      const res = await fetch(`${this.base()}/models${anthropic ? "?limit=1000" : ""}`, {
+        signal: ctrl.signal,
+        headers: anthropic
+          ? { "x-api-key": this.opts.apiKey, "anthropic-version": "2023-06-01" }
+          : { authorization: `Bearer ${this.opts.apiKey}` },
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { data?: Array<{ id?: unknown }> };
+      const ids = (data.data ?? []).map((m) => m.id).filter((id): id is string => typeof id === "string");
+      return this.opts.provider === "openai" ? ids.filter((id) => !NOT_A_CHAT_MODEL.test(id)) : ids;
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
   private base(): string {
     if (this.opts.endpoint) return this.opts.endpoint.replace(/\/+$/, "");
     return this.opts.provider === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1";
@@ -473,7 +501,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
+        max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
         system,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],
       }),
@@ -526,7 +554,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
+        max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
         system,
         stream: true,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],

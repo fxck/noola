@@ -136,6 +136,12 @@ export async function resolveModelDriver(
   });
 }
 
+/** The models the saved provider serves the saved key, for the model picker. Empty for the built-in model or without a key. */
+export async function listAvailableModels(tenantId: string): Promise<string[]> {
+  const driver = await resolveModelDriver(tenantId);
+  return driver instanceof HttpChatModelDriver ? driver.listModels() : [];
+}
+
 /** Live reachability probe against the tenant's SAVED config. Baseline → always ok;
  *  a hosted config runs a tiny draft and reports success or the failure reason. */
 export async function testModelConfig(tenantId: string): Promise<{ ok: boolean; error?: string }> {

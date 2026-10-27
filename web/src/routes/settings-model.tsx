@@ -18,6 +18,7 @@ import {
   MODEL_PLACEHOLDER,
   MODEL_SUGGESTIONS,
   fetchModelSettings,
+  fetchAvailableModels,
   saveModelSettings,
   testModelSettings,
 } from "@/lib/settings";
@@ -147,6 +148,21 @@ export function SettingsModelPage() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<ModelTestResult | null>(null);
+  // The saved provider's own list replaces the built-in suggestions once a key is saved.
+  const [available, setAvailable] = useState<string[]>([]);
+  useEffect(() => {
+    if (!settings?.hasKey || settings.provider === "managed") {
+      setAvailable([]);
+      return;
+    }
+    let live = true;
+    fetchAvailableModels()
+      .then((models) => live && setAvailable(models))
+      .catch(() => live && setAvailable([]));
+    return () => {
+      live = false;
+    };
+  }, [settings]);
 
   const load = useRef(async () => {
     setLoadError(false);
@@ -309,7 +325,9 @@ export function SettingsModelPage() {
                           id="model"
                           value={form.model}
                           onChange={(v) => patch({ model: v })}
-                          suggestions={MODEL_SUGGESTIONS[form.provider]}
+                          suggestions={
+                            available.length && form.provider === settings?.provider ? available : MODEL_SUGGESTIONS[form.provider]
+                          }
                           placeholder={MODEL_PLACEHOLDER[form.provider]}
                         />
                         <p className="text-xs text-muted-foreground">
