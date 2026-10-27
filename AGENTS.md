@@ -13,7 +13,7 @@ lives in [README.md](README.md).
 | `edge/` | realtime edge | Elixir / Phoenix |
 | `embedder/` | RAG embeddings | Node |
 | `geo/` | IP enrichment | Node |
-| `runner/` | flow-runner (docker image + `runnerd`) | Go + Docker |
+| `runner/` | run worker `runnerd` + flow-runner (the flow jobs' Box sandbox base) | Go + Zerops Box |
 | `site/` | marketing | static |
 | `sdk/go/` | Go client for the public API (account/contact sync from a system of record) — its own module | Go 1.22, stdlib only (`go test ./...`) |
 

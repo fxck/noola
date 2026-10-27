@@ -4,7 +4,7 @@
 # the apidev setup: deploys [.] and idles via `zsc noop`), plus the backing stores, a
 # shared embedder and Mailpit. Connect your IDE / SSH into `app` and run the api and web
 # dev servers inside it (both Node) against the shared data. The Elixir `edge` (realtime)
-# and the docker `runner` (Studio flow execution) are NOT in this single Node box — reach
+# and the `runner` (Studio flow execution) are NOT in this single Node box — reach
 # for the AI Agent rung when you need the full realtime + flow-execution stack. The `app`
 # subdomain exposes whatever dev server you start.
 

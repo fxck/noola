@@ -32,8 +32,8 @@ It runs as a monorepo of five services over six managed stores. A Node/Fastify *
 owns the domain, auth (better-auth, TOTP 2FA, SSO/SCIM), tickets, teams, routing, SLA,
 broadcasts and the RAG pipeline; an Elixir/Phoenix **edge** fans realtime events and
 the collaborative canvas out to browsers over WebSockets; a self-hosted **embedder**
-turns text into vectors offline; a Docker **runner** launches one ephemeral, auto-removed
-container per automation run for clean isolation; and a React 19 + Vite **web** SPA is
+turns text into vectors offline; a Go **runner** runs each automation run in its own
+Zerops Box sandbox, terminated when the run ends; and a React 19 + Vite **web** SPA is
 the console. Managed **PostgreSQL**, **Valkey**, **NATS JetStream**, **Typesense**,
 **Qdrant** and **object storage** back them.
 
@@ -49,7 +49,7 @@ development, a single-node stage, and production on shared (Small) or dedicated 
 - **AI answers grounded in your content** — retrieval-augmented generation over your knowledge base, with a self-hosted embedding sidecar so nothing but the final LLM call leaves your infra.
 - **Bring-your-own model key** — the LLM provider key is per-tenant and encrypted at rest; there is no shared vendor dependency.
 - **Visual automation Studio** — compose automations and AI agents on a live multiplayer canvas, run them, and watch each step stream with a saved replay.
-- **Isolated execution** — one ephemeral `docker run --rm` container per automation run, guaranteed cleanup.
+- **Isolated execution** — one Zerops Box sandbox (its own microVM) per automation run, terminated when the run ends.
 - **Teams, routing, SLA & broadcasts** — round-robin/skill routing, SLA policies with business hours, outbound broadcasts with tracking, and an analytics suite.
 - **Enterprise-ready** — TOTP 2FA, SSO + SCIM provisioning, per-tenant data retention, IP allowlists and GDPR export/erase.
 - **One repo, one click** — a monorepo (api + edge + embedder + runner + web) deploys as a complete project from a single recipe.
@@ -99,8 +99,8 @@ Five runtime services over six managed stores:
   canvas. Verifies socket tokens against the api at `API_INTERNAL_URL`.
 - **embedder** (Node 24) — a self-hosted all-MiniLM sidecar; the api calls `POST /embed`
   at `EMBED_URL`. The model is baked at build time, so the runtime is keyless and offline.
-- **runner** (Docker-in-VM, Go) — consumes automation-run jobs from NATS JetStream and
-  launches one ephemeral `docker run --rm` container per run; replays are banked to object storage.
+- **runner** (Go) — consumes automation-run jobs from NATS JetStream and runs each in its
+  own sandbox on the project's Zerops **Box**, terminated after the run; replays are banked to object storage.
 - **web** (Vite / React 19) — the console SPA, built with the `api` and `edge` public
   subdomains baked in.
 

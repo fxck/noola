@@ -86,6 +86,23 @@
       "cwd": "site",
       "service": "sitepool",
       "command": "exec ./node_modules/.bin/vite --host 0.0.0.0 --port 5174 --strictPort"
+    },
+    {
+      "name": "runner",
+      "cwd": "runner",
+      "service": "runnerpool",
+      "command": "mkdir -p flow-runner/flow-core && cp ../api/packages/flow-core/src/index.ts flow-runner/flow-core/index.ts && go build -o runnerd . && exec ./runnerd",
+      "watch": {
+        "paths": [
+          "runner",
+          "api/packages/flow-core/src"
+        ],
+        "ignore": [
+          "runner/runnerd*",
+          "runner/flow-runner/flow-core",
+          "runner/flow-runner/node_modules"
+        ]
+      }
     }
   ]
 }

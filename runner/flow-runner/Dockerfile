@@ -1,8 +1,10 @@
-# ── Noola flow-runner ephemeral run container (Studio→Studio fold, Phase 3) ────
-# Headless Chromium + Stagehand/Claude + the containerized item-flow executor. The Go runner
-# worker launches ONE `docker run --rm --network=host` of this image per browser/AI flow job, so
-# every run is a fresh, self-cleaning sandbox (no cross-tenant state bleed). Mirrors the in-process
-# executor's runtime: node 22 (Debian, for apt) + playwright chromium pinned to the app's version.
+# ── Noola flow-runner sandbox base (Studio→Studio fold, Phase 3) ────────────────
+# Headless Chromium + Stagehand/Claude + the item-flow executor. Not run by Docker: the Go runner
+# sends this directory to the Zerops Box, which builds it into a sandbox base named after a hash of
+# the directory (noola-flow-runner-<hash>), and every browser/AI flow job runs in ONE fresh sandbox
+# booted from it — its own microVM, terminated after the run (no cross-tenant state bleed). Mirrors
+# the in-process executor's runtime: node 22 (Debian, for apt) + playwright chromium pinned to the
+# app's version.
 FROM node:22-bookworm-slim
 
 WORKDIR /app
@@ -11,11 +13,13 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 
-# Chromium (matching the installed playwright) + its system libraries. Build runs as root, so
+# Chromium (matching the installed playwright) + its system libraries, in a fixed path so the run
+# finds it whatever HOME the sandbox gives its process. Build runs as root, so
 # --with-deps' apt works without sudo. ffmpeg encodes the run's frame stream into the .webm
 # replay (0092) — libvpx ships in Debian's ffmpeg.
 # The browser binary download hits the Playwright CDN and occasionally times out (30s socket
 # timeout) — a single blip must NOT fail the whole runner boot, so retry up to 5× before giving up.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN for i in 1 2 3 4 5; do \
       npx -y playwright@1.61.1 install --with-deps chromium && break; \
       if [ "$i" = 5 ]; then echo "playwright chromium install failed after 5 attempts" >&2; exit 1; fi; \
@@ -37,4 +41,7 @@ COPY exec.mts ./
 RUN npm run build
 
 ENV NODE_ENV=production
-ENTRYPOINT ["node", "exec.mjs"]
+# The sandbox boots idle; the runner starts `node exec.mjs` in it as the job's own process, once it
+# has written the job's files.
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

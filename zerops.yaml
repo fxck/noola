@@ -414,10 +414,17 @@ zerops:
     run:
       base: static
 
-  # ═══ runner — agent-studio execution runner · runner/ (Docker-in-VM, Go) ══
-  # A Zerops docker service. The Go worker (a static CGO_ENABLED=0 binary) consumes
-  # run jobs from the shared `broker` NATS JetStream and launches ONE ephemeral
-  # `docker run --rm --network=host` container per job.
+  # ═══ runner — agent-studio execution runner · runner/ (Go + Zerops Box) ══
+  # The Go worker (a static CGO_ENABLED=0 binary) consumes run jobs from the shared `broker`
+  # NATS JetStream and runs each one in its OWN Zerops Box sandbox — a microVM on the `box`
+  # service, created for the job and terminated when it ends (create → exec → stream → terminate).
+  # A job's code never runs in this container: the sandbox reads no project value except the ones
+  # the worker hands it for that job, and runs on INTERNET (RUNNER_NETWORK_MODE: AIRGAPPED cuts the
+  # network too) — never PROJECT_INTERNET, which would reach the database. Flow jobs boot from a
+  # Box base the worker builds itself from runner/flow-runner (content-hash named, so an edit
+  # there builds a new base on the next start and an unrelated deploy reuses the current one).
+  # Sandbox sizing / limits: RUNNER_CPUS, RUNNER_MEMORY_MB, RUNNER_FLOW_MEMORY_MB,
+  # RUNNER_JOB_TIMEOUT_SECONDS (≤ 600) — see runner/worker.go.
   - setup: runnerdev
     build:
       base: go@1.22
@@ -429,22 +436,17 @@ zerops:
         - mkdir -p runner/flow-runner/flow-core && cp api/packages/flow-core/src/index.ts runner/flow-runner/flow-core/index.ts
       deployFiles:
         - .                            # self-deploy → whole monorepo, so the source is mountable
-      addToRunPrepare:
-        - runner/flow-runner
       cache: true
     run:
-      base: docker@26.1.5
-      # Same prepare-phase image bake as runnerprod — see the comment there for why this cannot
-      # live in initCommands. The dev half needs it too: without the image, flow-mode jobs fail.
-      prepareCommands:
-        - sh -c "timeout 180 sh -c 'until docker ps >/dev/null 2>&1; do sleep 2; done' || { echo 'dockerd unreachable in prepare phase'; exit 1; }; docker build -t noola-flow-runner:v1 /home/zerops/runner/flow-runner"
+      base: go@1.22
       envVariables:
         NATS_HOST: broker
         NATS_PORT: ${broker_port}
         NATS_USER: ${broker_user}
         NATS_PASS: ${broker_password}
         RUNNER_GLOBAL_MAX: "3"
-        RUNNER_IMAGE: alpine:3.20
+        BOX_API_URL: http://box:8080
+        BOX_API_KEY: ${box_ZBOX_WORKSPACE_API_KEY}
         DB_HOST: db
         DB_PORT: ${db_port}
         DB_NAME: ${db_dbName}
@@ -466,61 +468,41 @@ zerops:
         - cd runner && go mod tidy
         - cd runner && go build -o runnerd .
         # Vendor the shared DB-free item-node core into the flow-runner build context so the
-        # image's esbuild inlines @repo/flow-core (real source: api/packages/flow-core).
+        # flow base's esbuild inlines @repo/flow-core (real source: api/packages/flow-core).
         - mkdir -p runner/flow-runner/flow-core && cp api/packages/flow-core/src/index.ts runner/flow-runner/flow-core/index.ts
       deployFiles:
         - runner/runnerd
-        - runner/flow-runner
-      addToRunPrepare:
-        - runner/flow-runner
+        - runner/flow-runner             # the flow base's build context; the worker packs it for Box
       cache: true
     run:
-      base: docker@26.1.5
-      # Bake the flow image into the RUNTIME IMAGE, not into each container. prepareCommands run
-      # once when the runtime image is built, so every container this service ever starts —
-      # including a scale-out replica — boots with the image already in its docker storage.
-      # Building it in initCommands instead cost a full chromium+ffmpeg build (~10 min) on every
-      # new container, which is exactly the horizontal-scaling problem.
-      #
-      # The build context comes from build.addToRunPrepare, which is the only way to get build
-      # output into the prepare phase (deploy files are NOT at /var/www/ yet). It lands under
-      # /home/zerops/ with its path preserved — /home/zerops/runner/flow-runner.
-      #
-      # Staleness is handled by the platform: prepareCommands are cached in the runtime base layer,
-      # and that layer is invalidated when the addToRunPrepare payload changes — so editing
-      # flow-runner/ (exec.mts, Dockerfile, package.json) rebuilds the image on the next deploy,
-      # while an unrelated deploy re-uses the cached layer and costs nothing.
-      #
-      # The daemon wait is bounded: if dockerd is not up in the prepare phase the deploy fails
-      # fast and loudly rather than hanging the pipeline on an unbounded `until` loop.
-      prepareCommands:
-        - sh -c "timeout 180 sh -c 'until docker ps >/dev/null 2>&1; do sleep 2; done' || { echo 'dockerd unreachable in prepare phase'; exit 1; }; docker build -t noola-flow-runner:v1 /home/zerops/runner/flow-runner"
+      base: go@1.22
       envVariables:
         NATS_HOST: broker
         NATS_PORT: ${broker_port}
         NATS_USER: ${broker_user}
         NATS_PASS: ${broker_password}
+        # Jobs in flight per container, each its own sandbox. A Box as imported holds about six
+        # default (512 MiB) sandboxes; a flow sandbox takes 1 GiB. A full Box requeues the job.
         RUNNER_GLOBAL_MAX: "3"
-        RUNNER_IMAGE: alpine:3.20
+        # The Box workspace API. The key is the whole authority over the workspace: referenced,
+        # never copied, and never handed to a sandbox.
+        BOX_API_URL: http://box:8080
+        BOX_API_KEY: ${box_ZBOX_WORKSPACE_API_KEY}
         # DB super creds (BYPASSRLS) — the worker records run lifecycle to runner_runs
         # (any tenant's row), best-effort. Internal plain-TCP; the worker sets sslmode=disable.
+        # Only the worker holds them: a flow's progress comes back from its sandbox as events.
         DB_HOST: db
         DB_PORT: ${db_port}
         DB_NAME: ${db_dbName}
         DB_USER: ${db_superUser}
         DB_PASS: ${db_superUserPassword}
-        # Object storage — the flow container uploads run replays (runs/<tenant>/<id>.webm).
+        # Object storage — the worker presigns one PUT URL per flow run for its replay
+        # (runs/<tenant>/<id>.webm); the sandbox gets that URL, never these keys.
         STORAGE_ENDPOINT: ${storage_apiUrl}
         STORAGE_ACCESS_KEY: ${storage_accessKeyId}
         STORAGE_SECRET_KEY: ${storage_secretAccessKey}
         STORAGE_BUCKET: ${storage_bucketName}
         STORAGE_REGION: us-east-1
-      # The flow image is built in run.prepareCommands above (baked into the runtime image), so no
-      # build happens here — container start must stay fast for scale-out. This only reports whether
-      # the baked image is present, so a regression in the prepare step is obvious in the logs
-      # instead of silently costing every new container a 10-minute rebuild.
-      initCommands:
-        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker image inspect noola-flow-runner:v1 >/dev/null 2>&1 && echo 'flow image present (baked in runtime image)' || echo 'WARNING flow image MISSING — run.prepareCommands did not bake it'"
       start: runner/runnerd
 
   # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══
@@ -778,4 +760,53 @@ zerops:
         - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
         - mkdir -p /var/www && cp -a /home/zerops/site /var/www/
         - cd /var/www/site && npm install --no-package-lock
+      start: zcp-devsup run
+
+  - setup: runnerpool
+    build:
+      base: go@1.22
+      os: ubuntu
+      buildCommands:
+        - echo "runnerpool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - runner/go.mod
+        - runner/go.sum
+    run:
+      base: go@1.22
+      os: ubuntu
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        # The modules (and the Go toolchain go.mod asks for) bake into the module cache under
+        # $HOME, which survives every reset; the runner has no other dependencies to install.
+        - cd /home/zerops/runner && go mod download
+      envVariables:
+        CGO_ENABLED: "0"
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        # One job at a time: a lease's runner shares the broker's `runner` consumer with the
+        # runner's preview, so it takes jobs too while its dev server runs.
+        RUNNER_GLOBAL_MAX: "1"
+        BOX_API_URL: http://box:8080
+        BOX_API_KEY: ${box_ZBOX_WORKSPACE_API_KEY}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_USER: ${db_superUser}
+        DB_PASS: ${db_superUserPassword}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
       start: zcp-devsup run
