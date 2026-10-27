@@ -43,6 +43,7 @@ import trackingRoutes from "./routes/tracking.js";
 import automationRoutes from "./routes/automation.js";
 import scimRoutes from "./routes/scim.js";
 import uploadsRoutes from "./routes/uploads.js";
+import preferencesRoutes from "./routes/preferences.js";
 
 // The Bearer-token session resolved on every request (see the onRequest hook below).
 // Declared here so req.session is strongly typed everywhere instead of cast ad-hoc.
@@ -435,6 +436,7 @@ await app.register(trackingRoutes);
 await app.register(automationRoutes);
 await app.register(scimRoutes);
 await app.register(uploadsRoutes);
+await app.register(preferencesRoutes);
 
 // ---- Boot ----------------------------------------------------------------
 const port = Number(process.env.PORT ?? 3000);

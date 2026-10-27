@@ -14,6 +14,7 @@ import type { MirrorTransport } from "../src/discord-gateway.js";
 import { ingestInbound } from "../src/ingest.js";
 import { persistBufferAttachments } from "../src/attachments.js";
 import { splitForDiscord } from "../src/channels/format.js";
+import { handleMessageEmbeds } from "../src/discord.js";
 
 // Discord forum ops-mirror gate (PILOT-AND-DISCORD-PLAN D1-D4): binding filter → forum post,
 // manual push, timeline relay into the post, note-by-default responder messages, 📤 promote-to-
@@ -352,6 +353,26 @@ async function main() {
   const dcReply = await relayPool.query("SELECT payload->>'body' AS body FROM discord_relay_outbox WHERE kind = 'reply' AND ticket_id = $1", [dcTicket.ticketId]);
   check("a promote to a Discord customer keeps the emoji token", dcReply.rows[0]?.body === emojiText, dcReply.rows[0]?.body);
   await relayPool.query("DELETE FROM discord_relay_outbox WHERE ticket_id = $1", [dcTicket.ticketId]);
+
+  // A preview that arrives after a message was promoted lands on the reply, which replaced the note.
+  await handleMessageEmbeds(GUILD, "mirtest-dm-1", [
+    { url: "https://example.invalid/b.mp4", filename: "gif.mp4", contentType: "video/mp4", size: 0, embedUrl: "https://tenor.com/view/mirtest-promoted" },
+  ]);
+  const promotedRow = await relayPool.query("SELECT promoted_message_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-1'");
+  const promotedAtt = await withTenant(A, (c) => c.query("SELECT embed_url FROM message_attachments WHERE message_id = $1 AND embed_url IS NOT NULL", [promotedRow.rows[0]?.promoted_message_id]));
+  check("a preview of a promoted message lands on the reply", promotedAtt.rows[0]?.embed_url === "https://tenor.com/view/mirtest-promoted", promotedAtt.rows);
+
+  // A GIF that Discord adds to a mirror-thread message later lands on its note.
+  await handleMirrorPostMessage({
+    guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-gif",
+    authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: "https://tenor.com/view/mirtest-gif", roleIds: [ROLE], isBotOrWebhook: false,
+  });
+  await handleMessageEmbeds(GUILD, "mirtest-dm-gif", [
+    { url: "https://example.invalid/a.mp4", filename: "gif.mp4", contentType: "video/mp4", size: 0, embedUrl: "https://tenor.com/view/mirtest-gif" },
+  ]);
+  const gifNote = await relayPool.query("SELECT note_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-gif'");
+  const gifAtt = await withTenant(A, (c) => c.query("SELECT embed_url FROM message_attachments WHERE note_id = $1", [gifNote.rows[0]?.note_id]));
+  check("a GIF added to a mirror message later lands on its note", gifAtt.rows[0]?.embed_url === "https://tenor.com/view/mirtest-gif", gifAtt.rows);
 
   // An e-mail ticket's post says which support address it was sent to.
   calls.length = 0;

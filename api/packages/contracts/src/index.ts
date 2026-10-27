@@ -1660,3 +1660,11 @@ export function stripReservedAttributes(attrs: Record<string, unknown>): Record<
   }
   return out;
 }
+
+/** One member's own settings. A missing key falls back to its default, so a new setting needs no migration. */
+export const UserPreferences = z.object({
+  /** Show a GIF or image that a message links to, instead of only the link. */
+  linkPreviews: z.boolean().default(true),
+});
+export type UserPreferences = z.infer<typeof UserPreferences>;
+export const UserPreferencesPatch = UserPreferences.partial().strict();

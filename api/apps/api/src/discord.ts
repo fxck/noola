@@ -1,6 +1,6 @@
 import { relayPool, withTenant } from "@repo/db";
 import { ingestInbound, type IngestResult } from "./ingest.js";
-import { persistInboundAttachments } from "./attachments.js";
+import { persistInboundAttachments, persistInboundNoteAttachments } from "./attachments.js";
 import { getDiscordSender, getMirrorTransport, rateLimitWaitMs } from "./discord-gateway.js";
 import { classifyDiscordAuthor } from "./discord-classify.js";
 import { discordTokensToText, normalizeBlockquotes, plainThreadName } from "./channels/format.js";
@@ -31,6 +31,8 @@ export interface DiscordAttachment {
   filename: string;
   contentType: string;
   size: number;
+  /** Set on the media of a link preview, e.g. a GIF: the page it previews. */
+  embedUrl?: string | null;
 }
 
 /**
@@ -488,6 +490,28 @@ export async function handleMessageUpdate(u: MessageUpdateInput): Promise<boolea
     );
     return (r.rowCount ?? 0) > 0;
   });
+}
+
+/** Link-preview media that Discord added after the message was sent, stored on its message or mirror note. */
+export async function handleMessageEmbeds(guildId: string, messageId: string, media: DiscordAttachment[]): Promise<void> {
+  if (!media.length) return;
+  const mirrored = await relayPool.query<{ tenant_id: string; ticket_id: string; note_id: string | null; promoted_message_id: string | null }>(
+    "SELECT tenant_id, ticket_id, note_id, promoted_message_id FROM ticket_mirror_messages WHERE discord_message_id = $1",
+    [messageId],
+  );
+  if (mirrored.rowCount) {
+    const m = mirrored.rows[0];
+    // A promoted message's note was replaced by the reply, so its preview belongs on the reply.
+    if (m.promoted_message_id) await persistInboundAttachments(m.tenant_id, m.ticket_id, m.promoted_message_id, media);
+    else if (m.note_id) await persistInboundNoteAttachments(m.tenant_id, m.ticket_id, m.note_id, media);
+    return;
+  }
+  const tenantId = await resolveTenant(guildId);
+  if (!tenantId) return;
+  const msg = await withTenant(tenantId, (c) =>
+    c.query<{ id: string; ticket_id: string }>("SELECT id, ticket_id FROM messages WHERE idempotency_key = $1", [`discord:${messageId}`]),
+  );
+  if (msg.rowCount) await persistInboundAttachments(tenantId, msg.rows[0].ticket_id, msg.rows[0].id, media);
 }
 
 export interface MessageDeleteInput {

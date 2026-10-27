@@ -1,5 +1,6 @@
-import { ChannelType, type Client } from "discord.js";
-import { buildMirrorTransport, type MirrorFile } from "../src/discord-gateway.js";
+import { ChannelType, EmbedType, type Client, type Embed } from "discord.js";
+import { buildMirrorTransport, embedMedia, inMessageOrder, type MirrorFile } from "../src/discord-gateway.js";
+import { readCapped } from "../src/attachments.js";
 
 // The mirror transport against a fake discord.js client. Discord refuses an upload over the server's
 // limit with code 40005 (HTTP 413) and creates nothing, which the fake mirrors for files over LIMIT.
@@ -75,6 +76,41 @@ async function main() {
   const post = await tp.createForumPost("forum", "TRANSPORT title", "TRANSPORT header", [], [big("video.mp4"), small("message.txt", true)]);
   check("a refused forum post is created with only the kept file", !!post && created.length === 1 && names(created[0].message).join() === "message.txt", created.map((c) => names(c.message)));
   check("and notes the dropped file", created[0]?.message.content?.includes("1 attachment was too large") === true, created[0]?.message.content);
+
+  // GIF and image previews become files to copy, other previews don't.
+  const embed = (o: Record<string, unknown>) => o as unknown as Embed;
+  const media = embedMedia([
+    embed({ url: "https://tenor.com/view/x", data: { type: EmbedType.GIFV }, video: { url: "https://media.tenor.com/x.mp4", proxyURL: "https://images-ext-1.discordapp.net/x.mp4" } }),
+    embed({ url: "https://i.example/y.png", data: { type: EmbedType.Image }, thumbnail: { url: "https://i.example/y.png", proxyURL: "https://images-ext-2.discordapp.net/y.png" }, image: null }),
+    embed({ url: "https://youtube.com/watch?v=z", data: { type: EmbedType.Video }, video: { url: "https://youtube.com/embed/z" } }),
+    embed({ url: "https://blog.example/post", data: { type: EmbedType.Article }, thumbnail: { url: "https://blog.example/t.png" } }),
+  ]);
+  check("a GIF preview is copied from Discord's proxy as an mp4", media[0]?.url === "https://images-ext-1.discordapp.net/x.mp4" && media[0]?.contentType === "video/mp4" && media[0]?.embedUrl === "https://tenor.com/view/x", media[0]);
+  check("an image preview is copied from Discord's proxy", media[1]?.url === "https://images-ext-2.discordapp.net/y.png" && media[1]?.embedUrl === "https://i.example/y.png", media[1]);
+  check("video and page previews are not copied", media.length === 2, media.length);
+
+  // An update for a message waits for the message's own handling, also when that fails.
+  const order: string[] = [];
+  let release!: () => void;
+  const firstEvent = inMessageOrder("m1", async () => {
+    await new Promise<void>((r) => (release = r));
+    order.push("create");
+    throw new Error("ingest failed");
+  });
+  const secondEvent = inMessageOrder("m1", async () => { order.push("update"); });
+  const other = inMessageOrder("m2", async () => { order.push("other message"); });
+  await other;
+  release();
+  await firstEvent.catch(() => {});
+  await secondEvent;
+  check("events for one message run in order, other messages don't wait", order.join() === "other message,create,update", order);
+
+  // The copy cap holds when the response has no Content-Length.
+  const stream = (bytes: number) => new Response(new ReadableStream({
+    start(c) { for (let i = 0; i < bytes; i += 1000) c.enqueue(new Uint8Array(Math.min(1000, bytes - i))); c.close(); },
+  }));
+  check("a body within the cap is read", (await readCapped(stream(5000), 6000)).byteLength === 5000);
+  check("a body over the cap is refused", await readCapped(stream(7000), 6000).then(() => false, () => true));
 
   console.log(failures ? `\n${failures} FAILURES` : "\nDISCORD-TRANSPORT: all checks green");
   process.exit(failures ? 1 : 0);
