@@ -29,6 +29,8 @@ function parserChecks() {
   check("no_reply alone", none.kind === "ok" && none.noReply && none.reply === "" && none.note === null, none);
   const noneNote = ok("<no_reply />\n<internal>They confirmed the fix.</internal>");
   check("no_reply with a note", noneNote.kind === "ok" && noneNote.noReply && noneNote.note === "They confirmed the fix.", noneNote);
+  const noteFirst = ok("<internal>The customer was rude, no action needed.</internal><no_reply/>");
+  check("a note before no_reply sends nothing and keeps the note", noteFirst.kind === "ok" && noteFirst.noReply && noteFirst.reply === "" && noteFirst.note === "The customer was rude, no action needed.", noteFirst);
   for (const [name, text] of [
     ["two notes", "Hi.<internal>a</internal><internal>b</internal>"],
     ["an empty note", "Hi.<internal> </internal>"],
@@ -106,6 +108,8 @@ async function main() {
     const noted = await turn("<internal>The docs don't cover this. Someone from the team should answer.</internal>");
     check("a note alone: nothing is sent and the turn stays with us", noted.res?.reason === "note_only" && noted.replies.length === 0 && noted.ticket.whose_turn === "us", noted);
     check("a note alone: the note is posted", noted.notes.length === 1);
+    const paused = await superPool.query("SELECT assistant_enabled FROM tickets WHERE id = $1", [noted.m.ticketId]);
+    check("a note alone pauses the AI on the conversation", paused.rows[0].assistant_enabled === false, paused.rows[0]);
 
     const broken = await turn("Sure, here you go <internal>secret plan");
     check("a malformed draft is held for review", broken.res?.reason === "malformed_output" && broken.replies.length === 0, broken.res);

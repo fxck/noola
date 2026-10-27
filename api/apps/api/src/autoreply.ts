@@ -548,6 +548,8 @@ async function evaluateForMessage(
       messageId, ticketId, outcome: decisionOutcome, reason,
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
     });
+    // A note alone asks a teammate to answer, so the AI is paused on the conversation until it is switched back on.
+    if (id && !outcome.noReply && channelMode === "auto") await muteAssistantForHandoff(tenantId, ticketId);
     return id ? { outcome: decisionOutcome, reason, decisionId: id } : null;
   }
   const replyText = outcome.reply;

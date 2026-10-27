@@ -43,12 +43,20 @@ export function parseDraftOutcome(text: string): DraftOutcome {
 }
 
 /** The instruction a hosted model gets alongside the reply rules when it may use the tags above. */
-export const DRAFT_OUTCOMES_SYSTEM =
-  "You may also leave a note for the support team that the customer never sees. Put it in one " +
-  "<internal>...</internal> block, either alone or after your reply. Use it for what the team should know or do, " +
-  "for example that the customer reports a bug or that you could not find the answer. " +
-  "If the customer's latest message needs no answer at all, for example a plain thank-you or a confirmation " +
-  "that closes the topic, write <no_reply/> instead of a reply, optionally with an internal note. " +
-  "If you cannot answer, still write the reply the rules above ask for, and add the note after it. " +
-  "Leave only a note when you want a teammate to answer instead of you. " +
-  "Never use these tags in any other way, and never mention them to the customer.";
+export const DRAFT_OUTCOMES_SYSTEM = [
+  "Besides replying, you can leave a note for the support team, which the customer never sees, " +
+    "and you can decide that a message needs no reply.",
+  "Your answer must take exactly one of these five forms:",
+  "1. A reply to the customer.",
+  "2. A reply, then <internal>a note for the team</internal>. Use this when you can answer but the team should know something, " +
+    "for example that the customer reports a bug.",
+  "3. <no_reply/> on its own, when the customer's latest message needs no answer at all, for example a plain thank-you or a goodbye.",
+  "4. <no_reply/> followed by <internal>a note for the team</internal>, when the message needs no answer " +
+    "but the team should know something about it. The customer gets nothing and the team gets the note.",
+  "5. <internal>a note for the team</internal> on its own, when a teammate should answer instead of you. " +
+    "The customer gets no reply from you and a teammate takes over.",
+  "If you cannot answer the question, use form 1 or 2 with the reply the rules above ask for, not form 5.",
+  "Everything outside the tags is sent to the customer exactly as you write it, so never add remarks about your own reply, " +
+    "for example that you are not replying. To send the customer nothing, use form 3 or 4.",
+  "Use each tag at most once, never use them in any other way, and never mention them to the customer.",
+].join("\n");
