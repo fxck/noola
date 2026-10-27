@@ -15,7 +15,7 @@ import { ingestInbound } from "../src/ingest.js";
 import { persistBufferAttachments } from "../src/attachments.js";
 import { splitForDiscord } from "../src/channels/format.js";
 import { handleMessageEmbeds } from "../src/discord.js";
-import { getSendDelay, sendScheduledReplyNow, setSendDelay } from "../src/scheduled-replies.js";
+import { drainScheduledReplies, getSendDelay, sendScheduledReplyNow, setSendDelay } from "../src/scheduled-replies.js";
 
 // Discord forum ops-mirror gate (PILOT-AND-DISCORD-PLAN D1-D4): binding filter → forum post,
 // manual push, timeline relay into the post, note-by-default responder messages, 📤 promote-to-
@@ -386,6 +386,27 @@ async function main() {
     const sentLedger = await relayPool.query("SELECT promoted_message_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-delay'");
     check("send now sends a held 📤 as the reply", !!now?.messageId && sentLedger.rows[0]?.promoted_message_id === now?.messageId && (await delayedReplies()) === 1, now);
     check("a sent 📤 gets ✅ and loses ⏳", reactions("react", "✅") === 1 && reactions("unreact", "⏳") >= 1);
+
+    // A promote whose sender died after recording the reply is finished by the stuck-row check.
+    await handleMirrorPostMessage({
+      guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-recover",
+      authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: "MIRTEST recovered answer", roleIds: [ROLE], isBotOrWebhook: false,
+    });
+    await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-recover", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+    const crashed = await ingestInbound({
+      tenantId: A, ticketId: t1, body: "MIRTEST recovered answer", authorType: "agent", idempotencyKey: "discord-mirror-promote:mirtest-dm-recover",
+    });
+    await relayPool.query(
+      "UPDATE scheduled_replies SET status = 'sending', updated_at = now() - interval '1 hour' WHERE discord_message_id = 'mirtest-dm-recover'",
+    );
+    await drainScheduledReplies({ warn: () => {} });
+    await drainDiscordRelay();
+    const recovered = await relayPool.query("SELECT promoted_message_id, note_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-recover'");
+    const recoveredNote = await withTenant(A, (c) => c.query("SELECT 1 FROM ticket_notes WHERE id = $1", [recovered.rows[0]?.note_id]));
+    check("a recovered promote links its reply and drops the note", recovered.rows[0]?.promoted_message_id === crashed.messageId && recoveredNote.rowCount === 0, recovered.rows);
+    check("a recovered promote gets ✅ and loses ⏳",
+      calls.some((c) => c.fn === "react" && c.args[1] === "mirtest-dm-recover" && c.args[2] === "✅")
+      && calls.some((c) => c.fn === "unreact" && c.args[1] === "mirtest-dm-recover" && c.args[2] === "⏳"));
   } finally {
     await setSendDelay(A, delayBefore);
   }

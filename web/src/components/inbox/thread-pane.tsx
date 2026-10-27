@@ -215,7 +215,7 @@ export function ThreadPane({
     try {
       const out = await cancelScheduledReply(r.id);
       // A promoted Discord message was written in Discord, so only a composer reply goes back to the composer.
-      if (out.source === "composer" && !composerRef.current?.restoreDraft(ticketId, out.body)) {
+      if (out.source === "composer" && !composerRef.current?.restoreDraft(ticketId, out)) {
         const copied = await navigator.clipboard.writeText(out.body).then(() => true, () => false);
         toast.success(copied ? "Reply cancelled. Its text is copied to the clipboard." : "Reply cancelled.");
       }

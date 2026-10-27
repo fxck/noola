@@ -24,6 +24,8 @@ export interface ScheduledReplyRow {
   send_at: Date;
   status: "scheduled" | "sending" | "sent" | "cancelled" | "failed";
   attempts: number;
+  assistant_muted_at: Date | null;
+  created_at: Date;
 }
 
 /** How a source other than the composer sends and cancels its rows, e.g. the Discord mirror's 📤 promote. */
@@ -31,6 +33,8 @@ export interface ScheduledSource {
   deliver(row: ScheduledReplyRow): Promise<{ messageId: string | null; replay?: boolean }>;
   /** Undoes what the source holds for a row that won't be sent, because it was cancelled or failed for good. */
   release?(row: ScheduledReplyRow): Promise<void>;
+  /** Finishes a row whose message turned out to be recorded after its sender died. */
+  recovered?(row: ScheduledReplyRow, messageId: string): Promise<void>;
 }
 const testSources = new Map<string, ScheduledSource>();
 export function setScheduledSourceForTests(source: ScheduledReplyRow["source"], handler: ScheduledSource | null): void {
@@ -86,20 +90,23 @@ export interface ScheduleInput {
 /**
  * Holds a reply for `delaySeconds`. The assistant is muted at once, as a sent reply would mute it,
  * so it doesn't answer the customer while the reply waits.
+ * A reply that is cancelled or fails switches it back on (see `unmuteIfUnsent`).
  */
 export async function scheduleReply(tenantId: string, input: ScheduleInput, delaySeconds: number): Promise<{ id: string; sendAt: string }> {
   return withTenant(tenantId, async (c) => {
-    await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [input.ticketId]);
+    const muted = await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [input.ticketId]);
     const r = await c.query<{ id: string; send_at: Date }>(
       `INSERT INTO scheduled_replies
-         (tenant_id, ticket_id, author_id, author_name, author_email, body, request, source, discord_message_id, client_message_id, send_at)
-       VALUES (current_tenant(), $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, now() + make_interval(secs => $10))
+         (tenant_id, ticket_id, author_id, author_name, author_email, body, request, source, discord_message_id, client_message_id, send_at,
+          assistant_muted_at)
+       VALUES (current_tenant(), $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, now() + make_interval(secs => $10),
+               CASE WHEN $11::boolean THEN now() END)
        ON CONFLICT (tenant_id, client_message_id) WHERE client_message_id IS NOT NULL DO NOTHING
        RETURNING id, send_at`,
       [
         input.ticketId, input.author.userId, input.author.name, input.author.email, input.body,
         JSON.stringify(input.request ?? {}), input.source ?? "composer", input.discordMessageId ?? null,
-        input.clientMessageId ?? null, delaySeconds,
+        input.clientMessageId ?? null, delaySeconds, (muted.rowCount ?? 0) > 0,
       ],
     );
     if (!r.rowCount) {
@@ -144,8 +151,10 @@ export async function cancelScheduledReply(tenantId: string, id: string): Promis
       "UPDATE scheduled_replies SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'scheduled' RETURNING *",
       [id],
     );
-    if (r.rowCount) await emitScheduledUpdate(c, tenantId, r.rows[0].ticket_id, id, "cancelled");
-    return r.rows[0] ?? null;
+    if (!r.rowCount) return null;
+    await unmuteIfUnsent(c, r.rows[0]);
+    await emitScheduledUpdate(c, tenantId, r.rows[0].ticket_id, id, "cancelled");
+    return r.rows[0];
   });
   if (row) await (await sourceFor(row.source))?.release?.(row).catch(() => {});
   return row;
@@ -200,14 +209,18 @@ async function deliverClaimed(row: ScheduledReplyRow, log: Log): Promise<{ messa
     const failed = row.attempts >= MAX_ATTEMPTS;
     log.warn({ err, scheduledReplyId: row.id, attempt: row.attempts }, failed ? "scheduled reply failed for good" : "scheduled reply failed, retrying");
     const updated = await withTenant(row.tenant_id, async (c) => {
-      const u = await c.query(
+      const u = await c.query<ScheduledReplyRow>(
         `UPDATE scheduled_replies
             SET status = $2, last_error = $3, send_at = now() + make_interval(secs => $4), updated_at = now()
-          WHERE id = $1 AND status = 'sending' AND attempts = $5`,
+          WHERE id = $1 AND status = 'sending' AND attempts = $5
+          RETURNING *`,
         [row.id, failed ? "failed" : "scheduled", String((err as Error)?.message ?? err).slice(0, 500), 30 * row.attempts, row.attempts],
       );
-      if (u.rowCount) await emitScheduledUpdate(c, row.tenant_id, row.ticket_id, row.id, failed ? "failed" : "scheduled");
-      return (u.rowCount ?? 0) > 0;
+      if (!u.rowCount) return false;
+      // The fresh row, since a cancelled sibling may have handed this one the mute while it was sending.
+      if (failed) await unmuteIfUnsent(c, u.rows[0]);
+      await emitScheduledUpdate(c, row.tenant_id, row.ticket_id, row.id, failed ? "failed" : "scheduled");
+      return true;
     }).catch(() => false);
     // The pending reply leaves the thread, so a note keeps its text and says it was not sent.
     if (failed && updated) {
@@ -222,6 +235,66 @@ async function deliverClaimed(row: ScheduledReplyRow, log: Log): Promise<{ messa
   }
 }
 
+/**
+ * Switches the assistant back on when this reply switched it off and no agent has replied since.
+ * While another reply still waits, that reply takes over the job, so the last one that is never sent switches it on.
+ */
+async function unmuteIfUnsent(c: pg.PoolClient, row: ScheduledReplyRow): Promise<void> {
+  if (!row.assistant_muted_at) return;
+  // The status is checked again outside the subquery, so a sibling that is cancelled at the same moment can't receive it.
+  // The later of the two times wins, because a mute after a manual re-enable is the newer decision.
+  const handedOver = await c.query(
+    `UPDATE scheduled_replies SET assistant_muted_at = GREATEST(assistant_muted_at, $3)
+      WHERE id = (SELECT id FROM scheduled_replies
+                   WHERE ticket_id = $1 AND id <> $2 AND status IN ('scheduled', 'sending')
+                   ORDER BY created_at LIMIT 1
+                   FOR UPDATE SKIP LOCKED)
+        AND status IN ('scheduled', 'sending')`,
+    [row.ticket_id, row.id, row.assistant_muted_at],
+  );
+  if (handedOver.rowCount) return;
+  await c.query(
+    `UPDATE tickets SET assistant_enabled = true
+      WHERE id = $1 AND NOT assistant_enabled
+        AND NOT EXISTS (SELECT 1 FROM messages WHERE ticket_id = $1 AND author_type = 'agent' AND created_at > $2)`,
+    [row.ticket_id, row.assistant_muted_at],
+  );
+}
+
+/**
+ * Settles rows left in 'sending' by a process that died. A row whose message is recorded was sent, possibly to the
+ * customer too, so it is marked sent and must not be cancelled or sent again. Any other row waits for another attempt.
+ */
+async function settleStuckRows(log: Log): Promise<void> {
+  const settled = await relayPool.query<ScheduledReplyRow & { found_message_id: string | null }>(
+    `WITH stuck AS (
+       SELECT s.tenant_id, s.id,
+              (SELECT m.id FROM messages m
+                WHERE m.tenant_id = s.tenant_id
+                  AND m.idempotency_key = CASE WHEN s.source = 'discord_promote'
+                                               THEN 'discord-mirror-promote:' || s.discord_message_id
+                                               ELSE 'scheduled:' || s.id END) AS found_message_id
+         FROM scheduled_replies s
+        WHERE s.status = 'sending' AND s.updated_at < now() - make_interval(secs => $1)
+        FOR UPDATE SKIP LOCKED)
+     UPDATE scheduled_replies s
+        SET status = CASE WHEN stuck.found_message_id IS NULL THEN 'scheduled' ELSE 'sent' END,
+            message_id = stuck.found_message_id,
+            updated_at = now()
+       FROM stuck
+      WHERE s.tenant_id = stuck.tenant_id AND s.id = stuck.id
+     RETURNING s.*, stuck.found_message_id`,
+    [STUCK_SENDING_MS / 1000],
+  );
+  for (const row of settled.rows) {
+    if (row.found_message_id) {
+      await (await sourceFor(row.source))?.recovered?.(row, row.found_message_id)
+        .catch((err) => log.warn({ err, scheduledReplyId: row.id }, "recovered scheduled reply not finished"));
+    }
+    await withTenant(row.tenant_id, (c) => emitScheduledUpdate(c, row.tenant_id, row.ticket_id, row.id, row.status)).catch(() => {});
+  }
+}
+
 let draining = false;
 
 /** Sends due replies of every tenant. Each api process runs it, and a row is claimed by one of them. */
@@ -229,20 +302,7 @@ export async function drainScheduledReplies(log: Log): Promise<void> {
   if (draining) return;
   draining = true;
   try {
-    // A stuck row whose message is recorded was sent, possibly to the customer too, so it must not be cancelled or sent again.
-    await relayPool.query(
-      `UPDATE scheduled_replies s
-          SET status = CASE WHEN EXISTS (
-                SELECT 1 FROM messages m
-                 WHERE m.tenant_id = s.tenant_id
-                   AND m.idempotency_key = CASE WHEN s.source = 'discord_promote'
-                                                THEN 'discord-mirror-promote:' || s.discord_message_id
-                                                ELSE 'scheduled:' || s.id END)
-              THEN 'sent' ELSE 'scheduled' END,
-              updated_at = now()
-        WHERE status = 'sending' AND updated_at < now() - make_interval(secs => $1)`,
-      [STUCK_SENDING_MS / 1000],
-    );
+    await settleStuckRows(log);
     const claimed = await relayPool.query<ScheduledReplyRow>(
       `UPDATE scheduled_replies s SET status = 'sending', attempts = s.attempts + 1, updated_at = now()
         WHERE (s.tenant_id, s.id) IN (

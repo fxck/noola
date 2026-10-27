@@ -32,6 +32,19 @@ export interface AttachmentServe {
   content_type: string;
 }
 
+/** The given uploads that are still waiting for a reply, e.g. the files of a cancelled scheduled reply. */
+export async function pendingAttachments(tenantId: string, ticketId: string, ids: string[]): Promise<AttachmentRow[]> {
+  if (ids.length === 0) return [];
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, filename, content_type, size_bytes, embed_url FROM message_attachments
+        WHERE id = ANY($2::uuid[]) AND ticket_id = $1 AND message_id IS NULL AND note_id IS NULL`,
+      [ticketId, ids],
+    );
+    return r.rows as AttachmentRow[];
+  });
+}
+
 /** Record a freshly-uploaded (pending) attachment against a ticket. Returns the public metadata. */
 export async function createAttachment(
   tenantId: string,
