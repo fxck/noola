@@ -10,7 +10,7 @@
 // discord-mirror imports enqueueRelay from this module).
 import { relayPool } from "@repo/db";
 
-export type RelayKind = "message" | "note" | "react" | "reply";
+export type RelayKind = "message" | "note" | "react" | "reply" | "note_edit" | "note_delete";
 
 export interface RelayRow {
   id: string;
@@ -234,6 +234,48 @@ export async function requeueRepliesRefusedByOlderCode(opts: { now?: boolean } =
     .catch(() => {});
 }
 
+// A reply that reached Discord stays 'pending' in the inbox if writing its status failed, so finished rows are copied over.
+const RECONCILE_EVERY_MS = 60_000;
+let lastReconcileAt = 0;
+
+export async function reconcileReplyStatuses(opts: { now?: boolean } = {}): Promise<void> {
+  if (!opts.now && Date.now() - lastReconcileAt < RECONCILE_EVERY_MS) return;
+  lastReconcileAt = Date.now();
+  const r = await relayPool
+    .query<{ tenant_id: string; ticket_id: string; payload: Record<string, unknown>; status: string }>(
+      `SELECT o.tenant_id, o.ticket_id, o.payload, o.status
+         FROM discord_relay_outbox o
+         JOIN messages m ON m.id = CASE WHEN o.payload->>'messageId' ~ '^[0-9a-f-]{36}$' THEN (o.payload->>'messageId')::uuid END
+        WHERE o.kind = 'reply' AND o.status IN ('delivered', 'failed')
+          AND o.updated_at > now() - interval '1 day'
+          AND m.delivery_status = 'pending'
+        LIMIT 100`,
+    )
+    .catch(() => null);
+  if (!r?.rowCount) return;
+  const { markReplyDelivery } = await import("./discord.js");
+  for (const row of r.rows) await markReplyDelivery(row, row.status === "delivered" ? "sent" : "failed").catch(() => {});
+}
+
+// Finished rows stay this long, so a dead-lettered relay can still be looked into.
+const PURGE_AFTER_DAYS = 30;
+const PURGE_EVERY_MS = 60 * 60_000;
+let lastPurgeAt = 0;
+
+export async function purgeFinishedRelays(opts: { now?: boolean } = {}): Promise<void> {
+  if (!opts.now && Date.now() - lastPurgeAt < PURGE_EVERY_MS) return;
+  lastPurgeAt = Date.now();
+  await relayPool
+    .query(
+      `DELETE FROM discord_relay_outbox WHERE id IN (
+         SELECT id FROM discord_relay_outbox
+          WHERE status IN ('delivered', 'failed') AND updated_at < now() - make_interval(days => $1)
+          LIMIT 5000)`,
+      [PURGE_AFTER_DAYS],
+    )
+    .catch(() => {});
+}
+
 let draining = false;
 
 /**
@@ -247,6 +289,8 @@ export async function drainDiscordRelay(): Promise<void> {
   draining = true;
   try {
     await requeueRepliesRefusedByOlderCode();
+    await reconcileReplyStatuses();
+    await purgeFinishedRelays();
     // Lease the batch in one short transaction: push next_attempt_at forward + bump attempts so a
     // concurrent drainer (or a re-tick) skips these while we do the slow Discord I/O unlocked.
     const claimed = await relayPool.query(

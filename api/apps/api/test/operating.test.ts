@@ -8,7 +8,7 @@ import { listTickets, assignTicket, setTicketStatus, listUsers, type View } from
 
 const A = "33333333-3333-3333-3333-333333333333"; // TestCo (dedicated test tenant)
 const B = "22222222-2222-2222-2222-222222222222"; // Globex
-const ACME_U1 = "c0000000-0000-0000-0000-000000000001"; // Aleš
+const TESTCO_U1 = "c0000000-0000-0000-0000-000000000001"; // Tess
 const GLOBEX_U = "b0000000-0000-0000-0000-000000000001"; // Mia
 
 let failures = 0;
@@ -59,8 +59,8 @@ async function main() {
   check("agent reply flips whose_turn to 'customer'", (await whoseTurn(v3)) === "customer");
 
   // 2 — assignment + cross-tenant block
-  const asg = await assignTicket(A, v2, ACME_U1);
-  check("assign sets assignee_id to a same-tenant user", asg?.assigneeId === ACME_U1);
+  const asg = await assignTicket(A, v2, TESTCO_U1);
+  check("assign sets assignee_id to a same-tenant user", asg?.assigneeId === TESTCO_U1);
 
   let blocked = false;
   try {
@@ -70,7 +70,7 @@ async function main() {
   }
   check("cross-tenant assignment is blocked (composite FK, 23503)", blocked);
   const stillMine = await superPool.query("SELECT assignee_id FROM tickets WHERE id=$1", [v2]);
-  check("blocked assignment left the prior assignee intact", stillMine.rows[0].assignee_id === ACME_U1);
+  check("blocked assignment left the prior assignee intact", stillMine.rows[0].assignee_id === TESTCO_U1);
 
   await setTicketStatus(A, v4, "closed");
 
@@ -78,7 +78,7 @@ async function main() {
   check("View all = open tickets (V1,V2,V3)", eq(await subjectsIn("all"), ["OPTEST-V1", "OPTEST-V2", "OPTEST-V3"]));
   check("View needs_reply = whose_turn us & open (V1,V2)", eq(await subjectsIn("needs_reply"), ["OPTEST-V1", "OPTEST-V2"]));
   check("View unassigned = null assignee & open (V1,V3)", eq(await subjectsIn("unassigned"), ["OPTEST-V1", "OPTEST-V3"]));
-  check("View my(Aleš) = assigned to me & open (V2)", eq(await subjectsIn("my", ACME_U1), ["OPTEST-V2"]));
+  check("View my(Tess) = assigned to me & open (V2)", eq(await subjectsIn("my", TESTCO_U1), ["OPTEST-V2"]));
   check("View my with no assignee = empty", eq(await subjectsIn("my"), []));
   check("View closed = status closed (V4)", eq(await subjectsIn("closed"), ["OPTEST-V4"]));
 
@@ -90,13 +90,13 @@ async function main() {
   check("reopening V4 returns it to all", (await subjectsIn("all")).includes("OPTEST-V4"));
 
   // 5 — users listing is tenant-scoped
-  const acmeUsers = (await listUsers(A)).map((u) => (u as { name: string }).name);
-  check("Acme sees its agents (Aleš, Sam)", acmeUsers.includes("Aleš") && acmeUsers.includes("Sam"));
-  check("Acme does NOT see Globex's agent (Mia)", !acmeUsers.includes("Mia"));
+  const testcoUsers = (await listUsers(A)).map((u) => (u as { name: string }).name);
+  check("TestCo sees its agents (Tess, Tom)", testcoUsers.includes("Tess") && testcoUsers.includes("Tom"));
+  check("TestCo does NOT see Globex's agent (Mia) or Acme's (Aleš)", !testcoUsers.includes("Mia") && !testcoUsers.includes("Aleš"));
 
   // 6 — cross-tenant ticket isolation still holds through the View path
   const globexSees = (await listTickets(B, "all")).filter((t) => t.subject.startsWith("OPTEST"));
-  check("Globex sees none of Acme's OPTEST tickets", globexSees.length === 0);
+  check("Globex sees none of TestCo's OPTEST tickets", globexSees.length === 0);
 
   await clean();
   await superPool.end();

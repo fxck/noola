@@ -78,7 +78,7 @@ export const MODE_OPTIONS: {
 export const CHANNEL_OPTIONS: { value: AutoreplyChannel; label: string }[] = [
   { value: "synthetic", label: "API / synthetic" },
   { value: "widget", label: "Messenger widget" },
-  { value: "email", label: "Email" },
+  { value: "email", label: "E-mail" },
   { value: "discord", label: "Discord" },
   { value: "slack", label: "Slack" },
   { value: "telegram", label: "Telegram" },

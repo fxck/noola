@@ -272,7 +272,7 @@ export function ActionFields({
     return (
       <div className="space-y-2">
         <Input
-          placeholder="Contact email (the key) — e.g. {{contact.email}} or {{webhook.email}}"
+          placeholder="Contact e-mail (the key) — e.g. {{contact.email}} or {{webhook.email}}"
           value={action.contactEmail ?? ""}
           onChange={(e) => onChange({ contactEmail: e.target.value })}
         />

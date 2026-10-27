@@ -33,6 +33,8 @@ async function main() {
   // Delete order matters: messages carry a composite (tenant_id, author_contact_id) FK to contacts
   // with ON DELETE SET NULL — dropping a still-referenced contact would try to null the NOT-NULL
   // tenant_id. Clear messages (then tickets) before contacts so nothing references them.
+  // linkEmailRoute replaces a tenant's route, so the seeded one is put back afterwards.
+  const savedRoutes = (await superPool.query("SELECT address, tenant_id FROM email_routes WHERE tenant_id = ANY($1::uuid[]) AND address <> $2", [[A], ROUTE])).rows;
   const clean = async () => {
     await superPool.query("DELETE FROM messages WHERE idempotency_key LIKE 'email:bcastpromo-%'");
     await superPool.query("DELETE FROM tickets WHERE external_channel_id LIKE 'bcastpromo-%'");
@@ -40,6 +42,9 @@ async function main() {
     await superPool.query("DELETE FROM broadcasts WHERE subject LIKE 'BCASTPROMO%'");
     await superPool.query("DELETE FROM contacts WHERE email LIKE 'bcastpromo-%'");
     await superPool.query("DELETE FROM email_routes WHERE address = $1", [ROUTE]);
+    for (const r of savedRoutes) {
+      await superPool.query("INSERT INTO email_routes (address, tenant_id) VALUES ($1, $2) ON CONFLICT (address) DO NOTHING", [r.address, r.tenant_id]);
+    }
   };
   await clean();
 

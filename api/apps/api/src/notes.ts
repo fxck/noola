@@ -1,6 +1,7 @@
 import { withTenant } from "@repo/db";
 import type { PoolClient } from "pg";
 import { attachmentsForNotes, type AttachmentRow } from "./attachments.js";
+import { emitTicketUpdated } from "./ticket-events.js";
 
 // Internal notes / side conversations — agent-only annotations on a ticket. NEVER
 // dispatched to a channel. Notes can @mention teammates: the mention tokens are resolved
@@ -15,24 +16,42 @@ export interface NoteRow {
   mentioned_ids: string[];
   mentioned_names: string[];
   created_at: string;
+  edited_at: string | null;
   /** Files attached to the note (e.g. a screenshot posted in a Discord mirror thread). */
   attachments: AttachmentRow[];
+  /** "discord" when a teammate wrote it in the mirror thread, which Noola can't edit. */
+  origin?: "noola" | "discord";
+  /** A send of the note to the customer is waiting or under way. */
+  sending?: boolean;
 }
 
-const COLS = `n.id, n.ticket_id, n.author_id, n.author_name, n.body, n.mentioned_ids, n.created_at,
+const COLS = `n.id, n.ticket_id, n.author_id, n.author_name, n.body, n.mentioned_ids, n.created_at, n.edited_at,
   COALESCE((SELECT array_agg(u.name ORDER BY u.name) FROM users u WHERE u.id = ANY(n.mentioned_ids)), '{}') AS mentioned_names`;
 
 /** A ticket's internal notes, oldest first (thread order), each with its attachments hydrated. */
 export async function listNotes(tenantId: string, ticketId: string): Promise<NoteRow[]> {
-  const rows = await withTenant(tenantId, async (c) => {
+  const { rows, sending } = await withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT ${COLS} FROM ticket_notes n WHERE n.ticket_id = $1 ORDER BY n.created_at ASC LIMIT 500`,
       [ticketId],
     );
-    return r.rows as Omit<NoteRow, "attachments">[];
+    const s = await c.query<{ note_id: string }>(
+      `SELECT request->>'noteId' AS note_id FROM scheduled_replies
+        WHERE ticket_id = $1 AND source = 'note' AND status IN ('scheduled', 'sending')`,
+      [ticketId],
+    );
+    return { rows: r.rows as Omit<NoteRow, "attachments">[], sending: new Set(s.rows.map((x) => x.note_id)) };
   });
   const byNote = await attachmentsForNotes(tenantId, ticketId);
-  return rows.map((n) => ({ ...n, attachments: byNote.get(n.id) ?? [] }));
+  // Imported on use, because the mirror imports this module.
+  const { discordNoteStates } = await import("./discord-mirror.js");
+  const discord = await discordNoteStates(rows.map((n) => n.id)).catch(() => new Map<string, { promoting: boolean }>());
+  return rows.map((n) => ({
+    ...n,
+    attachments: byNote.get(n.id) ?? [],
+    origin: discord.has(n.id) ? "discord" : "noola",
+    sending: sending.has(n.id) || discord.get(n.id)?.promoting === true,
+  }));
 }
 
 /** Resolve @tokens in the body to member ids (match on full name or first name, case-insensitive). */
@@ -113,6 +132,29 @@ export async function addNote(
     // note.added event then triggers a listNotes refetch that hydrates them).
     const r = await c.query(`SELECT ${COLS} FROM ticket_notes n WHERE n.id = $1`, [ins.rows[0].id]);
     return { ...(r.rows[0] as Omit<NoteRow, "attachments">), attachments: [] };
+  });
+}
+
+/** Replaces a note's text. The @mentions in the new text replace the old ones, and new ones join the conversation. */
+export async function setNoteBody(tenantId: string, noteId: string, body: string): Promise<{ editedAt: Date } | null> {
+  return withTenant(tenantId, async (c) => {
+    const mentioned = await resolveMentions(c, body);
+    const r = await c.query<{ ticket_id: string; edited_at: Date }>(
+      "UPDATE ticket_notes SET body = $2, mentioned_ids = $3::uuid[], edited_at = now() WHERE id = $1 RETURNING ticket_id, edited_at",
+      [noteId, body, mentioned],
+    );
+    if (!r.rowCount) return null;
+    const ticketId = r.rows[0].ticket_id;
+    if (mentioned.length) {
+      await c.query(
+        `INSERT INTO ticket_participants (tenant_id, ticket_id, user_id)
+           SELECT current_tenant(), $1, unnest($2::uuid[])
+         ON CONFLICT (tenant_id, ticket_id, user_id) DO NOTHING`,
+        [ticketId, mentioned],
+      );
+    }
+    await emitTicketUpdated(c, tenantId, ticketId, { noteId, change: "edited" });
+    return { editedAt: r.rows[0].edited_at };
   });
 }
 

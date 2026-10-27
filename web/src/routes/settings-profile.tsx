@@ -13,6 +13,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "@/components/ui/toaster";
+import { Switch } from "@/components/ui/switch";
+import { SegmentedControl } from "@/components/ui/segmented-control";
+import { savePreferences, usePreferences, type UserPreferences } from "@/lib/preferences";
 
 // The account profile page — the signed-in user edits their own display name + photo. Read-only
 // email and role are surfaced for reference (they're managed elsewhere / server-authoritative).
@@ -150,7 +153,7 @@ export function SettingsProfilePage() {
               {/* Identity */}
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-1.5">
-                  <Label htmlFor="email">Email</Label>
+                  <Label htmlFor="email">E-mail</Label>
                   <Input
                     id="email"
                     type="email"
@@ -170,11 +173,58 @@ export function SettingsProfilePage() {
               </div>
             </div>
 
+            <PreferencesCard />
+
             <ConnectedAccountsCard />
 
             <TwoFactorCard />
           </div>
     </SettingsPage>
+  );
+}
+
+// ── Preferences ──────────────────────────────────────────────────────────────
+function PreferencesCard() {
+  const prefs = usePreferences();
+
+  function save(patch: Partial<UserPreferences>) {
+    savePreferences(patch).catch(() => toast.error("Couldn't save that. Please try again."));
+  }
+
+  return (
+    <div className="mt-6 space-y-4 rounded-xl border bg-card p-6 shadow-sm">
+      <div>
+        <h2 className="text-sm font-semibold">Preferences</h2>
+        <p className="mt-0.5 text-small text-muted-foreground">These apply only to you.</p>
+      </div>
+      <div className="flex items-start justify-between gap-4">
+        <div className="space-y-0.5">
+          <Label htmlFor="pref-link-previews">Show GIF and image previews</Label>
+          <p className="text-micro text-muted-foreground">
+            When a message links to a GIF or an image, show it in the conversation. Off shows only the link.
+          </p>
+        </div>
+        <Switch id="pref-link-previews" checked={prefs.linkPreviews} onCheckedChange={(linkPreviews) => save({ linkPreviews })} />
+      </div>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="space-y-0.5">
+          <Label>Send button default</Label>
+          <p className="text-micro text-muted-foreground">
+            When your workspace delays replies, what Send does. The other choice is in the menu next to it.
+          </p>
+        </div>
+        <SegmentedControl
+          aria-label="Send button default"
+          size="sm"
+          value={prefs.sendMode}
+          onValueChange={(sendMode) => save({ sendMode })}
+          options={[
+            { value: "delayed", label: "Send with delay" },
+            { value: "now", label: "Send now" },
+          ]}
+        />
+      </div>
+    </div>
   );
 }
 

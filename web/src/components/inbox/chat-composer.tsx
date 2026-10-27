@@ -88,7 +88,7 @@ function ResetPlugin({ resetKey }: { resetKey: string | number }) {
  *  `onFiles` instead of dumping binary junk into the draft; text/HTML pastes fall
  *  through to Lexical's own rich-paste handling — pasting formatted content and
  *  keeping its structure is a feature. */
-function PasteFilesPlugin({ onFiles }: { onFiles: (files: File[]) => void }) {
+export function PasteFilesPlugin({ onFiles }: { onFiles: (files: File[]) => void }) {
   const [editor] = useLexicalComposerContext();
   useEffect(() => {
     return editor.registerCommand(

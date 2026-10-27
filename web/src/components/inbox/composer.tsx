@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 import {
   SendHorizonal,
   AlertTriangle,
@@ -19,6 +19,7 @@ import {
   Hash,
   Phone,
   Send,
+  Clock,
 } from "lucide-react";
 import {
   type Ticket,
@@ -27,6 +28,7 @@ import {
   type Suggestion,
   type Attachment,
   type ReplyChannels,
+  type CancelledReply,
   sendReply,
   suggestReply,
   uploadAttachment,
@@ -40,17 +42,22 @@ import { NoteComposer } from "@/components/inbox/note-composer";
 import { ChatComposer, type ChatComposerHandle } from "@/components/inbox/chat-composer";
 import { DraftReceipt, ReasonChip } from "@/components/queue/draft-receipt";
 import { Button } from "@/components/ui/button";
+import { Menu, MenuItem } from "@/components/ui/menu";
 import { Spinner } from "@/components/ui/spinner";
 import { useRealtime } from "@/lib/realtime-context";
+import { usePreferences } from "@/lib/preferences";
+import { formatDelay } from "@/lib/settings";
 import { useNerdMode } from "@/lib/nerd-mode";
 import { NerdStats, ScoreBar, CopyId, fmtMs, fmtScore, fmtTokens, type StatRow } from "@/components/live/nerd-stats";
 import { cn } from "@/lib/utils";
+import type { ApiError } from "@/lib/api";
+import { SUBMIT_SHORTCUT } from "@/lib/platform";
 
 // Channel display metadata for the reply channel picker — a label + icon per known channel, so an
 // agent can send the reply on any channel the contact is reachable on. Unknown channels fall back
 // to a capitalized name + a generic bubble icon.
 const CHANNEL_META: Record<string, { label: string; icon: typeof Mail }> = {
-  email: { label: "Email", icon: Mail },
+  email: { label: "E-mail", icon: Mail },
   widget: { label: "Chat", icon: MessageCircle },
   discord: { label: "Discord", icon: Hash },
   slack: { label: "Slack", icon: Hash },
@@ -60,6 +67,12 @@ const CHANNEL_META: Record<string, { label: string; icon: typeof Mail }> = {
 };
 function channelMeta(type: string): { label: string; icon: typeof Mail } {
   return CHANNEL_META[type] ?? { label: type.charAt(0).toUpperCase() + type.slice(1), icon: MessageSquareText };
+}
+
+export interface ComposerHandle {
+  /** Puts a cancelled reply into the reply editor, after any draft already there.
+   *  False when the composer is on another ticket or is editing a pending draft. */
+  restoreDraft(ticketId: string, reply: CancelledReply): boolean;
 }
 
 // The reply composer footer: reply vs internal-note modes, the "Draft with AI" copilot (with
@@ -74,10 +87,12 @@ export function Composer({
   isDiscord,
   replyChannels,
   defaultCc,
+  sendDelay,
   pending,
   onSent,
   onMutated,
   onNoteAdded,
+  ref,
 }: {
   ticket: Ticket;
   users: AgentUser[];
@@ -85,13 +100,17 @@ export function Composer({
   replyChannels: ReplyChannels | null;
   /** The other recipients on the customer's latest email — the reply-all default (email only). */
   defaultCc?: string[];
+  /** The workspace's send delay in seconds. Above 0, Send becomes a split button. */
+  sendDelay: number;
   pending: QueueItem | null;
   onSent: () => void;
   onMutated: () => void;
   onNoteAdded: () => void;
+  ref?: Ref<ComposerHandle>;
 }) {
   const { setPresence } = useRealtime();
   const { nerd } = useNerdMode();
+  const { sendMode } = usePreferences();
   const { removeItem, refetch: refetchQueue } = useQueue();
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
@@ -127,7 +146,7 @@ export function Composer({
   // Approval-queue draft acting: which pending id (if any) we're editing, and a busy flag.
   const [queueBusy, setQueueBusy] = useState(false);
   const [editingPending, setEditingPending] = useState<string | null>(null);
-  // Reply attachments: uploaded eagerly on pick/paste (pending rows), claimed onto the message on send.
+  // Attachments: uploaded eagerly on pick/paste (pending rows), claimed onto the reply or note on send.
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   // Local image previews for pending attachments, keyed by attachment id — object URLs from
   // the picked File (the server copy is auth-gated), revoked on remove/clear/unmount.
@@ -174,6 +193,25 @@ export function Composer({
       return {};
     });
   }
+
+  useImperativeHandle(ref, () => ({
+    restoreDraft(ticketId, reply) {
+      if (ticketId !== ticket.id || editingPending) return false;
+      const hadDraft = !!body.trim();
+      const draft = hadDraft ? `${body.trimEnd()}\n\n${reply.body}` : reply.body;
+      setAttachments((prev) => [...prev, ...reply.attachments.filter((a) => !prev.some((p) => p.id === a.id))]);
+      if (reply.cc.length) {
+        setCc((prev) => [...prev, ...reply.cc.filter((addr) => !prev.includes(addr))]);
+        setCcOpen(true);
+      }
+      // A draft in progress keeps the channel the agent picked for it.
+      if (!hadDraft && reply.channel) setChannel(reply.channel);
+      setMode("reply");
+      // The reply editor isn't mounted until a switch from note mode commits.
+      requestAnimationFrame(() => replyRef.current?.setMarkdown(draft));
+      return true;
+    },
+  }));
 
   // fresh ticket → fresh draft
   useEffect(() => {
@@ -282,8 +320,13 @@ export function Composer({
       markTyping(false);
       onSent();
       onMutated();
-    } catch {
-      setNote({ kind: "warn", text: "Couldn't send the suggested reply — please try again." });
+    } catch (err) {
+      setNote({
+        kind: "warn",
+        text: (err as ApiError).status === 422
+          ? "Remove the AI's <internal> note and any tags before sending this reply."
+          : "Couldn't send the suggested reply — please try again.",
+      });
       refetchQueue(); // restore the card
     } finally {
       setQueueBusy(false);
@@ -348,9 +391,10 @@ export function Composer({
     }
   }
 
-  async function send() {
+  async function send(sendNow = sendMode === "now") {
     const text = body.trim();
-    if (!text || sending || queueBusy || sendingRef.current) return;
+    // ⌘↵ skips the disabled button, so a file still uploading would miss this message and ride the next one.
+    if (!text || sending || queueBusy || uploading > 0 || sendingRef.current) return;
     sendingRef.current = true;
     try {
       // Internal note mode: save an agent-only note (never dispatched to a channel).
@@ -358,10 +402,12 @@ export function Composer({
         setSending(true);
         setNote(null);
         try {
-          await addNote(ticket.id, text, mentionIds);
+          await addNote(ticket.id, text, mentionIds, attachments.map((a) => a.id));
           setBody("");
           setMentionIds([]);
           setNoteReset((n) => n + 1);
+          setAttachments([]);
+          clearPreviews();
           if (typingTimer.current) clearTimeout(typingTimer.current);
           markTyping(false);
           onNoteAdded();
@@ -385,7 +431,7 @@ export function Composer({
       const clientMessageId = crypto.randomUUID();
       try {
         const emailCc = activeChannel === "email" ? cc : undefined;
-        const { delivered, queued } = await sendReply(ticket.id, text, attachments.map((a) => a.id), activeChannel, emailCc, clientMessageId);
+        const result = await sendReply(ticket.id, text, attachments.map((a) => a.id), activeChannel, emailCc, clientMessageId, sendNow);
         setBody("");
         setReplyReset((n) => n + 1);
         setAttachments([]);
@@ -397,11 +443,11 @@ export function Composer({
         markTyping(false);
         onSent();
         onMutated();
-        if (isDiscord) {
+        if (isDiscord && result.kind === "sent") {
           setNote(
-            delivered
+            result.delivered
               ? { kind: "ok", text: "Sent — delivered to Discord." }
-              : queued
+              : result.queued
                 ? { kind: "warn", text: "Saved — Discord delivery is queued and will retry." }
                 : { kind: "warn", text: "Saved, but Discord delivery failed." },
           );
@@ -416,6 +462,11 @@ export function Composer({
       sendingRef.current = false;
     }
   }
+
+  const sendDisabled = sending || queueBusy || uploading > 0 || !body.trim();
+  // A suggested-reply edit goes out through the approval queue, which has no send delay.
+  const splitSend = mode === "reply" && !editingPending && sendDelay > 0;
+  const delayLabel = formatDelay(sendDelay);
 
   return (
     // STRUCTURE.md §7 — the composer is a single floating surface pinned at the
@@ -441,7 +492,12 @@ export function Composer({
                 </span>
                 <ReasonChip reason={pending.reason} />
               </div>
-              <p className="mt-2 line-clamp-4 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
+              <p
+                className={cn(
+                  "mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground",
+                  pending.reason !== "malformed_output" && "line-clamp-4",
+                )}
+              >
                 {pending.draft_body}
               </p>
               <DraftReceipt meta={pending.meta} className="mt-2" />
@@ -457,10 +513,13 @@ export function Composer({
                 <Button variant="outline" size="sm" onClick={() => editPending(pending)} disabled={queueBusy}>
                   <Pencil /> Edit
                 </Button>
-                <Button size="sm" onClick={() => void sendPending(pending)} disabled={queueBusy}>
-                  {queueBusy ? <Spinner className="size-4 text-background" /> : <SendHorizonal />}
-                  Send
-                </Button>
+                {/* A malformed draft still holds the AI's note for the team, so it can only be sent after an edit. */}
+                {pending.reason !== "malformed_output" && (
+                  <Button size="sm" onClick={() => void sendPending(pending)} disabled={queueBusy}>
+                    {queueBusy ? <Spinner className="size-4 text-background" /> : <SendHorizonal />}
+                    Send
+                  </Button>
+                )}
               </div>
             </div>
           ))}
@@ -490,11 +549,9 @@ export function Composer({
           </button>
         </div>
 
-        {/* Pending attachments — uploaded, waiting to ride the next reply. Images show as
-            real thumbnails (local object URL — the server copy is auth-gated); other files
-            keep the compact chip. Above the input so the draft reads top-to-bottom. Shown in
-            BOTH modes: they persist across the Reply/Note toggle anyway, and hiding the row
-            in note mode made the composer jump heights when switching. */}
+        {/* Pending attachments - uploaded, waiting to ride the next reply or note. Images show as
+            real thumbnails (local object URL - the server copy is auth-gated), other files
+            keep the compact chip. Above the input so the draft reads top-to-bottom. */}
         {(attachments.length > 0 || uploading > 0) && (
           <div className="flex flex-wrap items-center gap-2 px-1 pt-1">
             {attachments.map((a) =>
@@ -582,7 +639,7 @@ export function Composer({
                   setCcInput("");
                 }
               }}
-              placeholder={cc.length ? "" : "add email…"}
+              placeholder={cc.length ? "" : "add e-mail…"}
               className="min-w-[8rem] flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
             />
           </div>
@@ -599,6 +656,7 @@ export function Composer({
               pingTyping(text);
             }}
             onSubmit={() => void send()}
+            onFiles={(files) => void addFiles(files)}
           />
         ) : (
           // Rich reply editor at the plain textarea's exact rest footprint (3.75rem —
@@ -730,32 +788,27 @@ export function Composer({
               </Button>
             )}
 
-            {/* Attach a file to the reply */}
-            {mode === "reply" && (
-              <>
-                <input
-                  ref={fileRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => {
-                    void addFiles(Array.from(e.target.files ?? []));
-                    e.target.value = ""; // allow re-picking the same file
-                  }}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-8 text-muted-foreground hover:text-foreground"
-                  onClick={() => fileRef.current?.click()}
-                  disabled={sending}
-                  title="Attach a file"
-                  aria-label="Attach a file"
-                >
-                  <Paperclip />
-                </Button>
-              </>
-            )}
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void addFiles(Array.from(e.target.files ?? []));
+                e.target.value = ""; // allow re-picking the same file
+              }}
+            />
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 text-muted-foreground hover:text-foreground"
+              onClick={() => fileRef.current?.click()}
+              disabled={sending}
+              title="Attach a file"
+              aria-label="Attach a file"
+            >
+              <Paperclip />
+            </Button>
 
             {/* Macros — insert a saved canned response into the reply composer */}
             {mode === "reply" && (
@@ -817,19 +870,56 @@ export function Composer({
             >
               {note?.kind === "warn" && <AlertTriangle className="size-3.5" />}
               {note?.kind === "ok" && <CheckCircle2 className="size-3.5 text-success" />}
-              {note ? note.text : <span>⌘↵ to {mode === "note" ? "save" : "send"}</span>}
+              {note ? note.text : <span>{SUBMIT_SHORTCUT} to {mode === "note" ? "save" : splitSend ? (sendMode === "now" ? "send now" : `send in ${delayLabel}`) : "send"}</span>}
             </span>
           </div>
-          <Button size="sm" className="shrink-0" onClick={() => void send()} disabled={sending || queueBusy || uploading > 0 || !body.trim()}>
-            {sending || queueBusy ? (
-              <Spinner className="size-4 text-background" />
-            ) : mode === "note" ? (
-              <StickyNote />
-            ) : (
-              <SendHorizonal />
-            )}
-            {mode === "note" ? "Add note" : editingPending ? "Send edited" : "Send"}
-          </Button>
+          {splitSend ? (
+            <div className="flex shrink-0 items-center">
+              <Button
+                size="sm"
+                className="rounded-r-none"
+                onClick={() => void send()}
+                disabled={sendDisabled}
+                title={sendMode === "now" ? "Send at once" : `Send in ${delayLabel}. You can cancel it until then.`}
+              >
+                {sending || queueBusy ? <Spinner className="size-4 text-background" /> : <SendHorizonal />}
+                {sendMode === "now" ? "Send now" : "Send"}
+              </Button>
+              <Menu
+                width={176}
+                trigger={(open, toggle) => (
+                  <Button
+                    size="sm"
+                    className="rounded-l-none border-l border-background/20 px-2"
+                    onClick={toggle}
+                    disabled={sendDisabled}
+                    aria-label="More ways to send"
+                    aria-haspopup="menu"
+                    aria-expanded={open}
+                  >
+                    <ChevronDown />
+                  </Button>
+                )}
+              >
+                {sendMode === "now" ? (
+                  <MenuItem icon={Clock} label={`Send in ${delayLabel}`} onSelect={() => void send(false)} />
+                ) : (
+                  <MenuItem icon={SendHorizonal} label="Send now" onSelect={() => void send(true)} />
+                )}
+              </Menu>
+            </div>
+          ) : (
+            <Button size="sm" className="shrink-0" onClick={() => void send()} disabled={sendDisabled}>
+              {sending || queueBusy ? (
+                <Spinner className="size-4 text-background" />
+              ) : mode === "note" ? (
+                <StickyNote />
+              ) : (
+                <SendHorizonal />
+              )}
+              {mode === "note" ? "Add note" : editingPending ? "Send edited" : "Send"}
+            </Button>
+          )}
         </div>
       </div>
     </footer>

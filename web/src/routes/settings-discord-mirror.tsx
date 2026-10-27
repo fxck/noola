@@ -340,7 +340,7 @@ export function SettingsDiscordMirrorPage() {
           <DirectionPanel
             icon={Repeat2}
             title="Your team works tickets from Discord"
-            subtitle="A private forum where every conversation from email, widget and Slack shows up as a post — so your team can triage and reply without leaving Discord. Conversations that already live in a Discord channel never show up here."
+            subtitle="A private forum where every conversation from e-mail, widget and Slack shows up as a post — so your team can triage and reply without leaving Discord. Conversations that already live in a Discord channel never show up here."
           >
             <MirrorRules />
 
@@ -355,7 +355,7 @@ export function SettingsDiscordMirrorPage() {
                     <p className="mt-2 text-sm font-medium">No mirror forum yet</p>
                     <p className="mt-1 text-small text-muted-foreground">
                       Create a private, bot-only forum in Discord, then add it here.
-                      {!serverConnected && " Connect a server above first."} By default every email, widget and Slack
+                      {!serverConnected && " Connect a server above first."} By default every e-mail, widget and Slack
                       conversation shows up — add filters to narrow it.
                     </p>
                   </div>

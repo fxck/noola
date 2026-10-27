@@ -140,9 +140,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     const b = req.body as { name?: string; email?: string } | undefined;
     const name = b?.name?.trim();
     const email = b?.email ? b.email.trim().toLowerCase() : undefined;
-    if (!name && !email) return reply.code(400).send({ error: "name or email is required" });
+    if (!name && !email) return reply.code(400).send({ error: "name or e-mail is required" });
     if (email !== undefined && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      return reply.code(400).send({ error: "invalid email" });
+      return reply.code(400).send({ error: "invalid e-mail" });
     }
     // better-auth is the auth authority. Update the display name through it (so its session payload
     // stays fresh); update the login email directly on its "user" row — email is only the lookup key,
@@ -158,7 +158,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       try {
         await authPool.query(`UPDATE "user" SET email = $2, "updatedAt" = now() WHERE id = $1`, [s.userId, email]);
       } catch {
-        return reply.code(409).send({ error: "That email is already in use." });
+        return reply.code(409).send({ error: "That e-mail is already in use." });
       }
     }
     // Mirror into the app users row (the request-path source of truth).

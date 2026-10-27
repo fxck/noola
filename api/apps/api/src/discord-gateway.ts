@@ -1,14 +1,15 @@
 import {
   Client, GatewayIntentBits, Events, ChannelType, Partials, PermissionFlagsBits,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, Routes,
-  type ChatInputCommandInteraction, type ButtonInteraction, type Guild,
+  type ChatInputCommandInteraction, type ButtonInteraction, type Guild, type GuildMember,
   type ForumChannel, type ThreadChannel, type Message, type RateLimitData, RateLimitError, type GuildTextBasedChannel,
+  type Embed, EmbedType,
 } from "discord.js";
 import { SimpleShardingStrategy, type WebSocketManager } from "@discordjs/ws";
 import type { Agent as HttpAgent } from "node:http";
 import { relayPool } from "@repo/db";
 import { discordEgress, proxiedMakeRequest } from "./discord-egress.js";
-import { backfillChannels, lastSeenConnected, loadGuildScopes, recordSeenConnected, type BackfillChannel } from "./discord-backfill.js";
+import { backfillChannels, lastSeenConnected, loadGuildScopes, recordSeenConnected, type BackfillChannel, type HeldBack } from "./discord-backfill.js";
 import { isDiscordEventLeader, probeDiscordLeaderNow, startDiscordLeaderElection } from "./discord-leader.js";
 import { discordTokensToText, splitForDiscord } from "./channels/format.js";
 import {
@@ -17,6 +18,8 @@ import {
   handleThreadUpdate,
   handleThreadDelete,
   handleMessageUpdate,
+  handleMessageEmbeds,
+  type DiscordAttachment,
   handleMessageDelete,
   type Sender,
 } from "./discord.js";
@@ -57,6 +60,8 @@ export function getDiscordSender(botId = "shared"): Sender | null {
 export interface MirrorFile {
   name: string;
   data: Buffer;
+  /** Still sent when Discord refuses the upload as too large, e.g. the full text of a cut message. */
+  keepWhenRefused?: boolean;
 }
 
 export interface MirrorTransport {
@@ -74,7 +79,14 @@ export interface MirrorTransport {
   /** Post into a thread; optional `files` upload as Discord attachments (on the first content chunk).
    *  `opts.nonce` (<= 21 chars) is sent per chunk with enforce_nonce, so a retried write whose earlier
    *  attempt already landed is collapsed by Discord instead of posting a second copy. */
-  postToThread(threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[], opts?: { nonce?: string }): Promise<boolean>;
+  postToThread(
+    threadId: string, content: string, files?: MirrorFile[], mentionUserIds?: string[],
+    opts?: { nonce?: string; onPosted?: (messageIds: string[]) => void },
+  ): Promise<boolean>;
+  /** Replaces the text of a message in a thread. "gone" when the message no longer exists. */
+  editInThread?(threadId: string, messageId: string, content: string): Promise<"edited" | "gone" | "failed">;
+  /** "forbidden" when the bot may not delete it, e.g. a teammate's message without Manage Messages. */
+  deleteInThread?(threadId: string, messageId: string): Promise<"deleted" | "forbidden" | "failed">;
   setArchived(threadId: string, archived: boolean): Promise<boolean>;
   applyTags(threadId: string, tagNames: string[]): Promise<boolean>;
   /** Parent-forum tag names for a thread — used to detect an existing "Solved/Resolved" tag. */
@@ -88,11 +100,19 @@ export interface MirrorTransport {
   /** Lock a thread (per-binding close action). Optional, like forumTagNames. */
   setLocked?(threadId: string, locked: boolean): Promise<boolean>;
   react(threadId: string, messageId: string, emoji: string): Promise<boolean>;
+  /** Removes the bot's own reaction. True also when it isn't there. */
+  unreact?(threadId: string, messageId: string, emoji: string): Promise<boolean>;
   memberRoleIds(guildId: string, userId: string): Promise<string[]>;
 }
 /** Map our provider-agnostic MirrorFile[] to discord.js's message `files` shape. */
 function toDiscordFiles(files?: MirrorFile[]): { attachment: Buffer; name: string }[] {
   return (files ?? []).map((f) => ({ attachment: f.data, name: f.name }));
+}
+
+/** The files to try again after a too-large refusal, or none when that would repeat the refused upload. */
+function filesKeptWhenRefused(files?: MirrorFile[]): { attachment: Buffer; name: string }[] {
+  const kept = (files ?? []).filter((f) => f.keepWhenRefused);
+  return kept.length < (files ?? []).length ? toDiscordFiles(kept) : [];
 }
 
 const mirrorTransports = new Map<string, MirrorTransport>();
@@ -156,7 +176,7 @@ function filesNotUploadedNote(n: number): string {
   return `_(${n} attachment${n > 1 ? "s were" : " was"} too large to upload to Discord - open the ticket in Noola to see ${n > 1 ? "them" : "it"})_`;
 }
 
-function buildMirrorTransport(client: Client): MirrorTransport {
+export function buildMirrorTransport(client: Client): MirrorTransport {
   const forum = async (id: string): Promise<ForumChannel | null> => {
     const ch = await client.channels.fetch(id).catch(() => null);
     return ch?.type === ChannelType.GuildForum ? (ch as ForumChannel) : null;
@@ -200,18 +220,24 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       if (!f) return null;
       const appliedTags = await resolveForumTagIds(f, tagNames).catch(() => []);
       const df = toDiscordFiles(files);
-      const create = (body: string, withFiles: boolean) => {
+      const kept = filesKeptWhenRefused(files);
+      const create = (body: string, withFiles: { attachment: Buffer; name: string }[]) => {
         const chunks = splitForDiscord(body, 2000);
         return f.threads.create({
           name: name.slice(0, 100) || "Support ticket",
-          message: { content: chunks[0], allowedMentions: { parse: [] }, ...(withFiles && df.length ? { files: df } : {}) },
+          message: { content: chunks[0], allowedMentions: { parse: [] }, ...(withFiles.length ? { files: withFiles } : {}) },
           appliedTags,
         }).then((thread) => ({ thread, chunks }));
       };
+      const withNote = (dropped: number) => `${content}\n${filesNotUploadedNote(dropped)}`;
       // Without the files the post still lands, so a too-large upload doesn't lose the whole mirror.
-      const made = await create(content, true).catch((e: unknown) =>
-        df.length && uploadTooLarge(e) ? create(`${content}\n${filesNotUploadedNote(df.length)}`, false).catch(() => null) : null,
-      );
+      const made = await create(content, df).catch(async (e: unknown) => {
+        if (!df.length || !uploadTooLarge(e)) return null;
+        const withKept = kept.length
+          ? await create(withNote(df.length - kept.length), kept).catch((e2: unknown) => (uploadTooLarge(e2) ? null : Promise.reject(e2)))
+          : null;
+        return withKept ?? create(withNote(df.length), []);
+      }).catch(() => null);
       if (!made) return null;
       const { thread: created, chunks } = made;
       for (let i = 1; i < chunks.length; i++) {
@@ -241,6 +267,7 @@ function buildMirrorTransport(client: Client): MirrorTransport {
       // wants to ping (assignee / participant notifications) — @everyone/@here and stray pings never fire.
       const allow = mentionUserIds?.length ? { users: mentionUserIds, parse: [] as never[] } : { parse: [] as never[] };
       let filesNotUploaded = 0;
+      const posted: string[] = [];
       for (let i = 0; i < chunks.length; i++) {
         // Attach files once, on the first chunk, so a long reply doesn't duplicate uploads. The ping
         // rides the first chunk (where the <@id> mention text is).
@@ -251,14 +278,19 @@ function buildMirrorTransport(client: Client): MirrorTransport {
           ...(opts?.nonce ? { nonce: `${opts.nonce}.${i}`, enforceNonce: true } : {}),
         };
         if (i === 0 && df.length) {
-          // A refused upload created no message, so the text goes again without the files, under the same nonce.
-          await t.send({ ...message, files: df }).catch(async (e: unknown) => {
+          // A refused upload created no message, so the text goes again under the same nonce, with only the kept files.
+          const first = await t.send({ ...message, files: df }).catch(async (e: unknown) => {
             if (!uploadTooLarge(e)) throw e;
-            filesNotUploaded = df.length;
-            await t.send(message);
+            const kept = filesKeptWhenRefused(files);
+            const keptSent = kept.length
+              ? await t.send({ ...message, files: kept }).catch((e2: unknown) => (uploadTooLarge(e2) ? null : Promise.reject(e2)))
+              : null;
+            filesNotUploaded = df.length - (keptSent ? kept.length : 0);
+            return keptSent ?? (await t.send(message));
           });
+          posted.push(first.id);
         } else {
-          await t.send(message);
+          posted.push((await t.send(message)).id);
         }
       }
       if (filesNotUploaded) {
@@ -268,7 +300,56 @@ function buildMirrorTransport(client: Client): MirrorTransport {
           ...(opts?.nonce ? { nonce: `${opts.nonce}.f`, enforceNonce: true } : {}),
         });
       }
+      opts?.onPosted?.(posted);
       return true;
+    },
+    async editInThread(threadId, messageId, content) {
+      const patch = () => client.rest.patch(Routes.channelMessage(threadId, messageId), { body: { content, allowed_mentions: { parse: [] } } });
+      try {
+        await patch();
+        return "edited";
+      } catch (e) {
+        const code = (e as { code?: number }).code;
+        if (code === 10008) return "gone"; // Unknown Message
+        // 50083: an archived thread refuses edits until it is unarchived.
+        if (code !== 50083) return "failed";
+        const t = await thread(threadId);
+        if (!t) return "failed";
+        await t.setArchived(false).catch(() => {});
+        try {
+          await patch();
+          return "edited";
+        } catch {
+          return "failed";
+        } finally {
+          await t.setArchived(true).catch(() => {});
+        }
+      }
+    },
+    async deleteInThread(threadId, messageId) {
+      const del = async (): Promise<"deleted" | "forbidden" | "failed" | "archived"> => {
+        try {
+          await client.rest.delete(Routes.channelMessage(threadId, messageId));
+          return "deleted";
+        } catch (e) {
+          const code = (e as { code?: number }).code;
+          if (code === 10008) return "deleted"; // Unknown Message: nothing is left to delete
+          if (code === 50083) return "archived";
+          return code === 50013 ? "forbidden" : "failed"; // 50013 Missing Permissions
+        }
+      };
+      const first = await del();
+      if (first !== "archived") return first;
+      // An archived thread refuses changes until it is unarchived.
+      const t = await thread(threadId);
+      if (!t) return "failed";
+      await t.setArchived(false).catch(() => {});
+      try {
+        const again = await del();
+        return again === "archived" ? "failed" : again;
+      } finally {
+        await t.setArchived(true).catch(() => {});
+      }
     },
     async setArchived(threadId, archived) {
       const t = await thread(threadId, true);
@@ -344,6 +425,16 @@ function buildMirrorTransport(client: Client): MirrorTransport {
         } finally {
           await t.setArchived(true).catch(() => {});
         }
+      }
+    },
+    async unreact(threadId, messageId, emoji) {
+      try {
+        await client.rest.delete(Routes.channelMessageOwnReaction(threadId, messageId, encodeURIComponent(emoji)));
+        return true;
+      } catch (e) {
+        // 10008 Unknown Message, 10014 Unknown Emoji: nothing is left to remove.
+        const code = (e as { code?: number }).code;
+        return code === 10008 || code === 10014;
       }
     },
     async memberRoleIds(guildId, userId) {
@@ -507,15 +598,20 @@ function backfillableChannels(client: Client): GatewayChannel[] {
 
 /** Read back the messages a bot missed since it was last seen connected, then resume its heartbeat.
  *  A retry passes the first attempt's `since`, because the heartbeat may have moved on in between. */
-async function backfillBot(botId: string, log: Log, retry?: { since: number | null | undefined; attempt: number }): Promise<void> {
+async function backfillBot(
+  botId: string,
+  log: Log,
+  retry?: { since: number | null | undefined; attempt: number; heldBack: HeldBack },
+): Promise<void> {
   const client = clients.get(botId);
   if (!client?.isReady() || !isDiscordEventLeader() || backfillsRunning.has(botId)) return;
   backfillsRunning.add(botId);
   heartbeatPaused.add(botId);
   let since: number | null | undefined = retry?.since;
+  let heldBack: HeldBack = retry?.heldBack ?? new Map();
   const retryLater = (delayMs: number) => {
     // An undefined `since` means the heartbeat was never read, so the retry reads it.
-    const t = setTimeout(() => void backfillBot(botId, log, { since, attempt: (retry?.attempt ?? 0) + 1 }), delayMs);
+    const t = setTimeout(() => void backfillBot(botId, log, { since, attempt: (retry?.attempt ?? 0) + 1, heldBack }), delayMs);
     if (typeof t.unref === "function") t.unref();
   };
   try {
@@ -529,14 +625,15 @@ async function backfillBot(botId: string, log: Log, retry?: { since: number | nu
     const { evaluateAutoreply } = await import("./autoreply.js");
     const s = await backfillChannels<Message, GatewayChannel>(backfillableChannels(client), scopes, since, {
       onThreadCreated: async (ch) => {
-        if (ch.raw.isThread()) await ingestGatewayThreadCreate(ch.raw);
+        if (ch.raw.isThread()) await ingestGatewayThreadCreate(ch.raw, { backfill: true });
       },
-      onMessage: (m) => ingestGatewayMessage(m, log, { skipAutoreply: true }),
+      onMessage: (m) => ingestGatewayMessage(m, log, { skipAutoreply: true, backfill: true }),
       onTicketBackfilled: async (tenantId, ticketId, messageId) => {
         await evaluateAutoreply(tenantId, ticketId, messageId, { combineUnanswered: true });
       },
       abortOn: (err) => err instanceof RateLimitError,
-    });
+    }, Date.now(), heldBack);
+    heldBack = s.heldBack;
     log.info(
       `discord: backfill for bot ${botId} covered ${s.gapSeconds}s - read ${s.fetched} of ${s.checked} channel(s), ` +
         `${s.messages} message(s), ${s.failed} channel(s) unreadable, ${s.failedMessages} message(s) failed` +
@@ -715,7 +812,7 @@ export function gatewayStrategy(agent: HttpAgent) {
 async function ingestGatewayMessage(
   msg: Message,
   log: Log,
-  opts: { skipAutoreply?: boolean } = {},
+  opts: { skipAutoreply?: boolean; backfill?: boolean } = {},
 ): Promise<{ tenantId: string; ticketId: string; messageId: string } | null> {
   if (!msg.guildId) return null; // DM — dropped (the seam re-checks; keep the cheap guard here too)
   // §5.10 fetch-on-demand fallback: msg.member can be null (uncached/webhook) OR present with an
@@ -724,7 +821,7 @@ async function ingestGatewayMessage(
   // member's role cache always contains at least @everyone, so size 0 signals an uncached member.)
   let member = msg.member;
   if ((member === null || member.roles.cache.size === 0) && msg.guild) {
-    const fetched = await msg.guild.members.fetch(msg.author.id).catch(() => null);
+    const fetched = await fetchMember(msg.guild, msg.author.id, opts.backfill);
     if (fetched) member = fetched;
   }
   const tax = threadTaxonomy(msg.channel);
@@ -733,12 +830,15 @@ async function ingestGatewayMessage(
   const resolvedContent = resolveMentions(msg);
   // Discord CDN attachments (screenshots/files). Built up-front so BOTH seams can persist them —
   // previously this ran AFTER the mirror-seam early-return, so internal notes lost every file.
-  const attachments = [...msg.attachments.values()].map((a) => ({
-    url: a.url,
-    filename: a.name ?? "file",
-    contentType: a.contentType ?? "application/octet-stream",
-    size: a.size ?? 0,
-  }));
+  const attachments = [
+    ...[...msg.attachments.values()].map((a) => ({
+      url: a.url,
+      filename: a.name ?? "file",
+      contentType: a.contentType ?? "application/octet-stream",
+      size: a.size ?? 0,
+    })),
+    ...embedMedia(msg.embeds),
+  ];
 
   // Ops-mirror seam: a message inside a mirror forum post is team collaboration on the mirrored
   // ticket (note by default, 📤 promotes) — it must NEVER fall through to customer ingest. The
@@ -787,13 +887,53 @@ async function ingestGatewayMessage(
   return r.replay ? null : { tenantId: r.tenantId, ticketId: r.ticketId, messageId: r.messageId };
 }
 
+// Gateway events for one message run in order. An edit or a link preview that arrives while the message is
+// still being stored then waits for it, instead of finding no message to update.
+const messageWork = new Map<string, Promise<void>>();
+export function inMessageOrder(messageId: string, work: () => Promise<void>): Promise<void> {
+  const next = (messageWork.get(messageId) ?? Promise.resolve()).then(work, work);
+  const settled = next.catch(() => {});
+  messageWork.set(messageId, settled);
+  void settled.then(() => {
+    if (messageWork.get(messageId) === settled) messageWork.delete(messageId);
+  });
+  return next;
+}
+
+/** The media of GIF and image link previews, as files to copy. Video and page previews keep only their text. */
+export function embedMedia(embeds: readonly Embed[]): DiscordAttachment[] {
+  const out: DiscordAttachment[] = [];
+  for (const e of embeds) {
+    if (!e.url) continue;
+    if (e.data.type === EmbedType.GIFV) {
+      const src = e.video?.proxyURL ?? e.video?.url;
+      if (src) out.push({ url: src, filename: "gif.mp4", contentType: "video/mp4", size: 0, embedUrl: e.url });
+    } else if (e.data.type === EmbedType.Image) {
+      const src = e.thumbnail?.proxyURL ?? e.thumbnail?.url ?? e.image?.proxyURL ?? e.image?.url;
+      if (src) out.push({ url: src, filename: "image", contentType: "", size: 0, embedUrl: e.url });
+    }
+  }
+  return out;
+}
+
+/**
+ * A guild member, or null when the lookup fails. A backfill rethrows a rate limit, which aborts the run and retries the gap later.
+ * A live event has no retry, so it goes on without the member's roles.
+ */
+async function fetchMember(guild: Guild, userId: string, rethrowRateLimit = false): Promise<GuildMember | null> {
+  try {
+    return await guild.members.fetch(userId);
+  } catch (e) {
+    if (rethrowRateLimit && e instanceof RateLimitError) throw e;
+    return null;
+  }
+}
+
 /** A new thread, live or backfilled: seats the owner as the customer of a ticket on the thread. */
-async function ingestGatewayThreadCreate(thread: ThreadChannel): Promise<void> {
+async function ingestGatewayThreadCreate(thread: ThreadChannel, opts: { backfill?: boolean } = {}): Promise<void> {
   if (thread.ownerId && thread.ownerId === thread.client.user?.id) return;
   const parentIsForum = thread.parent?.type === ChannelType.GuildForum;
-  const owner = thread.ownerId
-    ? await thread.guild.members.fetch(thread.ownerId).catch(() => null)
-    : null;
+  const owner = thread.ownerId ? await fetchMember(thread.guild, thread.ownerId, opts.backfill) : null;
   // A bot-owned thread (our VIP thread-per-message anchor) must not pre-seat a ticket with the
   // bot as the customer — the triggering message's ingest already seated it on this thread id.
   if (owner?.user.bot) return;
@@ -891,7 +1031,9 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   client.on(Events.MessageCreate, async (msg) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
-      await ingestGatewayMessage(msg, log);
+      await inMessageOrder(msg.id, async () => {
+        await ingestGatewayMessage(msg, log);
+      });
     } catch (err) {
       log.error({ err }, "discord inbound ingest failed");
     }
@@ -941,7 +1083,20 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     try {
       // A partial update has no content, and storing it would blank the message.
       if (!msg.guildId || msg.partial) return;
-      await handleMessageUpdate({ guildId: msg.guildId, messageId: msg.id, newContent: resolveMentions(msg) });
+      const guildId = msg.guildId;
+      await inMessageOrder(msg.id, async () => {
+        await handleMessageUpdate({
+          guildId,
+          messageId: msg.id,
+          newContent: resolveMentions(msg),
+          stickers: [...msg.stickers.values()].map((st) => st.name),
+          poll: msg.poll?.question.text ?? null,
+        });
+        // Discord adds a link's preview, e.g. a /gif GIF, in an update shortly after the message is sent.
+        await handleMessageEmbeds(guildId, msg.id, embedMedia(msg.embeds));
+        const { syncMirrorEdit } = await import("./discord-mirror.js");
+        await syncMirrorEdit(msg.id, resolveMentions(msg));
+      });
     } catch (err) {
       log.error({ err }, "discord MessageUpdate failed");
     }
@@ -952,6 +1107,8 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
     try {
       if (!msg.guildId) return;
       await handleMessageDelete({ guildId: msg.guildId, messageId: msg.id });
+      const { syncMirrorDelete } = await import("./discord-mirror.js");
+      await syncMirrorDelete(msg.id);
     } catch (err) {
       log.error({ err }, "discord MessageDelete failed");
     }
@@ -961,6 +1118,19 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   // in the tenant's reaction-triage map (shared with Slack) triages the mirrored ticket in place.
   // Partials are fetched so reactions on pre-restart messages still resolve; non-mirror threads
   // no-op instantly on the ticket_mirror lookup.
+  client.on(Events.MessageReactionRemove, async (reaction, user) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
+    try {
+      if (user.bot) return;
+      const { cancelPromoteOnUnreact } = await import("./discord-mirror.js");
+      // A 📤 that another teammate still has on the message keeps the send.
+      const left = reaction.partial ? await reaction.fetch().then((r) => r.count ?? 0, () => 0) : reaction.count ?? 0;
+      await cancelPromoteOnUnreact(reaction.message.id, reaction.emoji.name ?? "", left);
+    } catch (err) {
+      log.error({ err }, "discord MessageReactionRemove failed");
+    }
+  });
+
   client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
@@ -989,6 +1159,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
         return;
       }
       if (res.promoted) log.info(`discord-mirror: message ${full.message.id} promoted to reply`);
+      else if (res.reason === "scheduled") log.info(`discord-mirror: message ${full.message.id} held for the send delay`);
       else if (res.action && !res.reason) log.info(`discord-mirror: reaction triage '${res.action}' applied`);
       else if (res.reason && res.reason !== "not_mirror" && res.reason !== "unmapped_emoji")
         log.info(`discord-mirror: reaction refused (${res.reason})`);

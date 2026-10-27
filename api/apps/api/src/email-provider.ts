@@ -80,7 +80,7 @@ export async function saveTenantEmailProvider(
   input: { provider?: EmailProviderName; apiKey?: string; webhookSecret?: string; active?: boolean; replyAddress?: string },
 ): Promise<EmailProviderStatus> {
   if (!encryptionAvailable()) {
-    throw new EmailProviderSecretsUnavailableError("MODEL_KEY_SECRET is not set — cannot store email provider credentials");
+    throw new EmailProviderSecretsUnavailableError("MODEL_KEY_SECRET is not set — cannot store e-mail provider credentials");
   }
   const setApiKey = input.apiKey !== undefined;
   const setWebhook = input.webhookSecret !== undefined;

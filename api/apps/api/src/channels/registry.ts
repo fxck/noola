@@ -106,10 +106,10 @@ const discord: ChannelDriver = {
 
 const email: ChannelDriver = {
   id: "email",
-  label: "Email",
+  label: "E-mail",
   direction: "both",
   status: "live",
-  blurb: "Inbound addresses route to tickets; replies send as threaded email (Mailpit in dev).",
+  blurb: "Inbound addresses route to tickets; replies send as threaded e-mail (Mailpit in dev).",
   // Honest status: without SMTP_HOST outbound silently no-ops — don't show "Available" (audit).
   credentialed: () => Boolean(process.env.SMTP_HOST),
   connections: (tenantId) =>

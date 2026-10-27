@@ -10,6 +10,7 @@
 // an agent's "let me look into it" keeps the ball on our side.
 
 import { requireEnv } from "./env.js";
+import { DRAFT_OUTCOMES_SYSTEM } from "./ai-outcome.js";
 
 export type WhoseTurn = "us" | "customer";
 
@@ -59,12 +60,16 @@ export interface DraftReplyInput {
   // hosted model answers in the team's configured tone/signature. The extractive rule baseline
   // ignores it — it can't paraphrase, so it stays honest regardless of persona.
   persona?: string;
+  /** Lets the draft carry a note for the team or say that no reply is needed (ai-outcome.ts). The rule baseline ignores it. */
+  outcomes?: boolean;
 }
 
 /** A drafted reply plus the signals the autoreply gate + trace store need: how
  *  confident the model is (0..1) and token usage when the driver reports it. */
 export interface DraftResult {
   text: string;
+  /** The model was told about the outcome tags, so its text must be parsed for them. */
+  outcomes?: boolean;
   confidence?: number;
   tokensIn?: number;
   tokensOut?: number;
@@ -293,6 +298,11 @@ const DRAFT_SYSTEM =
 // tokenize ~2-3x heavier than English, so a normal-length answer hit the cap and was sent truncated
 // mid-word. 1500 gives a full support reply headroom while still bounding a runaway generation.
 const DRAFT_MAX_TOKENS = 1500;
+// Current Claude models think before they answer, and the thinking counts against max_tokens.
+// The ceiling itself costs nothing, only the tokens the model produces, thinking included.
+const ANTHROPIC_DRAFT_MAX_TOKENS = 8000;
+// An OpenAI account also lists embedding, audio and image models, which can't draft a reply.
+const NOT_A_CHAT_MODEL = /embedding|whisper|tts|audio|realtime|transcribe|dall-e|image|moderation|davinci|babbage/i;
 
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const sources = input.sources
@@ -301,7 +311,8 @@ function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.
   const persona = input.persona?.trim();
-  const base = persona ? `${persona}\n\n${DRAFT_SYSTEM}` : DRAFT_SYSTEM;
+  const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${DRAFT_OUTCOMES_SYSTEM}` : DRAFT_SYSTEM;
+  const base = persona ? `${persona}\n\n${rules}` : rules;
   const system = sources ? `${base}\n\nSources:\n${sources}` : base;
   const latest = input.customerMessage || "(the customer has not written anything yet)";
   // Render prior turns as a labeled transcript so the model can see the conversation — without it a
@@ -366,7 +377,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       if (!text) throw new Error("empty completion");
       // A hosted model is more trustworthy than the extractive baseline, but not
       // blindly — 0.7 is a sane default until real per-tenant eval data tunes it.
-      return { text, confidence: 0.7, tokensIn: r.tokensIn, tokensOut: r.tokensOut };
+      return { text, confidence: 0.7, tokensIn: r.tokensIn, tokensOut: r.tokensOut, outcomes: input.outcomes === true };
     } finally {
       clearTimeout(timer);
     }
@@ -398,7 +409,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       }
       text = text.trim();
       if (!text) throw new Error("empty completion");
-      yield { done: { text, confidence: 0.7, tokensIn, tokensOut } };
+      yield { done: { text, confidence: 0.7, tokensIn, tokensOut, outcomes: input.outcomes === true } };
     } finally {
       clearTimeout(timer);
     }
@@ -417,6 +428,29 @@ export class HttpChatModelDriver implements ModelServingDriver {
       return r.text.trim();
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /** The model ids the provider serves this key, newest first where the provider orders them. Empty when the list can't be read. */
+  async listModels(): Promise<string[]> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const anthropic = this.opts.provider === "anthropic";
+      const res = await fetch(`${this.base()}/models${anthropic ? "?limit=1000" : ""}`, {
+        signal: ctrl.signal,
+        headers: anthropic
+          ? { "x-api-key": this.opts.apiKey, "anthropic-version": "2023-06-01" }
+          : { authorization: `Bearer ${this.opts.apiKey}` },
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { data?: Array<{ id?: unknown }> };
+      const ids = (data.data ?? []).map((m) => m.id).filter((id): id is string => typeof id === "string");
+      return this.opts.provider === "openai" ? ids.filter((id) => !NOT_A_CHAT_MODEL.test(id)) : ids;
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(t);
     }
   }
 
@@ -473,7 +507,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
+        max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
         system,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],
       }),
@@ -526,7 +560,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
+        max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
         system,
         stream: true,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],

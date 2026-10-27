@@ -1447,6 +1447,15 @@ export const WIDGET_JS = String.raw`(function () {
       hydrateThread(convId);                       // reconcile now that the answer is persisted
       if (done) done();
     }
+    // The AI decided not to reply, or handed the visitor to a teammate: nothing of it stays in the log.
+    function drop() {
+      if (doneCalled) return; doneCalled = true; streamingConv = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking);
+      if (bubbleRow && bubbleRow.parentNode) bubbleRow.parentNode.removeChild(bubbleRow);
+      hydrateThread(convId);                       // after a handoff this shows the human queue
+      if (done) done();
+    }
     function fail() {
       if (doneCalled) return; doneCalled = true; streamingConv = null;
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
@@ -1458,7 +1467,7 @@ export const WIDGET_JS = String.raw`(function () {
     streamSSE(API + '/public/ask/stream', body, {
       onEvent: function (event, data) {
         if (event === 'delta') { if (data && data.t) onDelta(data.t); }
-        else if (event === 'done') finish(data && data.messageId);
+        else if (event === 'done') { if (data && !data.messageId && (data.quiet || data.handoff)) drop(); else finish(data && data.messageId); }
         else if (event === 'error') fail();
       },
       onJson: function () { streamingConv = null; if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); hydrateThread(convId); if (done) done(); },

@@ -13,12 +13,36 @@ export interface AttachmentRow {
   filename: string;
   content_type: string;
   size_bytes: number;
+  /** The page a link preview came from, e.g. a Tenor GIF. Null for an uploaded file. */
+  embed_url: string | null;
+}
+
+/** An inbound file at a URL. `embedUrl` marks the media of a link preview and names the page it previews. */
+export interface InboundFile {
+  url: string;
+  filename: string;
+  contentType: string;
+  size: number;
+  embedUrl?: string | null;
 }
 
 export interface AttachmentServe {
   storage_key: string;
   filename: string;
   content_type: string;
+}
+
+/** The given uploads that are still waiting for a reply, e.g. the files of a cancelled scheduled reply. */
+export async function pendingAttachments(tenantId: string, ticketId: string, ids: string[]): Promise<AttachmentRow[]> {
+  if (ids.length === 0) return [];
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, filename, content_type, size_bytes, embed_url FROM message_attachments
+        WHERE id = ANY($2::uuid[]) AND ticket_id = $1 AND message_id IS NULL AND note_id IS NULL`,
+      [ticketId, ids],
+    );
+    return r.rows as AttachmentRow[];
+  });
 }
 
 /** Record a freshly-uploaded (pending) attachment against a ticket. Returns the public metadata. */
@@ -30,7 +54,7 @@ export async function createAttachment(
     const r = await c.query(
       `INSERT INTO message_attachments (tenant_id, ticket_id, uploaded_by, filename, content_type, size_bytes, storage_key)
        VALUES (current_tenant(), $1, $2, $3, $4, $5, $6)
-       RETURNING id, filename, content_type, size_bytes`,
+       RETURNING id, filename, content_type, size_bytes, embed_url`,
       [a.ticketId, a.uploadedBy, a.filename, a.contentType, a.sizeBytes, a.storageKey],
     );
     return r.rows[0] as AttachmentRow;
@@ -43,8 +67,23 @@ const INBOUND_CDN_HOSTS = new Set([
   "cdn.discordapp.com",
   "media.discordapp.net",
 ]);
+// Discord's proxy for link-preview media, e.g. images-ext-1.discordapp.net.
+const DISCORD_MEDIA_PROXY = /^images-ext-\d+\.discordapp\.net$/;
 // The copy is buffered in memory, and a Nitro user can upload up to 500 MB. A larger file keeps only its url.
 const INBOUND_COPY_MAX_BYTES = 25 * 1024 * 1024;
+
+/** The response body, or a throw once it passes `max` bytes, also when the response has no Content-Length. */
+export async function readCapped(res: Response, max: number): Promise<Buffer> {
+  if (!res.body) return Buffer.alloc(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    total += chunk.byteLength;
+    if (total > max) throw new Error("too large to copy");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
 
 /** Persist inbound-channel attachments (Discord) onto an already-inserted message — one row per file,
  *  best-effort post-commit (mirrors the reply route's claim pattern). We COPY the source bytes into
@@ -57,7 +96,7 @@ export async function persistInboundAttachments(
   tenantId: string,
   ticketId: string,
   messageId: string,
-  files: { url: string; filename: string; contentType: string; size: number }[],
+  files: InboundFile[],
 ): Promise<void> {
   return persistInboundOwned(tenantId, ticketId, { messageId }, files);
 }
@@ -68,7 +107,7 @@ export async function persistInboundNoteAttachments(
   tenantId: string,
   ticketId: string,
   noteId: string,
-  files: { url: string; filename: string; contentType: string; size: number }[],
+  files: InboundFile[],
 ): Promise<void> {
   return persistInboundOwned(tenantId, ticketId, { noteId }, files);
 }
@@ -77,19 +116,31 @@ async function persistInboundOwned(
   tenantId: string,
   ticketId: string,
   owner: { messageId: string } | { noteId: string },
-  files: { url: string; filename: string; contentType: string; size: number }[],
+  files: InboundFile[],
 ): Promise<void> {
   if (files.length === 0) return;
   const messageId = "messageId" in owner ? owner.messageId : null;
   const noteId = "noteId" in owner ? owner.noteId : null;
+  // Discord can send a message's previews again in an edit, and a stored preview isn't fetched twice.
+  const embedUrls = files.map((f) => f.embedUrl).filter((u): u is string => !!u);
+  const stored = embedUrls.length
+    ? await withTenant(tenantId, async (c) => {
+        const r = await c.query<{ embed_url: string }>(
+          "SELECT embed_url FROM message_attachments WHERE coalesce(message_id, note_id) = $1 AND embed_url = ANY($2::text[])",
+          [messageId ?? noteId, embedUrls],
+        );
+        return new Set(r.rows.map((x) => x.embed_url));
+      })
+    : new Set<string>();
   for (const f of files) {
+    if (f.embedUrl && stored.has(f.embedUrl)) continue;
     const safe = (f.filename || "file").replace(/^.*[\\/]/, "").replace(/[^\w.\- ]+/g, "_").slice(0, 120) || "file";
-    const contentType = f.contentType || "application/octet-stream";
+    let contentType = f.contentType || "application/octet-stream";
     let storageKey = f.url; // fallback: the raw url (degraded — not servable, but the row survives)
     let sizeBytes = f.size || 0;
     try {
       const u = new URL(f.url);
-      if (u.protocol !== "https:" || !INBOUND_CDN_HOSTS.has(u.hostname)) throw new Error("host not allowed");
+      if (u.protocol !== "https:" || !(INBOUND_CDN_HOSTS.has(u.hostname) || DISCORD_MEDIA_PROXY.test(u.hostname))) throw new Error("host not allowed");
       if (f.size > INBOUND_COPY_MAX_BYTES) throw new Error("too large to copy");
       const res = await fetch(f.url, discordFetchInit());
       if (!res.ok) throw new Error(`fetch ${res.status}`);
@@ -97,7 +148,9 @@ async function persistInboundOwned(
         await res.body?.cancel().catch(() => {});
         throw new Error("too large to copy");
       }
-      const buf = Buffer.from(await res.arrayBuffer());
+      const buf = await readCapped(res, INBOUND_COPY_MAX_BYTES);
+      // A link preview's image type is only known from the response.
+      if (!f.contentType) contentType = res.headers.get("content-type")?.split(";")[0].trim() || contentType;
       if (buf.byteLength > 0) {
         const key = `attachments/${tenantId}/${randomUUID()}-${safe}`;
         await putBuffer(key, buf, contentType);
@@ -109,9 +162,10 @@ async function persistInboundOwned(
     }
     await withTenant(tenantId, async (c) => {
       await c.query(
-        `INSERT INTO message_attachments (tenant_id, ticket_id, message_id, note_id, uploaded_by, filename, content_type, size_bytes, storage_key)
-         VALUES (current_tenant(), $1, $2, $3, NULL, $4, $5, $6, $7)`,
-        [ticketId, messageId, noteId, safe, contentType, sizeBytes, storageKey],
+        `INSERT INTO message_attachments (tenant_id, ticket_id, message_id, note_id, uploaded_by, filename, content_type, size_bytes, storage_key, embed_url)
+         VALUES (current_tenant(), $1, $2, $3, NULL, $4, $5, $6, $7, $8)
+         ON CONFLICT DO NOTHING`,
+        [ticketId, messageId, noteId, safe, contentType, sizeBytes, storageKey, f.embedUrl ?? null],
       );
     });
   }
@@ -163,7 +217,7 @@ export async function claimAttachments(
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `UPDATE message_attachments
-          SET message_id = $2
+          SET message_id = $2, note_id = NULL
         WHERE id = ANY($3::uuid[]) AND ticket_id = $1 AND message_id IS NULL
         RETURNING storage_key, filename, content_type`,
       [ticketId, messageId, ids],
@@ -179,7 +233,7 @@ export async function attachmentsForTicket(
 ): Promise<Map<string, AttachmentRow[]>> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT message_id, id, filename, content_type, size_bytes
+      `SELECT message_id, id, filename, content_type, size_bytes, embed_url
          FROM message_attachments
         WHERE ticket_id = $1 AND message_id IS NOT NULL
         ORDER BY created_at ASC`,
@@ -188,7 +242,7 @@ export async function attachmentsForTicket(
     const by = new Map<string, AttachmentRow[]>();
     for (const row of r.rows as (AttachmentRow & { message_id: string })[]) {
       const list = by.get(row.message_id) ?? [];
-      list.push({ id: row.id, filename: row.filename, content_type: row.content_type, size_bytes: row.size_bytes });
+      list.push({ id: row.id, filename: row.filename, content_type: row.content_type, size_bytes: row.size_bytes, embed_url: row.embed_url });
       by.set(row.message_id, list);
     }
     return by;
@@ -202,7 +256,7 @@ export async function attachmentsForNotes(
 ): Promise<Map<string, AttachmentRow[]>> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT note_id, id, filename, content_type, size_bytes
+      `SELECT note_id, id, filename, content_type, size_bytes, embed_url
          FROM message_attachments
         WHERE ticket_id = $1 AND note_id IS NOT NULL
         ORDER BY created_at ASC`,
@@ -211,7 +265,7 @@ export async function attachmentsForNotes(
     const by = new Map<string, AttachmentRow[]>();
     for (const row of r.rows as (AttachmentRow & { note_id: string })[]) {
       const list = by.get(row.note_id) ?? [];
-      list.push({ id: row.id, filename: row.filename, content_type: row.content_type, size_bytes: row.size_bytes });
+      list.push({ id: row.id, filename: row.filename, content_type: row.content_type, size_bytes: row.size_bytes, embed_url: row.embed_url });
       by.set(row.note_id, list);
     }
     return by;
@@ -236,6 +290,31 @@ export async function attachmentStorageForMessage(tenantId: string, messageId: s
       [messageId],
     );
     return r.rows as AttachmentStorage[];
+  });
+}
+
+/** Storage info for a note's files, oldest first. */
+export async function attachmentStorageForNote(tenantId: string, noteId: string): Promise<AttachmentStorage[]> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, filename, content_type, size_bytes, storage_key
+         FROM message_attachments WHERE note_id = $1 ORDER BY created_at ASC`,
+      [noteId],
+    );
+    return r.rows as AttachmentStorage[];
+  });
+}
+
+/** Moves uploads that are still waiting onto a note. Returns how many were attached. */
+export async function claimNoteAttachments(tenantId: string, ticketId: string, noteId: string, ids: string[]): Promise<number> {
+  if (ids.length === 0) return 0;
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `UPDATE message_attachments SET note_id = $2
+        WHERE id = ANY($3::uuid[]) AND ticket_id = $1 AND message_id IS NULL AND note_id IS NULL`,
+      [ticketId, noteId, ids],
+    );
+    return r.rowCount ?? 0;
   });
 }
 

@@ -7,6 +7,7 @@ import {
   handleThreadCreate,
   handleMessageUpdate,
   handleMessageDelete,
+  handleMessageEmbeds,
   type InboundDiscordMessage,
 } from "../src/discord.js";
 import { claimAnswer } from "../src/answer-claims.js";
@@ -202,6 +203,28 @@ async function main() {
       check("a sticker-only message is ingested as a placeholder", !!sticker && s.rows[0]?.body === "[sticker: wave]", s.rows[0]?.body);
       const p = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-poll-1'");
       check("a poll keeps its text and adds its question", !!poll && p.rows[0]?.body === "DISCTEST vote please\n\n[poll: Which plan?]", p.rows[0]?.body);
+    });
+    // Adding text to a sticker-only message keeps its sticker line.
+    await handleMessageUpdate({ guildId: GUILD_A, messageId: "disctest-sticker-1", newContent: "DISCTEST hello", stickers: ["wave"] });
+    await withTenant(A, async (c) => {
+      const s = await c.query("SELECT body FROM messages WHERE idempotency_key = 'discord:disctest-sticker-1'");
+      check("an edit keeps the sticker line", s.rows[0]?.body === "DISCTEST hello\n\n[sticker: wave]", s.rows[0]?.body);
+    });
+  }
+
+  // 7c — a GIF preview is stored once on its message, also when Discord sends it again or adds it later
+  {
+    // A host outside the copy allowlist keeps the test off the network, and the row keeps the URL.
+    const gif = { url: "https://example.invalid/a.mp4", filename: "gif.mp4", contentType: "video/mp4", size: 0, embedUrl: "https://tenor.com/view/disctest-gif" };
+    const r = await handleInboundMessage(thread({ threadId: "disctest-thread-gif", authorId: "cust-g", discordMessageId: "disctest-gif-1", content: gif.embedUrl, attachments: [gif] }));
+    await handleMessageEmbeds(GUILD_A, "disctest-gif-1", [gif]);
+    const late = await handleInboundMessage(thread({ threadId: "disctest-thread-gif2", authorId: "cust-g2", discordMessageId: "disctest-gif-2", content: "https://tenor.com/view/disctest-late" }));
+    await handleMessageEmbeds(GUILD_A, "disctest-gif-2", [{ ...gif, embedUrl: "https://tenor.com/view/disctest-late" }]);
+    await withTenant(A, async (c) => {
+      const once = await c.query("SELECT embed_url FROM message_attachments WHERE message_id = $1", [r!.messageId]);
+      check("a GIF preview is stored once with the page it previews", once.rowCount === 1 && once.rows[0].embed_url === gif.embedUrl, once.rows);
+      const added = await c.query("SELECT embed_url FROM message_attachments WHERE message_id = $1", [late!.messageId]);
+      check("a preview that arrives in an update is added to its message", added.rowCount === 1 && added.rows[0].embed_url === "https://tenor.com/view/disctest-late", added.rows);
     });
   }
 

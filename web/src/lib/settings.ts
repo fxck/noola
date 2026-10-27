@@ -43,7 +43,7 @@ export const PROVIDER_OPTIONS: { value: ModelProvider; label: string }[] = [
 export const MODEL_PLACEHOLDER: Record<ModelProvider, string> = {
   managed: "",
   openai: "gpt-4o-mini",
-  anthropic: "claude-3-5-sonnet-latest",
+  anthropic: "claude-opus-5-5",
   custom: "e.g. llama-3.1-70b-instruct",
 };
 
@@ -54,12 +54,13 @@ export const MODEL_SUGGESTIONS: Record<ModelProvider, string[]> = {
   managed: [],
   openai: ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini", "o4-mini", "o3"],
   anthropic: [
-    "claude-opus-4-8",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
     "claude-sonnet-5",
-    "claude-haiku-4-5",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-3-5-sonnet-latest",
+    "claude-opus-4-8",
   ],
   custom: [],
 };
@@ -79,6 +80,11 @@ export const DEFAULT_SETTINGS: ModelSettings = {
 
 export async function fetchModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>("/settings/model");
+}
+
+/** The models the saved provider serves the saved key. Empty until a key and model are saved, or when the provider doesn't list them. */
+export async function fetchAvailableModels(): Promise<string[]> {
+  return (await api<{ models: string[] }>("/settings/model/available")).models;
 }
 
 export async function saveModelSettings(input: ModelSettingsInput): Promise<ModelSettings> {
@@ -148,6 +154,27 @@ export async function fetchTranslationSettings(): Promise<TranslationSettings> {
 
 export async function saveTranslationSettings(input: TranslationSettingsInput): Promise<TranslationSettings> {
   return api<TranslationSettings>("/settings/translation", { method: "PUT", body: JSON.stringify(input) });
+}
+
+// ── Replies ──────────────────────────────────────────────────────────────────
+
+export const MAX_SEND_DELAY_SECONDS = 600;
+
+/** How long a reply from the composer waits before it is sent, so it can still be cancelled. 0 sends at once. */
+export async function fetchSendDelay(): Promise<number> {
+  return (await api<{ sendDelaySeconds: number }>("/settings/replies")).sendDelaySeconds;
+}
+
+/** Admin only. Returns the stored value. */
+export async function saveSendDelay(sendDelaySeconds: number): Promise<number> {
+  return (
+    await api<{ sendDelaySeconds: number }>("/settings/replies", { method: "PUT", body: JSON.stringify({ sendDelaySeconds }) })
+  ).sendDelaySeconds;
+}
+
+/** A delay as the composer and settings name it: "30 s", "2 min", "90 s". */
+export function formatDelay(seconds: number): string {
+  return seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`;
 }
 
 // ── Auto-tagging config (STUDIO-SEEDED-FLOWS.md #1) ───────────────────────────

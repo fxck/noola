@@ -30,7 +30,7 @@ function page(reply: FastifyReply, status: number, title: string, detail: string
     ? `<p style="margin:16px 0 0;font-size:13px;color:#71717a">Changed your mind? <a href="${opts.undoHref}" style="color:#b45309">Resubscribe</a>.</p>`
     : "";
   const manage = opts?.manageHref
-    ? `<p style="margin:12px 0 0;font-size:13px;color:#71717a"><a href="${opts.manageHref}" style="color:#b45309">Manage all your email preferences</a>.</p>`
+    ? `<p style="margin:12px 0 0;font-size:13px;color:#71717a"><a href="${opts.manageHref}" style="color:#b45309">Manage all your e-mail preferences</a>.</p>`
     : "";
   return reply
     .code(status)
@@ -60,7 +60,7 @@ export default async function unsubscribeRoutes(app: FastifyInstance): Promise<v
       reply,
       200,
       "Unsubscribe preview",
-      "This is a preview. Every real email carries a working, one-click unsubscribe link unique to its recipient — this placeholder stands in while you compose.",
+      "This is a preview. Every real e-mail carries a working, one-click unsubscribe link unique to its recipient — this placeholder stands in while you compose.",
     ),
   );
 
@@ -88,7 +88,7 @@ export default async function unsubscribeRoutes(app: FastifyInstance): Promise<v
         reply,
         200,
         `Unsubscribed from ${esc(t.name)}`,
-        `You'll no longer receive <strong>${esc(t.name)}</strong> emails from this workspace. Other subscriptions are unchanged, and replies about your open support conversations are unaffected.`,
+        `You'll no longer receive <strong>${esc(t.name)}</strong> e-mails from this workspace. Other subscriptions are unchanged, and replies about your open support conversations are unaffected.`,
         { undoHref: `/u/${token}/undo?t=${topic}`, manageHref: `/u/${token}/preferences` },
       );
     }
@@ -130,7 +130,7 @@ export default async function unsubscribeRoutes(app: FastifyInstance): Promise<v
     if (topic) {
       const ok = await setTopicOptout(id.tenantId, id.contactId, topic, false);
       if (!ok) return page(reply, 404, "This link is invalid", "That subscription no longer exists.", { manageHref: `/u/${token}/preferences` });
-      return page(reply, 200, "You're resubscribed", "You'll receive these emails from this workspace again.", { manageHref: `/u/${token}/preferences` });
+      return page(reply, 200, "You're resubscribed", "You'll receive these e-mails from this workspace again.", { manageHref: `/u/${token}/preferences` });
     }
     const who = await setSubscription(id.tenantId, id.contactId, false);
     if (!who) return page(reply, 404, "This link is invalid", "The link no longer matches a contact. Nothing was changed.");
@@ -192,11 +192,11 @@ function renderPreferences(
   const globalRow = state.globallyUnsubscribed
     ? `<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:16px;margin:0 0 16px">
          <p style="font-size:14px;font-weight:600;color:#b45309;margin:0">You're unsubscribed from everything</p>
-         <p style="font-size:13px;color:#71717a;margin:6px 0 12px">You won't receive any marketing emails. Resubscribe to manage individual topics.</p>
+         <p style="font-size:13px;color:#71717a;margin:6px 0 12px">You won't receive any marketing e-mails. Resubscribe to manage individual topics.</p>
          ${form("all_on", null, btn("Resubscribe to all", "on"))}
        </div>`
     : `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #f4f4f5">
-         <div><p style="font-size:14px;font-weight:600;color:#18181b;margin:0">All marketing emails</p>
+         <div><p style="font-size:14px;font-weight:600;color:#18181b;margin:0">All marketing e-mails</p>
          <p style="font-size:13px;color:#71717a;margin:4px 0 0">Turn everything off in one tap.</p></div>
          ${form("all_off", null, btn("Unsubscribe from all", "off"))}
        </div>`;
@@ -218,10 +218,10 @@ function renderPreferences(
       }).join("");
 
   return `<!doctype html>
-<html><head>${SHELL_HEAD}<title>Email preferences</title></head>
+<html><head>${SHELL_HEAD}<title>E-mail preferences</title></head>
 ${BODY_OPEN}
     <div style="background:#fff;border:1px solid #e4e4e7;border-radius:12px;padding:28px">
-      <p style="font-size:16px;font-weight:600;color:#18181b;margin:0 0 4px">Email preferences</p>
+      <p style="font-size:16px;font-weight:600;color:#18181b;margin:0 0 4px">E-mail preferences</p>
       <p style="font-size:13px;color:#71717a;margin:0 0 20px">Choose what you hear about. Replies to your open support conversations are always delivered.</p>
       ${globalRow}
       ${topicRows}

@@ -97,8 +97,15 @@ export const ReplyInput = z.object({
    *  it retries the same send (double-submit, transport retry) so the server collapses the duplicate
    *  instead of storing + dispatching the reply — and the external channel send — twice. */
   clientMessageId: z.string().min(1).max(128).optional(),
+  /** Skip the workspace's send delay and send at once. */
+  sendNow: z.boolean().optional(),
 });
 export type ReplyInput = z.infer<typeof ReplyInput>;
+
+export const ReplySettingsInput = z.object({
+  /** How long a sent reply waits, so it can still be cancelled. 0 sends at once. */
+  sendDelaySeconds: z.number().int().min(0).max(600),
+});
 
 /** Start a NEW outbound conversation with a single contact (Intercom "new message"). The agent's
  *  opening message creates a real, inbox-visible ticket keyed to the contact + delivered over their
@@ -227,8 +234,17 @@ export const NoteInput = z.object({
   body: z.string().min(1).max(8000),
   // Member ids from the composer's mention chips — authoritative loop-in list when present.
   mentionIds: z.array(z.guid()).max(50).optional(),
+  /** Files uploaded for this note. They are shown on it and on its copy in the Discord mirror. */
+  attachmentIds: z.array(z.guid()).max(10).optional(),
 });
 export type NoteInput = z.infer<typeof NoteInput>;
+
+export const NoteEditInput = z.object({ body: z.string().min(1).max(8000) });
+
+export const NoteSendInput = z.object({
+  /** Skip the workspace's send delay and send at once. */
+  sendNow: z.boolean().optional(),
+});
 
 // --- Public tickets API (Wave A) ---
 export const PublicTicketInput = z.object({
@@ -1660,3 +1676,13 @@ export function stripReservedAttributes(attrs: Record<string, unknown>): Record<
   }
   return out;
 }
+
+/** One member's own settings. A missing key falls back to its default, so a new setting needs no migration. */
+export const UserPreferences = z.object({
+  /** Show a GIF or image that a message links to, instead of only the link. */
+  linkPreviews: z.boolean().default(true),
+  /** What the composer's Send button does when the workspace has a send delay. The other choice is in its menu. */
+  sendMode: z.enum(["delayed", "now"]).default("delayed"),
+});
+export type UserPreferences = z.infer<typeof UserPreferences>;
+export const UserPreferencesPatch = UserPreferences.partial().strict();

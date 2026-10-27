@@ -22,6 +22,7 @@ async function main() {
   const clean = async () => {
     await superPool.query("DELETE FROM messages WHERE provider_message_id LIKE 'mdlv-%'");
     await superPool.query("DELETE FROM email_suppressions WHERE address LIKE 'mdlv-%'");
+    await superPool.query("DELETE FROM broadcast_events WHERE address LIKE 'mdlv-%'");
     await superPool.query("DELETE FROM tickets WHERE subject LIKE 'MDLV%'");
   };
   await clean();

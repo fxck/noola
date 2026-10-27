@@ -139,6 +139,79 @@ async function pure() {
   }, NOW);
   check("an abort hands on finished tickets and holds back the aborting channel's", handedAbort.length === 1 && handedAbort[0] === "T6", handedAbort);
 
+  // The abort hit the page after a full one, so every message of T8 is a replay on the retry.
+  const fullId = at(NOW - 86_400_000 + 1);
+  const fullMsgs = Array.from({ length: 100 }, (_, i) => ({ id: at(GAP_START + 1000 + i), ticketId: "T8" }));
+  let fullCalls = 0;
+  const full = channel({
+    id: fullId, lastMessageId: at(t),
+    fetchAfter: async (after) => {
+      if (fullCalls++ === 1) throw stopErr;
+      return fullMsgs.filter((m) => BigInt(m.id) > BigInt(after)).slice(0, 100);
+    },
+  });
+  const later = channel({ id: at(NOW - 86_400_000 + 2), lastMessageId: at(t) }, [{ id: at(t), ticketId: "T9" }]);
+  const first = await backfillChannels([full, later], scope({}), GAP_START, {
+    onThreadCreated: async () => {},
+    onMessage: async (m) => ({ tenantId: A, ticketId: m.ticketId!, messageId: m.id }),
+    onTicketBackfilled: async () => {},
+    abortOn: (e) => e === stopErr,
+  }, NOW);
+  check("an abort returns the aborting channel's tickets for the retry", first.heldBack.get(fullId)?.has("T8") === true, [...first.heldBack.keys()]);
+  const retried: string[] = [];
+  await backfillChannels([full, later], scope({}), GAP_START, {
+    onThreadCreated: async () => {},
+    onMessage: async () => null,
+    onTicketBackfilled: async (_t, ticketId) => { retried.push(ticketId); },
+    abortOn: (e) => e === stopErr,
+  }, NOW, first.heldBack);
+  check("the retry hands on a held-back ticket whose messages are all replays", retried.length === 1 && retried[0] === "T8", retried);
+
+  // A carried ticket waits again when the retry aborts before its channel is read to the end.
+  const stillDown = channel({ id: fullId, lastMessageId: at(t), fetchAfter: async () => { throw stopErr; } });
+  const again = await backfillChannels([stillDown], scope({}), GAP_START, {
+    onThreadCreated: async () => {},
+    onMessage: async () => null,
+    onTicketBackfilled: async (_t, ticketId) => { retried.push(ticketId); },
+    abortOn: (e) => e === stopErr,
+  }, NOW, first.heldBack);
+  check("a carried ticket stays held back when its channel aborts again", retried.length === 1 && again.heldBack.get(fullId)?.has("T8") === true, retried);
+
+  // A ticket across a finished channel and an aborting one is handed on once, after the retry.
+  const spanTop = channel({ id: "vip", isThread: false, parentId: null, lastMessageId: at(t) }, [{ id: at(t - 2000), ticketId: "T10" }]);
+  const spanThread = channel({ id: at(NOW - 86_400_000 + 3), lastMessageId: at(t) }, [
+    { id: at(t - 1000), ticketId: "T10" },
+    { id: at(t - 500), ticketId: "T10-limited" },
+  ]);
+  const spanHanded: string[] = [];
+  const spanFirst = await backfillChannels([spanTop, spanThread], scope({}), GAP_START, {
+    onThreadCreated: async () => {},
+    onMessage: async (m) => {
+      if (m.ticketId === "T10-limited") throw stopErr;
+      return { tenantId: A, ticketId: m.ticketId!, messageId: m.id };
+    },
+    onTicketBackfilled: async (_t, ticketId) => { spanHanded.push(ticketId); },
+    abortOn: (e) => e === stopErr,
+  }, NOW);
+  check("a ticket held back in one channel isn't handed on by another", spanHanded.length === 0, spanHanded);
+  await backfillChannels([spanTop, spanThread], scope({}), GAP_START, {
+    onThreadCreated: async () => {},
+    onMessage: async () => null,
+    onTicketBackfilled: async (_t, ticketId) => { spanHanded.push(ticketId); },
+    abortOn: (e) => e === stopErr,
+  }, NOW, spanFirst.heldBack);
+  check("and the retry hands it on once", spanHanded.length === 1 && spanHanded[0] === "T10", spanHanded);
+
+  // A carried channel that is gone, e.g. a deleted thread, hands its tickets on.
+  const goneHanded: string[] = [];
+  await backfillChannels([], scope({}), GAP_START, {
+    onThreadCreated: async () => {},
+    onMessage: async () => null,
+    onTicketBackfilled: async (_t, ticketId) => { goneHanded.push(ticketId); },
+    abortOn: () => false,
+  }, NOW, new Map([["deleted-thread", new Map([["T11", { tenantId: A, messageId: "m11" }]])]]));
+  check("a carried ticket whose channel is gone is handed on", goneHanded.length === 1 && goneHanded[0] === "T11", goneHanded);
+
   // An unreadable channel is skipped. An aborting error stops the run.
   const broken = channel({ id: at(NOW - 86_400_000), lastMessageId: at(t), fetchAfter: async () => { throw new Error("Missing Access"); } });
   const after = channel({ id: at(NOW - 86_400_000), lastMessageId: at(t) }, [{ id: at(t), ticketId: "T4" }]);

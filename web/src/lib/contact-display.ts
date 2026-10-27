@@ -84,7 +84,7 @@ export function composedName(c: Pick<Contact, "attributes">): string {
 
 const CHANNEL_VISITOR: Record<string, string> = {
   widget: "Widget visitor",
-  email: "Email contact",
+  email: "E-mail contact",
   discord: "Discord user",
   slack: "Slack user",
   telegram: "Telegram user",
@@ -107,7 +107,7 @@ export function contactDisplayName(c: Contact): string {
 
 const CHANNEL_LABEL: Record<string, string> = {
   widget: "Web widget",
-  email: "Email",
+  email: "E-mail",
   discord: "Discord",
   slack: "Slack",
   telegram: "Telegram",

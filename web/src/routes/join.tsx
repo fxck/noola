@@ -77,9 +77,9 @@ export function JoinPage() {
         status === 409
           ? "This account already belongs to another workspace."
           : status === 403
-            ? "Your email isn't allowed for this invite link."
+            ? "Your e-mail isn't allowed for this invite link."
             : status === 401
-              ? "That email already has an account — enter its existing password."
+              ? "That e-mail already has an account — enter its existing password."
               : "Couldn't join this workspace — please try again.",
       );
       setBusy(false);
@@ -135,7 +135,7 @@ export function JoinPage() {
             <CardContent>
               <form onSubmit={onSubmit} className="flex flex-col gap-4">
                 <div className="flex flex-col gap-2">
-                  <Label htmlFor="email">Email</Label>
+                  <Label htmlFor="email">E-mail</Label>
                   <Input
                     id="email"
                     type="email"

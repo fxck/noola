@@ -82,13 +82,13 @@ async function apiFetch<T = Record<string, unknown>>(url: string, init: RequestI
       headers: { authorization: `Bearer ${key}`, "content-type": "application/json", ...(init.headers ?? {}) },
     });
   } catch (e) {
-    throw new SendingProviderError(`email provider unreachable: ${(e as Error).message}`);
+    throw new SendingProviderError(`e-mail provider unreachable: ${(e as Error).message}`);
   } finally {
     clearTimeout(t);
   }
   const body = (await res.json().catch(() => ({}))) as { message?: string; errors?: { message?: string }[] } & T;
   if (!res.ok) {
-    throw new SendingProviderError(body?.message || body?.errors?.[0]?.message || `email provider error (${res.status})`);
+    throw new SendingProviderError(body?.message || body?.errors?.[0]?.message || `e-mail provider error (${res.status})`);
   }
   return body;
 }

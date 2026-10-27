@@ -161,10 +161,10 @@ const KIND: Record<IntegrationKind, KindMeta> = {
     blurb: "Post messages into a Discord channel via a channel webhook.",
   },
   email: {
-    label: "Email",
+    label: "E-mail",
     Icon: Mail,
     toField: true,
-    blurb: "Send an email alert to a fixed recipient.",
+    blurb: "Send an e-mail alert to a fixed recipient.",
   },
   http: {
     label: "HTTP endpoint",
@@ -514,8 +514,8 @@ export function SettingsIntegrationsPage() {
                     {/* ── Connect dialogs (0092 self-serve creds) ── */}
                     <FormDialog
                       open={connectDialog === "email"}
-                      title="Support email address"
-                      description="The From address for outbound ticket replies (so a customer's reply routes back here). It must be on a domain your email provider is authorized to send from — otherwise sends are rejected."
+                      title="Support e-mail address"
+                      description="The From address for outbound ticket replies (so a customer's reply routes back here). It must be on a domain your e-mail provider is authorized to send from — otherwise sends are rejected."
                       onClose={closeConnect}
                       onSubmit={() => void onConnectSubmit()}
                       submitLabel="Save"
@@ -973,7 +973,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
       await deleteEmailProvider();
       setProvider(null); setSel("resend");
       setApiKey(""); setWebhookSecret("");
-      toast.success("Provider disconnected — email falls back to the shared account.");
+      toast.success("Provider disconnected — e-mail falls back to the shared account.");
       setDisconnect(false);
     } catch {
       toast.error("Couldn't disconnect.");
@@ -990,18 +990,18 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
     <section className="mt-8">
       <div className="mb-1 flex items-center gap-2">
         <KeyRound className="size-4 text-muted-foreground" />
-        <h2 className="text-sm font-semibold text-foreground">Bring your own email provider</h2>
+        <h2 className="text-sm font-semibold text-foreground">Bring your own e-mail provider</h2>
         {connected && <Badge variant="success" className="h-5 text-micro">{PROVIDER_LABEL[provider!.provider]} connected</Badge>}
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
-        Connect your own <span className="font-mono">Resend</span> or <span className="font-mono">SendGrid</span> account so email
+        Connect your own <span className="font-mono">Resend</span> or <span className="font-mono">SendGrid</span> account so e-mail
         sends and receives through your credentials — your sending reputation, your billing and quota, your key to rotate. Leave
         this empty to use the shared platform account. Your keys are encrypted at rest and never shown again after saving.
       </p>
 
       {!isAdmin ? (
         <p className="rounded-lg border border-dashed px-4 py-3 text-xs text-muted-foreground">
-          {connected ? `Your workspace is using its own ${PROVIDER_LABEL[provider!.provider]} account.` : "Using the shared email account."} Only an admin can change this.
+          {connected ? `Your workspace is using its own ${PROVIDER_LABEL[provider!.provider]} account.` : "Using the shared e-mail account."} Only an admin can change this.
         </p>
       ) : (
         <div className="space-y-4 rounded-lg border p-4">
@@ -1041,7 +1041,7 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
           {/* Step 2 — inbound. Sequential: the URL only exists once the account is connected. */}
           <div className="space-y-2">
             <Label className="flex items-center gap-1.5">
-              <StepBadge n={2} done={step2Done} /> Inbound {sel === "sendgrid" ? "parse" : "webhook"} <span className="text-micro font-normal text-muted-foreground">(to receive email as tickets)</span>
+              <StepBadge n={2} done={step2Done} /> Inbound {sel === "sendgrid" ? "parse" : "webhook"} <span className="text-micro font-normal text-muted-foreground">(to receive e-mail as tickets)</span>
             </Label>
             {!connected ? (
               <p className="rounded-md border border-dashed px-3 py-2 text-micro text-muted-foreground">
@@ -1115,8 +1115,8 @@ function EmailProviderSection({ isAdmin }: { isAdmin: boolean }) {
 
       <ConfirmDialog
         open={disconnect}
-        title="Disconnect your email provider?"
-        message={<>Email will fall back to the shared platform account. Your stored key and webhook secret are deleted. This can't be undone.</>}
+        title="Disconnect your e-mail provider?"
+        message={<>E-mail will fall back to the shared platform account. Your stored key and webhook secret are deleted. This can't be undone.</>}
         confirmLabel="Disconnect"
         destructive
         busy={removing}
@@ -1155,7 +1155,7 @@ function SenderModeSection({ isAdmin }: { isAdmin: boolean }) {
 
   const OPTIONS: { value: EmailSenderSettings["mode"]; title: string; desc: string }[] = [
     { value: "shared", title: "Shared support address", desc: "All replies send from your support address, with the teammate's name shown (e.g. \"Alex from " + settings.workspace + "\")." },
-    { value: "teammate", title: "Each teammate's own address", desc: "Replies send from the teammate's own email (e.g. alex@yourdomain.com) when that domain is verified below — otherwise they fall back to the support address." },
+    { value: "teammate", title: "Each teammate's own address", desc: "Replies send from the teammate's own e-mail (e.g. alex@yourdomain.com) when that domain is verified below — otherwise they fall back to the support address." },
   ];
 
   return (
@@ -1165,7 +1165,7 @@ function SenderModeSection({ isAdmin }: { isAdmin: boolean }) {
         <h2 className="text-sm font-semibold text-foreground">Reply sending address</h2>
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
-        Which address outgoing email replies are sent from. Customer replies always thread back to the right conversation
+        Which address outgoing e-mail replies are sent from. Customer replies always thread back to the right conversation
         either way.
       </p>
 
@@ -1279,12 +1279,12 @@ function SendingDomainsSection({ isAdmin }: { isAdmin: boolean }) {
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
         Verify a domain you own to send replies from your own address (e.g. <span className="font-mono">support@yourdomain.com</span>)
-        with real DKIM/SPF — so email lands in the inbox and looks like it's from you. Publish the DNS records we show, then verify.
+        with real DKIM/SPF — so e-mail lands in the inbox and looks like it's from you. Publish the DNS records we show, then verify.
       </p>
 
       {!providerEnabled && (
         <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
-          Self-serve provisioning is off — connect your Resend or SendGrid account in “Bring your own email provider” above to
+          Self-serve provisioning is off — connect your Resend or SendGrid account in “Bring your own e-mail provider” above to
           auto-create the DNS records here. You can still track a domain and authenticate it by hand in your provider's dashboard.
         </p>
       )}

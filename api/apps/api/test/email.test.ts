@@ -1,6 +1,6 @@
 import pg from "pg";
 import { appPool, relayPool, withTenant } from "@repo/db";
-import { handleInboundEmail, routeEmailOutbound, linkEmailRoute } from "../src/email.js";
+import { handleInboundEmail, routeEmailOutbound, linkEmailRoute, ticketReplyAddress } from "../src/email.js";
 
 // Slice-05 seam gate: proves the email channel resolves recipient→tenant, ingests
 // into ticket+message+outbox, dedupes on the Message-ID, guards the echo loop
@@ -35,12 +35,17 @@ async function main() {
     max: 1,
   });
 
+  // linkEmailRoute replaces a tenant's route, so the seeded one is put back afterwards.
+  const savedRoutes = (await superPool.query("SELECT address, tenant_id FROM email_routes WHERE tenant_id = ANY($1::uuid[]) AND address NOT LIKE 'emailtest-%'", [[A, B]])).rows;
   const clean = async () => {
     await superPool.query("DELETE FROM messages WHERE body LIKE 'EMAILTEST%'");
     await superPool.query("DELETE FROM messages WHERE idempotency_key LIKE 'email:emailtest-%'");
     await superPool.query("DELETE FROM tickets WHERE external_channel_id LIKE 'emailtest-%'");
     await superPool.query("DELETE FROM outbox WHERE payload->'data'->>'body' LIKE 'EMAILTEST%'");
     await superPool.query("DELETE FROM email_routes WHERE address LIKE 'emailtest-%'");
+    for (const r of savedRoutes) {
+      await superPool.query("INSERT INTO email_routes (address, tenant_id) VALUES ($1, $2) ON CONFLICT (address) DO NOTHING", [r.address, r.tenant_id]);
+    }
   };
   await clean();
 
@@ -87,6 +92,8 @@ async function main() {
       );
       const m = await c.query("SELECT count(*)::int AS n FROM messages WHERE ticket_id = $1", [acmeTicketId]);
       check("Acme ticket carries exactly 1 message", m.rows[0].n === 1);
+      const to = await c.query("SELECT meta->>'to' AS to FROM messages WHERE ticket_id = $1", [acmeTicketId]);
+      check("the message keeps the support address it was sent to", to.rows[0]?.to === ROUTE_A.toLowerCase(), to.rows[0]);
     });
 
     const ob = await relayPool.query(
@@ -110,6 +117,18 @@ async function main() {
         "SELECT count(*)::int AS n FROM tickets WHERE external_channel_id = $1", [CUST_A],
       );
       check("still exactly one ticket for the customer", t.rows[0].n === 1);
+    });
+  }
+
+  // 3b — a reply to our reply-token address stores the plain support address
+  {
+    const r = await handleInboundEmail({
+      messageId: "emailtest-a-token", from: CUST_A, to: ticketReplyAddress(ROUTE_A, acmeTicketId),
+      subject: "Re: EMAILTEST subject", body: "EMAILTEST reply through the token",
+    });
+    await withTenant(A, async (c) => {
+      const to = await c.query("SELECT meta->>'to' AS to FROM messages WHERE id = $1", [r?.messageId]);
+      check("a reply-token address is stored as the plain support address", to.rows[0]?.to === ROUTE_A.toLowerCase(), to.rows[0]);
     });
   }
 

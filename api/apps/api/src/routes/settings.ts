@@ -7,7 +7,7 @@ import {
   TranslationSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
-import { getModelConfig, putModelConfig, testModelConfig } from "../modelconfig.js";
+import { getModelConfig, listAvailableModels, putModelConfig, testModelConfig } from "../modelconfig.js";
 import { getAiOverview } from "../ai-overview.js";
 import {
   getPolicy, putPolicy, listDecisionsForTicket, listQueue, sendQueued, dismissQueued,
@@ -84,6 +84,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
 
   // Live reachability probe for the tenant's saved config (a tiny draft round-trip).
   app.post("/settings/model/test", tenanted(async (tenantId) => testModelConfig(tenantId)));
+  app.get("/settings/model/available", tenanted(async (tenantId) => ({ models: await listAvailableModels(tenantId) })));
 
   // ---- Settings: translation (Wave 4) --------------------------------------
   // The workspace language + the auto-translate master switch. Detection + the language analytics
@@ -259,7 +260,10 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const { id } = req.params as { id: string };
     const body = (req.body as { body?: string } | undefined)?.body;
     const out = await sendQueued(tenantId, id, body);
-    if (!out.ok) return reply.code(out.code).send({ error: out.code === 404 ? "not found" : "not pending" });
+    if (!out.ok) {
+      const error = out.code === 404 ? "not found" : out.code === 422 ? "edit_required" : "not pending";
+      return reply.code(out.code).send({ error });
+    }
     return { message: out.message };
   }));
 
@@ -536,7 +540,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     }
     // reply address: "" clears; a non-empty value must look like an email (basic shape only).
     if (typeof b.replyAddress === "string" && b.replyAddress.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.replyAddress.trim())) {
-      return reply.code(400).send({ error: "replyAddress must be a valid email address" });
+      return reply.code(400).send({ error: "replyAddress must be a valid e-mail address" });
     }
     const patch: { provider?: "resend" | "sendgrid"; apiKey?: string; webhookSecret?: string; active?: boolean; replyAddress?: string } = {};
     if (isEmailProvider(b.provider)) patch.provider = b.provider;
@@ -559,7 +563,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
   app.post("/email/provider/rotate-handle", tenanted(async (tenantId, req, reply) => {
     if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
     const handle = await rotateInboundHandle(tenantId);
-    if (!handle) return reply.code(404).send({ error: "no email provider configured" });
+    if (!handle) return reply.code(404).send({ error: "no e-mail provider configured" });
     return { provider: providerView(await getTenantEmailProvider(tenantId)) };
   }));
 
@@ -858,13 +862,14 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
           await postResponse(responseUrl, { response_type: "ephemeral", replace_original: true, text: notice });
         }
       } else if (command === "/draft") {
-        const res = await handleSlackDraftCommand({ teamId, channelId, text });
+        const res = await handleSlackDraftCommand({ teamId, channelId, userId, text });
         if (res.status === "drafted" && res.text && res.ticketId) {
           const token = stashSlackDraft({ teamId, channelId, ticketId: res.ticketId, text: res.text });
           await postResponse(responseUrl, { response_type: "ephemeral", blocks: draftBlocks(res.text, token) });
         } else {
           const notice =
             res.status === "no_ticket" ? "No open ticket in this channel yet — reply in the channel first."
+            : res.status === "forbidden" ? "Only teammates can use /draft. If you are one, add your Slack member ID to your Noola profile."
             : res.status === "not_connected" ? "This workspace isn't connected to the assistant."
             : res.status === "empty" ? "Please include what the reply should address."
             : "Something went wrong.";
@@ -921,8 +926,20 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
         void postResponse(payload.response_url ?? "", { replace_original: true, text: "This draft expired — run /draft again." });
         return reply.code(200).send();
       }
+      const forbidden = () => postResponse(payload.response_url ?? "", {
+        response_type: "ephemeral",
+        text: "Only teammates can post this draft. If you are one, add your Slack member ID to your Noola profile.",
+      });
+      if (teamId !== draft.teamId) {
+        void forbidden();
+        return reply.code(200).send();
+      }
       void (async () => {
-        const r = await slackPostDraft({ teamId: draft.teamId, channelId: draft.channelId, ticketId: draft.ticketId, text: draft.text, postId: token });
+        const r = await slackPostDraft({ teamId: draft.teamId, channelId: draft.channelId, ticketId: draft.ticketId, text: draft.text, postId: token, userId });
+        if (r.forbidden) {
+          await forbidden();
+          return;
+        }
         deleteSlackDraft(token);
         await postResponse(payload.response_url ?? "", {
           replace_original: true,

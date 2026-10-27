@@ -238,7 +238,7 @@ export function ContextRail({
           </FactRow>
         )}
         {t.contact_email && (
-          <FactRow label="Email">
+          <FactRow label="E-mail">
             <a
               href={`mailto:${t.contact_email}`}
               className="min-w-0 truncate underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"

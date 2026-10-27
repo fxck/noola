@@ -61,7 +61,7 @@ export function LoginPage() {
       await navigate({ to: "/" });
     } catch (err) {
       const status = (err as { status?: number }).status;
-      setError(status === 401 ? "Wrong email or password." : "Couldn't sign in — please try again.");
+      setError(status === 401 ? "Wrong e-mail or password." : "Couldn't sign in — please try again.");
       setBusy(false);
     }
   }
@@ -150,7 +150,7 @@ export function LoginPage() {
             ) : (
             <form onSubmit={onSubmit} className="flex flex-col gap-4">
               <div className="flex flex-col gap-2">
-                <Label htmlFor="email">Email</Label>
+                <Label htmlFor="email">E-mail</Label>
                 <Input
                   id="email"
                   type="email"
