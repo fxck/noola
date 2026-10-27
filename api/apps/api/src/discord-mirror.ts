@@ -245,7 +245,7 @@ function postHeader(t: TicketBrief, quotedBody: string | null, quickLinks: Quick
   // Contact metadata — only the parts we actually have, and email only when it isn't already the
   // "who", so we never print a bare or duplicated field.
   const meta: string[] = [];
-  if (t.contact_email && t.contact_email !== who) meta.push(`Email: ${t.contact_email}`);
+  if (t.contact_email && t.contact_email !== who) meta.push(`E-mail: ${t.contact_email}`);
   if (t.contact_external_id) meta.push(`ID: ${t.contact_external_id}`);
   if (t.contact_company) meta.push(`Company: ${t.contact_company}`);
   if (meta.length) lines.push(meta.join(" · "));

@@ -69,7 +69,7 @@ export function OriginalEmailDialog({
       className="motion-overlay fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-black/40 p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Original email"
+      aria-label="Original e-mail"
       onClick={onClose}
     >
       <div
@@ -80,7 +80,7 @@ export function OriginalEmailDialog({
           <div className="flex min-w-0 items-center gap-2">
             <Mail className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
-              <h2 className="text-sm font-semibold text-foreground">Original email</h2>
+              <h2 className="text-sm font-semibold text-foreground">Original e-mail</h2>
               <p className="text-micro text-muted-foreground">The untouched message as it arrived, before quote-stripping.</p>
             </div>
           </div>
@@ -141,7 +141,7 @@ export function OriginalEmailDialog({
                 // Sandboxed WITHOUT allow-scripts / allow-same-origin: customer HTML renders (styles,
                 // images) but no script executes and it can't touch the app origin — no XSS surface.
                 <iframe
-                  title="Original email body"
+                  title="Original e-mail body"
                   sandbox=""
                   srcDoc={data.html ?? ""}
                   className="min-h-[55vh] w-full flex-1 bg-white"

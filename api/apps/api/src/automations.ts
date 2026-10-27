@@ -408,7 +408,7 @@ async function runAction(
       }
       case "contact_update": {
         const email = interpolate(action.contactEmail ?? "", ctx).trim();
-        if (!email) return { type: action.type, ok: false, detail: "empty email" };
+        if (!email) return { type: action.type, ok: false, detail: "empty e-mail" };
         const name = action.contactName ? interpolate(action.contactName, ctx).trim() : undefined;
         const attributes = action.contactFields ? parseHeaders(action.contactFields, ctx) : undefined;
         const { upsertContact } = await import("./contacts.js");

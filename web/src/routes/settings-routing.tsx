@@ -371,7 +371,7 @@ function RuleEditor({
     <div className="space-y-5">
       <div className="space-y-1.5">
         <Label htmlFor="rname">Rule name</Label>
-        <Input id="rname" value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="e.g. Urgent email → senior team" autoFocus />
+        <Input id="rname" value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="e.g. Urgent e-mail → senior team" autoFocus />
       </div>
 
       {/* Conditions */}

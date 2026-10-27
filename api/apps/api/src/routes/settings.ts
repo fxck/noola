@@ -536,7 +536,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     }
     // reply address: "" clears; a non-empty value must look like an email (basic shape only).
     if (typeof b.replyAddress === "string" && b.replyAddress.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.replyAddress.trim())) {
-      return reply.code(400).send({ error: "replyAddress must be a valid email address" });
+      return reply.code(400).send({ error: "replyAddress must be a valid e-mail address" });
     }
     const patch: { provider?: "resend" | "sendgrid"; apiKey?: string; webhookSecret?: string; active?: boolean; replyAddress?: string } = {};
     if (isEmailProvider(b.provider)) patch.provider = b.provider;
@@ -559,7 +559,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
   app.post("/email/provider/rotate-handle", tenanted(async (tenantId, req, reply) => {
     if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
     const handle = await rotateInboundHandle(tenantId);
-    if (!handle) return reply.code(404).send({ error: "no email provider configured" });
+    if (!handle) return reply.code(404).send({ error: "no e-mail provider configured" });
     return { provider: providerView(await getTenantEmailProvider(tenantId)) };
   }));
 

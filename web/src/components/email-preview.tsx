@@ -121,7 +121,7 @@ export function EmailPreview({
                 }}
               >
                 <iframe
-                  title="Email preview"
+                  title="E-mail preview"
                   sandbox=""
                   srcDoc={html}
                   style={{ width: deviceWidth, height: frameHeight }}

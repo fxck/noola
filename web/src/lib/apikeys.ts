@@ -11,7 +11,7 @@ export const SCOPE_LABELS: Record<ApiScope, string> = {
   "tickets:read": "Read tickets",
   "tickets:write": "Create & update tickets",
   "contacts:read": "Read contacts",
-  "contacts:write": "Create & update contacts, set email consent",
+  "contacts:write": "Create & update contacts, set e-mail consent",
   "accounts:read": "Read clients, projects & technology usage",
   "accounts:write": "Sync clients, members, projects & technology catalog",
 };

@@ -44,7 +44,7 @@ export function MessageContactDialog({
         body: body.trim(),
         clientMessageId: crypto.randomUUID(),
       });
-      const where = res.channel === "widget" ? "in-app" : "by email";
+      const where = res.channel === "widget" ? "in-app" : "by e-mail";
       toast.success(
         res.delivered || res.channel === "widget"
           ? `Message sent ${where} — conversation opened.`
@@ -57,7 +57,7 @@ export function MessageContactDialog({
       const status = (e as { status?: number }).status;
       toast.error(
         status === 422
-          ? "There's no way to reach this contact yet — no email, and they haven't used the chat widget."
+          ? "There's no way to reach this contact yet — no e-mail, and they haven't used the chat widget."
           : "Couldn't start that conversation. Please try again.",
       );
       setBusy(false);
@@ -72,7 +72,7 @@ export function MessageContactDialog({
       title={`Message ${contactName}`}
       description={
         contactEmail
-          ? `Delivered in-app if they're active in the chat widget, otherwise emailed to ${contactEmail}. Opens a conversation you can follow in the inbox.`
+          ? `Delivered in-app if they're active in the chat widget, otherwise e-mailed to ${contactEmail}. Opens a conversation you can follow in the inbox.`
           : "Delivered in-app if they're active in the chat widget. Opens a conversation you can follow in the inbox."
       }
       onClose={() => {

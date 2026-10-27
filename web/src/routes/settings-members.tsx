@@ -142,7 +142,7 @@ export function SettingsMembersPage() {
       toast.success(
         inst.emailEnabled
           ? `Invitation sent to ${email}.`
-          : `Invite created for ${email} — email isn't configured, copy the link from Pending invitations.`,
+          : `Invite created for ${email} — e-mail isn't configured, copy the link from Pending invitations.`,
       );
       setInviteEmail("");
       await load(true);
@@ -262,7 +262,7 @@ export function SettingsMembersPage() {
                 {isAdmin && (
                   <div className="space-y-4 rounded-xl border bg-card p-5 shadow-sm">
                     <div>
-                      <h2 className="text-sm font-semibold">Invite by email</h2>
+                      <h2 className="text-sm font-semibold">Invite by e-mail</h2>
                       <div className="mt-2.5 flex flex-col gap-2 sm:flex-row">
                         <Input
                           type="email"

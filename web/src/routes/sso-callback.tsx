@@ -30,7 +30,7 @@ export function SsoCallbackPage() {
       {failed ? (
         <>
           <p className="text-sm text-muted-foreground">
-            We couldn't complete single sign-on. Please try again, or sign in with your email and password.
+            We couldn't complete single sign-on. Please try again, or sign in with your e-mail and password.
           </p>
           <a href="/login" className="text-sm font-medium text-primary underline-offset-4 hover:underline">
             Back to sign in

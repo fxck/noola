@@ -44,7 +44,7 @@ function DeliveryBadge({
   viaEmailFallback?: boolean;
   channel?: string | null;
 }) {
-  const via = viaEmailFallback ? " · by email" : "";
+  const via = viaEmailFallback ? " · by e-mail" : "";
   const discord = channel === "discord";
   let icon: ReactNode;
   let label: string;
@@ -53,17 +53,17 @@ function DeliveryBadge({
   if (status === "complained") {
     icon = <TriangleAlert className="size-3" />;
     label = "Marked spam";
-    title = "The recipient marked this email as spam";
+    title = "The recipient marked this e-mail as spam";
     tone = "text-destructive";
   } else if (status === "bounced") {
     icon = <TriangleAlert className="size-3" />;
     label = "Bounced";
-    title = `Email bounced${bounceKind ? ` (${bounceKind})` : ""} — it did not reach the recipient`;
+    title = `E-mail bounced${bounceKind ? ` (${bounceKind})` : ""} — it did not reach the recipient`;
     tone = "text-destructive";
   } else if (status === "failed") {
     icon = <TriangleAlert className="size-3" />;
     label = "Failed to send";
-    title = discord ? "Discord didn't accept this message after repeated retries" : "The email could not be handed off to the provider";
+    title = discord ? "Discord didn't accept this message after repeated retries" : "The e-mail could not be handed off to the provider";
     tone = "text-destructive";
   } else if (status === "pending") {
     icon = <Clock className="size-3" />;
@@ -72,7 +72,7 @@ function DeliveryBadge({
   } else if (openedAt) {
     icon = <Eye className="size-3" />;
     label = "Opened";
-    title = `Recipient opened the email${via}`;
+    title = `Recipient opened the e-mail${via}`;
   } else if (status === "delivered") {
     icon = <CheckCheck className="size-3" />;
     label = "Delivered";
@@ -80,7 +80,7 @@ function DeliveryBadge({
   } else if (status === "sent") {
     icon = <Check className="size-3" />;
     label = "Sent";
-    title = discord ? "Delivered to Discord" : `Handed off to the email provider${via}`;
+    title = discord ? "Delivered to Discord" : `Handed off to the e-mail provider${via}`;
   } else {
     return null;
   }
@@ -301,7 +301,7 @@ export function MessageBubble({
               type="button"
               onClick={() => setShowOriginalEmail(true)}
               className="underline-offset-2 hover:text-foreground hover:underline"
-              title="View the untouched email as it arrived — full HTML, quoted history, and headers"
+              title="View the untouched e-mail as it arrived — full HTML, quoted history, and headers"
             >
               View original
             </button>

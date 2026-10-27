@@ -50,7 +50,7 @@ import { cn } from "@/lib/utils";
 // agent can send the reply on any channel the contact is reachable on. Unknown channels fall back
 // to a capitalized name + a generic bubble icon.
 const CHANNEL_META: Record<string, { label: string; icon: typeof Mail }> = {
-  email: { label: "Email", icon: Mail },
+  email: { label: "E-mail", icon: Mail },
   widget: { label: "Chat", icon: MessageCircle },
   discord: { label: "Discord", icon: Hash },
   slack: { label: "Slack", icon: Hash },
@@ -582,7 +582,7 @@ export function Composer({
                   setCcInput("");
                 }
               }}
-              placeholder={cc.length ? "" : "add email…"}
+              placeholder={cc.length ? "" : "add e-mail…"}
               className="min-w-[8rem] flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
             />
           </div>

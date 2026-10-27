@@ -24,7 +24,7 @@ const DESCRIPTIONS: Record<SettingsSection, string> = {
   "tag-rules": "Auto-tag new tickets from their text — keyword rules plus optional AI classification.",
   integrations: "Connect channels and third-party tools.",
   messenger: "Personalize the embeddable chat widget — brand, greeting, and tabs.",
-  "email-templates": "The wrapper and styling for outbound email.",
+  "email-templates": "The wrapper and styling for outbound e-mail.",
   webhooks: "Send ticket and message events to your own endpoints.",
   "discord-mirror": "VIP customer channels and the forum ops mirror \u2014 tickets in and out of Discord.",
   channels: "Connect channels and third-party tools.",

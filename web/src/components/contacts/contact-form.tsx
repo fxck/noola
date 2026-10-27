@@ -221,7 +221,7 @@ export function ContactForm({
     const n = name.trim();
     const em = email.trim();
     if (!n && !em) {
-      setError("Give the contact a name or an email.");
+      setError("Give the contact a name or an e-mail.");
       return;
     }
     // Preserve the Noola-managed system attributes (not shown as editable rows) so this replace-update
@@ -292,7 +292,7 @@ export function ContactForm({
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="c-email">Email</Label>
+            <Label htmlFor="c-email">E-mail</Label>
             <Input
               id="c-email"
               type="email"
@@ -442,7 +442,7 @@ export function BulkImportDialog({
       }
       const r = row as Record<string, unknown>;
       if (!r.external_id && !r.email) {
-        setParseError(`Row ${i + 1} needs an external_id or email.`);
+        setParseError(`Row ${i + 1} needs an external_id or e-mail.`);
         return null;
       }
       rows.push(r as BulkImportRow);
@@ -540,7 +540,7 @@ export function BulkImportDialog({
               <code className="rounded bg-muted px-1 py-0.5 text-xs">name</code>,{" "}
               <code className="rounded bg-muted px-1 py-0.5 text-xs">external_id</code> and{" "}
               <code className="rounded bg-muted px-1 py-0.5 text-xs">company</code> are recognized; any
-              other column becomes a custom attribute. A row needs an email, an external_id or a name —
+              other column becomes a custom attribute. A row needs an e-mail, an external_id or a name —
               name-only rows import as leads, matched on name + company. The company column links each
               person to your existing client of that name when exactly one matches, and creates the
               company otherwise. Everyone imported here is a{" "}
@@ -656,9 +656,9 @@ function ImportSummary({ result, onDone }: { result: CsvImportResult; onDone: ()
         </p>
         {(result.without_email ?? 0) > 0 && (
           <p className="text-muted-foreground">
-            {result.without_email} {result.without_email === 1 ? "row has" : "rows have"} a name but no email — imported as leads
-            that can't be emailed. Re-importing the same list won't duplicate them (matched by name + company); if you later get
-            their email, merge the two contacts on the contact page.
+            {result.without_email} {result.without_email === 1 ? "row has" : "rows have"} a name but no e-mail — imported as leads
+            that can't be e-mailed. Re-importing the same list won't duplicate them (matched by name + company); if you later get
+            their e-mail, merge the two contacts on the contact page.
           </p>
         )}
         {issues.length > 0 && (
