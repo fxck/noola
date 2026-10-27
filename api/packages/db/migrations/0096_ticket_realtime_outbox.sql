@@ -24,7 +24,9 @@ BEGIN
    OR NEW.team_id       IS DISTINCT FROM OLD.team_id
    OR NEW.type_id       IS DISTINCT FROM OLD.type_id
    OR NEW.snoozed_until IS DISTINCT FROM OLD.snoozed_until
-   OR NEW.tags          IS DISTINCT FROM OLD.tags) THEN
+   OR NEW.tags          IS DISTINCT FROM OLD.tags
+   -- The AI pausing or resuming, e.g. a widget visitor choosing "Ask Noola" again, which posts no message.
+   OR NEW.assistant_enabled IS DISTINCT FROM OLD.assistant_enabled) THEN
     INSERT INTO outbox (tenant_id, event_type, subject, payload)
     VALUES (
       NEW.tenant_id,

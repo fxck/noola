@@ -74,6 +74,34 @@ async function findWidgetTicket(
     return { id: r.rows[0].id as string, status: r.rows[0].status as string, assistantEnabled: r.rows[0].assistant_enabled !== false };
   });
 }
+/** Whether the AI or a teammate has replied since the visitor's last "talk to a human", or there was none yet. */
+async function answeredSinceLastHandoff(tenantId: string, ticketId: string): Promise<boolean> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query<{ answered: boolean }>(
+      `WITH last AS (
+         SELECT max(created_at) AS at FROM messages WHERE ticket_id = $1 AND idempotency_key LIKE 'widget:esc-%')
+       SELECT (SELECT at FROM last) IS NULL
+           OR EXISTS (SELECT 1 FROM messages WHERE ticket_id = $1 AND author_type = 'agent' AND created_at > (SELECT at FROM last)) AS answered`,
+      [ticketId],
+    );
+    return r.rows[0].answered;
+  });
+}
+
+/**
+ * Pauses the AI and puts the ticket back in the needs-reply queue, for a handoff that posts no message.
+ * A visitor's closing "thanks" can have taken it out of the queue.
+ */
+async function awaitHuman(tenantId: string, ticketId: string): Promise<void> {
+  await withTenant(tenantId, (c) =>
+    c.query(
+      `UPDATE tickets SET assistant_enabled = false, whose_turn = 'us'
+        WHERE id = $1 AND (assistant_enabled IS DISTINCT FROM false OR whose_turn IS DISTINCT FROM 'us')`,
+      [ticketId],
+    ),
+  );
+}
+
 /** Hand exactly the ticket a message landed on to a human (mute its assistant). */
 async function muteWidgetTicket(tenantId: string, ticketId: string): Promise<void> {
   await withTenant(tenantId, (c) =>
@@ -235,7 +263,14 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (escalate && conversationId) {
       const current = await findWidgetTicket(wk.tenantId, conversationId);
       if (current && current.status === "open" && !current.assistantEnabled) {
+        // A stale second tab can repeat a handoff that an agent has already answered.
+        if (!(await answeredSinceLastHandoff(wk.tenantId, current.id))) await awaitHuman(wk.tenantId, current.id);
         return reply.code(200).send({ escalated: true, alreadyEscalated: true, conversationId: current.id });
+      }
+      // Nobody has answered the last handoff yet, so pause the AI without posting the request again.
+      if (current && current.status === "open" && !(await answeredSinceLastHandoff(wk.tenantId, current.id))) {
+        await awaitHuman(wk.tenantId, current.id);
+        return reply.code(200).send({ escalated: true, conversationId: current.id });
       }
     }
     if (conversationId && resumeAi === true && !escalate && !humanRequest) {
