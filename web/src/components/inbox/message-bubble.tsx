@@ -13,6 +13,7 @@ import {
 import { type Note } from "@/lib/notes";
 import { ChannelIcon } from "@/components/inbox/badges";
 import { ArticleBody } from "@/components/editor/article-body";
+import { slackToMarkdown, splitLinks } from "@/lib/markdown";
 import { NoolaMark } from "@/components/noola-mark";
 import { Avatar } from "@/components/ui/avatar";
 import { avatarSrc } from "@/lib/avatar-upload";
@@ -111,7 +112,7 @@ export function NoteBubble({ note }: { note: Note }) {
             · {relativeTime(note.created_at)}
           </span>
         </div>
-        <p className="whitespace-pre-wrap break-words text-sm text-foreground">{note.body}</p>
+        <ArticleBody markdown={note.body} className={cn(BUBBLE_MD, "break-words")} messageLinks />
         {note.mentioned_names.length > 0 && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1 text-micro text-muted-foreground">
             <span>Looped in:</span>
@@ -135,16 +136,34 @@ export function NoteBubble({ note }: { note: Note }) {
   );
 }
 
-/** A single customer/agent message bubble. Renders the agent-facing text (with the auto-translation
- *  "translated from X" badge + show-original toggle when a translation is present) and, for AI/auto
- *  messages, the AiReceipt. */
-// Agent-side replies are authored markdown (composer, macros, AI drafts) — render
-// them as real structure at chat scale. Customer text stays verbatim pre-wrap.
+// Markdown bodies (notes, agent replies, Discord and Slack messages) at chat scale.
 const BUBBLE_MD =
   "text-sm leading-relaxed [&_p]:mb-2 [&_p]:leading-relaxed [&_p:last-child]:mb-0 " +
   "[&_ol]:mb-2 [&_ul]:mb-2 [&_ol:last-child]:mb-0 [&_ul:last-child]:mb-0 " +
   "[&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-sm [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-semibold";
 
+/** A message body as its channel writes it: markdown for agents, Discord and Slack, plain text otherwise. Links are clickable in both. */
+function MessageText({ text, isAgent, channel }: { text: string; isAgent: boolean; channel?: string | null }) {
+  if (isAgent || channel === "discord") return <ArticleBody markdown={text} className={BUBBLE_MD} messageLinks />;
+  if (channel === "slack") return <ArticleBody markdown={slackToMarkdown(text)} className={BUBBLE_MD} messageLinks />;
+  return (
+    <span className="whitespace-pre-wrap">
+      {splitLinks(text).map((p, i) =>
+        p.url ? (
+          <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-foreground">
+            {p.text}
+          </a>
+        ) : (
+          <Fragment key={i}>{p.text}</Fragment>
+        ),
+      )}
+    </span>
+  );
+}
+
+/** A single customer/agent message bubble. Renders the agent-facing text (with the auto-translation
+ *  "translated from X" badge + show-original toggle when a translation is present) and, for AI/auto
+ *  messages, the AiReceipt. */
 export function MessageBubble({
   message,
   showChannel = false,
@@ -237,10 +256,10 @@ export function MessageBubble({
             "break-words rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed",
             isAgent
               ? "rounded-tr-md bg-accent text-foreground"
-              : "whitespace-pre-wrap rounded-tl-md bg-muted/60 text-foreground",
+              : "rounded-tl-md bg-muted/60 text-foreground",
           )}
         >
-          {isAgent ? <ArticleBody markdown={shownText} className={BUBBLE_MD} /> : shownText}
+          <MessageText text={shownText} isAgent={isAgent} channel={message.channel_type} />
         </div>
         {/* one quiet meta line UNDER the bubble — time, plus the Auto marker for
             AI-sent replies and a channel glyph only when the conversation spans
