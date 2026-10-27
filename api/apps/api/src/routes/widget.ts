@@ -17,7 +17,8 @@ import { createAttachment, claimAttachments, attachmentsForTicket, type Attachme
 import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
 import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
-import { suggestionMeta } from "../autoreply.js";
+import { settleWidgetAnswer, suggestionMeta } from "../autoreply.js";
+import { withoutOutcomeTags } from "../ai-outcome.js";
 import { wantsHuman, type DraftImage } from "../model.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen, absorbAnonymousByHandles } from "../contacts.js";
@@ -293,8 +294,8 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       deferMirror: files.length > 0,
       // Idempotency: a retried turn (same token) is collapsed to one visitor message, not duplicated.
       idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
-      // A handoff turn is for a human — never let ambient autoreply answer it.
-      skipAutoreply: !!escalate || humanRequest,
+      // The widget answers its own turns below, and the ambient autoreply answering too would send a second reply.
+      skipAutoreply: true,
     });
     // Mute AFTER the message is stored, on the ticket it actually landed on. The old pre-ingest mute keyed
     // on the conversation handle, which on a first-turn escalation matched no ticket yet — the AI stayed
@@ -325,12 +326,19 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     }
 
     try {
-      const s = await suggestForQuery(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files) });
+      const s = await suggestForQuery(wk.tenantId, question, {
+        audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files), outcomes: true,
+      });
+      const answer = await settleWidgetAnswer(wk.tenantId, inbound.ticketId, inbound.messageId, s);
+      if (answer.kind !== "reply") {
+        if (answer.kind === "handoff") await awaitHuman(wk.tenantId, inbound.ticketId);
+        return { deferred: true, conversationId: inbound.ticketId, messageId: inbound.messageId };
+      }
       // Persist the AI answer as an agent message on the SAME ticket → threads + fans out over the
       // widget WS. origin:'automation' suppresses re-triggering the rules engine off the AI's reply.
       const answerMsg = await ingestInbound({
         tenantId: wk.tenantId,
-        body: s.draft,
+        body: answer.reply,
         authorType: "agent",
         ticketId: inbound.ticketId,
         channelType: "widget",
@@ -346,8 +354,9 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           JSON.stringify(suggestionMeta(s, "widget")),
         ]);
       }).catch(() => {});
+      if (answer.handoff) await awaitHuman(wk.tenantId, inbound.ticketId);
       return {
-        answer: s.draft,
+        answer: answer.reply,
         citations: s.citations.map((c) => ({ title: c.title, snippet: c.snippet })),
         confidence: s.confidence,
         conversationId: inbound.ticketId,
@@ -416,7 +425,8 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       // Idempotency: persist-before-stream means a mid-stream failure + retry could double the ask;
       // the same token collapses it to one message.
       idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
-      skipAutoreply: humanRequest,
+      // The widget answers its own turns below, and the ambient autoreply answering too would send a second reply.
+      skipAutoreply: true,
     });
     // Hand off AFTER storing, keyed on the ticket the message landed on (see /public/ask).
     if (humanRequest) await muteWidgetTicket(wk.tenantId, inbound.ticketId);
@@ -457,23 +467,46 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const hb = setInterval(() => raw.write(": ping\n\n"), 15_000);
 
     try {
-      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files) });
+      const stream = suggestForQueryStream(wk.tenantId, question, {
+        audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files), outcomes: true,
+      });
       // Manual iteration so we capture the generator's RETURN value (the final Suggestion).
       let suggestion: Awaited<ReturnType<typeof suggestForQuery>>;
+      let written = "";
+      let shown = "";
       for (;;) {
         const step = await stream.next();
         if (step.done) {
           suggestion = step.value;
           break;
         }
-        if (step.value?.delta) send("delta", { t: step.value.delta });
+        if (!step.value?.delta) continue;
+        written += step.value.delta;
+        // A note or "no reply" tag must never reach the visitor, so text from the model's first "<" waits for the whole answer.
+        const lt = written.indexOf("<");
+        const visible = lt === -1 ? written : written.slice(0, lt);
+        if (visible.trim() && visible.length > shown.length) {
+          send("delta", { t: visible.slice(shown.length) });
+          shown = visible;
+        }
       }
+
+      const answer = await settleWidgetAnswer(wk.tenantId, inbound.ticketId, inbound.messageId, suggestion);
+      if (answer.kind !== "reply") {
+        if (answer.kind === "handoff") await awaitHuman(wk.tenantId, inbound.ticketId);
+        // No message: the widget drops what it showed and reloads the thread, which shows the human queue after a handoff.
+        send("done", { messageId: null, conversationId: inbound.ticketId, [answer.kind === "none" ? "quiet" : "handoff"]: true });
+        return;
+      }
+      // The tags come after the text the visitor already saw, so the rest of the reply continues it.
+      const rest = (suggestion.outcomes ? withoutOutcomeTags(written) : written).slice(shown.length).trimEnd();
+      if (rest.trim()) send("delta", { t: rest });
 
       // Persist the finished answer as an agent message on the SAME ticket → threads + fans out over
       // the widget WS. origin:'automation' stops the AI's own reply re-triggering the rules engine.
       const answerMsg = await ingestInbound({
         tenantId: wk.tenantId,
-        body: suggestion.draft,
+        body: answer.reply,
         authorType: "agent",
         ticketId: inbound.ticketId,
         channelType: "widget",
@@ -487,6 +520,8 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           JSON.stringify(suggestionMeta(suggestion, "widget")),
         ]);
       }).catch(() => {});
+      // Paused before "done", so the widget's reload shows the human queue under the reply.
+      if (answer.handoff) await awaitHuman(wk.tenantId, inbound.ticketId);
       send("done", {
         messageId: answerMsg.messageId,
         conversationId: inbound.ticketId,

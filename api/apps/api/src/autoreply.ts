@@ -509,10 +509,10 @@ async function evaluateForMessage(
 
   const draftMeta = suggestionMeta(suggestion, "suggested");
 
-  // A hosted model may also leave a note for the team, or decide that the message needs no reply.
+  // A hosted model may also leave a note for the team, hand over to a teammate, or decide that the message needs no reply.
   const outcome: DraftOutcome = suggestion.outcomes
     ? parseDraftOutcome(suggestion.draft)
-    : { kind: "ok", reply: suggestion.draft, note: null, noReply: false };
+    : { kind: "ok", reply: suggestion.draft, note: null, noReply: false, handoff: false };
   if (outcome.kind === "malformed") {
     await stampGate("suppressed", "malformed_output");
     const id = await recordDecision(tenantId, {
@@ -534,7 +534,7 @@ async function evaluateForMessage(
   };
 
   if (!outcome.reply) {
-    let reason = outcome.noReply ? "no_reply_suggested" : "note_only";
+    let reason = outcome.noReply ? "no_reply_suggested" : outcome.note ? "note_only" : "handoff";
     if (outcome.noReply && channelMode === "auto") {
       if (!(await claimAnswer(tenantId, messageId, "autoreply"))) reason = "claimed_elsewhere";
       else {
@@ -542,15 +542,19 @@ async function evaluateForMessage(
         reason = "no_reply_needed";
       }
     }
-    const decisionOutcome = reason === "note_only" || reason === "no_reply_suggested" ? "assist" : "suppressed";
+    const decisionOutcome = reason === "note_only" || reason === "handoff" || reason === "no_reply_suggested" ? "assist" : "suppressed";
     await stampGate(decisionOutcome, reason);
     const id = await decide({
       messageId, ticketId, outcome: decisionOutcome, reason,
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
     });
+    // A note or a handoff without a reply means a teammate answers, so the AI is paused until someone switches it back on.
+    if (id && !outcome.noReply && channelMode === "auto") await muteAssistantForHandoff(tenantId, ticketId);
     return id ? { outcome: decisionOutcome, reason, decisionId: id } : null;
   }
   const replyText = outcome.reply;
+  // A held reply that hands off still pauses the AI when a teammate sends it from the queue.
+  const heldMeta = outcome.handoff ? { ...draftMeta, handoff: true } : draftMeta;
 
   // suggest_only never sends — the draft is ready for a human. The CHANNEL mode decides
   // (an explicit per-channel 'auto' upgrades a suggest_only tenant default and vice versa).
@@ -563,7 +567,7 @@ async function evaluateForMessage(
     // Queue the draft for human review (idempotent on message_id).
     const queueItemId = await enqueueSuggestion(tenantId, {
       ticketId, messageId, draftBody: replyText,
-      meta: draftMeta, reason: "suggest_only",
+      meta: heldMeta, reason: "suggest_only",
     });
     return id
       ? { outcome: "assist", reason: "suggest_only", decisionId: id, queueItemId: queueItemId ?? undefined, meta: draftMeta }
@@ -586,7 +590,7 @@ async function evaluateForMessage(
     // The draft exists but was held by the gate — queue it for human review.
     const queueItemId = await enqueueSuggestion(tenantId, {
       ticketId, messageId, draftBody: replyText,
-      meta: draftMeta, reason: holdReason,
+      meta: heldMeta, reason: holdReason,
     });
     return id
       ? { outcome: "suppressed", reason: holdReason, decisionId: id, queueItemId: queueItemId ?? undefined, meta: draftMeta }
@@ -666,11 +670,52 @@ async function evaluateForMessage(
     messageId, ticketId, outcome: "auto_sent", reason: "sent",
     agreement, topScore, confidence, riskTags, sentMessageId: sent.messageId, traceId: suggestion.traceId,
   });
+  // The reply said that a teammate takes over, so the AI is paused and the conversation waits for that teammate.
+  if (id && outcome.handoff) await muteAssistantForHandoff(tenantId, ticketId);
   // If the decision insert lost the idempotency race, another evaluation already
   // recorded + sent (dedup'd by idempotencyKey) — report that outcome without erroring.
   return id
     ? { outcome: "auto_sent", reason: "sent", decisionId: id, sentMessageId: sent.messageId, meta }
     : null;
+}
+
+export type WidgetAnswer = { kind: "reply"; reply: string; handoff: boolean } | { kind: "none" } | { kind: "handoff" };
+
+/**
+ * Applies the outcome tags of the widget's own answer, which answers outside the ambient autoreply.
+ * "No reply" hands the turn to the visitor. A handoff, a note without a reply, or broken tags mean a teammate
+ * should answer, so the caller pauses the AI. A handoff with a reply sends the reply first.
+ * A broken draft also waits in the review queue.
+ */
+export async function settleWidgetAnswer(tenantId: string, ticketId: string, messageId: string, s: Suggestion): Promise<WidgetAnswer> {
+  if (!s.outcomes) return { kind: "reply", reply: s.draft, handoff: false };
+  const outcome = parseDraftOutcome(s.draft);
+  const decision = (outcome: DecisionInput["outcome"], reason: string) =>
+    recordDecision(tenantId, {
+      messageId, ticketId, outcome, reason, source: "on_demand",
+      agreement: s.retrieval.agreement, topScore: s.retrieval.topScore, confidence: s.confidence,
+      riskTags: [], sentMessageId: null, traceId: s.traceId,
+    });
+  if (outcome.kind === "malformed") {
+    if (await decision("suppressed", "malformed_output")) {
+      await enqueueSuggestion(tenantId, {
+        ticketId, messageId, draftBody: s.draft, meta: suggestionMeta(s, "suggested"), reason: "malformed_output",
+      });
+    }
+    return { kind: "handoff" };
+  }
+  if (outcome.reply) {
+    if (outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
+    return { kind: "reply", reply: outcome.reply, handoff: outcome.handoff };
+  }
+  const id = await decision(
+    outcome.noReply ? "suppressed" : "assist",
+    outcome.noReply ? "no_reply_needed" : outcome.note ? "note_only" : "handoff",
+  );
+  if (id && outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
+  if (!outcome.noReply) return { kind: "handoff" };
+  await handTurnToCustomer(tenantId, ticketId);
+  return { kind: "none" };
 }
 
 /** Who writes AI notes in the thread and in the Discord mirror. */
@@ -836,6 +881,7 @@ export async function sendQueued(
       [id],
     );
   });
+  if ((item.meta as { handoff?: boolean } | null)?.handoff) await muteAssistantForHandoff(tenantId, item.ticket_id);
 
   return { ok: true, message: { ticketId: sent.ticketId, messageId: sent.messageId, delivered, queued } };
 }
