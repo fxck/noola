@@ -92,7 +92,7 @@ export const auth = betterAuth({
         "Reset your Noola password",
         `Someone requested a password reset for your Noola account.\n\n` +
           `Reset your password:\n${link}\n\n` +
-          `This link expires soon. If you didn't request this, you can safely ignore this email.`,
+          `This link expires soon. If you didn't request this, you can safely ignore this e-mail.`,
       );
     },
   },
@@ -144,7 +144,7 @@ export const auth = betterAuth({
           `You're invited to ${org} on Noola`,
           `You've been invited to join ${org} as ${data.role} on Noola.\n\n` +
             `Accept your invitation:\n${link}\n\n` +
-            `If you weren't expecting this, you can safely ignore this email.`,
+            `If you weren't expecting this, you can safely ignore this e-mail.`,
         );
       },
       // ── Reverse identity projection + single-org enforcement ────────────────
@@ -739,7 +739,7 @@ export async function createSso(
   input: SsoAdminInput,
 ): Promise<{ ok: true; connection: SsoConnectionView } | { ok: false; status: number; error: string }> {
   const domain = (input.emailDomain ?? "").trim().toLowerCase().replace(/^@+/, "");
-  if (!domain) return { ok: false, status: 400, error: "email domain is required" };
+  if (!domain) return { ok: false, status: 400, error: "e-mail domain is required" };
   if (!input.clientId) return { ok: false, status: 400, error: "client id is required" };
   const providerId = slugId(input.name ?? "", domain);
   const issuer = input.issuer || input.authorizeUrl || `https://${domain}`;

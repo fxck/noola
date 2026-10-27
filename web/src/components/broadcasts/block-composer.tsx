@@ -345,7 +345,7 @@ function BlockCard({
 const VARIABLES: { label: string; tag: string }[] = [
   { label: "First name", tag: "{{firstName|there}}" },
   { label: "Name", tag: "{{name|there}}" },
-  { label: "Email", tag: "{{email}}" },
+  { label: "E-mail", tag: "{{email}}" },
   { label: "Company", tag: "{{company|your company}}" },
 ];
 
@@ -650,7 +650,7 @@ function HtmlBlockEditor({
         aria-label="Raw HTML"
         className="min-h-24 font-mono text-xs"
       />
-      <p className="text-xs text-muted-foreground">Raw HTML is sent as-is to email clients.</p>
+      <p className="text-xs text-muted-foreground">Raw HTML is sent as-is to e-mail clients.</p>
     </div>
   );
 }

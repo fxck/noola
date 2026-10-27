@@ -561,7 +561,7 @@ function ContactFacts({
       <div className="px-4 py-3">
         <dl className="flex flex-col">
           {c.email && (
-            <FactRow label="Email">
+            <FactRow label="E-mail">
               <a
                 href={`mailto:${c.email}`}
                 className="min-w-0 truncate underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"

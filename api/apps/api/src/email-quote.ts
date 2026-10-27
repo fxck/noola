@@ -56,7 +56,7 @@ const FORWARD_RE = /^\s*(?:Begin forwarded message|Anfang der weitergeleiteten N
 // A lone line of underscores — Outlook's reply divider that precedes the From/Sent/To header block.
 const UNDERSCORE_RE = /^\s*_{5,}\s*$/;
 // Our OWN outbound footer, quoted back to us — a reliable backstop when nothing else matches.
-const OWN_FOOTER_RE = /^\s*Reply to this email to continue the conversation\.\s*$/i;
+const OWN_FOOTER_RE = /^\s*Reply to this e-?mail to continue the conversation\.\s*$/i;
 // The RFC-3676 signature delimiter ("-- " on its own line) — cut the sender's trailing sig.
 const SIG_DELIM_RE = /^--\s?$/;
 

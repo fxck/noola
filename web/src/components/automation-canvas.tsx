@@ -231,7 +231,7 @@ const ACTION_HELP: Partial<Record<ActionType, NodeHelp>> = {
     example: () => ({ action: { type: "kb_upsert", kbTitle: "How to {{subject}}", kbBody: "{{rag.answer}}" } }),
   },
   contact_update: {
-    body: "Upserts a contact keyed by email. Add one field: value per line to enrich the record from webhook/HTTP data.",
+    body: "Upserts a contact keyed by e-mail. Add one field: value per line to enrich the record from webhook/HTTP data.",
     example: () => ({ action: { type: "contact_update", contactEmail: "{{contact.email}}", contactName: "{{contact.name}}", contactFields: "plan: {{webhook.plan}}" } }),
   },
   broadcast_send: {
@@ -239,7 +239,7 @@ const ACTION_HELP: Partial<Record<ActionType, NodeHelp>> = {
     example: () => ({ action: { type: "broadcast_send", broadcastSubject: "An update on {{subject}}", broadcastBody: "Hi {{contact.name}}, here's the latest…" } }),
   },
   rag: { body: "Drafts a grounded answer from your knowledge base for the current ticket, available downstream as {{rag.answer}}. Toggle auto-reply to post it straight away." },
-  notify: { body: "Sends an alert through a connector (Slack / Discord / email). Add the connector in Settings → Integrations, then pick it here." },
+  notify: { body: "Sends an alert through a connector (Slack / Discord / e-mail). Add the connector in Settings → Integrations, then pick it here." },
   web_fetch: {
     body: "Fetches a page and extracts its readable text into {{web.text}} — pair with Save to knowledge base to ingest docs. For JS-rendered SPAs, use Render a page instead.",
     example: () => ({ action: { type: "web_fetch", url: "https://docs.example.com/faq" } }),
@@ -492,7 +492,7 @@ function actionSubtitle(a: Action, assignees: Opt[], integrations: Opt[]): strin
     case "http": return (a.url ?? "").trim() ? `${a.method ?? "GET"} ${a.url}` : "No URL yet";
     case "rag": return a.autoReply ? "Draft + auto-reply" : "Draft a grounded answer";
     case "kb_upsert": return (a.kbTitle ?? "").trim() || "No article title yet";
-    case "contact_update": return (a.contactEmail ?? "").trim() || "No contact email yet";
+    case "contact_update": return (a.contactEmail ?? "").trim() || "No contact e-mail yet";
     case "broadcast_send": return (a.broadcastSubject ?? "").trim() || "No subject yet";
     case "set_fields": { const n = (a.setFields ?? "").split("\n").filter((l) => l.includes(":")).length; return n ? `${n} field${n === 1 ? "" : "s"}` : "No fields yet"; }
     case "web_fetch": return (a.url ?? "").trim() || "No URL yet";
@@ -1035,7 +1035,7 @@ const PALETTE: { group: string; items: PaletteItem[] }[] = [
   {
     group: "Integrations & code",
     items: [
-      { kind: "action", actionType: "notify", icon: Bell, hue: ACCENT.code, label: "Notify a connector", desc: "Alert Slack / Discord / email" },
+      { kind: "action", actionType: "notify", icon: Bell, hue: ACCENT.code, label: "Notify a connector", desc: "Alert Slack / Discord / e-mail" },
       { kind: "action", actionType: "http", icon: Globe, hue: ACCENT.code, label: "Call an HTTP API", desc: "Fetch or post to any URL" },
       { kind: "action", actionType: "set_fields", icon: Braces, hue: ACCENT.code, label: "Set fields", desc: "Compute values into variables" },
       { kind: "action", actionType: "run", icon: Terminal, hue: ACCENT.code, label: "Run code", desc: "Execute in a sandboxed runner" },

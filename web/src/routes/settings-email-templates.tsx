@@ -290,7 +290,7 @@ export function SettingsEmailTemplatesPage() {
         ) : (
           <div className="min-w-0 flex-1 overflow-y-auto">
             <header className="flex h-12 shrink-0 items-center gap-2 px-6">
-              <h1 className="text-sm font-semibold tracking-tight">Email templates</h1>
+              <h1 className="text-sm font-semibold tracking-tight">E-mail templates</h1>
               {status === "ready" && (
                 <span className="text-sm tabular-nums text-muted-foreground">{templates.length}</span>
               )}
@@ -312,7 +312,7 @@ export function SettingsEmailTemplatesPage() {
               )}
             </header>
             <p className="px-6 text-small text-muted-foreground">
-              The stationery your outbound email wears. Broadcasts pick a template at compose time,
+              The stationery your outbound e-mail wears. Broadcasts pick a template at compose time,
               and one custom template can frame ticket replies; built-ins are read-only — duplicate
               one to make it yours.
             </p>
@@ -322,7 +322,7 @@ export function SettingsEmailTemplatesPage() {
                   <Label htmlFor="email-brand-name">Brand name</Label>
                   <BrandNameField branding={branding} onSave={saveBranding} />
                   <p className="text-xs text-muted-foreground">
-                    Shown as the wordmark on Branded emails and the sender name on automated replies.
+                    Shown as the wordmark on Branded e-mails and the sender name on automated replies.
                     Defaults to your workspace name.
                   </p>
                 </div>
@@ -333,7 +333,7 @@ export function SettingsEmailTemplatesPage() {
                 <RowsSkeleton rows={4} />
               ) : status === "error" ? (
                 <ErrorState
-                  title="Couldn't load your email templates"
+                  title="Couldn't load your e-mail templates"
                   onRetry={() => void load()}
                 />
               ) : (

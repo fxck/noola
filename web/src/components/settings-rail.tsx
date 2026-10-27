@@ -43,7 +43,7 @@ export const SETTINGS_GROUPS: { label: string; items: SettingsItem[] }[] = [
     items: [
       { key: "integrations", to: "/settings/integrations", label: "Channels & integrations", Icon: Plug },
       { key: "messenger", to: "/settings/messenger", label: "Messenger", Icon: MessagesSquare },
-      { key: "email-templates", to: "/settings/email-templates", label: "Email templates", Icon: LayoutTemplate },
+      { key: "email-templates", to: "/settings/email-templates", label: "E-mail templates", Icon: LayoutTemplate },
       { key: "webhooks", to: "/settings/webhooks", label: "Webhooks", Icon: WebhookIcon },
       { key: "discord-mirror", to: "/settings/discord-mirror", label: "Discord", Icon: Hash },
     ],

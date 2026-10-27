@@ -283,7 +283,7 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
   // merge data, no recipient logging, no draft required. Email channel only by design.
   app.post("/broadcasts/test", tenanted(async (tenantId, req, reply) => {
     const to = req.session?.email;
-    if (!to) return reply.code(400).send({ error: "your session has no email address to send to" });
+    if (!to) return reply.code(400).send({ error: "your session has no e-mail address to send to" });
     const b = (req.body ?? {}) as { subject?: string; body?: string; blocks?: unknown; templateId?: string };
     if (!b.subject || typeof b.subject !== "string") return reply.code(400).send({ error: "subject is required" });
     let blocks = undefined;
@@ -359,7 +359,7 @@ export default async function outboundRoutes(app: FastifyInstance): Promise<void
     const body =
       typeof b.body === "string" && b.body
         ? b.body.slice(0, 10000)
-        : "Hi there,\n\nThis is what your emails will look like. **Bold**, _italic_, and [links](https://example.com) pick up your template's styling.\n\n- Product updates\n- Onboarding tips\n\nThanks for reading!";
+        : "Hi there,\n\nThis is what your e-mails will look like. **Bold**, _italic_, and [links](https://example.com) pick up your template's styling.\n\n- Product updates\n- Onboarding tips\n\nThanks for reading!";
     const { html, text } = await renderBroadcastEmail(subject, body, {
       tokens,
       unsubscribeHref: "https://example.com/unsubscribe-preview",

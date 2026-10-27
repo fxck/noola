@@ -226,9 +226,9 @@ function DrillLinks({ conditions, compact }: { conditions: { field: string; op: 
         <Users className="size-3.5" />
         {!compact && "People"}
       </Link>
-      <Link to="/broadcasts" search={{ audience: json }} className={cls} title="Email these people">
+      <Link to="/broadcasts" search={{ audience: json }} className={cls} title="E-mail these people">
         <Mail className="size-3.5" />
-        {!compact && "Email"}
+        {!compact && "E-mail"}
       </Link>
     </div>
   );

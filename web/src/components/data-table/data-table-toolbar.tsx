@@ -48,7 +48,7 @@ export function DataTableToolbar<T>({
   facets,
   filter,
   right,
-  searchPlaceholder = "Search name, email, company…",
+  searchPlaceholder = "Search name, e-mail, company…",
   onReset,
 }: {
   table: TanstackTable<T>;

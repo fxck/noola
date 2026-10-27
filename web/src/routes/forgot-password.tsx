@@ -39,7 +39,7 @@ export function ForgotPasswordPage() {
       <Card>
           <CardHeader>
             <CardTitle className="text-xl">Reset your password</CardTitle>
-            <CardDescription>We'll email you a link to set a new one.</CardDescription>
+            <CardDescription>We'll e-mail you a link to set a new one.</CardDescription>
           </CardHeader>
           <CardContent>
             {sent ? (
@@ -59,7 +59,7 @@ export function ForgotPasswordPage() {
             ) : (
               <form onSubmit={onSubmit} className="flex flex-col gap-4">
                 <div className="flex flex-col gap-2">
-                  <Label htmlFor="email">Email</Label>
+                  <Label htmlFor="email">E-mail</Label>
                   <Input
                     id="email"
                     type="email"

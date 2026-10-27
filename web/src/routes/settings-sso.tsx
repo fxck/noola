@@ -119,7 +119,7 @@ export function SettingsSsoPage() {
     <SettingsPage
       active="sso"
       title="Single sign-on"
-      description="Connect your identity provider (OIDC / SAML) — people whose email matches a connection's domain get a “Sign in with SSO” button on the login page."
+      description="Connect your identity provider (OIDC / SAML) — people whose e-mail matches a connection's domain get a “Sign in with SSO” button on the login page."
       actions={
         !draft && (
           <Button size="sm" className="h-8" onClick={() => setDraft({ ...EMPTY })}>
@@ -137,7 +137,7 @@ export function SettingsSsoPage() {
                     <Input id="sname" value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="Okta / Azure AD / Google" autoFocus />
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="sdom">Email domain</Label>
+                    <Label htmlFor="sdom">E-mail domain</Label>
                     <Input id="sdom" value={draft.emailDomain} onChange={(e) => set({ emailDomain: e.target.value })} placeholder="acme.com" />
                   </div>
                 </div>

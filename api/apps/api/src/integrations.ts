@@ -267,7 +267,7 @@ async function deliver(tenantId: string, it: ResolvedCredential, msg: DispatchMe
   if (kind === "email") {
     const to = typeof config.to === "string" ? (config.to as string) : "";
     const res = await sendOutboundEmail(tenantId, to, msg.subject ?? "Automation", msg.text);
-    if (!res.delivered) throw new Error(res.reason ?? "email not delivered");
+    if (!res.delivered) throw new Error(res.reason ?? "e-mail not delivered");
     return;
   }
   if (kind === "http") {

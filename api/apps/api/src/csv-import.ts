@@ -110,7 +110,7 @@ export function parseCsvContacts(
   const headers = grid[0].map(normalizeHeader);
   const has = (set: Set<string>) => headers.some((h) => set.has(h));
   if (!has(EMAIL_HEADERS) && !has(ID_HEADERS) && !has(NAME_HEADERS) && !has(FIRST_HEADERS) && !has(LAST_HEADERS)) {
-    return { error: "header row needs an email, external id or name column (e.g. email, name, jméno, příjmení)" };
+    return { error: "header row needs an e-mail, external id or name column (e.g. email, name, jméno, příjmení)" };
   }
   // Rows WITH an identity (email / external id) — idempotent upsert; rows with only a name — imported
   // as leads that can't be emailed (matched on re-import by name + company).
@@ -176,12 +176,12 @@ export function parseCsvContacts(
     if (badEmail !== null && !contact.external_id) {
       // A typo'd address would otherwise land as a separate email-less contact and duplicate the person
       // once fixed — better to report it and let the row be corrected.
-      skip(rowNo, `invalid email “${badEmail.slice(0, 80)}”`);
+      skip(rowNo, `invalid e-mail “${badEmail.slice(0, 80)}”`);
       continue;
     }
     if (contact.email || contact.external_id) rows.push(contact);
     else if (contact.name) withoutEmail.push(contact);
-    else if (cells.some((v) => v.trim())) skip(rowNo, "no email and no name");
+    else if (cells.some((v) => v.trim())) skip(rowNo, "no e-mail and no name");
     else continue; // a blank line — not worth reporting
     if (rows.length + withoutEmail.length >= 10_000) break; // hard row ceiling per import
   }

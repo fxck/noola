@@ -36,7 +36,7 @@ export function SignupPage() {
       const status = (err as { status?: number }).status;
       setError(
         status === 409
-          ? "That email is already registered — try signing in instead."
+          ? "That e-mail is already registered — try signing in instead."
           : "Couldn't create your workspace — please try again.",
       );
       setBusy(false);
@@ -82,7 +82,7 @@ export function SignupPage() {
                 />
               </div>
               <div className="flex flex-col gap-2">
-                <Label htmlFor="email">Email</Label>
+                <Label htmlFor="email">E-mail</Label>
                 <Input
                   id="email"
                   type="email"

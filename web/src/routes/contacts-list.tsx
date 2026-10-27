@@ -186,8 +186,8 @@ const COLUMNS: ColumnDef<Contact>[] = [
   },
   {
     accessorKey: "email",
-    header: "Email",
-    meta: { label: "Email" },
+    header: "E-mail",
+    meta: { label: "E-mail" },
     cell: ({ getValue }) => {
       const v = getValue() as string;
       return v ? <span className="block max-w-[16rem] truncate text-muted-foreground">{v}</span> : null;
@@ -499,7 +499,7 @@ export function ContactsPage() {
   const filterFields = useMemo<BuilderFieldDef[]>(
     () => [
       { key: "name", label: "Name", type: "text", icon: User },
-      { key: "email", label: "Email", type: "text", icon: Mail },
+      { key: "email", label: "E-mail", type: "text", icon: Mail },
       { key: "company", label: "Company", type: "text", icon: Building2 },
       ...attrKeys.map(
         (k): BuilderFieldDef => ({
@@ -882,7 +882,7 @@ export function ContactsPage() {
                 <Input
                   value={q}
                   onChange={(e) => handleSearchChange(e.target.value)}
-                  placeholder="Search name, email, company…"
+                  placeholder="Search name, e-mail, company…"
                   aria-label="Search contacts"
                   className="h-8 w-44 pl-8 text-sm lg:w-56"
                 />
@@ -1047,7 +1047,7 @@ export function ContactsPage() {
             setImportOpen(false);
             const skipped = res.skipped ? `, ${res.skipped} skipped` : "";
             const linked = res.linked ? `, ${res.linked} linked to companies` : "";
-            const noEmail = res.without_email ? `, ${res.without_email} without email` : "";
+            const noEmail = res.without_email ? `, ${res.without_email} without e-mail` : "";
             const tagged = res.tag
               ? ` Tagged ${res.tagged ?? 0} “${res.tag}”${res.tagged_existing ? ` (${res.tagged_existing} already existed — only the tag was added)` : ""}.`
               : "";

@@ -129,6 +129,6 @@ export default async function policiesRoutes(app: FastifyInstance): Promise<void
       const target = `${webBase}/sso/callback#token=${encodeURIComponent(token)}`;
       return `<!doctype html><meta charset="utf-8"><title>Signing in…</title><meta http-equiv="refresh" content="0;url=${target}"><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center"><h1>Signing you in…</h1><p>If you are not redirected, <a href="${target}">continue</a>.</p></body>`;
     }
-    return `<!doctype html><meta charset="utf-8"><title>SSO</title><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center"><h1>Single sign-on didn't complete</h1><p>The identity provider handoff didn't establish a session. Please try again, or sign in with your email and password.</p><a href="${webBase}/login">Back to sign in</a></body>`;
+    return `<!doctype html><meta charset="utf-8"><title>SSO</title><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center"><h1>Single sign-on didn't complete</h1><p>The identity provider handoff didn't establish a session. Please try again, or sign in with your e-mail and password.</p><a href="${webBase}/login">Back to sign in</a></body>`;
   });
 }

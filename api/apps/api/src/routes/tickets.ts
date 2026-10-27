@@ -558,7 +558,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
           ? "widget"
           : "email";
     if (channelType === "email" && !email) {
-      return reply.code(422).send({ error: "contact_unreachable", detail: "contact has no email address" });
+      return reply.code(422).send({ error: "contact_unreachable", detail: "contact has no e-mail address" });
     }
 
     // A widget conversation is keyed by a generated conversation handle (external_channel_id); the

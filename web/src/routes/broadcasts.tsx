@@ -271,7 +271,7 @@ function windowWords(b: Broadcast): string | null {
 
 // ── delivery channel — labels + the creds each stub channel needs ────────────
 const CHANNEL_LABEL: Record<BroadcastChannel, string> = {
-  email: "Email",
+  email: "E-mail",
   discord: "Discord",
   slack: "Slack",
   telegram: "Telegram",
@@ -304,7 +304,7 @@ function templateName(id: string, templates: EmailTemplate[] | null): string {
 // it was composed.
 const CORE_FIELD_LABEL: Record<string, string> = {
   name: "Name",
-  email: "Email",
+  email: "E-mail",
   company: "Company",
   created_at: "Created",
   updated_at: "Last activity",
@@ -1051,7 +1051,7 @@ function ComposeBroadcast({
   const filterFields = useMemo<BuilderFieldDef[]>(
     () => [
       { key: "name", label: "Name", type: "text", icon: User },
-      { key: "email", label: "Email", type: "text", icon: Mail },
+      { key: "email", label: "E-mail", type: "text", icon: Mail },
       { key: "company", label: "Company", type: "text", icon: Building2 },
       ...attrKeys.map(
         (k): BuilderFieldDef => ({
@@ -1289,7 +1289,7 @@ function ComposeBroadcast({
       toast.success(`Test sent to ${res.to}.`);
     } catch (err) {
       // The server's reason (400 subject / 502 mailer) beats a generic apology.
-      toast.error((err as ApiError).detail ?? "Couldn't send the test email.");
+      toast.error((err as ApiError).detail ?? "Couldn't send the test e-mail.");
     } finally {
       setTestBusy(false);
     }
@@ -1706,7 +1706,7 @@ function ComposeBroadcast({
                 id="b-q"
                 value={q}
                 onChange={(e) => editQ(e.target.value)}
-                placeholder="Matches name, email, or company…"
+                placeholder="Matches name, e-mail, or company…"
                 className="h-8 text-xs"
                 autoComplete="off"
               />
