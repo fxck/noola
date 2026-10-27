@@ -6,12 +6,11 @@ import { getNatsConnection } from "./nats-conn.js";
 // A run is enqueued by INSERTing a runner_runs row (status 'queued') AND an outbox row on
 // subject `jobs.run` in ONE transaction (withTenant runs inside a tenant-scoped txn). The
 // existing single-writer outbox drainer (server.ts) then publishes it → JetStream routes
-// `jobs.run` into the RUNS stream → the `runner` docker service consumes and launches ONE
-// ephemeral container per job. Reusing the transactional outbox (atomic with the row,
-// at-least-once) beats a second NATS client in the request path — the enqueue can't succeed
-// while the row write rolls back, or vice versa. Slice A: rows stay 'queued' (the skeleton
-// container just echoes); slice B: the worker records lifecycle (started_at/result/finished_at).
-// All RLS-scoped via withTenant.
+// `jobs.run` into the RUNS stream → the `runner` service consumes it and runs the job in ONE
+// Zerops Box sandbox of its own, terminated after the run. Reusing the transactional outbox
+// (atomic with the row, at-least-once) beats a second NATS client in the request path — the
+// enqueue can't succeed while the row write rolls back, or vice versa. The runner records the
+// lifecycle (started_at/result/finished_at). All RLS-scoped via withTenant.
 
 export interface RunnerRun {
   id: string;
@@ -53,7 +52,7 @@ function mapRun(r: Record<string, unknown>): RunnerRun {
 
 /** Enqueue a run: create a queued runner_runs row + an outbox `jobs.run` job in one txn, so the
  *  job is published (by the drainer) iff the row commits. Returns the new run's id + status; the
- *  runner consumes the job asynchronously. `payload.cmd` is the command the run container runs. */
+ *  runner consumes the job asynchronously. `payload.cmd` is the command the run's sandbox runs. */
 export async function createRun(
   tenantId: string,
   kind: string,
@@ -74,8 +73,8 @@ export async function createRun(
         runId: run.id, tenantId,
         cmd: payload.cmd ?? "", creds: payload.creds ?? [],
         mode: payload.mode ?? "", url: payload.url ?? "",
-        // `flow`-mode jobs carry the whole graph + the seed item; the Go worker passes them to the
-        // flow-runner container as GRAPH/INPUT env. Serialize to strings (Job.Graph/Input are strings).
+        // `flow`-mode jobs carry the whole graph + the seed item; the Go worker writes them into the
+        // flow-runner sandbox as files. Serialize to strings (Job.Graph/Input are strings).
         graph: payload.graph != null ? (typeof payload.graph === "string" ? payload.graph : JSON.stringify(payload.graph)) : "",
         input: payload.input != null ? (typeof payload.input === "string" ? payload.input : JSON.stringify(payload.input)) : "",
       })],
