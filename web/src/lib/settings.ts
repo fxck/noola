@@ -156,6 +156,27 @@ export async function saveTranslationSettings(input: TranslationSettingsInput): 
   return api<TranslationSettings>("/settings/translation", { method: "PUT", body: JSON.stringify(input) });
 }
 
+// ── Replies ──────────────────────────────────────────────────────────────────
+
+export const MAX_SEND_DELAY_SECONDS = 600;
+
+/** How long a reply from the composer waits before it is sent, so it can still be cancelled. 0 sends at once. */
+export async function fetchSendDelay(): Promise<number> {
+  return (await api<{ sendDelaySeconds: number }>("/settings/replies")).sendDelaySeconds;
+}
+
+/** Admin only. Returns the stored value. */
+export async function saveSendDelay(sendDelaySeconds: number): Promise<number> {
+  return (
+    await api<{ sendDelaySeconds: number }>("/settings/replies", { method: "PUT", body: JSON.stringify({ sendDelaySeconds }) })
+  ).sendDelaySeconds;
+}
+
+/** A delay as the composer and settings name it: "30 s", "2 min", "90 s". */
+export function formatDelay(seconds: number): string {
+  return seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`;
+}
+
 // ── Auto-tagging config (STUDIO-SEEDED-FLOWS.md #1) ───────────────────────────
 // The keyword→tag rules + AI toggle that project into the managed 'autotag' Studio flows.
 export interface TagRule {

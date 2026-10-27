@@ -93,6 +93,8 @@ export interface MirrorTransport {
   /** Lock a thread (per-binding close action). Optional, like forumTagNames. */
   setLocked?(threadId: string, locked: boolean): Promise<boolean>;
   react(threadId: string, messageId: string, emoji: string): Promise<boolean>;
+  /** Removes the bot's own reaction. True also when it isn't there. */
+  unreact?(threadId: string, messageId: string, emoji: string): Promise<boolean>;
   memberRoleIds(guildId: string, userId: string): Promise<string[]>;
 }
 /** Map our provider-agnostic MirrorFile[] to discord.js's message `files` shape. */
@@ -368,6 +370,16 @@ export function buildMirrorTransport(client: Client): MirrorTransport {
         } finally {
           await t.setArchived(true).catch(() => {});
         }
+      }
+    },
+    async unreact(threadId, messageId, emoji) {
+      try {
+        await client.rest.delete(Routes.channelMessageOwnReaction(threadId, messageId, encodeURIComponent(emoji)));
+        return true;
+      } catch (e) {
+        // 10008 Unknown Message, 10014 Unknown Emoji: nothing is left to remove.
+        const code = (e as { code?: number }).code;
+        return code === 10008 || code === 10014;
       }
     },
     async memberRoleIds(guildId, userId) {
@@ -1047,6 +1059,19 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
   // in the tenant's reaction-triage map (shared with Slack) triages the mirrored ticket in place.
   // Partials are fetched so reactions on pre-restart messages still resolve; non-mirror threads
   // no-op instantly on the ticket_mirror lookup.
+  client.on(Events.MessageReactionRemove, async (reaction, user) => {
+    if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
+    try {
+      if (user.bot) return;
+      const { cancelPromoteOnUnreact } = await import("./discord-mirror.js");
+      // A 📤 that another teammate still has on the message keeps the send.
+      const left = reaction.partial ? await reaction.fetch().then((r) => r.count ?? 0, () => 0) : reaction.count ?? 0;
+      await cancelPromoteOnUnreact(reaction.message.id, reaction.emoji.name ?? "", left);
+    } catch (err) {
+      log.error({ err }, "discord MessageReactionRemove failed");
+    }
+  });
+
   client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (!isDiscordEventLeader()) return; // one api process acts on gateway events (see discord-leader.ts)
     try {
@@ -1075,6 +1100,7 @@ function openBot(botId: string, token: string, scope: "shared" | "tenant", tenan
         return;
       }
       if (res.promoted) log.info(`discord-mirror: message ${full.message.id} promoted to reply`);
+      else if (res.reason === "scheduled") log.info(`discord-mirror: message ${full.message.id} held for the send delay`);
       else if (res.action && !res.reason) log.info(`discord-mirror: reaction triage '${res.action}' applied`);
       else if (res.reason && res.reason !== "not_mirror" && res.reason !== "unmapped_emoji")
         log.info(`discord-mirror: reaction refused (${res.reason})`);

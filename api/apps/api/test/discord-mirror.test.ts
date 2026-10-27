@@ -4,7 +4,7 @@ import {
   setMirrorTransportForTests, replaceMirrorBindings, listMirrorBindings,
   evaluateAutoMirror, pushTicketToDiscord, getTicketMirror, mirrorByThread, mirrorUrl,
   matchesMirrorFilter, relayTicketMessage, syncMirrorState,
-  handleMirrorPostMessage, handleMirrorReaction, PROMOTE_EMOJI,
+  handleMirrorPostMessage, handleMirrorReaction, PROMOTE_EMOJI, cancelPromoteOnUnreact,
   onConversationSpam, onConversationUnspam,
   flushMirrorSyncs,
 } from "../src/discord-mirror.js";
@@ -15,6 +15,7 @@ import { ingestInbound } from "../src/ingest.js";
 import { persistBufferAttachments } from "../src/attachments.js";
 import { splitForDiscord } from "../src/channels/format.js";
 import { handleMessageEmbeds } from "../src/discord.js";
+import { getSendDelay, sendScheduledReplyNow, setSendDelay } from "../src/scheduled-replies.js";
 
 // Discord forum ops-mirror gate (PILOT-AND-DISCORD-PLAN D1-D4): binding filter → forum post,
 // manual push, timeline relay into the post, note-by-default responder messages, 📤 promote-to-
@@ -65,6 +66,10 @@ const mock: MirrorTransport = {
   },
   async react(threadId, messageId, emoji) {
     calls.push({ fn: "react", args: [threadId, messageId, emoji] });
+    return true;
+  },
+  async unreact(threadId, messageId, emoji) {
+    calls.push({ fn: "unreact", args: [threadId, messageId, emoji] });
     return true;
   },
   async memberRoleIds() { return []; },
@@ -353,6 +358,37 @@ async function main() {
   const dcReply = await relayPool.query("SELECT payload->>'body' AS body FROM discord_relay_outbox WHERE kind = 'reply' AND ticket_id = $1", [dcTicket.ticketId]);
   check("a promote to a Discord customer keeps the emoji token", dcReply.rows[0]?.body === emojiText, dcReply.rows[0]?.body);
   await relayPool.query("DELETE FROM discord_relay_outbox WHERE ticket_id = $1", [dcTicket.ticketId]);
+
+  // With a send delay, 📤 holds the reply under ⏳, removing the last 📤 cancels it, and Send now sends it with ✅.
+  const delayBefore = await getSendDelay(A);
+  await setSendDelay(A, 30);
+  try {
+    await handleMirrorPostMessage({
+      guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-delay",
+      authorId: "mirtest-user-bob", authorDisplayName: "Bob", content: "MIRTEST delayed answer", roleIds: [ROLE], isBotOrWebhook: false,
+    });
+    const reactions = (fn: string, emoji: string) => calls.filter((c) => c.fn === fn && c.args[1] === "mirtest-dm-delay" && c.args[2] === emoji).length;
+    const delayedReplies = async () =>
+      (await withTenant(A, (c) => c.query("SELECT id FROM messages WHERE ticket_id = $1 AND body = 'MIRTEST delayed answer'", [t1]))).rowCount;
+    const held = await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-delay", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+    await drainDiscordRelay();
+    check("a 📤 with a send delay holds the reply", held.reason === "scheduled" && (await delayedReplies()) === 0, held);
+    check("a held 📤 gets ⏳", reactions("react", "⏳") === 1);
+    check("a 📤 that another teammate keeps doesn't cancel", (await cancelPromoteOnUnreact("mirtest-dm-delay", PROMOTE_EMOJI, 1)) === false);
+    check("removing the last 📤 cancels", (await cancelPromoteOnUnreact("mirtest-dm-delay", PROMOTE_EMOJI, 0)) === true);
+    await drainDiscordRelay();
+    const unclaimed = await relayPool.query("SELECT promoted_at FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-delay'");
+    check("a cancelled 📤 removes ⏳ and can be promoted again", reactions("unreact", "⏳") === 1 && unclaimed.rows[0]?.promoted_at === null && (await delayedReplies()) === 0);
+    await handleMirrorReaction({ guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-delay", reactorId: "mirtest-user-bob", emoji: PROMOTE_EMOJI, reactorRoleIds: [ROLE] });
+    const waiting = await withTenant(A, (c) => c.query("SELECT id FROM scheduled_replies WHERE discord_message_id = 'mirtest-dm-delay' AND status = 'scheduled'"));
+    const now = await sendScheduledReplyNow(A, waiting.rows[0]?.id, { warn: () => {} });
+    await drainDiscordRelay();
+    const sentLedger = await relayPool.query("SELECT promoted_message_id FROM ticket_mirror_messages WHERE discord_message_id = 'mirtest-dm-delay'");
+    check("send now sends a held 📤 as the reply", !!now?.messageId && sentLedger.rows[0]?.promoted_message_id === now?.messageId && (await delayedReplies()) === 1, now);
+    check("a sent 📤 gets ✅ and loses ⏳", reactions("react", "✅") === 1 && reactions("unreact", "⏳") >= 1);
+  } finally {
+    await setSendDelay(A, delayBefore);
+  }
 
   // A preview that arrives after a message was promoted lands on the reply, which replaced the note.
   await handleMessageEmbeds(GUILD, "mirtest-dm-1", [

@@ -15,6 +15,7 @@ import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
 import { discordTokensToText, mdToDiscord, plainThreadName } from "./channels/format.js";
 import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
+import { cancelScheduledReply, getSendDelay, scheduleReply, type ScheduledSource } from "./scheduled-replies.js";
 
 // Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
 // (email/widget/…) can be selectively mirrored as ONE forum post in a Discord forum channel; the
@@ -33,6 +34,7 @@ import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./d
 
 export const PROMOTE_EMOJI = "📤";
 const PROMOTED_EMOJI = "✅";
+const PENDING_EMOJI = "⏳";
 const TRIAGED_EMOJI = "🆗";
 
 export interface MirrorFilter {
@@ -612,7 +614,7 @@ export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
     return deliverNoteRelay(tp, mirror, (row.payload.authorName as string | null) ?? null, String(row.payload.body ?? ""), relayNonce(row.id));
   }
   if (row.kind === "react") {
-    return deliverReactRelay(tp, String(row.payload.threadId ?? ""), String(row.payload.discordMessageId ?? ""), String(row.payload.emoji ?? ""));
+    return deliverReactRelay(tp, String(row.payload.threadId ?? ""), String(row.payload.discordMessageId ?? ""), String(row.payload.emoji ?? ""), row.payload.remove === true);
   }
   return { ok: false, retriable: false, error: `unknown relay kind ${(row as RelayRow).kind}` };
 }
@@ -676,10 +678,10 @@ async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorNa
   return { ok: true, retriable: false };
 }
 
-async function deliverReactRelay(tp: MirrorTransport, threadId: string, discordMessageId: string, emoji: string): Promise<DeliverResult> {
+async function deliverReactRelay(tp: MirrorTransport, threadId: string, discordMessageId: string, emoji: string, remove = false): Promise<DeliverResult> {
   if (!threadId || !discordMessageId || !emoji) return { ok: false, retriable: false, error: "missing react args" };
   try {
-    const ok = await tp.react(threadId, discordMessageId, emoji);
+    const ok = remove ? (await tp.unreact?.(threadId, discordMessageId, emoji)) ?? true : await tp.react(threadId, discordMessageId, emoji);
     return ok ? { ok: true, retriable: false } : { ok: false, retriable: true, error: "react not applied" };
   } catch (e) {
     return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
@@ -1108,25 +1110,74 @@ export async function handleMirrorReaction(
       ? seatName ?? row.author_display_name
       : binding?.attribution_name ?? seatName ?? null;
 
-  const readable = discordTokensToText(row.body);
+  const delay = await getSendDelay(row.tenant_id);
+  if (delay > 0) {
+    await scheduleReply(
+      row.tenant_id,
+      {
+        ticketId: row.ticket_id,
+        body: discordTokensToText(row.body),
+        author: { userId: seatId ?? null, name: attribution ?? row.author_display_name ?? "Support", email: null },
+        request: { attribution },
+        source: "discord_promote",
+        discordMessageId: r.discordMessageId,
+      },
+      delay,
+    );
+    await enqueueRelay("react", row.tenant_id, row.ticket_id, `react:${r.discordMessageId}:${PENDING_EMOJI}`, {
+      threadId: r.threadId,
+      discordMessageId: r.discordMessageId,
+      emoji: PENDING_EMOJI,
+    }, { reapply: true });
+    return { promoted: false, reason: "scheduled" };
+  }
+  const sent = await sendPromotedMessage({
+    tenantId: row.tenant_id, ticketId: row.ticket_id, discordMessageId: r.discordMessageId, threadId: r.threadId,
+    body: row.body, noteId: row.note_id, seatId, attribution, authorDisplayName: row.author_display_name,
+  });
+  return { promoted: true, reason: sent.delivered ? undefined : sent.reason };
+}
+
+interface PromotedMessage {
+  tenantId: string;
+  ticketId: string;
+  discordMessageId: string;
+  threadId: string;
+  /** The Discord message as written, with its emoji and timestamp tokens. */
+  body: string;
+  noteId: string | null;
+  seatId: string | null;
+  attribution: string | null;
+  authorDisplayName: string | null;
+}
+
+/** Records a promoted Discord message as the customer reply and sends it to the ticket's channel. */
+async function sendPromotedMessage(p: PromotedMessage): Promise<{ messageId: string; delivered: boolean; reason?: string; replay?: boolean }> {
+  const { seatId, attribution } = p;
+  const readable = discordTokensToText(p.body);
   const result = await ingestInbound({
-    tenantId: row.tenant_id,
-    ticketId: row.ticket_id,
+    tenantId: p.tenantId,
+    ticketId: p.ticketId,
     body: readable,
     authorType: "agent",
     authorKind: seatId ? "agent" : "community",
     authorId: seatId ?? null,
-    authorExternalName: attribution ?? row.author_display_name ?? "Support",
+    authorExternalName: attribution ?? p.authorDisplayName ?? "Support",
     origin: "discord_mirror",
-    idempotencyKey: `discord-mirror-promote:${r.discordMessageId}`,
+    idempotencyKey: `discord-mirror-promote:${p.discordMessageId}`,
   });
+  // A retry after a crash finds the reply recorded, and it may already have reached the customer.
+  if (result.replay) {
+    await relayPool.query("UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1", [p.discordMessageId, result.messageId]);
+    return { messageId: result.messageId, delivered: true, replay: true };
+  }
 
   // Durable ✅ confirmation, enqueued as soon as the reply is RECORDED. It used to be the last step, so
   // any later failure (dispatch, bookkeeping) meant no ✅ — and promoted_at was already claimed, so the
   // teammate couldn't retry. The drainer retries until it lands.
-  await enqueueRelay("react", row.tenant_id, result.ticketId, `react:${r.discordMessageId}:${PROMOTED_EMOJI}`, {
-    threadId: r.threadId,
-    discordMessageId: r.discordMessageId,
+  await enqueueRelay("react", p.tenantId, result.ticketId, `react:${p.discordMessageId}:${PROMOTED_EMOJI}`, {
+    threadId: p.threadId,
+    discordMessageId: p.discordMessageId,
     emoji: PROMOTED_EMOJI,
   });
 
@@ -1134,31 +1185,31 @@ export async function handleMirrorReaction(
   // carried from the internal note onto the reply (the widget + agent thread both render message
   // attachments), then drop the now-duplicate note. The promote's own message.created event makes the
   // web refetch messages + notes, so the reply appears with its image and the note disappears live.
-  if (row.note_id) {
-    await withTenant(row.tenant_id, async (c) => {
+  if (p.noteId) {
+    await withTenant(p.tenantId, async (c) => {
       await c.query(
         "UPDATE message_attachments SET message_id = $1, note_id = NULL WHERE note_id = $2 AND ticket_id = $3",
-        [result.messageId, row.note_id, row.ticket_id],
+        [result.messageId, p.noteId, p.ticketId],
       );
-      await c.query("DELETE FROM ticket_notes WHERE id = $1", [row.note_id]);
+      await c.query("DELETE FROM ticket_notes WHERE id = $1", [p.noteId]);
     }).catch(() => {});
   }
 
   // A human promoted this Discord message to a customer reply — stand the assistant down on the ticket
   // so ambient autoreply doesn't talk over the human (matches the console reply path). Idempotent.
-  await withTenant(row.tenant_id, async (c) => {
+  await withTenant(p.tenantId, async (c) => {
     await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
   }).catch(() => {});
 
   // Only Discord renders the custom emoji and timestamp tokens as written.
-  const outbound = result.channelType === "discord" ? row.body : readable;
-  const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, outbound);
-  if (meta) void stampOutboundTranslation(row.tenant_id, result.messageId, meta);
+  const outbound = result.channelType === "discord" ? p.body : readable;
+  const { dispatchBody, meta } = await translateOutboundReply(p.tenantId, result.ticketId, outbound);
+  if (meta) void stampOutboundTranslation(p.tenantId, result.messageId, meta);
 
   const driver = getChannelDriver(result.channelType);
   const out = driver?.dispatch
     ? await driver.dispatch(
-        { tenantId: row.tenant_id, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId, messageId: result.messageId },
+        { tenantId: p.tenantId, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId, messageId: result.messageId },
         dispatchBody,
         // Read receipt: embed the pixel keyed to THIS agent message so an email open stamps seen_at —
         // same as the web composer's reply route. Without it a promoted reply never shows "Seen".
@@ -1170,7 +1221,7 @@ export async function handleMirrorReaction(
   // if the customer isn't currently in the widget and we have their email, ALSO email the promoted
   // reply — otherwise an away customer never hears back until they reopen the widget. Best-effort.
   if (!out.delivered && (result.channelType === "widget" || out.reason === "no-driver")) {
-    void notifyContactByEmailIfAway(row.tenant_id, {
+    void notifyContactByEmailIfAway(p.tenantId, {
       ticketId: result.ticketId,
       subject: result.subject,
       body: dispatchBody,
@@ -1181,9 +1232,59 @@ export async function handleMirrorReaction(
 
   await relayPool.query(
     "UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1",
-    [r.discordMessageId, result.messageId],
+    [p.discordMessageId, result.messageId],
   );
-  return { promoted: true, reason: out.delivered ? undefined : out.reason };
+  return { messageId: result.messageId, delivered: out.delivered, reason: out.delivered ? undefined : out.reason };
+}
+
+/** Sends and releases the scheduled rows of 📤 promotes. */
+export const promoteSource: ScheduledSource = {
+  async deliver(scheduled) {
+    const led = await relayPool.query<{ body: string; note_id: string | null; post_thread_id: string; author_display_name: string | null }>(
+      "SELECT body, note_id, post_thread_id, author_display_name FROM ticket_mirror_messages WHERE discord_message_id = $1",
+      [scheduled.discord_message_id],
+    );
+    if (!led.rowCount) throw new Error("promoted Discord message is gone");
+    const m = led.rows[0];
+    const sent = await sendPromotedMessage({
+      tenantId: scheduled.tenant_id, ticketId: scheduled.ticket_id, discordMessageId: scheduled.discord_message_id!, threadId: m.post_thread_id,
+      body: m.body, noteId: m.note_id, seatId: scheduled.author_id, attribution: scheduled.request.attribution ?? null,
+      authorDisplayName: m.author_display_name,
+    });
+    await removePendingReaction(scheduled.tenant_id, scheduled.ticket_id, scheduled.discord_message_id!, m.post_thread_id);
+    return { messageId: sent.messageId, replay: sent.replay };
+  },
+  // The message can be promoted again once its 📤 is added back.
+  async release(scheduled) {
+    const led = await relayPool.query<{ post_thread_id: string }>(
+      `UPDATE ticket_mirror_messages SET promoted_at = NULL
+        WHERE discord_message_id = $1 AND promoted_message_id IS NULL RETURNING post_thread_id`,
+      [scheduled.discord_message_id],
+    );
+    if (led.rowCount) await removePendingReaction(scheduled.tenant_id, scheduled.ticket_id, scheduled.discord_message_id!, led.rows[0].post_thread_id);
+  },
+};
+
+async function removePendingReaction(tenantId: string, ticketId: string, discordMessageId: string, threadId: string): Promise<void> {
+  await enqueueRelay("react", tenantId, ticketId, `unreact:${discordMessageId}:${PENDING_EMOJI}`, {
+    threadId, discordMessageId, emoji: PENDING_EMOJI, remove: true,
+  }, { reapply: true });
+}
+
+/** Cancels a waiting 📤 promote when the last 📤 is removed from the message. */
+export async function cancelPromoteOnUnreact(discordMessageId: string, emoji: string, remaining: number): Promise<boolean> {
+  if (canonicalEmojiName(emoji) !== "outbox_tray" || remaining > 0) return false;
+  const led = await relayPool.query<{ tenant_id: string }>(
+    "SELECT tenant_id FROM ticket_mirror_messages WHERE discord_message_id = $1 AND promoted_at IS NOT NULL AND promoted_message_id IS NULL",
+    [discordMessageId],
+  );
+  if (!led.rowCount) return false;
+  const tenantId = led.rows[0].tenant_id;
+  const open = await withTenant(tenantId, (c) =>
+    c.query<{ id: string }>("SELECT id FROM scheduled_replies WHERE discord_message_id = $1 AND status = 'scheduled'", [discordMessageId]),
+  );
+  if (!open.rowCount) return false;
+  return (await cancelScheduledReply(tenantId, open.rows[0].id)) !== null;
 }
 
 /** Default snooze horizon for a reaction (no duration channel on an emoji): 1 day. */

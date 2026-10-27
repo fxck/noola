@@ -304,9 +304,14 @@ export async function fetchMessageOriginal(ticketId: string, messageId: string):
 // ---- Write actions (tenant is server-authoritative; bodies carry only the
 //      payload — the api reads the session tenant, never the client's word) ---
 
+export type SendReplyResult =
+  | { kind: "sent"; delivered: boolean; queued?: boolean }
+  | { kind: "scheduled"; scheduledReplyId: string; sendAt: string };
+
 /** Reply as the agent. Persists + emits the outbox event + posts to the origin
  *  channel (Discord/email…). `attachmentIds` are pre-uploaded files to attach.
- *  `delivered` reports whether the external post succeeded. */
+ *  `delivered` reports whether the external post succeeded. When the workspace has a send delay,
+ *  the reply is scheduled instead, unless `sendNow` is set. */
 export async function sendReply(
   ticketId: string,
   body: string,
@@ -314,20 +319,54 @@ export async function sendReply(
   channel?: string,
   cc?: string[],
   clientMessageId?: string,
-): Promise<{ delivered: boolean; queued?: boolean }> {
-  return api<{ ticketId: string; messageId: string; delivered: boolean; queued?: boolean }>(
-    `/tickets/${ticketId}/reply`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        body,
-        ...(attachmentIds?.length ? { attachmentIds } : {}),
-        ...(channel ? { channel } : {}),
-        ...(cc?.length ? { cc } : {}),
-        ...(clientMessageId ? { clientMessageId } : {}),
-      }),
-    },
-  );
+  sendNow?: boolean,
+): Promise<SendReplyResult> {
+  const r = await api<
+    | { ticketId: string; messageId: string; delivered: boolean; queued?: boolean }
+    | { ticketId: string; scheduledReplyId: string; sendAt: string }
+  >(`/tickets/${ticketId}/reply`, {
+    method: "POST",
+    body: JSON.stringify({
+      body,
+      ...(attachmentIds?.length ? { attachmentIds } : {}),
+      ...(channel ? { channel } : {}),
+      ...(cc?.length ? { cc } : {}),
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(sendNow ? { sendNow } : {}),
+    }),
+  });
+  if ("scheduledReplyId" in r) return { kind: "scheduled", scheduledReplyId: r.scheduledReplyId, sendAt: r.sendAt };
+  return { kind: "sent", delivered: r.delivered, queued: r.queued };
+}
+
+// ---- Scheduled replies (the workspace's send delay) --------------------------
+
+/** A reply that waits out the send delay, or is being sent. `discord_promote` is a Discord mirror message promoted to a reply. */
+export interface ScheduledReply {
+  id: string;
+  body: string;
+  sendAt: string;
+  status: "scheduled" | "sending";
+  source: "composer" | "discord_promote";
+  authorId: string | null;
+  authorName: string | null;
+}
+
+export async function fetchScheduledReplies(ticketId: string): Promise<ScheduledReply[]> {
+  return (await api<{ scheduledReplies: ScheduledReply[] }>(`/tickets/${ticketId}/scheduled-replies`)).scheduledReplies;
+}
+
+/** Throws a 409 ApiError when the reply is already being sent. */
+export async function cancelScheduledReply(id: string): Promise<{ body: string; source: ScheduledReply["source"] }> {
+  return api<{ cancelled: true; body: string; source: ScheduledReply["source"] }>(`/scheduled-replies/${id}/cancel`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+/** Throws a 409 ApiError when the reply was already sent or cancelled, and a 502 when the send failed and will be retried. */
+export async function sendScheduledReplyNow(id: string): Promise<void> {
+  await api(`/scheduled-replies/${id}/send`, { method: "POST", body: "{}" });
 }
 
 // ---- Attachments (upload before send; download is authed → blob) -------------

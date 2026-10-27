@@ -5,20 +5,25 @@ import {
   type Message,
   type AgentUser,
   type ReplyChannels,
+  type ScheduledReply,
   fetchMessages,
+  fetchScheduledReplies,
+  cancelScheduledReply,
+  sendScheduledReplyNow,
   assignTicket,
   setTicketOpen,
   unspamTicket,
   relativeTime,
 } from "@/lib/tickets";
 import { toast } from "@/components/ui/toaster";
+import type { ApiError } from "@/lib/api";
 import { useQueue } from "@/lib/queue-context";
 import { type Note, fetchNotes } from "@/lib/notes";
 import { ContextRail } from "@/components/inbox/context-rail";
 import { ThreadActions } from "@/components/inbox/thread-actions";
 import { AssigneePicker } from "@/components/inbox/assignee-picker";
-import { Composer } from "@/components/inbox/composer";
-import { MessageBubble, NoteBubble } from "@/components/inbox/message-bubble";
+import { Composer, type ComposerHandle } from "@/components/inbox/composer";
+import { MessageBubble, NoteBubble, PendingReplyBubble } from "@/components/inbox/message-bubble";
 import { AutoreplyPanel } from "@/components/inbox/autoreply-panel";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -106,12 +111,14 @@ export function ThreadPane({
   // Reply-all default (0092): the other recipients on the customer's latest email.
   const [emailCc, setEmailCc] = useState<string[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
+  const [scheduled, setScheduled] = useState<ScheduledReply[]>([]);
   const [loadErr, setLoadErr] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   // Details-rail visibility — an operator preference that sticks (Intercom's
   // "hide right menu"). The responsive classes still gate WHERE it can render.
   const [railOpen, setRailOpen] = useLocalFlag("noola.inbox.rail", true);
   const prevTicketId = useRef<string | null>(null);
+  const composerRef = useRef<ComposerHandle>(null);
 
   const reloadNotes = useRef((id: string) => {
     fetchNotes(id)
@@ -131,6 +138,9 @@ export function ThreadPane({
 
   async function loadMessages() {
     setLoadErr(false);
+    fetchScheduledReplies(ticket.id)
+      .then(setScheduled)
+      .catch(() => setScheduled([]));
     try {
       const { messages: m, channels, emailCc: cc } = await fetchMessages(ticket.id);
       setMessages(m);
@@ -148,6 +158,7 @@ export function ThreadPane({
     if (prevTicketId.current !== ticket.id) {
       prevTicketId.current = ticket.id;
       setMessages(null);
+      setScheduled([]);
       setLoadErr(false);
     }
     fetchMessages(ticket.id)
@@ -161,6 +172,9 @@ export function ThreadPane({
     fetchNotes(ticket.id)
       .then((n) => !cancelled && setNotes(n))
       .catch(() => !cancelled && setNotes([]));
+    fetchScheduledReplies(ticket.id)
+      .then((r) => !cancelled && setScheduled(r))
+      .catch(() => !cancelled && setScheduled([]));
     return () => {
       cancelled = true;
     };
@@ -190,6 +204,43 @@ export function ThreadPane({
     (acc, m) => (m.author_type === "agent" && m.seen_at ? m : acc),
     null,
   );
+
+  // The agent may switch tickets while a request runs, and then the pane must not load the old one.
+  function reloadIfStillOn(ticketId: string) {
+    if (prevTicketId.current === ticketId) void loadMessages();
+  }
+
+  async function cancelPending(r: ScheduledReply) {
+    const ticketId = ticket.id;
+    try {
+      const out = await cancelScheduledReply(r.id);
+      // A promoted Discord message was written in Discord, so only a composer reply goes back to the composer.
+      if (out.source === "composer" && !composerRef.current?.restoreDraft(ticketId, out.body)) {
+        const copied = await navigator.clipboard.writeText(out.body).then(() => true, () => false);
+        toast.success(copied ? "Reply cancelled. Its text is copied to the clipboard." : "Reply cancelled.");
+      }
+    } catch (err) {
+      toast.error((err as ApiError).status === 409 ? "This reply is already being sent." : "Couldn't cancel the reply.");
+    }
+    reloadIfStillOn(ticketId);
+  }
+
+  async function sendPendingNow(r: ScheduledReply) {
+    const ticketId = ticket.id;
+    try {
+      await sendScheduledReplyNow(r.id);
+    } catch (err) {
+      const status = (err as ApiError).status;
+      toast.error(
+        status === 409
+          ? "This reply was already sent or cancelled."
+          : status === 502
+            ? "Couldn't send it now. It will be retried."
+            : "Couldn't send the reply.",
+      );
+    }
+    reloadIfStillOn(ticketId);
+  }
 
   async function runAction(fn: () => Promise<void>) {
     setActionBusy(true);
@@ -293,12 +344,12 @@ export function ThreadPane({
               </Button>
             </div>
           )}
-          {messages && timeline.length === 0 && (
+          {messages && timeline.length === 0 && scheduled.length === 0 && (
             <div className="grid flex-1 place-items-center text-sm text-muted-foreground">
               No messages in this ticket yet.
             </div>
           )}
-          {messages && timeline.length > 0 && (
+          {messages && (timeline.length > 0 || scheduled.length > 0) && (
             <ol className="mx-auto flex w-full max-w-3xl flex-col gap-4">
               {timeline.map((item, i) => {
                 // Separators key off the MERGED chronological stream — a note
@@ -329,6 +380,15 @@ export function ThreadPane({
                   </Fragment>
                 );
               })}
+              {scheduled.map((r) => (
+                <PendingReplyBubble
+                  key={`scheduled-${r.id}`}
+                  reply={r}
+                  authorAvatarUrl={users.find((u) => u.id === r.authorId)?.avatar_url}
+                  onCancel={() => cancelPending(r)}
+                  onSendNow={() => sendPendingNow(r)}
+                />
+              ))}
             </ol>
           )}
         </StickToBottom.Content>
@@ -371,6 +431,7 @@ export function ThreadPane({
         </footer>
       ) : (
         <Composer
+          ref={composerRef}
           ticket={ticket}
           users={users}
           isDiscord={isDiscord}

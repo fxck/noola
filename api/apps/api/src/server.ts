@@ -14,6 +14,7 @@ import { ensureThreadsCollection, reindexAllThreads } from "./threads.js";
 import { ensureVectorCollections, reindexAllVectors } from "./vector.js";
 import { startDiscord } from "./discord-gateway.js";
 import { drainDiscordRelay } from "./discord-relay-outbox.js";
+import { drainScheduledReplies } from "./scheduled-replies.js";
 import { backfillSeedFlows } from "./seedflows.js";
 import { runScheduledAutomations } from "./automations.js";
 import { detectSlaBreaches } from "./sla.js";
@@ -44,6 +45,7 @@ import automationRoutes from "./routes/automation.js";
 import scimRoutes from "./routes/scim.js";
 import uploadsRoutes from "./routes/uploads.js";
 import preferencesRoutes from "./routes/preferences.js";
+import scheduledReplyRoutes from "./routes/scheduled-replies.js";
 
 // The Bearer-token session resolved on every request (see the onRequest hook below).
 // Declared here so req.session is strongly typed everywhere instead of cast ad-hoc.
@@ -437,6 +439,7 @@ await app.register(automationRoutes);
 await app.register(scimRoutes);
 await app.register(uploadsRoutes);
 await app.register(preferencesRoutes);
+await app.register(scheduledReplyRoutes);
 
 // ---- Boot ----------------------------------------------------------------
 const port = Number(process.env.PORT ?? 3000);
@@ -463,6 +466,8 @@ setInterval(() => void drainOutbox(), 500);
 // Discord ops-mirror relay outbox (0113): deliver mirror messages/notes + promote ✅ reacts durably,
 // surviving degraded Discord connections and process restarts. Single-flight internally; 1s cadence.
 setInterval(() => void drainDiscordRelay(), 1000);
+// Replies held for the workspace's send delay go out when it ends.
+setInterval(() => void drainScheduledReplies(app.log).catch((err) => app.log.warn({ err }, "scheduled replies drain failed")), 2000);
 // Prune stale answer_claims (§6) — the claim only needs to serialize concurrent answerers within one
 // customer turn, so anything older than a couple of days is dead weight. Runs on relayPool as role
 // event_relay (BYPASSRLS janitor); the 0076 `GRANT ... DELETE ... TO event_relay` is what lets this
