@@ -43,11 +43,14 @@ export async function getAiOverview(tenantId: string): Promise<AiOverview> {
       const r = await c.query(
         `SELECT
            (SELECT count(*)::int FROM autoreply_queue WHERE status = 'pending') AS pending,
-           (SELECT count(*)::int FROM draft_traces WHERE created_at > now() - interval '7 days') AS drafts,
+           -- Traces past the retention are counted per day in draft_trace_counts.
+           ((SELECT count(*) FROM draft_traces WHERE created_at > now() - interval '7 days')
+             + (SELECT COALESCE(sum(drafts), 0) FROM draft_trace_counts WHERE day > ((now() - interval '7 days') AT TIME ZONE 'UTC')::date))::int AS drafts,
            (SELECT count(*)::int FROM autoreply_decisions WHERE outcome = 'auto_sent' AND created_at > now() - interval '7 days') AS auto_sent,
            (SELECT count(*)::int FROM autoreply_decisions WHERE outcome <> 'auto_sent' AND created_at > now() - interval '7 days') AS held,
            (SELECT count(*)::int FROM agent_runs WHERE created_at > now() - interval '7 days') AS agent_runs,
-           (SELECT count(*)::int FROM draft_traces WHERE source = 'live' AND ticket_id IS NULL AND created_at > now() - interval '7 days') AS deflected`,
+           ((SELECT count(*) FROM draft_traces WHERE source = 'live' AND ticket_id IS NULL AND created_at > now() - interval '7 days')
+             + (SELECT COALESCE(sum(deflected), 0) FROM draft_trace_counts WHERE day > ((now() - interval '7 days') AT TIME ZONE 'UTC')::date))::int AS deflected`,
       );
       return r.rows[0] as Record<string, number>;
     }),

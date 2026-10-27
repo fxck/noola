@@ -1,16 +1,23 @@
 import { useEffect, useState } from "react";
 import { ShieldAlert, Bot } from "lucide-react";
+import { useAuth } from "@/auth/auth";
 import { type AutoreplyDecision, fetchAutoreplyDecisions } from "@/lib/autoreply";
+import { fetchTicketTraces, traceOutcomeLabel, type TraceSummary } from "@/lib/traces";
 import { relativeTime } from "@/lib/tickets";
 import { NerdStats } from "@/components/live/nerd-stats";
+import { TraceDialog } from "@/components/inbox/trace-dialog";
 import { cn } from "@/lib/utils";
 
 // The autoreply decision trail for a ticket — a nerd-mode panel above the thread explaining why the
-// AI acted or held on each inbound. Stays quiet (renders nothing) when the endpoint is absent or
-// there are no decisions, so it never clutters a normal conversation.
+// AI acted or held on each inbound, and for admins the AI traces behind them. Stays quiet (renders nothing)
+// when there are neither decisions nor traces, so it never clutters a normal conversation.
 export function AutoreplyPanel({ ticketId, refreshKey }: { ticketId: string; refreshKey: number }) {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin" || user?.role === "owner";
   const [rows, setRows] = useState<AutoreplyDecision[] | null>(null);
   const [failed, setFailed] = useState(false);
+  const [traces, setTraces] = useState<TraceSummary[]>([]);
+  const [openTrace, setOpenTrace] = useState<string | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -23,25 +30,51 @@ export function AutoreplyPanel({ ticketId, refreshKey }: { ticketId: string; ref
     };
   }, [ticketId, refreshKey]);
 
+  useEffect(() => {
+    if (!isAdmin) {
+      setTraces([]);
+      return;
+    }
+    let live = true;
+    fetchTicketTraces(ticketId)
+      .then((t) => live && setTraces(t))
+      .catch(() => live && setTraces([]));
+    return () => {
+      live = false;
+    };
+  }, [ticketId, refreshKey, isAdmin]);
+
   // Endpoint not wired yet, or nothing to show → stay quiet rather than clutter.
-  if (failed) return null;
-  if (rows && rows.length === 0) return null;
+  const noDecisions = failed || (rows !== null && rows.length === 0);
+  if (noDecisions && traces.length === 0) return null;
 
   return (
     <div className="shrink-0 border-b bg-muted/20 px-4 py-2 sm:px-6">
-      <div className="mx-auto max-w-3xl">
-        <NerdStats title="autoreply decisions">
-          {rows === null ? (
-            <span className="text-muted-foreground">loading…</span>
-          ) : (
-            <div className="space-y-1.5">
-              {rows.map((d, i) => (
-                <DecisionRow key={d.id ?? i} d={d} />
+      <div className="mx-auto max-w-3xl space-y-2">
+        {!noDecisions && (
+          <NerdStats title="autoreply decisions">
+            {rows === null ? (
+              <span className="text-muted-foreground">loading…</span>
+            ) : (
+              <div className="space-y-1.5">
+                {rows.map((d, i) => (
+                  <DecisionRow key={d.id ?? i} d={d} />
+                ))}
+              </div>
+            )}
+          </NerdStats>
+        )}
+        {traces.length > 0 && (
+          <NerdStats title="ai traces">
+            <div className="max-h-40 space-y-0.5 overflow-y-auto">
+              {traces.map((t) => (
+                <TraceRow key={t.id} t={t} onOpen={() => setOpenTrace(t.id)} />
               ))}
             </div>
-          )}
-        </NerdStats>
+          </NerdStats>
+        )}
       </div>
+      {openTrace && <TraceDialog traceId={openTrace} onClose={() => setOpenTrace(null)} />}
     </div>
   );
 }
@@ -82,5 +115,29 @@ function DecisionRow({ d }: { d: AutoreplyDecision }) {
         <span className="shrink-0 text-muted-foreground">{relativeTime(d.created_at)}</span>
       )}
     </div>
+  );
+}
+
+function TraceRow({ t, onOpen }: { t: TraceSummary; onOpen: () => void }) {
+  const { label, tone } = traceOutcomeLabel(t.gateOutcome, t.gateReason);
+  const firstLine = t.query.split("\n").find((l) => l.trim())?.trim() ?? "";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      title="View trace"
+      className="flex w-full items-baseline gap-2 rounded px-1 text-left hover:bg-muted/60"
+    >
+      <span className="w-14 shrink-0 text-muted-foreground">{relativeTime(t.createdAt)}</span>
+      <span
+        className={cn(
+          "shrink-0",
+          tone === "held" ? "text-warning" : tone === "sent" ? "text-success" : "text-muted-foreground",
+        )}
+      >
+        {label}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-foreground/80">{firstLine}</span>
+    </button>
   );
 }

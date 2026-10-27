@@ -1,6 +1,7 @@
 import { withTenant } from "@repo/db";
+import { hasOutcomeTag, parseDraftOutcome, type DraftOutcome } from "./ai-outcome.js";
 
-// draft_traces: the durable record of every drafted reply — the query, the retrieved
+// draft_traces: the record of every drafted reply, kept for each workspace's trace retention — the query, the retrieved
 // sources + fused scores, the draft, model + tokens + latency, and (back-filled) the
 // gate decision and the human outcome. It's both the audit trail and the eval
 // baseline — Opik's PATTERN, self-hosted. `TRACE_SINK` optionally mirrors each trace
@@ -171,4 +172,96 @@ function buildOtlpSpan(traceId: string, input: DraftTraceInput): unknown {
       },
     ],
   };
+}
+
+// ---- Admin trace viewer --------------------------------------------------------
+
+export interface TraceSummary {
+  id: string;
+  createdAt: string;
+  messageId: string | null;
+  model: string;
+  query: string;
+  draftPreview: string;
+  gateOutcome: string | null;
+  gateReason: string | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  latencyMs: number | null;
+}
+
+export interface TraceDetail extends TraceSummary {
+  ticketId: string | null;
+  draft: string;
+  /** What Noola made of the draft's answer tags. A draft without tags is a plain reply. */
+  parsed: DraftOutcome;
+  sources: TraceSource[];
+  topScore: number | null;
+  agreement: number | null;
+  confidence: number | null;
+  embedModel: string | null;
+  riskTags: string[];
+  humanOutcome: string | null;
+  decisions: { outcome: string; reason: string; source: string; sentMessageId: string | null; createdAt: string }[];
+}
+
+const SUMMARY_COLS = `id, created_at, message_id, model, left(query, 200) AS query, left(draft, 200) AS draft_preview,
+  gate_outcome, gate_reason, tokens_in, tokens_out, latency_ms`;
+
+type SummaryRow = {
+  id: string; created_at: Date; message_id: string | null; model: string; query: string; draft_preview: string;
+  gate_outcome: string | null; gate_reason: string | null; tokens_in: number | null; tokens_out: number | null; latency_ms: number | null;
+};
+
+function toSummary(r: SummaryRow): TraceSummary {
+  return {
+    id: r.id, createdAt: r.created_at.toISOString(), messageId: r.message_id, model: r.model, query: r.query,
+    draftPreview: r.draft_preview, gateOutcome: r.gate_outcome, gateReason: r.gate_reason,
+    tokensIn: r.tokens_in, tokensOut: r.tokens_out, latencyMs: r.latency_ms,
+  };
+}
+
+/** Every AI draft on a ticket, newest first, including drafts that sent nothing. */
+export async function listTicketTraces(tenantId: string, ticketId: string): Promise<TraceSummary[]> {
+  const r = await withTenant(tenantId, (c) =>
+    c.query<SummaryRow>(`SELECT ${SUMMARY_COLS} FROM draft_traces WHERE ticket_id = $1 ORDER BY created_at DESC LIMIT 200`, [ticketId]),
+  );
+  return r.rows.map(toSummary);
+}
+
+/** One trace with its sources, the parsed answer tags and the decisions made on it. Null once retention deleted it. */
+export async function getTrace(tenantId: string, traceId: string): Promise<TraceDetail | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query<SummaryRow & {
+      ticket_id: string | null; draft: string; sources: TraceSource[]; top_score: number | null; agreement: number | null;
+      confidence: number | null; embed_model: string | null; risk_tags: string[]; outcome: string | null; full_query: string;
+    }>(
+      `SELECT ${SUMMARY_COLS}, query AS full_query, ticket_id, draft, sources, top_score, agreement, confidence, embed_model, risk_tags, outcome
+         FROM draft_traces WHERE id = $1`,
+      [traceId],
+    );
+    const t = r.rows[0];
+    if (!t) return null;
+    const d = await c.query<{ outcome: string; reason: string; source: string; sent_message_id: string | null; created_at: Date }>(
+      "SELECT outcome, reason, source, sent_message_id, created_at FROM autoreply_decisions WHERE trace_id = $1 ORDER BY created_at",
+      [traceId],
+    );
+    return {
+      ...toSummary(t),
+      query: t.full_query,
+      ticketId: t.ticket_id,
+      draft: t.draft,
+      parsed: hasOutcomeTag(t.draft) ? parseDraftOutcome(t.draft) : { kind: "ok", reply: t.draft.trim(), note: null, noReply: false, handoff: false },
+      sources: t.sources ?? [],
+      topScore: t.top_score,
+      agreement: t.agreement,
+      confidence: t.confidence,
+      embedModel: t.embed_model,
+      riskTags: t.risk_tags ?? [],
+      humanOutcome: t.outcome,
+      decisions: d.rows.map((x) => ({
+        outcome: x.outcome, reason: x.reason, source: x.source, sentMessageId: x.sent_message_id, createdAt: x.created_at.toISOString(),
+      })),
+    };
+  });
 }

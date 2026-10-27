@@ -25,6 +25,8 @@ export function roleAtLeast(role: string | undefined | null, min: string): boole
 export const ADMIN_ROUTES = new Set<string>([
   // Settings / policy
   "PUT /settings/model",
+  "GET /traces/:id",
+  "GET /tickets/:id/traces",
   "PUT /settings/replies",
   "PUT /autoreply/policy",
   "POST /topics/reclassify",

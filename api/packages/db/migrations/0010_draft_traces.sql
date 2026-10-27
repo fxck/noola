@@ -3,8 +3,8 @@
 -- decision, and the eventual human outcome. The durable trace store AND the eval
 -- baseline (Opik's pattern, self-hosted). FORCE-RLS like every tenant table.
 --
--- ticket_id is a SOFT reference (no FK): eval rows have no ticket, and the trace store
--- is an append-only audit/eval log meant to outlive the tickets it references — a
+-- ticket_id is a SOFT reference (no FK): eval rows have no ticket, and a trace may
+-- outlive the ticket it references, until the trace retention (0131) deletes it — a
 -- composite (tenant_id, ticket_id) FK with ON DELETE SET NULL can't null one column
 -- without violating tenant_id NOT NULL, and CASCADE would erase eval-relevant history.
 

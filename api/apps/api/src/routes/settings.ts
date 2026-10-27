@@ -13,7 +13,7 @@ import {
   getPolicy, putPolicy, listDecisionsForTicket, listQueue, sendQueued, dismissQueued,
   enqueueBacklog, drainJobs, listJobs,
 } from "../autoreply.js";
-import { patchTraceOutcome } from "../trace.js";
+import { patchTraceOutcome, getTrace, listTicketTraces } from "../trace.js";
 import {
   linkGuild, listDiscordChannelBindings, replaceDiscordChannelBindings,
   listDiscordChannelAccounts, setDiscordChannelAccount, unsetDiscordChannelAccount,
@@ -56,7 +56,7 @@ import { BUILTIN_RISK_TAGS } from "../model.js";
 import { channelCatalog } from "../channels/registry.js";
 import { verifyWhatsAppChallenge, handleWhatsAppWebhook } from "../whatsapp.js";
 import { listChannelConnections, saveChannelConnection, deleteChannelConnection, ChannelSecretsUnavailableError } from "../channel-connections.js";
-import { getPolicies, putPolicies, ipAllowed, isInternalIp } from "../governance.js";
+import { getPolicies, putPolicies, ipAllowed, isInternalIp, TRACE_RETENTION_DEFAULT_DAYS, type TenantPolicies } from "../governance.js";
 import { roleAtLeast } from "../rbac.js";
 
 // Operational settings + inbound channels + ticket search: the BYO model config, the autoreply
@@ -279,6 +279,19 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     decisions: await listDecisionsForTicket(tenantId, (req.params as { id: string }).id),
   })));
 
+  // The AI trace viewer. Traces hold customer text and the model's raw output, so only admins read them.
+  app.get("/tickets/:id/traces", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    return { traces: await listTicketTraces(tenantId, (req.params as { id: string }).id) };
+  }));
+
+  app.get("/traces/:id", tenanted(async (tenantId, req, reply) => {
+    if (!roleAtLeast(req.session?.role, "admin")) return reply.code(403).send({ error: "admin role required" });
+    const trace = await getTrace(tenantId, (req.params as { id: string }).id);
+    if (!trace) return reply.code(404).send({ error: "not_found", detail: "This trace no longer exists. It may have passed the retention period." });
+    return { trace };
+  }));
+
   // Back-fill the human verdict on a draft trace — the outcome signal the eval harness learns from.
   app.patch("/traces/:id/outcome", tenanted(async (tenantId, req, reply) => {
     const outcome = (req.body as { outcome?: string } | undefined)?.outcome ?? "";
@@ -381,14 +394,23 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
   // better-auth's organization row is the authority (id == tenant uuid); the app-side tenants
   // projection mirrors the name. Logo rides the avatar keyspace (public GET /avatar/<uuid>.<ext>).
   // Workspace governance policies (0092): retention window, IP allowlist, 2FA requirement.
-  app.get("/settings/policies", tenanted(async (tenantId) => getPolicies(tenantId)));
+  // An unset trace retention shows as the default it falls back to.
+  const withTraceDefault = (p: TenantPolicies) => ({ ...p, traceRetentionDays: p.traceRetentionDays ?? TRACE_RETENTION_DEFAULT_DAYS });
+  app.get("/settings/policies", tenanted(async (tenantId) => withTraceDefault(await getPolicies(tenantId))));
 
   app.put("/settings/policies", tenanted(async (tenantId, req, reply) => {
     if (!roleAtLeast(req.session?.role, "admin")) {
       return reply.code(403).send({ error: "admin role required" });
     }
-    const b = (req.body ?? {}) as Partial<{ retentionDays: number | null; ipAllowlist: string[]; require2fa: boolean }>;
-    const patch: { retentionDays?: number | null; ipAllowlist?: string[]; require2fa?: boolean } = {};
+    const b = (req.body ?? {}) as Partial<{ retentionDays: number | null; ipAllowlist: string[]; require2fa: boolean; traceRetentionDays: number | null }>;
+    const patch: { retentionDays?: number | null; ipAllowlist?: string[]; require2fa?: boolean; traceRetentionDays?: number | null } = {};
+    if ("traceRetentionDays" in b) {
+      const days = b.traceRetentionDays as number | null;
+      if (days !== null && (!Number.isInteger(days) || days < 1 || days > 365)) {
+        return reply.code(400).send({ error: "traceRetentionDays must be 1–365, or null for the default" });
+      }
+      patch.traceRetentionDays = days;
+    }
     if ("retentionDays" in b) {
       if (b.retentionDays !== null && (!Number.isInteger(b.retentionDays) || (b.retentionDays as number) < 7 || (b.retentionDays as number) > 3650)) {
         return reply.code(400).send({ error: "retentionDays must be 7–3650, or null to keep forever" });
@@ -410,7 +432,7 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
       patch.ipAllowlist = list;
     }
     if ("require2fa" in b) patch.require2fa = Boolean(b.require2fa);
-    return putPolicies(tenantId, patch);
+    return withTraceDefault(await putPolicies(tenantId, patch));
   }));
 
   app.get("/settings/workspace", tenanted(async (tenantId) => {

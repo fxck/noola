@@ -33,6 +33,8 @@ import { NerdStats, CopyId, compactNum, fmtMs, fmtScore, fmtTokens, type StatRow
 import { estimateCost, fmtCost, isLocalModel, shortModel } from "@/lib/model-cost";
 import { ImageLightbox } from "@/components/inbox/image-lightbox";
 import { OriginalEmailDialog } from "@/components/inbox/original-email-dialog";
+import { TraceDialog } from "@/components/inbox/trace-dialog";
+import { useAuth } from "@/auth/auth";
 import { cn } from "@/lib/utils";
 
 // The thread's message-rendering family: customer/agent bubbles (with auto-translation display),
@@ -883,6 +885,9 @@ function AttachmentChip({ a }: { a: Attachment }) {
  */
 function AiReceipt({ message, align }: { message: Message; align: "start" | "end" }) {
   const meta = message.meta ?? null;
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin" || user?.role === "owner";
+  const [traceOpen, setTraceOpen] = useState(false);
 
   const model = meta?.model ?? null;
   const tokensIn = meta?.tokensIn ?? null;
@@ -964,13 +969,19 @@ function AiReceipt({ message, align }: { message: Message; align: "start" | "end
         content={
           meta ? (
             <div className="rounded-xl bg-popover/95 p-px shadow-2xl shadow-black/40 ring-1 ring-border/60 backdrop-blur-sm">
-              <AiReceiptStats meta={meta} cost={cost} local={local} />
+              <AiReceiptStats
+                meta={meta}
+                cost={cost}
+                local={local}
+                onViewTrace={isAdmin ? () => setTraceOpen(true) : undefined}
+              />
             </div>
           ) : null
         }
       >
         {line}
       </HoverPopover>
+      {traceOpen && meta?.traceId && <TraceDialog traceId={meta.traceId} onClose={() => setTraceOpen(false)} />}
     </div>
   );
 }
@@ -980,10 +991,12 @@ function AiReceiptStats({
   meta,
   cost,
   local,
+  onViewTrace,
 }: {
   meta: MessageMeta;
   cost: number | null;
   local: boolean;
+  onViewTrace?: () => void;
 }) {
   const rows: StatRow[] = [];
   rows.push({ label: "model", value: meta.model, title: meta.model });
@@ -1023,7 +1036,14 @@ function AiReceiptStats({
       {meta.traceId && (
         <div className="flex items-center justify-between gap-2 pt-1 text-muted-foreground">
           <span>trace</span>
-          <CopyId value={meta.traceId} className="text-muted-foreground" />
+          <span className="flex min-w-0 items-center gap-2">
+            <CopyId value={meta.traceId} className="min-w-0 text-muted-foreground" />
+            {onViewTrace && (
+              <button type="button" onClick={onViewTrace} className="shrink-0 text-primary hover:underline">
+                View trace
+              </button>
+            )}
+          </span>
         </div>
       )}
     </NerdStats>

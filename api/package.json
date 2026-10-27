@@ -27,6 +27,7 @@
     "test:ai-outcomes": "tsx apps/api/test/ai-outcomes.test.ts",
     "test:widget-handoff": "tsx apps/api/test/widget-handoff.test.ts",
     "test:widget-ai-answers": "tsx apps/api/test/widget-ai-answers.test.ts",
+    "test:ai-traces": "tsx apps/api/test/ai-traces.test.ts",
     "test:slack-triage": "tsx apps/api/test/slack-triage.test.ts",
     "test:operating": "tsx apps/api/test/operating.test.ts",
     "test:auth": "tsx apps/api/test/auth.test.ts",

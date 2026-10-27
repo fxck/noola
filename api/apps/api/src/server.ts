@@ -22,7 +22,7 @@ import { runScheduledSourceRefresh } from "./sources.js";
 import { wakeSnoozedTickets } from "./tickets.js";
 import { runBroadcastScheduler } from "./broadcast-scheduler.js";
 import { runZeropsCatalogScheduler } from "./zerops-catalog.js";
-import { runRetentionSweep } from "./governance.js";
+import { runRetentionSweep, runTraceRetentionSweep } from "./governance.js";
 import { pollEmail } from "./email.js";
 import { pollTelegram } from "./telegram.js";
 // ---- Route plugins (domain modules; see ./routes/*.ts) ----
@@ -507,6 +507,9 @@ setInterval(() => void runZeropsCatalogScheduler(app.log), 60 * 60_000);
 // no-op for tenants without a window; 6h cadence (idempotent), first pass shortly after boot.
 setTimeout(() => void runRetentionSweep(app.log), 120_000);
 setInterval(() => void runRetentionSweep(app.log), 6 * 60 * 60_000);
+// AI draft traces past each workspace's trace retention, on the same cadence.
+setTimeout(() => void runTraceRetentionSweep(app.log), 150_000);
+setInterval(() => void runTraceRetentionSweep(app.log), 6 * 60 * 60_000);
 // Inbound email: poll Mailpit (dev/stage) for new customer mail. No-ops when
 // MAILPIT_API_URL is unset (like initNats/startDiscord without a backend).
 if (process.env.MAILPIT_API_URL) setInterval(() => void pollEmail(app.log), 3000);
