@@ -49,7 +49,7 @@ export function AutoreplyPanel({ ticketId, refreshKey }: { ticketId: string; ref
 /** Turn a raw decision row into a plain-language line + a tone. */
 function describeDecision(d: AutoreplyDecision): { text: string; held: boolean } {
   const outcome = String(d.outcome ?? "").toLowerCase();
-  if (outcome === "sent") return { text: "AI replied automatically", held: false };
+  if (outcome === "auto_sent" || outcome === "sent") return { text: "AI replied automatically", held: false };
   const reason = d.reason ?? "";
   if (reason === "no_reply_needed") return { text: "AI decided no reply is needed", held: false };
   if (reason === "no_reply_suggested") return { text: "AI suggests no reply is needed", held: true };
