@@ -25,6 +25,7 @@
     "test:preferences": "tsx apps/api/test/preferences.test.ts",
     "test:scheduled-replies": "tsx apps/api/test/scheduled-replies.test.ts",
     "test:ai-outcomes": "tsx apps/api/test/ai-outcomes.test.ts",
+    "test:widget-handoff": "tsx apps/api/test/widget-handoff.test.ts",
     "test:slack-triage": "tsx apps/api/test/slack-triage.test.ts",
     "test:operating": "tsx apps/api/test/operating.test.ts",
     "test:auth": "tsx apps/api/test/auth.test.ts",
