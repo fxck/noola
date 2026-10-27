@@ -653,7 +653,9 @@ zerops:
         - mix local.hex --force
         - mix local.rebar --force
         - mkdir -p /var/www && cp -a /home/zerops/edge /var/www/
-        - cd /var/www/edge && mix deps.get && mix deps.compile
+        # Cap the BEAM's schedulers: by default it starts one thread per host core, which runs
+        # past the container's task limit ("Failed to create dirty cpu scheduler thread").
+        - cd /var/www/edge && export ELIXIR_ERL_OPTIONS="+S 2:2 +SDcpu 2:2 +SDio 4 +A 4" && mix deps.get && MIX_OS_DEPS_COMPILE_PARTITION_COUNT=1 mix deps.compile
       envVariables:
         # API_INTERNAL_URL is composed per lease in the edge dev server's command (API_HOST sibling).
         NATS_HOST: broker
@@ -662,7 +664,9 @@ zerops:
         NATS_PASS: ${broker_password}
         PORT: "4000"
         MIX_ENV: dev
-        ELIXIR_ERL_OPTIONS: "+sbwt none +sbwtdcpu none +sbwtdio none"
+        # No scheduler busy-waiting (as edgedev), and a capped scheduler count so a lease stays
+        # within the supervisor's task limit beside its other processes.
+        ELIXIR_ERL_OPTIONS: "+sbwt none +sbwtdcpu none +sbwtdio none +S 2:2 +SDcpu 2:2 +SDio 4 +A 4"
       start: zcp-devsup run
 
   - setup: embedderpool
