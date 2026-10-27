@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "previewPortBase": 8100,
+  "siblingEnv": {
+    "API_HOST": "apipool",
+    "EMBED_HOST": "embedderpool",
+    "GEO_HOST": "geopool"
+  },
+  "siblingPreviewEnv": {
+    "API_BASE_URL": "apipool",
+    "VITE_API_URL": "apipool",
+    "EDGE_PREVIEW_URL": "edgepool",
+    "WEB_BASE_URL": "webpool"
+  },
+  "servers": [
+    {
+      "name": "api",
+      "port": 3000,
+      "cwd": "api",
+      "service": "apipool",
+      "healthPath": "/health",
+      "command": "./node_modules/.bin/tsx packages/db/src/migrate.ts && EMBED_URL=\"http://$EMBED_HOST:3001\" GEO_URL=\"http://$GEO_HOST:3002\" exec ./node_modules/.bin/tsx apps/api/src/server.ts",
+      "watch": {
+        "paths": [
+          "api/apps/api/src",
+          "api/packages"
+        ],
+        "ignore": [
+          "api/packages/*/dist"
+        ]
+      }
+    },
+    {
+      "name": "edge",
+      "port": 4000,
+      "cwd": "edge",
+      "service": "edgepool",
+      "healthPath": "/health",
+      "command": "API_INTERNAL_URL=\"http://$API_HOST:3000\" exec mix phx.server",
+      "watch": {
+        "paths": [
+          "edge/lib",
+          "edge/config"
+        ]
+      }
+    },
+    {
+      "name": "embedder",
+      "port": 3001,
+      "cwd": "embedder",
+      "service": "embedderpool",
+      "healthPath": "/health",
+      "command": "exec node server.mjs",
+      "watch": {
+        "paths": [
+          "embedder"
+        ],
+        "ignore": [
+          "embedder/.cache"
+        ]
+      }
+    },
+    {
+      "name": "geo",
+      "port": 3002,
+      "cwd": "geo",
+      "service": "geopool",
+      "healthPath": "/health",
+      "command": "exec node server.mjs",
+      "watch": {
+        "paths": [
+          "geo"
+        ]
+      }
+    },
+    {
+      "name": "web",
+      "port": 5173,
+      "cwd": "web",
+      "service": "webpool",
+      "command": "VITE_EDGE_URL=\"$(printf %s \"$EDGE_PREVIEW_URL\" | sed \"s#^https://#wss://#\")\" exec ./node_modules/.bin/vite --host 0.0.0.0 --port 5173 --strictPort"
+    },
+    {
+      "name": "site",
+      "port": 5174,
+      "cwd": "site",
+      "service": "sitepool",
+      "command": "exec ./node_modules/.bin/vite --host 0.0.0.0 --port 5174 --strictPort"
+    }
+  ]
+}

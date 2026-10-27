@@ -556,3 +556,222 @@ zerops:
         - site/dist/~
     run:
       base: static
+
+  # ═══ dev pools — one swarm@1 pool per part, one leased container per branch ═══
+  # Each part's dev environment is a pool (apipool, edgepool, …) instead of a *dev service:
+  # zerops_lease checks a branch out into /var/www of a clean container and the declared dev
+  # servers (.zcp/dev-servers.json) start under zcp-devsup. The image bakes the part's
+  # dependencies into /var/www in run.prepareCommands (they survive every reset and the checkout
+  # keeps them, being git-ignored); build.addToRunPrepare carries the manifests they install
+  # from, so the image rebuilds when one changes. Siblings reach each other through the
+  # siblingEnv / siblingPreviewEnv values the supervisor hands each lease, so no pool setup
+  # names another part. Ports 8101–8103 are the per-lease preview ports (previewPortBase 8100 +
+  # the container's stable number, maxContainers 3). Nothing here runs on stage or production.
+  - setup: apipool
+    build:
+      base: ubuntu/nodejs@24
+      buildCommands:
+        - echo "apipool image" > pool-image.log
+      deployFiles:
+        - pool-image.log               # git-ignored marker; the image's payload is the baked deps below
+      addToRunPrepare:
+        - api/package.json
+        - api/bun.lock
+        - api/patches
+        - api/apps/api/package.json
+        - api/packages/contracts/package.json
+        - api/packages/db/package.json
+        - api/packages/flow-core/package.json
+        - api/packages/sdk/package.json
+    run:
+      base: ubuntu/nodejs@24
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - sudo npm install -g bun@1.4
+        - mkdir -p /var/www && cp -a /home/zerops/api /var/www/
+        - cd /var/www/api && bun install --frozen-lockfile
+      envVariables:
+        NODE_ENV: development
+        PORT: "3000"
+        NODE_OPTIONS: --max-old-space-size=1024
+        EMBED_DRIVER: service
+        # EMBED_URL / GEO_URL are composed per lease in the api dev server's command from the
+        # EMBED_HOST / GEO_HOST sibling values, so they always name this branch's own leases.
+        QDRANT_URL: http://qdrant:${qdrant_port}
+        QDRANT_API_KEY: ${qdrant_apiKey}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_SUPER_USER: ${db_superUser}
+        DB_SUPER_PASSWORD: ${db_superUserPassword}
+        APP_DB_USER: app_user
+        RELAY_DB_USER: event_relay
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        CACHE_URL: ${cache_connectionString}
+        SEARCH_HOST: search
+        SEARCH_PORT: ${search_port}
+        SEARCH_API_KEY: ${search_apiKey}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+      start: zcp-devsup run
+
+  - setup: edgepool
+    build:
+      base: ubuntu/elixir@1.16
+      buildCommands:
+        - echo "edgepool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - edge/mix.exs
+        - edge/mix.lock
+        - edge/config
+    run:
+      base: ubuntu/elixir@1.16
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mix local.hex --force
+        - mix local.rebar --force
+        - mkdir -p /var/www && cp -a /home/zerops/edge /var/www/
+        - cd /var/www/edge && mix deps.get && mix deps.compile
+      envVariables:
+        # API_INTERNAL_URL is composed per lease in the edge dev server's command (API_HOST sibling).
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        PORT: "4000"
+        MIX_ENV: dev
+        ELIXIR_ERL_OPTIONS: "+sbwt none +sbwtdcpu none +sbwtdio none"
+      start: zcp-devsup run
+
+  - setup: embedderpool
+    build:
+      base: ubuntu/nodejs@24
+      buildCommands:
+        - echo "embedderpool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - embedder/package.json
+        - embedder/package-lock.json
+        - embedder/embed.mjs
+        - embedder/warmup.mjs
+    run:
+      base: ubuntu/nodejs@24
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      verticalAutoscaling:
+        minRam: 1
+        maxRam: 4
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/embedder /var/www/
+        - cd /var/www/embedder && npm ci
+        - cd /var/www/embedder && node warmup.mjs     # bake all-MiniLM into embedder/.cache (git-ignored)
+      envVariables:
+        PORT: "3001"
+        OMP_NUM_THREADS: "1"
+      start: zcp-devsup run
+
+  - setup: geopool
+    build:
+      base: ubuntu/nodejs@24
+      buildCommands:
+        - echo "geopool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - geo/package.json
+    run:
+      base: ubuntu/nodejs@24
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/geo /var/www/
+        - cd /var/www/geo && npm install --no-package-lock
+        # The mmdb lives outside the checkout (it is not git-ignored); non-fatal like geodev.
+        - 'mkdir -p /home/zerops/geoip && (for M in $(date +%Y-%m) $(date -d "-1 month" +%Y-%m); do curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-$M.mmdb.gz" -o /tmp/geo.gz && break; done && gunzip -c /tmp/geo.gz > /home/zerops/geoip/geoip.mmdb && ls -la /home/zerops/geoip/geoip.mmdb) || echo "geo db download failed — lookups will be empty"'
+      envVariables:
+        PORT: "3002"
+        GEOIP_DB_PATH: /home/zerops/geoip/geoip.mmdb
+      start: zcp-devsup run
+
+  - setup: webpool
+    build:
+      base: ubuntu/nodejs@22
+      buildCommands:
+        - echo "webpool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - web/package.json
+    run:
+      base: ubuntu/nodejs@22
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/web /var/www/
+        - cd /var/www/web && npm install --no-package-lock
+      start: zcp-devsup run
+
+  - setup: sitepool
+    build:
+      base: ubuntu/nodejs@22
+      buildCommands:
+        - echo "sitepool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - site/package.json
+    run:
+      base: ubuntu/nodejs@22
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/site /var/www/
+        - cd /var/www/site && npm install --no-package-lock
+      start: zcp-devsup run
