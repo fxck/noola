@@ -35,6 +35,7 @@ import { ViewsRail, ViewsChips, VIEWS } from "@/components/inbox/views-rail";
 import { TicketRow } from "@/components/inbox/ticket-row";
 import { ThreadPane } from "@/components/inbox/thread-pane";
 import { cn } from "@/lib/utils";
+import { isMac } from "@/lib/platform";
 
 const EMPTY_COPY: Record<ViewKey, string> = {
   all: "No open tickets. When a customer writes in, it lands here.",
@@ -49,7 +50,7 @@ const EMPTY_COPY: Record<ViewKey, string> = {
 
 const SHORTCUTS: [string[], string][] = [
   [["J", "K"], "Move between conversations"],
-  [["↵"], "Open / mark read"],
+  [[isMac ? "↵" : "Enter"], "Open / mark read"],
   [["E"], "Close conversation"],
   [["[", "]"], "Switch view"],
 ];

@@ -78,6 +78,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { shortcut } from "@/lib/platform";
 import { Combobox } from "@/components/ui/combobox";
 import { cn } from "@/lib/utils";
 import { isDarkNow } from "@/lib/theme";
@@ -911,7 +912,7 @@ function CanvasInner({ draft, isAdmin, assigneeOptions, integrationOptions, setT
             <div className="flex flex-col items-center gap-2 text-center text-muted-foreground/70">
               <Sparkles className="size-7" />
               <p className="text-sm font-medium text-muted-foreground">Build your flow</p>
-              <p className="text-xs">Right-click the canvas to add a step in place, or press <kbd className="rounded border bg-muted px-1 font-sans">⌘K</kbd> / open <span className="font-medium text-foreground">Steps</span> to browse.</p>
+              <p className="text-xs">Right-click the canvas to add a step in place, or press <kbd className="rounded border bg-muted px-1 font-sans">{shortcut("K")}</kbd> / open <span className="font-medium text-foreground">Steps</span> to browse.</p>
             </div>
           </div>
         )}
