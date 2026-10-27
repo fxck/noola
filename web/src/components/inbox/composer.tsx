@@ -28,6 +28,7 @@ import {
   type Suggestion,
   type Attachment,
   type ReplyChannels,
+  type CancelledReply,
   sendReply,
   suggestReply,
   uploadAttachment,
@@ -70,7 +71,7 @@ function channelMeta(type: string): { label: string; icon: typeof Mail } {
 export interface ComposerHandle {
   /** Puts a cancelled reply into the reply editor, after any draft already there.
    *  False when the composer is on another ticket or is editing a pending draft. */
-  restoreDraft(ticketId: string, text: string): boolean;
+  restoreDraft(ticketId: string, reply: CancelledReply): boolean;
 }
 
 // The reply composer footer: reply vs internal-note modes, the "Draft with AI" copilot (with
@@ -196,9 +197,17 @@ export function Composer({
   }, []);
 
   useImperativeHandle(ref, () => ({
-    restoreDraft(ticketId, text) {
+    restoreDraft(ticketId, reply) {
       if (ticketId !== ticket.id || editingPending) return false;
-      const draft = body.trim() ? `${body.trimEnd()}\n\n${text}` : text;
+      const hadDraft = !!body.trim();
+      const draft = hadDraft ? `${body.trimEnd()}\n\n${reply.body}` : reply.body;
+      setAttachments((prev) => [...prev, ...reply.attachments.filter((a) => !prev.some((p) => p.id === a.id))]);
+      if (reply.cc.length) {
+        setCc((prev) => [...prev, ...reply.cc.filter((addr) => !prev.includes(addr))]);
+        setCcOpen(true);
+      }
+      // A draft in progress keeps the channel the agent picked for it.
+      if (!hadDraft && reply.channel) setChannel(reply.channel);
       setMode("reply");
       // The reply editor isn't mounted until a switch from note mode commits.
       requestAnimationFrame(() => replyRef.current?.setMarkdown(draft));

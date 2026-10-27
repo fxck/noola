@@ -43,6 +43,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS scheduled_replies_client_uq
 CREATE UNIQUE INDEX IF NOT EXISTS scheduled_replies_promote_uq
   ON scheduled_replies (tenant_id, discord_message_id) WHERE discord_message_id IS NOT NULL AND status IN ('scheduled', 'sending');
 
+-- When the assistant was switched off for this reply, so a reply that is never sent can switch it back on.
+-- Null when the assistant was already off. A cancelled reply hands it to the next one that is still waiting.
+ALTER TABLE scheduled_replies ADD COLUMN IF NOT EXISTS assistant_muted_at timestamptz;
+
 GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_replies TO app_user;
 -- The send worker claims due rows across tenants.
 GRANT SELECT, UPDATE ON scheduled_replies TO event_relay;

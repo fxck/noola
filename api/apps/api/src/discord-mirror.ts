@@ -1166,34 +1166,9 @@ async function sendPromotedMessage(p: PromotedMessage): Promise<{ messageId: str
     origin: "discord_mirror",
     idempotencyKey: `discord-mirror-promote:${p.discordMessageId}`,
   });
+  await settlePromotedMessage(p.tenantId, p.ticketId, p.discordMessageId, p.threadId, p.noteId, result.messageId);
   // A retry after a crash finds the reply recorded, and it may already have reached the customer.
-  if (result.replay) {
-    await relayPool.query("UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1", [p.discordMessageId, result.messageId]);
-    return { messageId: result.messageId, delivered: true, replay: true };
-  }
-
-  // Durable ✅ confirmation, enqueued as soon as the reply is RECORDED. It used to be the last step, so
-  // any later failure (dispatch, bookkeeping) meant no ✅ — and promoted_at was already claimed, so the
-  // teammate couldn't retry. The drainer retries until it lands.
-  await enqueueRelay("react", p.tenantId, result.ticketId, `react:${p.discordMessageId}:${PROMOTED_EMOJI}`, {
-    threadId: p.threadId,
-    discordMessageId: p.discordMessageId,
-    emoji: PROMOTED_EMOJI,
-  });
-
-  // A promoted message BECOMES the customer reply, so move any attachments the original Discord message
-  // carried from the internal note onto the reply (the widget + agent thread both render message
-  // attachments), then drop the now-duplicate note. The promote's own message.created event makes the
-  // web refetch messages + notes, so the reply appears with its image and the note disappears live.
-  if (p.noteId) {
-    await withTenant(p.tenantId, async (c) => {
-      await c.query(
-        "UPDATE message_attachments SET message_id = $1, note_id = NULL WHERE note_id = $2 AND ticket_id = $3",
-        [result.messageId, p.noteId, p.ticketId],
-      );
-      await c.query("DELETE FROM ticket_notes WHERE id = $1", [p.noteId]);
-    }).catch(() => {});
-  }
+  if (result.replay) return { messageId: result.messageId, delivered: true, replay: true };
 
   // A human promoted this Discord message to a customer reply — stand the assistant down on the ticket
   // so ambient autoreply doesn't talk over the human (matches the console reply path). Idempotent.
@@ -1230,11 +1205,41 @@ async function sendPromotedMessage(p: PromotedMessage): Promise<{ messageId: str
     }).catch(() => {});
   }
 
-  await relayPool.query(
-    "UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1",
-    [p.discordMessageId, result.messageId],
-  );
   return { messageId: result.messageId, delivered: out.delivered, reason: out.delivered ? undefined : out.reason };
+}
+
+/**
+ * Ties a recorded promote to its Discord message: links the reply, queues the ✅ and moves the note's files onto the reply.
+ * Every step is idempotent, so a retry or a recovery after a crash can run it again.
+ */
+async function settlePromotedMessage(
+  tenantId: string, ticketId: string, discordMessageId: string, threadId: string, noteId: string | null, messageId: string,
+): Promise<void> {
+  // Linked first, so a link preview that arrives from here on lands on the reply, not on the note that is removed below.
+  await relayPool.query("UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1", [discordMessageId, messageId]);
+
+  // Durable ✅ confirmation, enqueued as soon as the reply is RECORDED. It used to be the last step, so
+  // any later failure (dispatch, bookkeeping) meant no ✅ — and promoted_at was already claimed, so the
+  // teammate couldn't retry. The drainer retries until it lands.
+  await enqueueRelay("react", tenantId, ticketId, `react:${discordMessageId}:${PROMOTED_EMOJI}`, {
+    threadId,
+    discordMessageId,
+    emoji: PROMOTED_EMOJI,
+  });
+
+  // A promoted message BECOMES the customer reply, so move any attachments the original Discord message
+  // carried from the internal note onto the reply (the widget + agent thread both render message
+  // attachments), then drop the now-duplicate note. The promote's own message.created event makes the
+  // web refetch messages + notes, so the reply appears with its image and the note disappears live.
+  if (noteId) {
+    await withTenant(tenantId, async (c) => {
+      await c.query(
+        "UPDATE message_attachments SET message_id = $1, note_id = NULL WHERE note_id = $2 AND ticket_id = $3",
+        [messageId, noteId, ticketId],
+      );
+      await c.query("DELETE FROM ticket_notes WHERE id = $1", [noteId]);
+    }).catch(() => {});
+  }
 }
 
 /** Sends and releases the scheduled rows of 📤 promotes. */
@@ -1253,6 +1258,16 @@ export const promoteSource: ScheduledSource = {
     });
     await removePendingReaction(scheduled.tenant_id, scheduled.ticket_id, scheduled.discord_message_id!, m.post_thread_id);
     return { messageId: sent.messageId, replay: sent.replay };
+  },
+  async recovered(scheduled, messageId) {
+    const led = await relayPool.query<{ note_id: string | null; post_thread_id: string }>(
+      "SELECT note_id, post_thread_id FROM ticket_mirror_messages WHERE discord_message_id = $1",
+      [scheduled.discord_message_id],
+    );
+    if (!led.rowCount) return;
+    const m = led.rows[0];
+    await settlePromotedMessage(scheduled.tenant_id, scheduled.ticket_id, scheduled.discord_message_id!, m.post_thread_id, m.note_id, messageId);
+    await removePendingReaction(scheduled.tenant_id, scheduled.ticket_id, scheduled.discord_message_id!, m.post_thread_id);
   },
   // The message can be promoted again once its 📤 is added back.
   async release(scheduled) {

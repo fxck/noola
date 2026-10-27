@@ -357,8 +357,17 @@ export async function fetchScheduledReplies(ticketId: string): Promise<Scheduled
 }
 
 /** Throws a 409 ApiError when the reply is already being sent. */
-export async function cancelScheduledReply(id: string): Promise<{ body: string; source: ScheduledReply["source"] }> {
-  return api<{ cancelled: true; body: string; source: ScheduledReply["source"] }>(`/scheduled-replies/${id}/cancel`, {
+/** A cancelled reply as the composer can offer it again. */
+export interface CancelledReply {
+  body: string;
+  source: ScheduledReply["source"];
+  attachments: Attachment[];
+  cc: string[];
+  channel: string | null;
+}
+
+export async function cancelScheduledReply(id: string): Promise<CancelledReply> {
+  return api<CancelledReply & { cancelled: true }>(`/scheduled-replies/${id}/cancel`, {
     method: "POST",
     body: "{}",
   });

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { ReplySettingsInput } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
+import { pendingAttachments } from "../attachments.js";
 import {
   cancelScheduledReply,
   getSendDelay,
@@ -15,12 +16,16 @@ export default async function scheduledReplyRoutes(app: FastifyInstance) {
     return { scheduledReplies: await listOpenScheduledReplies(tenantId, id) };
   }));
 
-  // The body comes back so the composer can offer the text again.
+  // The reply comes back so the composer can offer it again, with its files, Cc and channel.
   app.post("/scheduled-replies/:id/cancel", tenanted(async (tenantId, req, reply) => {
     const { id } = req.params as { id: string };
     const row = await cancelScheduledReply(tenantId, id);
     if (!row) return reply.code(409).send({ error: "already_sent", detail: "This reply is already being sent." });
-    return { cancelled: true, body: row.body, source: row.source };
+    const attachments = await pendingAttachments(tenantId, row.ticket_id, row.request.attachmentIds ?? []).catch(() => []);
+    return {
+      cancelled: true, body: row.body, source: row.source,
+      attachments, cc: row.request.cc ?? [], channel: row.request.channel ?? null,
+    };
   }));
 
   app.post("/scheduled-replies/:id/send", tenanted(async (tenantId, req, reply) => {
