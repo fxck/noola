@@ -19,13 +19,13 @@ import { indexResolvedThread, unindexThread } from "../threads.js";
 import { recordAudit } from "../audit.js";
 import { emitDomainEvent } from "../automations.js";
 import { ingestInbound } from "../ingest.js";
+import { sendAgentReply } from "../agent-reply.js";
+import { getSendDelay, scheduleReply } from "../scheduled-replies.js";
 import { suggestReply } from "../copilot.js";
 import { getChannelDriver } from "../channels/registry.js";
-import { translateOutboundReply, stampOutboundTranslation } from "../translate.js";
-import { claimAttachments, attachmentsForTicket } from "../attachments.js";
+import { attachmentsForTicket } from "../attachments.js";
 import { getTicketMirror, pushTicketToDiscord, mirrorUrl, requestMirrorSync, mirrorEligibility, pingSeatInMirror } from "../discord-mirror.js";
-import { getObject } from "../storage.js";
-import { notifyContactByEmailIfAway, tenantSupportAddress, stripOwnCcAddresses, type MailAttachment } from "../email.js";
+import { tenantSupportAddress, stripOwnCcAddresses } from "../email.js";
 import { tenantReplyAddress } from "../email-provider.js";
 
 // Attach computed SLA state to ticket rows (policy loaded once; null when disabled).
@@ -402,115 +402,44 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     const parsed = ReplyInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
-    const result = await ingestInbound({
-      tenantId,
-      body: parsed.data.body,
-      authorType: "agent",
-      ticketId: id,
-      authorId: req.session?.userId ?? null,
-      channelOverride: parsed.data.channel ?? null,
-      // Idempotency: a client-supplied token collapses a double-submit / transport retry to one message.
-      idempotencyKey: parsed.data.clientMessageId ? `reply:${parsed.data.clientMessageId}` : null,
-    });
-
-    // Replay: this exact send already landed on a prior request (double ⌘↵, retry). The message exists
-    // and was fully handled the first time — return it WITHOUT muting the assistant, claiming
-    // attachments, or dispatching to the channel again. Re-dispatching is the duplicate external send
-    // this guard exists to prevent.
-    if (result.replay) {
-      return reply.code(200).send({ ticketId: result.ticketId, messageId: result.messageId, delivered: true, replay: true });
-    }
-
-    // A human agent stepped in — stand the assistant down on this ticket so ambient autoreply doesn't
-    // talk over the human on the customer's next message (the human owns the thread until the AI is
-    // re-enabled via the assistant-mode toggle). whose_turn is left alone — the reply already moved the
-    // ball to the customer. Idempotent + cheap (a no-op once already muted).
-    await withTenant(tenantId, async (c) => {
-      await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
-    }).catch(() => {});
-
-    // Claim any pre-uploaded attachments onto this agent message (best-effort, post-commit). Returns
-    // the claimed files' storage info so an email reply can carry them as real attachments.
-    const claimed = await claimAttachments(tenantId, result.ticketId, result.messageId, parsed.data.attachmentIds ?? [])
-      .catch((err) => { app.log.warn({ err, ticketId: id }, "attachment claim failed"); return []; });
-
-    // Auto-translation (Wave 4): when the ticket is in another language and auto-translate is on, the
-    // customer receives the reply in THEIR language while the stored message keeps the agent's words.
-    // `dispatchBody` is what the channel sends; `meta` (when set) is stamped on the agent message so
-    // the thread shows a "sent in X" note. A no-op (dispatchBody === body, meta null) otherwise.
-    const { dispatchBody, meta } = await translateOutboundReply(tenantId, result.ticketId, parsed.data.body);
-    if (meta) void stampOutboundTranslation(tenantId, result.messageId, meta);
-
-    // Dispatch the agent reply back to the ticket's origin channel through the channel registry —
-    // one uniform seam for discord/email/slack/telegram/whatsapp. Channels with no outbound driver
-    // (synthetic, widget — the widget replies over the realtime edge) simply have nothing to send.
-    // For an email reply, fetch the claimed attachment bytes so nodemailer sends them inline with the
-    // message. Other channels don't carry file attachments, so we only pay this for email.
-    let mailAttachments: MailAttachment[] | undefined;
-    if (claimed.length && result.channelType === "email") {
-      const parts = await Promise.all(
-        claimed.map(async (a) => {
-          const obj = await getObject(a.storage_key);
-          return obj ? ({ filename: a.filename, content: obj.body, contentType: a.content_type } as MailAttachment) : null;
-        }),
+    const author = { userId: req.session?.userId ?? null, name: req.session?.name ?? null, email: req.session?.email ?? null };
+    const delay = parsed.data.sendNow ? 0 : await getSendDelay(tenantId);
+    if (delay > 0) {
+      const scheduled = await scheduleReply(
+        tenantId,
+        {
+          ticketId: id,
+          body: parsed.data.body,
+          request: { attachmentIds: parsed.data.attachmentIds, channel: parsed.data.channel ?? null, cc: parsed.data.cc },
+          author,
+          clientMessageId: parsed.data.clientMessageId ?? null,
+        },
+        delay,
       );
-      mailAttachments = parts.filter((p): p is MailAttachment => p !== null);
+      return reply.code(202).send({ ticketId: id, scheduledReplyId: scheduled.id, sendAt: scheduled.sendAt });
     }
-
-    const driver = getChannelDriver(result.channelType);
-    const out = driver?.dispatch
-      ? await driver.dispatch(
-          { tenantId, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId, messageId: result.messageId },
-          dispatchBody,
-          // agentName signs the email render ("— Ales"); attachments only when claimed.
-          {
-            ...(mailAttachments?.length ? { attachments: mailAttachments } : {}),
-            ...(parsed.data.cc?.length && result.channelType === "email" ? { cc: parsed.data.cc } : {}),
-            agentName: req.session?.name ?? null,
-            // Teammate sending: the agent's signup email becomes the From address when the workspace is
-            // in teammate mode and that domain is verified (else it's just the display name on support@).
-            agentEmail: req.session?.email ?? null,
-            // Read receipt: embed a tracking pixel keyed to THIS agent message so an email open stamps seen_at.
-            seenMessageId: result.messageId,
-          },
-        )
-      : { delivered: false as boolean, reason: "no-driver" };
-    if (driver?.dispatch && !out.delivered) {
-      app.log.warn({ ticketId: id, channel: result.channelType, reason: out.reason }, "outbound not delivered");
+    const sent = await sendAgentReply(
+      tenantId,
+      {
+        ticketId: id,
+        body: parsed.data.body,
+        attachmentIds: parsed.data.attachmentIds,
+        channel: parsed.data.channel ?? null,
+        cc: parsed.data.cc,
+        // Idempotency: a client-supplied token collapses a double-submit / transport retry to one message.
+        idempotencyKey: parsed.data.clientMessageId ? `reply:${parsed.data.clientMessageId}` : null,
+        author,
+      },
+      app.log,
+    );
+    if (sent.replay) {
+      return reply.code(200).send({ ticketId: sent.ticketId, messageId: sent.messageId, delivered: true, replay: true });
     }
-
-    // Email delivery tracking (0114): persist the provider Message-ID + an initial head so the thread
-    // shows send confidence immediately — 'sent' (SMTP handed off) or 'failed' (driver couldn't send).
-    // A provider delivery webhook later advances 'sent' → delivered / bounced / complained. Best-effort.
-    if (result.channelType === "email" && driver?.dispatch) {
-      await withTenant(tenantId, (c) =>
-        c.query("UPDATE messages SET provider_message_id = $2, delivery_status = $3 WHERE id = $1", [
-          result.messageId,
-          out.providerMessageId ?? null,
-          out.delivered ? "sent" : "failed",
-        ]),
-      ).catch((err) => app.log.warn({ err, ticketId: id }, "delivery status stamp failed"));
-    }
-
-    // Widget/away fallback: a widget reply has no outbound driver (the widget polls). If the customer
-    // isn't currently in the widget and we have their email, ALSO email the reply so an away customer
-    // still hears back instead of it sitting unseen until they reopen the widget. Best-effort.
-    if (!out.delivered && (result.channelType === "widget" || out.reason === "no-driver")) {
-      void notifyContactByEmailIfAway(tenantId, {
-        ticketId: result.ticketId,
-        subject: result.subject,
-        body: dispatchBody,
-        agentName: req.session?.name ?? null,
-        // Read receipt: stamp seen_at on this reply if the away customer opens the fallback email.
-        messageId: result.messageId,
-      }).catch((err) => app.log.warn({ err, ticketId: id }, "email fallback failed"));
-    }
-
     return reply.code(201).send({
-      ticketId: result.ticketId,
-      messageId: result.messageId,
-      delivered: out.delivered,
-      queued: out.queued === true,
+      ticketId: sent.ticketId,
+      messageId: sent.messageId,
+      delivered: sent.delivered,
+      queued: sent.queued,
     });
   }));
 

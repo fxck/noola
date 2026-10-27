@@ -6,9 +6,11 @@ import { useAuth } from "@/auth/auth";
 export interface UserPreferences {
   /** Show a GIF or image that a message links to, instead of only the link. */
   linkPreviews: boolean;
+  /** What the composer's Send button does when the workspace has a send delay. The other choice is in its menu. */
+  sendMode: "delayed" | "now";
 }
 
-const DEFAULTS: UserPreferences = { linkPreviews: true };
+const DEFAULTS: UserPreferences = { linkPreviews: true, sendMode: "delayed" };
 
 // One copy for the whole app, so every message bubble reads the same value without its own request.
 let current: UserPreferences = DEFAULTS;

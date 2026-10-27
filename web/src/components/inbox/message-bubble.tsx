@@ -4,6 +4,7 @@ import {
   type Message,
   type MessageMeta,
   type Attachment,
+  type ScheduledReply,
   relativeTime,
   initials,
   downloadAttachment,
@@ -17,6 +18,7 @@ import { slackToMarkdown, splitLinks } from "@/lib/markdown";
 import { usePreferences } from "@/lib/preferences";
 import { NoolaMark } from "@/components/noola-mark";
 import { Avatar } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
 import { avatarSrc } from "@/lib/avatar-upload";
 import { localeName } from "@/lib/settings";
 import { HoverPopover } from "@/components/live/hover-popover";
@@ -356,6 +358,104 @@ export function MessageBubble({
       </div>
     </li>
   );
+}
+
+/** A reply that waits out the workspace's send delay, with a countdown and the controls to cancel it or send it at once. */
+export function PendingReplyBubble({
+  reply,
+  authorAvatarUrl,
+  onCancel,
+  onSendNow,
+}: {
+  reply: ScheduledReply;
+  authorAvatarUrl?: string | null;
+  onCancel: () => Promise<void>;
+  onSendNow: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const left = useSecondsUntil(reply.status === "scheduled" ? reply.sendAt : null);
+  const sending = reply.status === "sending" || left === 0;
+
+  async function run(action: () => Promise<void>) {
+    setBusy(true);
+    try {
+      await action();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li className="flex flex-row-reverse gap-3">
+      {authorAvatarUrl ? (
+        <Avatar
+          name={reply.authorName || "Agent"}
+          image={avatarSrc(authorAvatarUrl)}
+          className="mt-0.5 size-7 shrink-0 text-micro opacity-60"
+        />
+      ) : (
+        <span
+          className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-primary/10 text-micro font-semibold text-primary/70"
+          aria-hidden
+        >
+          {initials(reply.authorName || "Agent")}
+        </span>
+      )}
+      <div className="flex min-w-0 max-w-[82%] flex-col items-end gap-1">
+        <div className="break-words rounded-2xl rounded-tr-md border border-dashed border-border bg-accent/40 px-3.5 py-2.5 text-sm leading-relaxed text-muted-foreground">
+          <ArticleBody markdown={reply.body} className={BUBBLE_MD} messageLinks />
+        </div>
+        <div className="flex flex-row-reverse flex-wrap items-center gap-1.5 px-1 text-micro text-muted-foreground/80">
+          <span className="inline-flex items-center gap-1 tabular-nums">
+            <Clock className="size-3" />
+            {sending ? "Sending…" : `Sending in ${countdownLabel(left)}`}
+          </span>
+          {reply.source === "discord_promote" && (
+            <span className="rounded-full border px-1.5 py-px font-medium" title="Promoted from the Discord mirror thread">
+              from Discord
+            </span>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-micro"
+            disabled={busy || reply.status === "sending"}
+            onClick={() => void run(onSendNow)}
+          >
+            Send now
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-micro text-muted-foreground"
+            disabled={busy || reply.status === "sending"}
+            onClick={() => void run(onCancel)}
+          >
+            Cancel
+          </Button>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+/** Whole seconds until `iso`, re-rendered every second until it reaches 0. Null `iso` gives 0. */
+function useSecondsUntil(iso: string | null): number {
+  const [now, setNow] = useState(() => Date.now());
+  const left = iso ? Math.max(0, Math.ceil((Date.parse(iso) - now) / 1000)) : 0;
+  // A retry moves `sendAt`, and the clock stops ticking at 0, so a new target needs a fresh now.
+  useEffect(() => setNow(Date.now()), [iso]);
+  useEffect(() => {
+    if (left === 0) return;
+    const timer = setTimeout(() => setNow(Date.now()), 1000);
+    return () => clearTimeout(timer);
+  }, [left, now]);
+  return left;
+}
+
+function countdownLabel(seconds: number): string {
+  if (seconds < 60) return `${seconds} s`;
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 /** True when the text is only links whose previews are shown, as with a GIF from Discord's /gif. */

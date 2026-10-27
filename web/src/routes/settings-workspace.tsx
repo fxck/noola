@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Building2, Clock, Loader2, Network, ShieldCheck, Upload, X } from "lucide-react";
+import { Building2, Clock, Loader2, Network, SendHorizonal, ShieldCheck, Upload, X } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/auth/auth";
-import { fetchPolicies, savePolicies, type TenantPolicies } from "@/lib/settings";
+import { fetchPolicies, fetchSendDelay, MAX_SEND_DELAY_SECONDS, saveSendDelay, savePolicies, type TenantPolicies } from "@/lib/settings";
 import { SettingsPage } from "@/components/settings-page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "@/components/ui/toaster";
-import { api } from "@/lib/api";
+import { api, type ApiError } from "@/lib/api";
 import { avatarSrc } from "@/lib/avatar-upload";
 
 // Workspace identity — the name teammates and customers see, plus a logo — and the
@@ -142,9 +142,80 @@ export function SettingsWorkspacePage() {
           </div>
         )}
 
+        <SendDelayCard />
         <PoliciesCards />
       </div>
     </SettingsPage>
+  );
+}
+
+// ── Send delay ───────────────────────────────────────────────────────────────
+function SendDelayCard() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin" || user?.role === "owner";
+  const [saved, setSaved] = useState<number | null>(null);
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void fetchSendDelay()
+      .then((s) => {
+        setSaved(s);
+        setValue(String(s));
+      })
+      .catch(() => setSaved(null));
+  }, []);
+
+  async function save() {
+    setBusy(true);
+    try {
+      const s = await saveSendDelay(Number(value));
+      setSaved(s);
+      setValue(String(s));
+      toast.success(s > 0 ? "Send delay saved." : "Replies now send at once.");
+    } catch (err) {
+      toast.error((err as ApiError).status === 403 ? "Only an admin can change the send delay." : "Couldn't save the send delay.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (saved == null) return null;
+
+  const valid = value !== "" && Number(value) <= MAX_SEND_DELAY_SECONDS;
+  const dirty = value !== String(saved);
+
+  return (
+    <div className="mt-6 rounded-xl border bg-card p-6 shadow-sm">
+      <div className="flex items-start gap-3">
+        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+          <SendHorizonal className="size-4.5" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-sm font-semibold">Send delay</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            A reply from the inbox waits this long before it goes out, so the agent can still cancel it or send it at
+            once. Each member picks what their Send button does under Settings → Profile.
+          </p>
+          <div className="mt-3 flex items-center gap-2">
+            <Input
+              inputMode="numeric"
+              placeholder="0"
+              className="h-8 w-28"
+              value={value}
+              disabled={!isAdmin}
+              onChange={(e) => setValue(e.target.value.replace(/\D/g, ""))}
+            />
+            <span className="text-xs text-muted-foreground">seconds (0–{MAX_SEND_DELAY_SECONDS}, 0 sends at once)</span>
+            {isAdmin && dirty && (
+              <Button size="sm" variant="outline" className="h-8" disabled={busy || !valid} onClick={() => void save()}>
+                Save
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

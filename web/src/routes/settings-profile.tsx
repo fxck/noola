@@ -14,7 +14,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "@/components/ui/toaster";
 import { Switch } from "@/components/ui/switch";
-import { savePreferences, usePreferences } from "@/lib/preferences";
+import { SegmentedControl } from "@/components/ui/segmented-control";
+import { savePreferences, usePreferences, type UserPreferences } from "@/lib/preferences";
 
 // The account profile page — the signed-in user edits their own display name + photo. Read-only
 // email and role are surfaced for reference (they're managed elsewhere / server-authoritative).
@@ -186,8 +187,8 @@ export function SettingsProfilePage() {
 function PreferencesCard() {
   const prefs = usePreferences();
 
-  function toggle(linkPreviews: boolean) {
-    savePreferences({ linkPreviews }).catch(() => toast.error("Couldn't save that. Please try again."));
+  function save(patch: Partial<UserPreferences>) {
+    savePreferences(patch).catch(() => toast.error("Couldn't save that. Please try again."));
   }
 
   return (
@@ -203,7 +204,25 @@ function PreferencesCard() {
             When a message links to a GIF or an image, show it in the conversation. Off shows only the link.
           </p>
         </div>
-        <Switch id="pref-link-previews" checked={prefs.linkPreviews} onCheckedChange={toggle} />
+        <Switch id="pref-link-previews" checked={prefs.linkPreviews} onCheckedChange={(linkPreviews) => save({ linkPreviews })} />
+      </div>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="space-y-0.5">
+          <Label>Send button default</Label>
+          <p className="text-micro text-muted-foreground">
+            When your workspace delays replies, what Send does. The other choice is in the menu next to it.
+          </p>
+        </div>
+        <SegmentedControl
+          aria-label="Send button default"
+          size="sm"
+          value={prefs.sendMode}
+          onValueChange={(sendMode) => save({ sendMode })}
+          options={[
+            { value: "delayed", label: "Send with delay" },
+            { value: "now", label: "Send now" },
+          ]}
+        />
       </div>
     </div>
   );

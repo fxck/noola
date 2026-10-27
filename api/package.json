@@ -23,6 +23,7 @@
     "test:discord-backfill": "tsx apps/api/test/discord-backfill.test.ts",
     "test:discord-transport": "tsx apps/api/test/discord-transport.test.ts",
     "test:preferences": "tsx apps/api/test/preferences.test.ts",
+    "test:scheduled-replies": "tsx apps/api/test/scheduled-replies.test.ts",
     "test:slack-triage": "tsx apps/api/test/slack-triage.test.ts",
     "test:operating": "tsx apps/api/test/operating.test.ts",
     "test:auth": "tsx apps/api/test/auth.test.ts",
