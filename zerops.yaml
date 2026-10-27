@@ -1,0 +1,781 @@
+# Root manifest for the Noola monorepo — one repo, one zerops.yaml, every service.
+#
+# EXACTLY TWO setups per service we own — *dev and *prod — and no third for stage. A stage
+# service is built with the *prod setup ON PURPOSE: stage exists to validate the artifact and
+# config that production will run, so giving it its own setup would test something that never
+# ships. There is no `*stage` setup anywhere in this file and there must never be one.
+#
+#   *dev  — self-deploys the WHOLE monorepo (deployFiles: ["."]) and idles on `zsc noop`, so the
+#           source tree is mountable and an agent / developer drives the real server. Only ever
+#           runs in a dev/stage project, so it MAY pin dev siblings (embedderdev, apidev, …).
+#   *prod — builds a lean, self-contained runtime and ships only its own build output. Runs the
+#           stage half of a dev/stage project AND the service of a production project, so it MUST
+#           NOT name any sibling: the api is `apistage` in one and `api` in the other. Every
+#           cross-service URL it needs comes from project env, set per project in
+#           .zerops-recipe/<rung>/import.yaml — the only layer that knows the project's shape.
+#
+# Managed stores (db, cache, broker, search, qdrant, storage) are shared singles with identical
+# names in both shapes, so referencing them directly (DB_HOST: db, ${broker_port}) is always safe.
+#
+# Cross-service URLs that vary by topology — EMBED_URL, API_INTERNAL_URL, and the
+# SMTP / Mailpit endpoint — plus every signing/DB secret are PROJECT-LEVEL env, set
+# per environment in .zerops-recipe/<env>/import.yaml. Project vars + secrets are
+# auto-inherited by every service, so they are NOT wired here (re-referencing an
+# inherited var as ${VAR} would resolve to a literal string). One zerops.yaml serves
+# every rung, from a single agent-driven pair up to an HA cluster. Only genuine
+# cross-service references are wired below: managed-store wiring (${db_*}, ${cache_*},
+# ${broker_*}, ${search_*}, ${storage_*}, ${qdrant_*}) and the api/edge/web subdomains.
+zerops:
+  # ═══ api — Node 24 / Bun · apps/api + packages/{db,contracts,flow-core,sdk} ═══
+  - setup: apidev
+    build:
+      base:
+        - nodejs@24
+        - bun@1.4
+      buildCommands:
+        - cd api && bun install
+      deployFiles:
+        - .                            # self-deploy → the whole monorepo lands on the container
+      cache:
+        - api/node_modules
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3000
+          httpSupport: true
+      initCommands:
+        - 'zsc execOnce ${appVersionId} --retryUntilSuccessful -- bash -c "cd /var/www/api && npx tsx packages/db/src/migrate.ts"'
+        # Rich demo seed (Acme). Self-gates on DISABLE_DEMO_SEED — prod tiers set it and skip.
+        - 'zsc execOnce ${appVersionId}-seed --retryUntilSuccessful -- bash -c "cd /var/www/api && npx tsx apps/api/src/seed-demo.ts --apply"'
+      envVariables:
+        NODE_ENV: development
+        PORT: "3000"
+        EMBED_DRIVER: service
+        # Dev half talks to DEV siblings. These SHADOW the project-level values, which name the
+        # stage half — correct for apiprod (shared with production), wrong for the dev container.
+        # Safe to pin literally here because a *dev setup only ever runs in a dev/stage project,
+        # where these hostnames are fixed by convention.
+        EMBED_URL: http://embedderdev:3001
+        GEO_URL: http://geodev:3002
+        QDRANT_URL: http://qdrant:${qdrant_port}
+        QDRANT_API_KEY: ${qdrant_apiKey}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_SUPER_USER: ${db_superUser}
+        DB_SUPER_PASSWORD: ${db_superUserPassword}
+        APP_DB_USER: app_user
+        RELAY_DB_USER: event_relay
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        CACHE_URL: ${cache_connectionString}
+        SEARCH_HOST: search
+        SEARCH_PORT: ${search_port}
+        SEARCH_API_KEY: ${search_apiKey}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+        # WEB_BASE_URL (public web origin), EMBED_URL, API_INTERNAL_URL, MAILPIT_API_URL,
+        # SMTP_HOST, SMTP_PORT + all signing/DB secrets are project-level env — auto-inherited
+        # from import.yaml per rung, never re-referenced here (an inherited ${VAR} would resolve
+        # to a literal string). Only true cross-service refs (${db_*}, ${cache_*}, subdomains) wire here.
+      start: zsc noop --silent                   # dev: real server via zerops_dev_server (workDir /var/www/api)
+
+  - setup: apiprod
+    build:
+      base:
+        - nodejs@24
+        - bun@1.4
+      buildCommands:
+        # Typecheck gate — tsc across the project references. Bundlers strip types
+        # without checking them, so this is the only step that catches type errors.
+        - cd api && bun install
+        # The gateway proxy needs the @discordjs/ws patch (api/patches). Fail the build if a cached node_modules lacks it.
+        - 'cd api && grep -q "agent: this.strategy.options.agent" node_modules/@discordjs/ws/dist/index.mjs'
+        - cd api && ./node_modules/.bin/tsc --build
+        # Bundle server + migrator into self-contained ESM (workspace packages and
+        # all deps inlined) — no node_modules, no tsx, no raw source at runtime.
+        - cd api && bun build apps/api/src/server.ts --target=node --format=esm --outfile=dist/server.mjs
+        - cd api && bun build packages/db/src/migrate.ts --target=node --format=esm --outfile=dist/migrate.mjs
+        # Rich demo seed bundle (self-contained; imports the scenario library + data engine).
+        - cd api && bun build apps/api/src/seed-demo.ts --target=node --format=esm --outfile=dist/seed-demo.mjs
+        # The migrator reads its SQL files at runtime — ship them beside the bundle.
+        - cd api && cp -r packages/db/migrations dist/migrations
+      deployFiles:
+        - api/dist/~                   # ship ONLY the build output: two bundles + migrations, flattened to root
+      cache:
+        - api/node_modules
+    deploy:
+      readinessCheck:
+        httpGet:
+          port: 3000
+          path: /health
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3000
+          httpSupport: true
+      initCommands:
+        - 'zsc execOnce ${appVersionId} --retryUntilSuccessful -- node migrate.mjs'
+        # Rich demo seed (Acme). Self-gates on DISABLE_DEMO_SEED — prod tiers set it and skip.
+        - 'zsc execOnce ${appVersionId}-seed --retryUntilSuccessful -- node seed-demo.mjs --apply'
+      envVariables:
+        NODE_ENV: production
+        PORT: "3000"
+        MIGRATIONS_DIR: /var/www/migrations
+        EMBED_DRIVER: service
+        QDRANT_URL: http://qdrant:${qdrant_port}
+        QDRANT_API_KEY: ${qdrant_apiKey}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_SUPER_USER: ${db_superUser}
+        DB_SUPER_PASSWORD: ${db_superUserPassword}
+        APP_DB_USER: app_user
+        RELAY_DB_USER: event_relay
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        CACHE_URL: ${cache_connectionString}
+        SEARCH_HOST: search
+        SEARCH_PORT: ${search_port}
+        SEARCH_API_KEY: ${search_apiKey}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+        # WEB_BASE_URL (public web origin), EMBED_URL, API_INTERNAL_URL, MAILPIT_API_URL,
+        # SMTP_HOST, SMTP_PORT + all signing/DB secrets are project-level env — auto-inherited
+        # from import.yaml per rung, never re-referenced here (an inherited ${VAR} would resolve
+        # to a literal string). Only true cross-service refs (${db_*}, ${cache_*}, subdomains) wire here.
+      start: node server.mjs
+      healthCheck:
+        httpGet:
+          port: 3000
+          path: /health
+
+  # ═══ edge — Elixir 1.16 / Phoenix Channels · edge/ ═════════════════════
+  - setup: edgedev
+    build:
+      base: elixir@1.16
+      buildCommands:
+        - cd edge && mix local.hex --force && mix local.rebar --force && mix deps.get && mix compile
+      deployFiles:
+        - .
+      cache:
+        - edge/deps
+        - edge/_build
+    run:
+      base: elixir@1.16
+      ports:
+        - port: 4000
+          httpSupport: true
+      prepareCommands:
+        - mix local.hex --force
+        - mix local.rebar --force
+      start: zsc noop --silent
+      envVariables:
+        # Dev half verifies socket tokens against the DEV api (shadowing the project var, which
+        # names the stage half) so a token change is testable without touching stage.
+        API_INTERNAL_URL: http://apidev:3000
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        PORT: "4000"
+        MIX_ENV: dev
+        # No scheduler busy-waiting on shared-CPU autoscaled containers — the
+        # idle-spin starves a squeezed core (the release side carries the same
+        # flags in edge/rel/vm.args.eex).
+        ELIXIR_ERL_OPTIONS: "+sbwt none +sbwtdcpu none +sbwtdio none"
+        # API_INTERNAL_URL (edge → api socket-token verify) is project-level env, auto-inherited.
+
+  - setup: edgeprod
+    build:
+      base: elixir@1.16
+      # --force + --overwrite guarantee the release reflects current source: the
+      # incremental compiler otherwise skips files whose cache-restored beams
+      # out-mtime the shipped sources. _build is deliberately NOT cached here for
+      # the same reason (a clean compile is the right trade for correctness).
+      buildCommands:
+        - cd edge && mix local.hex --force && mix local.rebar --force && mix deps.get --only prod && MIX_ENV=prod mix compile --force && MIX_ENV=prod mix release --overwrite noola_edge
+      deployFiles:
+        - edge/_build/prod/rel/noola_edge/~    # ~ strips the release prefix → bin/ at deploy root
+      cache:
+        - edge/deps
+    deploy:
+      readinessCheck:
+        httpGet:
+          port: 4000
+          path: /health
+    run:
+      base: elixir@1.16
+      ports:
+        - port: 4000
+          httpSupport: true
+      # The watchdog (release overlay, edge/rel/overlays/bin/watchdog.sh) wraps
+      # `bin/noola_edge start`: probes /health from outside the VM and exits on
+      # sustained failure so the platform restarts the container — the BEAM can
+      # wedge without crashing.
+      start: bin/watchdog.sh
+      healthCheck:
+        httpGet:
+          port: 4000
+          path: /health
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        PORT: "4000"
+        MIX_ENV: prod
+        # API_INTERNAL_URL (edge → api socket-token verify) is project-level env, auto-inherited.
+
+  # ═══ embedder — Node 24 · embedder/ (self-hosted all-MiniLM sidecar) ═════
+  # A stateless text→vector sidecar. The model is baked at build time (warmup.mjs →
+  # embedder/.cache) and shipped with the code, so the runtime is keyless + offline.
+  # The api calls POST /embed over the project network at the EMBED_URL env var.
+  - setup: embedderdev
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd embedder && npm install
+        - cd embedder && node warmup.mjs        # bake all-MiniLM into embedder/.cache
+      deployFiles:
+        - .                            # self-deploy → whole monorepo, so the source is mountable
+      cache:
+        - embedder/node_modules
+        - embedder/.cache
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3001
+          httpSupport: true
+      verticalAutoscaling:
+        minRam: 1
+        maxRam: 4
+      start: zsc noop --silent          # dev: `node embedder/server.mjs` via zerops_dev_server
+      envVariables:
+        PORT: "3001"
+        OMP_NUM_THREADS: "1"
+
+  - setup: embedderprod
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd embedder && npm install
+        - cd embedder && node warmup.mjs        # bake all-MiniLM into embedder/.cache
+      deployFiles:
+        - embedder                     # ship the built embedder/ dir (deps + baked .cache)
+      cache:
+        - embedder/node_modules
+        - embedder/.cache
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3001
+          httpSupport: true
+      # onnxruntime + the model need real memory — the platform default (~0.12GB)
+      # OOM-kills model load. Give it a 1–4 GB envelope.
+      verticalAutoscaling:
+        minRam: 1
+        maxRam: 4
+      start: node embedder/server.mjs
+      healthCheck:
+        httpGet:
+          port: 3001
+          path: /health
+      envVariables:
+        PORT: "3001"
+        # Single-threaded ONNX (belt-and-suspenders with embed.mjs session_options) so
+        # onnxruntime never tries to pin CPU affinity on a cgroup-restricted container.
+        OMP_NUM_THREADS: "1"
+
+  # ═══ geo — IP→location sidecar · geo/ (bakes DB-IP City Lite mmdb) ══════
+  # Owns the heavy mmdb so the api artifact stays lean; the api calls it over the internal
+  # network at the GEO_URL env var (/lookup?ip=). geoLookup degrades to null on any failure,
+  # so a rung that runs no geo service sets GEO_URL empty to disable it outright.
+  - setup: geodev
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd geo && npm install
+        - 'cd geo && (for M in $(date +%Y-%m) $(date -d "-1 month" +%Y-%m); do curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-$M.mmdb.gz" -o /tmp/geo.gz && break; done && gunzip -c /tmp/geo.gz > geoip.mmdb && ls -la geoip.mmdb) || echo "geo db download failed — lookups will be empty"'
+      deployFiles:
+        - .                            # self-deploy → whole monorepo, so the source is mountable
+      cache:
+        - geo/node_modules
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3002
+          httpSupport: true
+      start: zsc noop --silent          # dev: `node geo/server.mjs` via zerops_dev_server
+      envVariables:
+        PORT: "3002"
+        GEOIP_DB_PATH: /var/www/geo/geoip.mmdb
+
+  - setup: geoprod
+    build:
+      base: nodejs@24
+      os: ubuntu
+      buildCommands:
+        - cd geo && npm install
+        # Keyless DB-IP City Lite (CC-BY). Try current month then last month; non-fatal —
+        # a failed download leaves no mmdb and geo lookups just return empty.
+        - 'cd geo && (for M in $(date +%Y-%m) $(date -d "-1 month" +%Y-%m); do curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-$M.mmdb.gz" -o /tmp/geo.gz && break; done && gunzip -c /tmp/geo.gz > geoip.mmdb && ls -la geoip.mmdb) || echo "geo db download failed — lookups will be empty"'
+      deployFiles:
+        - geo                          # ship the built geo/ dir (deps + baked mmdb)
+      cache:
+        - geo/node_modules
+    run:
+      base: nodejs@24
+      os: ubuntu
+      ports:
+        - port: 3002
+          httpSupport: true
+      start: node geo/server.mjs
+      healthCheck:
+        httpGet:
+          port: 3002
+          path: /health
+      envVariables:
+        PORT: "3002"
+        GEOIP_DB_PATH: /var/www/geo/geoip.mmdb
+
+  # ═══ web — React 19 / Vite · web/ ══════════════════════════════════════
+  - setup: webdev
+    build:
+      base: nodejs@22
+      os: ubuntu
+      buildCommands:
+        - cd web && npm install        # dev: preinstall deps only — the agent drives `vite dev`
+      deployFiles:
+        - .
+      cache:
+        - web/node_modules
+    run:
+      base: nodejs@22
+      os: ubuntu
+      ports:
+        - port: 5173
+          httpSupport: true
+      envVariables:
+        # The Vite dev server reaches the running api/edge over their public
+        # subdomains (the SPA is Bearer + cross-origin; the api sends CORS *).
+        # Dev half talks to DEV siblings (shadowing the project vars, which name the stage half),
+        # so editing api/edge code and reloading the SPA exercises what you just changed.
+        VITE_API_URL: ${apidev_zeropsSubdomain}
+        VITE_EDGE_URL: ${edgedev_zeropsSubdomain}
+      start: zsc noop --silent          # dev: `vite dev` via zerops_dev_server (workDir /var/www/web)
+
+  - setup: webprod
+    build:
+      base: nodejs@22
+      envVariables:
+        VITE_APP_ENV: production
+        # No *_DEFAULT fallbacks here. This setup is the ONE shared across project shapes — it
+        # builds the stage half of a dev/stage project AND the web service of a production
+        # project — so it cannot name a sibling: the api is `apistage` in the first and `api` in
+        # the second. The old defaults assembled `api-${zeropsSubdomainHost}` / `edge-...`, which
+        # is only ever right in a production-shaped project and silently produces a URL for a
+        # non-existent host anywhere else. VITE_API_URL / VITE_EDGE_URL come from project env,
+        # set per project in .zerops-recipe/<rung>/import.yaml, which is the only layer that
+        # knows which shape it is. Project vars are inherited into the build shell by name.
+      buildCommands:
+        # Clean install every build — do NOT cache web/node_modules. A cached node_modules
+        # from one platform poisons the next build: npm's optional-dependency bug (#4828)
+        # skips the platform-specific rollup binary (…/rollup-linux-x64-musl) when the dir
+        # already exists, so `vite build` dies with "Cannot find module @rollup/…-musl".
+        # A clean install resolves the right binary from the lockfile.
+        - cd web && npm install
+        # VITE_API_URL / VITE_EDGE_URL are inherited from project env (every rung that uses this
+        # setup sets both; a custom domain is just a different value there). Passed through
+        # explicitly so the build fails visibly if a rung ever forgets one: api.ts / realtime.ts
+        # throw on a production build with either missing, rather than shipping an SPA wired to
+        # nothing.
+        - cd web && npm run build
+      deployFiles:
+        - web/dist/~                   # the built SPA becomes the static document root
+    run:
+      base: static
+
+  # ═══ runner — agent-studio execution runner · runner/ (Docker-in-VM, Go) ══
+  # A Zerops docker service. The Go worker (a static CGO_ENABLED=0 binary) consumes
+  # run jobs from the shared `broker` NATS JetStream and launches ONE ephemeral
+  # `docker run --rm --network=host` container per job.
+  - setup: runnerdev
+    build:
+      base: go@1.22
+      envVariables:
+        CGO_ENABLED: "0"
+      buildCommands:
+        - cd runner && go mod tidy
+        - cd runner && go build -o runnerd .
+        - mkdir -p runner/flow-runner/flow-core && cp api/packages/flow-core/src/index.ts runner/flow-runner/flow-core/index.ts
+      deployFiles:
+        - .                            # self-deploy → whole monorepo, so the source is mountable
+      addToRunPrepare:
+        - runner/flow-runner
+      cache: true
+    run:
+      base: docker@26.1.5
+      # Same prepare-phase image bake as runnerprod — see the comment there for why this cannot
+      # live in initCommands. The dev half needs it too: without the image, flow-mode jobs fail.
+      prepareCommands:
+        - sh -c "timeout 180 sh -c 'until docker ps >/dev/null 2>&1; do sleep 2; done' || { echo 'dockerd unreachable in prepare phase'; exit 1; }; docker build -t noola-flow-runner:v1 /home/zerops/runner/flow-runner"
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        RUNNER_GLOBAL_MAX: "3"
+        RUNNER_IMAGE: alpine:3.20
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_USER: ${db_superUser}
+        DB_PASS: ${db_superUserPassword}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+      start: zsc noop --silent          # dev: `runner/runnerd` via zerops_dev_server (noHttpProbe)
+
+  - setup: runnerprod
+    build:
+      base: go@1.22
+      envVariables:
+        CGO_ENABLED: "0"
+      buildCommands:
+        - cd runner && go mod tidy
+        - cd runner && go build -o runnerd .
+        # Vendor the shared DB-free item-node core into the flow-runner build context so the
+        # image's esbuild inlines @repo/flow-core (real source: api/packages/flow-core).
+        - mkdir -p runner/flow-runner/flow-core && cp api/packages/flow-core/src/index.ts runner/flow-runner/flow-core/index.ts
+      deployFiles:
+        - runner/runnerd
+        - runner/flow-runner
+      addToRunPrepare:
+        - runner/flow-runner
+      cache: true
+    run:
+      base: docker@26.1.5
+      # Bake the flow image into the RUNTIME IMAGE, not into each container. prepareCommands run
+      # once when the runtime image is built, so every container this service ever starts —
+      # including a scale-out replica — boots with the image already in its docker storage.
+      # Building it in initCommands instead cost a full chromium+ffmpeg build (~10 min) on every
+      # new container, which is exactly the horizontal-scaling problem.
+      #
+      # The build context comes from build.addToRunPrepare, which is the only way to get build
+      # output into the prepare phase (deploy files are NOT at /var/www/ yet). It lands under
+      # /home/zerops/ with its path preserved — /home/zerops/runner/flow-runner.
+      #
+      # Staleness is handled by the platform: prepareCommands are cached in the runtime base layer,
+      # and that layer is invalidated when the addToRunPrepare payload changes — so editing
+      # flow-runner/ (exec.mts, Dockerfile, package.json) rebuilds the image on the next deploy,
+      # while an unrelated deploy re-uses the cached layer and costs nothing.
+      #
+      # The daemon wait is bounded: if dockerd is not up in the prepare phase the deploy fails
+      # fast and loudly rather than hanging the pipeline on an unbounded `until` loop.
+      prepareCommands:
+        - sh -c "timeout 180 sh -c 'until docker ps >/dev/null 2>&1; do sleep 2; done' || { echo 'dockerd unreachable in prepare phase'; exit 1; }; docker build -t noola-flow-runner:v1 /home/zerops/runner/flow-runner"
+      envVariables:
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        RUNNER_GLOBAL_MAX: "3"
+        RUNNER_IMAGE: alpine:3.20
+        # DB super creds (BYPASSRLS) — the worker records run lifecycle to runner_runs
+        # (any tenant's row), best-effort. Internal plain-TCP; the worker sets sslmode=disable.
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_USER: ${db_superUser}
+        DB_PASS: ${db_superUserPassword}
+        # Object storage — the flow container uploads run replays (runs/<tenant>/<id>.webm).
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+      # The flow image is built in run.prepareCommands above (baked into the runtime image), so no
+      # build happens here — container start must stay fast for scale-out. This only reports whether
+      # the baked image is present, so a regression in the prepare step is obvious in the logs
+      # instead of silently costing every new container a 10-minute rebuild.
+      initCommands:
+        - sh -c "until docker ps >/dev/null 2>&1; do sleep 1; done; docker image inspect noola-flow-runner:v1 >/dev/null 2>&1 && echo 'flow image present (baked in runtime image)' || echo 'WARNING flow image MISSING — run.prepareCommands did not bake it'"
+      start: runner/runnerd
+
+  # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══
+  # DELIBERATELY referenced by no rung in .zerops-recipe/: the marketing site is not part of
+  # "deploy your own copy of Noola" (a fork wants the app, not our landing page). It ships in
+  # the separate noola.cc project, which builds from this same repo — so these two setups stay
+  # here and MUST NOT be deleted as dead code just because this recipe never imports them.
+  - setup: sitedev
+    build:
+      base: nodejs@22
+      os: ubuntu
+      buildCommands:
+        - cd site && npm install
+      deployFiles:
+        - .
+      cache:
+        - site/node_modules
+    run:
+      base: nodejs@22
+      os: ubuntu
+      ports:
+        - port: 5173
+          httpSupport: true
+      start: zsc noop --silent
+
+  - setup: siteprod
+    build:
+      base: nodejs@22
+      buildCommands:
+        - cd site && npm install
+        - cd site && npm run build
+      deployFiles:
+        - site/dist/~
+    run:
+      base: static
+
+  # ═══ dev pools — one swarm@1 pool per part, one leased container per branch ═══
+  # Each part's dev environment is a pool (apipool, edgepool, …) instead of a *dev service:
+  # zerops_lease checks a branch out into /var/www of a clean container and the declared dev
+  # servers (.zcp/dev-servers.json) start under zcp-devsup. The image bakes the part's
+  # dependencies into /var/www in run.prepareCommands (they survive every reset and the checkout
+  # keeps them, being git-ignored); build.addToRunPrepare carries the manifests they install
+  # from, so the image rebuilds when one changes. Siblings reach each other through the
+  # siblingEnv / siblingPreviewEnv values the supervisor hands each lease, so no pool setup
+  # names another part. Ports 8101–8103 are the per-lease preview ports (previewPortBase 8100 +
+  # the container's stable number, maxContainers 3). Nothing here runs on stage or production.
+  - setup: apipool
+    build:
+      base: ubuntu/nodejs@24
+      buildCommands:
+        - echo "apipool image" > pool-image.log
+      deployFiles:
+        - pool-image.log               # git-ignored marker; the image's payload is the baked deps below
+      addToRunPrepare:
+        - api/package.json
+        - api/bun.lock
+        - api/patches
+        - api/apps/api/package.json
+        - api/packages/contracts/package.json
+        - api/packages/db/package.json
+        - api/packages/flow-core/package.json
+        - api/packages/sdk/package.json
+    run:
+      base: ubuntu/nodejs@24
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - sudo npm install -g bun@1.4
+        - mkdir -p /var/www && cp -a /home/zerops/api /var/www/
+        - cd /var/www/api && bun install --frozen-lockfile
+      envVariables:
+        NODE_ENV: development
+        PORT: "3000"
+        NODE_OPTIONS: --max-old-space-size=1024
+        EMBED_DRIVER: service
+        # EMBED_URL / GEO_URL are composed per lease in the api dev server's command from the
+        # EMBED_HOST / GEO_HOST sibling values, so they always name this branch's own leases.
+        QDRANT_URL: http://qdrant:${qdrant_port}
+        QDRANT_API_KEY: ${qdrant_apiKey}
+        DB_HOST: db
+        DB_PORT: ${db_port}
+        DB_NAME: ${db_dbName}
+        DB_SUPER_USER: ${db_superUser}
+        DB_SUPER_PASSWORD: ${db_superUserPassword}
+        APP_DB_USER: app_user
+        RELAY_DB_USER: event_relay
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        CACHE_URL: ${cache_connectionString}
+        SEARCH_HOST: search
+        SEARCH_PORT: ${search_port}
+        SEARCH_API_KEY: ${search_apiKey}
+        STORAGE_ENDPOINT: ${storage_apiUrl}
+        STORAGE_ACCESS_KEY: ${storage_accessKeyId}
+        STORAGE_SECRET_KEY: ${storage_secretAccessKey}
+        STORAGE_BUCKET: ${storage_bucketName}
+        STORAGE_REGION: us-east-1
+      start: zcp-devsup run
+
+  - setup: edgepool
+    build:
+      base: ubuntu/elixir@1.16
+      buildCommands:
+        - echo "edgepool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - edge/mix.exs
+        - edge/mix.lock
+        - edge/config
+    run:
+      base: ubuntu/elixir@1.16
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mix local.hex --force
+        - mix local.rebar --force
+        - mkdir -p /var/www && cp -a /home/zerops/edge /var/www/
+        # Cap the BEAM's schedulers: by default it starts one thread per host core, which runs
+        # past the container's task limit ("Failed to create dirty cpu scheduler thread").
+        - cd /var/www/edge && export ELIXIR_ERL_OPTIONS="+S 2:2 +SDcpu 2:2 +SDio 4 +A 4" && mix deps.get && MIX_OS_DEPS_COMPILE_PARTITION_COUNT=1 mix deps.compile
+      envVariables:
+        # API_INTERNAL_URL is composed per lease in the edge dev server's command (API_HOST sibling).
+        NATS_HOST: broker
+        NATS_PORT: ${broker_port}
+        NATS_USER: ${broker_user}
+        NATS_PASS: ${broker_password}
+        PORT: "4000"
+        MIX_ENV: dev
+        # No scheduler busy-waiting (as edgedev), and a capped scheduler count so a lease stays
+        # within the supervisor's task limit beside its other processes.
+        ELIXIR_ERL_OPTIONS: "+sbwt none +sbwtdcpu none +sbwtdio none +S 2:2 +SDcpu 2:2 +SDio 4 +A 4"
+      start: zcp-devsup run
+
+  - setup: embedderpool
+    build:
+      base: ubuntu/nodejs@24
+      buildCommands:
+        - echo "embedderpool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - embedder/package.json
+        - embedder/package-lock.json
+        - embedder/embed.mjs
+        - embedder/warmup.mjs
+    run:
+      base: ubuntu/nodejs@24
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      verticalAutoscaling:
+        minRam: 1
+        maxRam: 4
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/embedder /var/www/
+        - cd /var/www/embedder && npm ci
+        - cd /var/www/embedder && node warmup.mjs     # bake all-MiniLM into embedder/.cache (git-ignored)
+      envVariables:
+        PORT: "3001"
+        OMP_NUM_THREADS: "1"
+      start: zcp-devsup run
+
+  - setup: geopool
+    build:
+      base: ubuntu/nodejs@24
+      buildCommands:
+        - echo "geopool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - geo/package.json
+    run:
+      base: ubuntu/nodejs@24
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/geo /var/www/
+        - cd /var/www/geo && npm install --no-package-lock
+        # The mmdb lives outside the checkout (it is not git-ignored); non-fatal like geodev.
+        - 'mkdir -p /home/zerops/geoip && (for M in $(date +%Y-%m) $(date -d "-1 month" +%Y-%m); do curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-$M.mmdb.gz" -o /tmp/geo.gz && break; done && gunzip -c /tmp/geo.gz > /home/zerops/geoip/geoip.mmdb && ls -la /home/zerops/geoip/geoip.mmdb) || echo "geo db download failed — lookups will be empty"'
+      envVariables:
+        PORT: "3002"
+        GEOIP_DB_PATH: /home/zerops/geoip/geoip.mmdb
+      start: zcp-devsup run
+
+  - setup: webpool
+    build:
+      base: ubuntu/nodejs@22
+      buildCommands:
+        - echo "webpool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - web/package.json
+    run:
+      base: ubuntu/nodejs@22
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/web /var/www/
+        - cd /var/www/web && npm install --no-package-lock
+      start: zcp-devsup run
+
+  - setup: sitepool
+    build:
+      base: ubuntu/nodejs@22
+      buildCommands:
+        - echo "sitepool image" > pool-image.log
+      deployFiles:
+        - pool-image.log
+      addToRunPrepare:
+        - site/package.json
+    run:
+      base: ubuntu/nodejs@22
+      ports:
+        - port: 8101
+          httpSupport: true
+        - port: 8102
+          httpSupport: true
+        - port: 8103
+          httpSupport: true
+      prepareCommands:
+        - sudo sh -c 'u=https://github.com/zeropsio/zcp/releases/download/v9.221.0/zcp-devsup-linux-amd64; f=/usr/local/bin/zcp-devsup; if command -v curl >/dev/null; then curl -fsSL "$u" -o "$f"; else wget -qO "$f" "$u"; fi && chmod 0755 "$f"'
+        - mkdir -p /var/www && cp -a /home/zerops/site /var/www/
+        - cd /var/www/site && npm install --no-package-lock
+      start: zcp-devsup run

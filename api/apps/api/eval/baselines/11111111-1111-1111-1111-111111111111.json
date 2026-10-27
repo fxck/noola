@@ -1,0 +1,53 @@
+{
+  "tenant": "11111111-1111-1111-1111-111111111111",
+  "generatedAt": "2026-07-05T19:33:21.014Z",
+  "thresholds": {
+    "recall": 0.5,
+    "overlap": 0.12
+  },
+  "passRate": 1,
+  "cases": [
+    {
+      "query": "How do I reset my password?",
+      "recall": 1,
+      "overlap": 0.204,
+      "pass": true
+    },
+    {
+      "query": "I can't get into my account and it won't let me sign in anymore",
+      "recall": 1,
+      "overlap": 0.262,
+      "pass": true
+    },
+    {
+      "query": "What is your refund policy?",
+      "recall": 1,
+      "overlap": 0.483,
+      "pass": true
+    },
+    {
+      "query": "Can I get my money back after buying a subscription?",
+      "recall": 1,
+      "overlap": 0.367,
+      "pass": true
+    },
+    {
+      "query": "How do I upgrade or change my plan?",
+      "recall": 1,
+      "overlap": 0.429,
+      "pass": true
+    },
+    {
+      "query": "How do I set up SSO for my team?",
+      "recall": 1,
+      "overlap": 0.5,
+      "pass": true
+    },
+    {
+      "query": "How can I invite my teammates?",
+      "recall": 1,
+      "overlap": 0.257,
+      "pass": true
+    }
+  ]
+}

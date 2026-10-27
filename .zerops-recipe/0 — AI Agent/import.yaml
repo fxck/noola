@@ -1,0 +1,189 @@
+#zeropsPreprocessor=on
+
+# AI Agent — full dev + stage pairs for agent-driven development (the topology Noola itself
+# was built on). EVERY service we own is paired, so every one of them can be changed:
+#
+#   *dev   (apidev, edgedev, webdev, embedderdev, geodev, runnerdev)
+#          builds with the *dev setups — deploy the WHOLE monorepo, then idle on `zsc noop`,
+#          so each container boots WITH the source tree + deps, mountable and drivable via
+#          zerops_dev_server. A service with no dev half has nowhere to mount its source and
+#          therefore cannot be edited at all — which is why geo/embedder/runner are paired
+#          here rather than being shared singletons.
+#   *stage (apistage, edgestage, webstage, embedderstage, geostage, runnerstage)
+#          builds with the *prod setups — the exact artifact and configuration production
+#          runs. That is what makes stage a real gate, and why no *stage setup exists.
+#
+# The full loop this enables: edit on a dev mount → commit → cross-deploy to the stage half →
+# test the production build → push to main → production deploys.
+#
+# Cross-service URLs: project env below names the STAGE half, because the *prod setups inherit
+# from it and must stay shape-agnostic (they also run in a production project, where the same
+# service is called plain `api`). The *dev setups shadow these with their dev siblings in
+# zerops.yaml, so the dev half talks to the dev half. Managed stores are shared by both halves.
+#
+# Every signing/DB secret is generated. The demo workspace is seeded — sign in at the
+# `webstage` subdomain with ales@acme.test / demo1234.
+
+project:
+  name: noola-agent
+  corePackage: LIGHT
+  tags:
+    - noola
+    - support-platform
+    - ai-agent
+  envVariables:
+    # better-auth session signing
+    AUTH_SECRET: <@generateRandomString(<48>)>
+    # encrypts per-tenant model keys at rest
+    MODEL_KEY_SECRET: <@generateRandomString(<48>)>
+    # api ↔ edge service-to-service auth
+    EDGE_SHARED_SECRET: <@generateRandomString(<48>)>
+    # Phoenix (edge) signing base
+    SECRET_KEY_BASE: <@generateRandomString(<64>)>
+    # app_user DB role
+    APP_DB_PASSWORD: <@generateRandomString(<32>)>
+    # event_relay DB role
+    RELAY_DB_PASSWORD: <@generateRandomString(<32>)>
+    # auth_user DB role
+    AUTH_DB_PASSWORD: <@generateRandomString(<32>)>
+
+    # api → embedder (RAG)
+    EMBED_URL: http://embedderstage:3001
+    # api → geo (IP enrichment)
+    GEO_URL: http://geostage:3002
+    # edge → api (socket-token verify)
+    API_INTERNAL_URL: http://apistage:3000
+    # api → public web origin (links / CORS / invites)
+    WEB_BASE_URL: https://webstage-${zeropsSubdomainHost}.prg1.zerops.app
+    # api reads caught mail
+    MAILPIT_API_URL: http://mailpit:8025
+    # outbound mail → Mailpit sink
+    SMTP_HOST: mailpit
+    SMTP_PORT: "1025"
+    # public backend origins for the built SPA, assembled from the project subdomain
+    # ref (zeropsSubdomainHost) so they're known at build time — no dependency on the
+    # api/edge services having deployed yet (a sibling ${x_zeropsSubdomain} only resolves
+    # after that service's first deploy, which races the web build on a fresh import)
+    VITE_API_URL: https://apistage-${zeropsSubdomainHost}-3000.prg1.zerops.app
+    VITE_EDGE_URL: wss://edgestage-${zeropsSubdomainHost}-4000.prg1.zerops.app
+
+services:
+  # managed stores (start first)
+  - hostname: db
+    type: postgresql:single@18
+    profile: oltp-hobby
+    priority: 10
+  - hostname: cache
+    type: valkey:single@7.2
+    profile: hobby
+    priority: 10
+  - hostname: broker
+    type: nats:single@2.12
+    priority: 10
+  - hostname: search
+    type: typesense:single@30.2
+    priority: 10
+  - hostname: qdrant
+    type: qdrant:single@1.12
+    priority: 10
+  - hostname: storage
+    type: object-storage
+    objectStorageSize: 5
+    priority: 10
+  - hostname: mailpit
+    type: alpine@3.24
+    buildFromGit: https://github.com/zeropsio/recipe-mailpit
+    enableSubdomainAccess: true
+    priority: 10
+
+  # ── dev half ── boots WITH the source tree (*dev setups deploy the whole monorepo and
+  # idle on `zsc noop`), so every service we own is mountable and drivable by an agent.
+  # Each one talks to its DEV siblings, wired in zerops.yaml's *dev setups.
+  - hostname: apidev
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: apidev
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+  - hostname: edgedev
+    type: elixir@1.16.3
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: edgedev
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+    verticalAutoscaling:
+      minRam: 2
+      minFreeRamGB: 0.25
+  - hostname: webdev
+    type: nodejs@22
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: webdev
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+  - hostname: embedderdev
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: embedderdev
+    minContainers: 1
+    maxContainers: 1
+  - hostname: geodev
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: geodev
+    minContainers: 1
+    maxContainers: 1
+  - hostname: runnerdev
+    type: docker@26.1.5
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: runnerdev
+    minContainers: 1
+    maxContainers: 1
+
+  # ── stage half ── built with the *prod setups, i.e. the exact artifact + config
+  # production runs. That is the whole point of stage, so there is no *stage setup.
+  # Sibling URLs come from project.envVariables above, which name these hostnames.
+  - hostname: apistage
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: apiprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+  - hostname: edgestage
+    type: elixir@1.16.3
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: edgeprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+    verticalAutoscaling:
+      minRam: 2
+      minFreeRamGB: 0.25
+  - hostname: webstage
+    type: static@1.0
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: webprod
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+  - hostname: embedderstage
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: embedderprod
+    minContainers: 1
+    maxContainers: 1
+  - hostname: geostage
+    type: nodejs@24
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: geoprod
+    minContainers: 1
+    maxContainers: 1
+  - hostname: runnerstage
+    type: docker@26.1.5
+    buildFromGit: https://github.com/fxck/noola
+    zeropsSetup: runnerprod
+    minContainers: 1
+    maxContainers: 1

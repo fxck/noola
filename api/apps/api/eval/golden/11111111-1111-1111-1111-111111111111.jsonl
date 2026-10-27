@@ -1,0 +1,13 @@
+// Acme (11111111-1111-1111-1111-111111111111) golden set for `npm run eval`.
+// One JSON object per line: {query, expectCitationIds, expectAnswer}. IDs are the real
+// seeded KB article / document ids. Answers are drawn from the head of each source
+// (the extractive rule draft quotes the leading passage), so the content-word overlap
+// check is honest. Two cases are deliberately phrased with NO lexical overlap with the
+// source to exercise the semantic (vector/Qdrant) retrieval arm.
+{"query":"How do I reset my password?","expectCitationIds":["240ab302-8cc8-4c25-82ad-7e6175e15446"],"expectAnswer":"Open Settings then Security and click Reset. A one-time link arrives by email within a minute and it expires in 15 minutes."}
+{"query":"I can't get into my account and it won't let me sign in anymore","expectCitationIds":["30ca44ca-7a65-4f48-aa5d-b562db705fbf"],"expectAnswer":"If you are locked out go to Settings Security and choose Reset Password. We email a secure link that expires within one hour. Enterprise SSO users should contact their workspace admin."}
+{"query":"What is your refund policy?","expectCitationIds":["4dd43e73-1067-4794-9936-d083363be233"],"expectAnswer":"We offer a full refund within 30 days of purchase, no questions asked. After 30 days refunds are prorated based on unused time on your subscription."}
+{"query":"Can I get my money back after buying a subscription?","expectCitationIds":["4dd43e73-1067-4794-9936-d083363be233"],"expectAnswer":"We offer a full refund within 30 days of purchase. After 30 days refunds are prorated based on unused time on your subscription."}
+{"query":"How do I upgrade or change my plan?","expectCitationIds":["4dd43e73-1067-4794-9936-d083363be233"],"expectAnswer":"You can upgrade or downgrade your plan at any time from Settings Billing. Upgrades take effect immediately; downgrades apply at the start of your next billing cycle."}
+{"query":"How do I set up SSO for my team?","expectCitationIds":["bbdc4c15-61fa-442b-a956-74be699f8540"],"expectAnswer":"Enterprise plans support SAML single sign-on. Configure your identity provider under Settings Security SSO. We support Okta, Azure AD, and Google Workspace."}
+{"query":"How can I invite my teammates?","expectCitationIds":["bbdc4c15-61fa-442b-a956-74be699f8540"],"expectAnswer":"Admins can invite teammates from Settings Members. Each invite sends an email with a join link that expires after 7 days."}

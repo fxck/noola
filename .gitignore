@@ -1,0 +1,38 @@
+# dependencies
+node_modules/
+**/node_modules/
+
+# build output
+**/dist/
+api/dist/
+web/dist/
+*.tsbuildinfo
+
+# elixir
+edge/deps/
+edge/_build/
+*.beam
+
+# go / runner build artifacts
+runner/runnerd
+
+# embedder — the all-MiniLM model is baked at build time (warmup.mjs), never committed
+embedder/.cache/
+
+# turbo / tooling caches
+.turbo/
+
+# logs / scratch
+*.log
+zcp-dev-server.log
+probe*.mjs
+
+# local env — NEVER commit secrets (they are Zerops project secrets)
+.env
+.env.*
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

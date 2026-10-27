@@ -1,0 +1,966 @@
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import { withTenant, relayPool } from "@repo/db";
+import {
+  SyntheticMessageInput,
+  PublicAskInput,
+  PublicConversationInput,
+  WidgetKeyInput,
+  WidgetKeyUpdateInput,
+  PublicIdentifyInput,
+  PublicTrackInput,
+  stripReservedAttributes,
+} from "@repo/contracts";
+import { randomUUID } from "node:crypto";
+import { tenanted } from "../http/tenant.js";
+import { ingestInbound } from "../ingest.js";
+import { createAttachment, claimAttachments, attachmentsForTicket, type AttachmentRow } from "../attachments.js";
+import { putBuffer, getObject } from "../storage.js";
+import { indexTicket } from "../search.js";
+import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
+import { suggestionMeta } from "../autoreply.js";
+import { wantsHuman, type DraftImage } from "../model.js";
+import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
+import { upsertContact, bumpContactSeen, absorbAnonymousByHandles } from "../contacts.js";
+import { trackEvent } from "../contact-events.js";
+import { deriveContactContext } from "../enrich.js";
+import { listPublicArticles, listPublicCollections, getPublicArticleBySlug, searchPublicArticles } from "../kb.js";
+import { WIDGET_JS } from "../widget-embed.js";
+import { ANSWERS_JS } from "../answers-embed.js";
+import { PIXEL_GIF } from "../tracking.js";
+
+// The customer-facing embeddable surface: the synthetic inbound channel, the Ask-AI widget lane,
+// the public help center + support-form deflection, the two-way messenger conversation poll, the
+// embed script itself, and (authed) widget-key management. Every public route resolves its tenant
+// from a widget key (pre-context BYPASSRLS lookup) + a per-key domain allowlist — no session; all
+// are listed in server.ts's PUBLIC_ROUTES. widget-key management is the one authed, tenant-scoped lane.
+// Authoritative AI mode for a widget conversation (see migration 0075). Muted on human handoff so
+// neither the /public/ask lane nor the autoreply/automations engine answers past it.
+async function setWidgetAssistantMode(tenantId: string, conversationId: string, enabled: boolean): Promise<void> {
+  await withTenant(tenantId, (c) =>
+    c.query(
+      // Resuming AI (enabled=true) hands the conversation back to the bot, so it must also release the
+      // human assignee the escalation put on it — otherwise the ticket stays "owned" by an agent who is
+      // no longer handling it. Escalation (enabled=false) leaves assignee untouched (routing sets it).
+      //
+      // Match on the ticket id OR external_channel_id. The widget's `conversationId` is the ticket id
+      // the server handed back (responses return conversationId: ticketId), while `external_channel_id`
+      // is NULL for the common case — an identified visitor threads onto their existing ticket by
+      // contact identity, so nothing ever wrote the conversationId there. Keying ONLY on
+      // external_channel_id meant this UPDATE matched ZERO rows for those conversations, so "talk to a
+      // human" never actually muted the assistant and the bot kept answering past the handoff. The
+      // id::text branch fixes that; the external_channel_id branch keeps legacy client-uuid conversations
+      // (where the widget sent its own id and it WAS stored) working.
+      `UPDATE tickets SET assistant_enabled = $2,
+              assignee_id = CASE WHEN $2 THEN NULL ELSE assignee_id END
+         WHERE channel_type = 'widget' AND (id::text = $1 OR external_channel_id = $1)`,
+      [conversationId, enabled],
+    ),
+  );
+}
+/** The widget ticket a conversation handle currently points at: the OPEN one first (a closed ticket can
+ *  share the handle after the visitor wrote again), newest first. */
+async function findWidgetTicket(
+  tenantId: string,
+  conversationId: string,
+): Promise<{ id: string; status: string; assistantEnabled: boolean } | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, status, assistant_enabled FROM tickets
+        WHERE channel_type = 'widget' AND (id::text = $1 OR external_channel_id = $1)
+        ORDER BY (status = 'open') DESC, updated_at DESC LIMIT 1`,
+      [conversationId],
+    );
+    if (!r.rowCount) return null;
+    return { id: r.rows[0].id as string, status: r.rows[0].status as string, assistantEnabled: r.rows[0].assistant_enabled !== false };
+  });
+}
+/** Hand exactly the ticket a message landed on to a human (mute its assistant). */
+async function muteWidgetTicket(tenantId: string, ticketId: string): Promise<void> {
+  await withTenant(tenantId, (c) =>
+    c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled IS DISTINCT FROM false", [ticketId]),
+  );
+}
+async function widgetAssistantEnabled(tenantId: string, ticketId: string): Promise<boolean> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(`SELECT assistant_enabled FROM tickets WHERE id = $1 LIMIT 1`, [ticketId]);
+    return r.rowCount ? r.rows[0].assistant_enabled !== false : true;
+  });
+}
+
+const WIDGET_ATTACH_DATA_URL = /^data:([\w.+-]+\/[\w.+-]+);base64,(.+)$/i;
+const WIDGET_ATTACH_MAX_BYTES = 15 * 1024 * 1024; // 15MB raw, mirrors the agent upload cap
+
+// Image types every mainstream vision model (Anthropic + OpenAI) accepts. SVG is deliberately absent:
+// it's markup, not a raster the model gains anything from, and an XSS vector we don't want to forward.
+const WIDGET_VISION_MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const WIDGET_VISION_MAX_IMAGES = 4; // per turn — bounds the token/latency cost of a multi-image ask
+const WIDGET_VISION_MAX_BYTES = 5 * 1024 * 1024; // per image, comfortably under provider inline caps
+
+// Turn the visitor's inline attachments into model-ready image blocks so a vision-capable model can
+// SEE what they sent (a screenshot, an error) instead of answering blind to it. Non-image files
+// (PDFs, logs) are for a human to open, not the model; oversized or exotic types are skipped. The
+// base64 the widget already posted IS the payload — no storage round-trip. Never throws.
+function imagesForModel(files: Array<{ dataUrl: string; filename: string }>): DraftImage[] {
+  const out: DraftImage[] = [];
+  for (const f of files) {
+    if (out.length >= WIDGET_VISION_MAX_IMAGES) break;
+    const m = WIDGET_ATTACH_DATA_URL.exec(f.dataUrl ?? "");
+    if (!m) continue;
+    const mediaType = m[1].toLowerCase();
+    if (!WIDGET_VISION_MEDIA_TYPES.has(mediaType)) continue;
+    // Estimate decoded size from base64 length (4 chars → 3 bytes) without allocating the buffer.
+    const approxBytes = Math.floor((m[2].length * 3) / 4);
+    if (approxBytes === 0 || approxBytes > WIDGET_VISION_MAX_BYTES) continue;
+    out.push({ mediaType, dataBase64: m[2] });
+  }
+  return out;
+}
+
+// Store the visitor's inline files in object-storage and claim them onto the just-persisted widget
+// message — the same first-class message_attachments rows an agent reply produces, so the agent
+// console renders them with zero extra work. Bad/oversized entries are skipped, never fatal.
+async function persistWidgetAttachments(
+  tenantId: string,
+  ticketId: string,
+  messageId: string,
+  files: Array<{ dataUrl: string; filename: string }>,
+): Promise<AttachmentRow[]> {
+  const out: AttachmentRow[] = [];
+  for (const f of files) {
+    const m = WIDGET_ATTACH_DATA_URL.exec(f.dataUrl ?? "");
+    if (!m) continue;
+    const contentType = m[1].toLowerCase();
+    const bytes = Buffer.from(m[2], "base64");
+    if (bytes.byteLength === 0 || bytes.byteLength > WIDGET_ATTACH_MAX_BYTES) continue;
+    const safe = (f.filename ?? "file").replace(/^.*[\\/]/, "").replace(/[^\w.\- ]+/g, "_").slice(0, 120) || "file";
+    const storageKey = `attachments/${tenantId}/${randomUUID()}-${safe}`;
+    await putBuffer(storageKey, bytes, contentType);
+    const row = await createAttachment(tenantId, {
+      ticketId, uploadedBy: null, filename: safe, contentType, sizeBytes: bytes.byteLength, storageKey,
+    });
+    await claimAttachments(tenantId, ticketId, messageId, [row.id]);
+    out.push(row);
+  }
+  return out;
+}
+
+export default async function widgetRoutes(app: FastifyInstance): Promise<void> {
+  // Synthetic inbound channel — stands in for a real channel; funnels through the shared
+  // ingestInbound() core (see ingest.ts). A customer has no agent session by nature.
+  app.post("/synthetic/messages", async (req, reply) => {
+    const parsed = SyntheticMessageInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const input = parsed.data;
+
+    const result = await ingestInbound({
+      tenantId: input.tenantId,
+      body: input.body,
+      authorType: input.authorType,
+      idempotencyKey: input.idempotencyKey,
+      ticketId: input.ticketId,
+      subject: input.subject,
+    });
+
+    // Index the ticket into Typesense (tenant-scoped doc), best-effort.
+    if (!result.replay) {
+      void indexTicket({
+        id: result.ticketId,
+        tenant_id: input.tenantId,
+        subject: result.subject,
+        body: input.body,
+        created_at: Math.floor(Date.now() / 1000),
+      }).catch((err) => app.log.warn({ err }, "typesense index failed"));
+    }
+
+    return reply.code(result.replay ? 200 : 201).send({
+      replay: result.replay,
+      ticketId: result.ticketId,
+      messageId: result.messageId,
+      subject: result.subject,
+    });
+  });
+
+  // ---- Ask-AI embeddable widget ------------------------------------------
+  // The public, unauthenticated lane for a customer-site widget. The widget key resolves the
+  // tenant (pre-tenant BYPASSRLS lookup), a per-key domain allowlist gates the origin, and the
+  // same RAG core that drafts agent replies (suggestForQuery) answers.
+  //
+  // Intercom model — a widget conversation is ONE persisted ticket carrying the whole thread, so an
+  // agent sees the full AI context (not just the post-escalation message). Every turn is ingested:
+  //   - the visitor's question  → a CUSTOMER message (threads by conversationId + identity)
+  //   - the AI's answer          → an AGENT message on the SAME ticket (origin 'automation' so the
+  //     AI's own reply can't re-trigger the rules engine). Ingesting the agent message also fans it
+  //     out over the widget WS (widget:<conversationId>), so the widget renders each reply from ONE
+  //     source-of-truth (dedupe by message id) — the HTTP response carries that id to seed the dedupe.
+  //   - escalate:true            → the visitor's handoff message as a CUSTOMER inbound on the SAME
+  //     open ticket (no new ticket). A customer message leaves whose_turn='us', so the conversation
+  //     surfaces in the human "needs reply" queue with the full prior transcript intact. (A normal AI
+  //     answer flips whose_turn back to 'customer', so AI handling never forces the human queue.)
+  // bodyLimit lifted to fit base64-encoded inline attachments (~1.35× raw) + the JSON envelope.
+  app.post("/public/ask", { bodyLimit: 40 * 1024 * 1024 }, async (req, reply) => {
+    const parsed = PublicAskInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const { key, question, conversationId, escalate, resumeAi, name, userId, userHash, userJwt } = parsed.data;
+    const files = parsed.data.attachments ?? [];
+    const text = question.trim();
+    if (!text && files.length === 0) return reply.code(400).send({ error: "message is empty" });
+
+    const wk = await resolveWidgetKey(key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+
+    // Identity verification (Intercom-parity): the identity is either proven by a signed JWT
+    // (identity from its claims) or a user_hash HMAC. When verification is ENABLED, an unproven
+    // identified claim is DOWNGRADED to anonymous — dropped so the message can't be threaded into
+    // someone else's contact/conversation.
+    const rid = resolveVerifiedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    let email = rid.email ?? undefined;
+    let identName = name ?? null;
+    if (wk.config.verifyIdentity && !rid.verified) {
+      email = undefined;
+      identName = null;
+    }
+
+    // AI mode is authoritative on the ticket. A typed human-request ("talk to a human") hands off the same
+    // way as the escalate button; "Ask the assistant" (resumeAi) un-mutes before this turn is answered.
+    const humanRequest = wantsHuman(text);
+
+    // Escalation happens ONCE per conversation. If its open ticket is already with a human, a repeated
+    // escalate (stale button, second tab, retry, a poll that briefly showed the button again) is a no-op:
+    // no second canned message in the inbox, no second Discord post / webhook / notification.
+    if (escalate && conversationId) {
+      const current = await findWidgetTicket(wk.tenantId, conversationId);
+      if (current && current.status === "open" && !current.assistantEnabled) {
+        return reply.code(200).send({ escalated: true, alreadyEscalated: true, conversationId: current.id });
+      }
+    }
+    if (conversationId && resumeAi === true && !escalate && !humanRequest) {
+      await setWidgetAssistantMode(wk.tenantId, conversationId, true);
+    }
+
+    // Persist the visitor's message onto the widget ticket (creates it on the first turn, then threads
+    // every later turn onto the same open ticket by contact identity). An attachment-only turn still
+    // needs a body — fall back to the filenames so the agent sees what was sent.
+    const body = text || files.map((f) => f.filename).join(", ") || "(attachment)";
+    const inbound = await ingestInbound({
+      tenantId: wk.tenantId,
+      body,
+      authorType: "customer",
+      channelType: "widget",
+      externalChannelId: conversationId ?? null,
+      subject: body.slice(0, 80),
+      identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
+      // Attachments are stored just below (post-ingest); defer the Discord mirror so it waits for them.
+      deferMirror: files.length > 0,
+      // Idempotency: a retried turn (same token) is collapsed to one visitor message, not duplicated.
+      idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
+      // A handoff turn is for a human — never let ambient autoreply answer it.
+      skipAutoreply: !!escalate || humanRequest,
+    });
+    // Mute AFTER the message is stored, on the ticket it actually landed on. The old pre-ingest mute keyed
+    // on the conversation handle, which on a first-turn escalation matched no ticket yet — the AI stayed
+    // on, the next poll read "not escalated", "Talk to a human" came back, and visitors tapped it again.
+    if (escalate || humanRequest) await muteWidgetTicket(wk.tenantId, inbound.ticketId);
+
+    // Store + claim any inline files onto the persisted message (first-class attachments the agent
+    // console renders natively; the widget re-fetches them via /public/attachment).
+    const attached = files.length ? await persistWidgetAttachments(wk.tenantId, inbound.ticketId, inbound.messageId, files) : [];
+    // Files are on the message now — fire the deferred ops-mirror relay (no-ops if not mirrored).
+    if (files.length) {
+      void import("../discord-mirror.js")
+        .then((mm) => mm.relayTicketMessage(wk.tenantId, inbound.ticketId, inbound.messageId))
+        .catch(() => {});
+    }
+    if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId); // presence, best-effort
+
+    // Escalation: the question is already persisted above (whose_turn='us' → human queue) and the
+    // assistant is muted. The human takes over on the existing ticket with the whole thread visible.
+    if (escalate) {
+      return reply.code(201).send({ escalated: true, conversationId: inbound.ticketId, messageId: inbound.messageId });
+    }
+
+    // No AI on an attachment-only turn (a file is for a human to look at, not a RAG query), and none
+    // in human mode — persist the message for the agent, bot stays silent (single source of truth).
+    if (!text || humanRequest || !(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
+      return { deferred: true, conversationId: inbound.ticketId, messageId: inbound.messageId, attachments: attached };
+    }
+
+    try {
+      const s = await suggestForQuery(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files) });
+      // Persist the AI answer as an agent message on the SAME ticket → threads + fans out over the
+      // widget WS. origin:'automation' suppresses re-triggering the rules engine off the AI's reply.
+      const answerMsg = await ingestInbound({
+        tenantId: wk.tenantId,
+        body: s.draft,
+        authorType: "agent",
+        ticketId: inbound.ticketId,
+        channelType: "widget",
+        origin: "automation",
+      });
+      // The widget assistant IS the AI answering autonomously — mark the message auto=true + attach
+      // generation stats, same as the ambient autoreply path. Without this the AI's own answer looks
+      // like a human agent everywhere: "AG" (not the Noola mark) in the console, "Agent" (not "AI
+      // assistant") in the Discord mirror, no AiReceipt, and it's uncounted in AI analytics.
+      await withTenant(wk.tenantId, async (c) => {
+        await c.query("UPDATE messages SET auto = true, meta = $2::jsonb WHERE id = $1", [
+          answerMsg.messageId,
+          JSON.stringify(suggestionMeta(s, "widget")),
+        ]);
+      }).catch(() => {});
+      return {
+        answer: s.draft,
+        citations: s.citations.map((c) => ({ title: c.title, snippet: c.snippet })),
+        confidence: s.confidence,
+        conversationId: inbound.ticketId,
+        // The persisted agent-message id — the widget renders the answer once and dedupes the WS/poll
+        // echo of the same id, so there's never a duplicated bubble.
+        messageId: answerMsg.messageId,
+      };
+    } catch (err) {
+      app.log.error({ err }, "public ask failed");
+      // The question is already persisted (agent sees it); only the AI answer is unavailable.
+      return reply.code(502).send({ error: "answer unavailable" });
+    }
+  });
+
+  // Streaming sibling of /public/ask (Server-Sent Events). Same trust model + ingest, but the AI
+  // answer arrives token-by-token so the widget renders it live (Intercom-style perceived speed)
+  // instead of blocking on the full generation. The customer message is persisted first; the answer
+  // is persisted (agent/automation) only once the stream completes, then fanned out over the widget
+  // WS + returned by the terminal `done` event (messageId seeds the widget's dedupe so poll/WS
+  // echoes of the same id never double-render). SSE frames:
+  //   event: delta  data: {"t":"…"}                          — an incremental text chunk
+  //   event: done   data: {"messageId","conversationId","confidence","citations"} — final, persisted
+  //   event: error  data: {"error":"…"}                       — generation failed after ingest
+  // The widget uses this lane only for AI-mode text turns; escalate / human-mode / attachment-only
+  // turns still use /public/ask (no streamed answer to produce).
+  app.post("/public/ask/stream", { bodyLimit: 40 * 1024 * 1024 }, async (req, reply) => {
+    const parsed = PublicAskInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const { key, question, conversationId, name, userId, userHash, userJwt } = parsed.data;
+    const files = parsed.data.attachments ?? [];
+    const text = question.trim();
+    if (!text) return reply.code(400).send({ error: "message is empty" });
+
+    const wk = await resolveWidgetKey(key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    // Same identity-verification gate as /public/ask — drop an unverified identity claim.
+    const rid = resolveVerifiedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    let email = rid.email ?? undefined;
+    let identName = name ?? null;
+    if (wk.config.verifyIdentity && !rid.verified) {
+      email = undefined;
+      identName = null;
+    }
+
+    // A typed human-request ("talk to a human", "live agent") mutes the assistant BEFORE ingest — the
+    // handoff message itself must not trigger a bot reply — and drops the conversation to the human
+    // queue. This SSE lane is the one a typed message actually uses, so the handoff has to happen here.
+    const humanRequest = wantsHuman(text);
+
+    // Persist the visitor's message onto the widget ticket (creates/threads by identity), exactly
+    // like /public/ask, BEFORE opening the stream — so a mid-stream disconnect never loses the ask.
+    const inbound = await ingestInbound({
+      tenantId: wk.tenantId,
+      body: text,
+      authorType: "customer",
+      channelType: "widget",
+      externalChannelId: conversationId ?? null,
+      subject: text.slice(0, 80),
+      identity: { externalId: conversationId ?? null, email: email ?? null, name: identName },
+      // Attachments are stored just below (post-ingest); defer the Discord mirror so it waits for them.
+      deferMirror: files.length > 0,
+      // Idempotency: persist-before-stream means a mid-stream failure + retry could double the ask;
+      // the same token collapses it to one message.
+      idempotencyKey: parsed.data.clientMessageId ? `widget:${parsed.data.clientMessageId}` : null,
+      skipAutoreply: humanRequest,
+    });
+    // Hand off AFTER storing, keyed on the ticket the message landed on (see /public/ask).
+    if (humanRequest) await muteWidgetTicket(wk.tenantId, inbound.ticketId);
+    if (inbound.contactId) void bumpContactSeen(wk.tenantId, inbound.contactId);
+
+    // Store + claim any inline files onto the persisted message — the same first-class attachments the
+    // agent console renders and the visitor re-fetches. This lane carries text+image turns (the widget
+    // streams whenever there's text), so without this the screenshot would be dropped, not just unseen.
+    if (files.length) {
+      await persistWidgetAttachments(wk.tenantId, inbound.ticketId, inbound.messageId, files);
+      void import("../discord-mirror.js")
+        .then((mm) => mm.relayTicketMessage(wk.tenantId, inbound.ticketId, inbound.messageId))
+        .catch(() => {});
+    }
+
+    // Not in AI mode, or the visitor just asked for a human → nothing to stream; the widget falls back
+    // to its human-queue rendering (hydrateThread flips to human mode on assistantEnabled=false).
+    if (humanRequest || !(await widgetAssistantEnabled(wk.tenantId, inbound.ticketId))) {
+      return reply.code(200).send({ deferred: true, conversationId: inbound.ticketId, messageId: inbound.messageId });
+    }
+
+    // Hand the socket to us: write SSE frames on reply.raw. CORS headers are set explicitly because
+    // hijack bypasses the @fastify/cors reply-header staging; the origin is already allowlist-checked.
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no", // defeat proxy buffering so tokens flush immediately
+      "access-control-allow-origin": origin ?? "*",
+      vary: "Origin",
+    });
+    const send = (event: string, data: unknown): void => {
+      raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    // A heartbeat comment every 15s keeps intermediaries from idling the connection out on a slow model.
+    const hb = setInterval(() => raw.write(": ping\n\n"), 15_000);
+
+    try {
+      const stream = suggestForQueryStream(wk.tenantId, question, { audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files) });
+      // Manual iteration so we capture the generator's RETURN value (the final Suggestion).
+      let suggestion: Awaited<ReturnType<typeof suggestForQuery>>;
+      for (;;) {
+        const step = await stream.next();
+        if (step.done) {
+          suggestion = step.value;
+          break;
+        }
+        if (step.value?.delta) send("delta", { t: step.value.delta });
+      }
+
+      // Persist the finished answer as an agent message on the SAME ticket → threads + fans out over
+      // the widget WS. origin:'automation' stops the AI's own reply re-triggering the rules engine.
+      const answerMsg = await ingestInbound({
+        tenantId: wk.tenantId,
+        body: suggestion.draft,
+        authorType: "agent",
+        ticketId: inbound.ticketId,
+        channelType: "widget",
+        origin: "automation",
+      });
+      // Mark the streamed AI answer auto=true + attach stats, same as /public/ask and the ambient
+      // autoreply path — otherwise the widget assistant's own reply reads as a human agent.
+      await withTenant(wk.tenantId, async (c) => {
+        await c.query("UPDATE messages SET auto = true, meta = $2::jsonb WHERE id = $1", [
+          answerMsg.messageId,
+          JSON.stringify(suggestionMeta(suggestion, "widget")),
+        ]);
+      }).catch(() => {});
+      send("done", {
+        messageId: answerMsg.messageId,
+        conversationId: inbound.ticketId,
+        confidence: suggestion.confidence,
+        citations: suggestion.citations.map((c) => ({ title: c.title, snippet: c.snippet })),
+      });
+    } catch (err) {
+      app.log.error({ err }, "public ask stream failed");
+      send("error", { error: "answer unavailable" });
+    } finally {
+      clearInterval(hb);
+      raw.end();
+    }
+  });
+
+  // ---- Public help center (unauthenticated, widget-key-scoped) -----------
+  // The published+public subset of the KB, served for an on-brand help center + support-form
+  // deflection. Tenant resolves from a widget key (?key=); the kb.ts public queries hard-filter
+  // status='published' AND visibility='public' so drafts/internal articles can never leak.
+  async function tenantFromWidgetQuery(req: FastifyRequest): Promise<string | null> {
+    const key = (req.query as { key?: string }).key;
+    if (!key) return null;
+    const wk = await resolveWidgetKey(key);
+    return wk?.tenantId ?? null;
+  }
+
+  app.get("/public/kb", async (req, reply) => {
+    const tenantId = await tenantFromWidgetQuery(req);
+    if (!tenantId) return reply.code(401).send({ error: "invalid or missing widget key" });
+    const collectionId = (req.query as { collection?: string }).collection || undefined;
+    const [articles, collections] = await Promise.all([
+      listPublicArticles(tenantId, collectionId),
+      listPublicCollections(tenantId),
+    ]);
+    return { articles, collections };
+  });
+
+  app.get("/public/kb/search", async (req, reply) => {
+    const tenantId = await tenantFromWidgetQuery(req);
+    if (!tenantId) return reply.code(401).send({ error: "invalid or missing widget key" });
+    const q = ((req.query as { q?: string }).q || "").trim();
+    if (q.length < 2) return { articles: [] };
+    return { articles: await searchPublicArticles(tenantId, q) };
+  });
+
+  app.get("/public/kb/:slug", async (req, reply) => {
+    const tenantId = await tenantFromWidgetQuery(req);
+    if (!tenantId) return reply.code(401).send({ error: "invalid or missing widget key" });
+    const article = await getPublicArticleBySlug(tenantId, (req.params as { slug: string }).slug);
+    if (!article) return reply.code(404).send({ error: "not found" });
+    return { article };
+  });
+
+  // Support-form deflection: as a customer drafts a question, return the best-matching published
+  // articles + an AI answer so they can self-serve before filing a ticket. Reuses the RAG core.
+  app.post("/public/deflect", async (req, reply) => {
+    const parsed = PublicAskInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const wk = await resolveWidgetKey(parsed.data.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const q = parsed.data.question.trim();
+    if (q.length < 3) return { articles: [], answer: null };
+    const articles = await searchPublicArticles(wk.tenantId, q);
+    let answer: { text: string; confidence: number | null } | null = null;
+    try {
+      const s = await suggestForQuery(wk.tenantId, q, { audience: "public" });
+      answer = { text: s.draft, confidence: s.confidence };
+    } catch {
+      /* deflection degrades to article suggestions only */
+    }
+    return { articles, answer };
+  });
+
+  // ---- Messenger personalization + JS SDK (widget-key-scoped, public) ----
+  // The embedded widget bootstraps from GET /public/config (accent/greeting/position/tabs the
+  // admin set in Settings → Messenger), and the Noola(...) SDK feeds identity + activity through
+  // /public/identify (upsert the contact + stamp last-seen) and /public/track (custom events).
+  // All three resolve the tenant from the public widget key + the per-key domain allowlist — the
+  // same trust model as /public/ask, no session.
+
+  // Widget bootstrap: the personalization the embedded launcher/panel renders. Returns fully
+  // populated config (defaults fill any gaps). Short cache — it's per-key and cheap.
+  app.get("/public/config", async (req, reply) => {
+    const key = (req.query as { key?: string }).key;
+    const wk = key ? await resolveWidgetKey(key) : null;
+    if (!wk) return reply.code(401).send({ error: "invalid or missing widget key" });
+    reply.header("cache-control", "public, max-age=60");
+    return { config: wk.config };
+  });
+
+  // The support team shown in the widget home header (the "staffed" signal): up to 4 real agents,
+  // avatars-first. Names/avatars of the support team are meant to be customer-facing (like Intercom).
+  app.get("/public/team", async (req, reply) => {
+    const key = (req.query as { key?: string }).key;
+    const wk = key ? await resolveWidgetKey(key) : null;
+    if (!wk) return reply.code(401).send({ error: "invalid or missing widget key" });
+    const rows = await withTenant(wk.tenantId, (c) =>
+      c.query(
+        `SELECT name, avatar_url FROM users
+         WHERE role <> 'viewer' AND coalesce(name,'') <> ''
+         ORDER BY (avatar_url IS NULL), name
+         LIMIT 4`,
+      ),
+    );
+    reply.header("cache-control", "public, max-age=120");
+    return { team: rows.rows.map((r: { name: string; avatar_url: string | null }) => ({ name: r.name, avatarUrl: r.avatar_url })) };
+  });
+
+  // Identify a visitor (Noola('boot'|'update')). Upserts the contact by external user_id/email
+  // (attributes shallow-merge) and stamps a last-seen + last-page marker so an agent sees "user
+  // activity" on the contact. Anonymous visitors (no user_id/email) are a 200 no-op.
+  app.post("/public/identify", async (req, reply) => {
+    const parsed = PublicIdentifyInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const wk = await resolveWidgetKey(parsed.data.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    const { name, company, attributes, page, userHash, userJwt } = parsed.data;
+    // Company is a plain NAME string (legacy embeds) or an Intercom-style object with YOUR company_id
+    // (the external id we dedup on). Normalize both shapes to (name, externalId) for the upsert.
+    const companyName = typeof company === "string" ? company : company?.name;
+    const companyExternalId = typeof company === "object" && company ? company.company_id : undefined;
+    // Identity is either proven by a signed JWT (identity from its claims) or a user_hash HMAC.
+    const rid = resolveVerifiedIdentity(wk, { userId: parsed.data.userId, email: parsed.data.email, userHash, userJwt });
+    if (!rid.email && !rid.userId) return { ok: true, identified: false };
+    // When verification is enabled, refuse to attach an identity that isn't proven — the visitor
+    // stays anonymous rather than claiming someone else's profile. Off by default (opt-in, like Intercom).
+    if (wk.config.verifyIdentity && !rid.verified) {
+      return { ok: true, identified: false, verification: "failed" as const };
+    }
+    // Customer-supplied attributes are UNTRUSTED unless the identity is cryptographically verified —
+    // strip reserved/trusted keys (system telemetry + `plan`) so a widget visitor can't spoof a fact
+    // the agent UI trusts (claim plan='enterprise', fake their City, …). A verified identity (JWT /
+    // user_hash) is the customer's own backend and is authoritative. `last_seen_at` lives on its own
+    // COLUMN (bumpContactSeen below) — never mirror it into the bag (that was a double source of truth).
+    const customAttrs = rid.verified ? (attributes ?? {}) : stripReservedAttributes(attributes ?? {});
+    const merged: Record<string, unknown> = { ...customAttrs };
+    if (page?.url) merged.last_page_url = page.url;
+    if (page?.title) merged.last_page_title = page.title;
+    // Live enrichment (Intercom-parity): browser/OS from UA, language from header, timezone +
+    // referrer from the widget, geo from IP — written under Intercom's display-name keys so they
+    // overwrite the imported snapshot in place. Best-effort: never fails the identify.
+    Object.assign(merged, await deriveContactContext(req, {
+      timezone: parsed.data.timezone,
+      referrer: parsed.data.referrer,
+      language: parsed.data.language,
+    }));
+    const { contact } = await upsertContact(wk.tenantId, {
+      external_id: rid.userId ?? undefined,
+      email: rid.email ?? undefined,
+      name,
+      company: companyName,
+      company_external_id: companyExternalId,
+      // A company NAME from an unverified visitor is a claim, not proof: it resolves among the
+      // tenant's own id-less companies and can never file them under a real synced client. A verified
+      // identity (JWT / user_hash) is the customer's backend talking, so its name is trusted — and a
+      // `company_id` is authoritative either way (it dedups on external_id, above).
+      company_name_trusted: rid.verified,
+      attributes: merged,
+    });
+    // Lead -> user: this visitor may have chatted BEFORE they identified, as one anonymous contact per
+    // conversation. Fold those shells into the contact we just resolved, so signing up converts the
+    // lead (history, tags, first-seen carried over) instead of stranding it next to a fresh profile.
+    // Until now the widget's conversation handles were accepted here and ignored — the only fold ran
+    // on message ingest, so "chat anonymously, sign up, come back logged in" left two contacts.
+    const handles = [parsed.data.conversationId, ...(parsed.data.conversationIds ?? [])]
+      .filter((h): h is string => typeof h === "string" && h.trim() !== "");
+    let folded = 0;
+    if (handles.length) {
+      // Best-effort: a failed fold must never fail the identify (the profile write already landed).
+      try {
+        folded = await absorbAnonymousByHandles(wk.tenantId, contact.id, "widget", handles);
+      } catch (e) {
+        req.log.warn({ err: e, contactId: contact.id }, "widget identify: anonymous fold failed");
+      }
+    }
+    void bumpContactSeen(wk.tenantId, contact.id); // presence, best-effort
+    return { ok: true, identified: true, converted: folded };
+  });
+
+  // Track a custom activity event (Noola('track', name, metadata?)). Upserts the contact by
+  // identity first (so a track before any profile sync still lands). Anonymous → 200 no-op.
+  app.post("/public/track", async (req, reply) => {
+    const parsed = PublicTrackInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const wk = await resolveWidgetKey(parsed.data.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    const rid = resolveVerifiedIdentity(wk, {
+      userId: parsed.data.userId, email: parsed.data.email, userHash: parsed.data.userHash, userJwt: parsed.data.userJwt,
+    });
+    // Don't attribute an event to an unverified identity claim when verification is enabled.
+    if (wk.config.verifyIdentity && (rid.email || rid.userId) && !rid.verified) {
+      return { ok: true, recorded: false, verification: "failed" as const };
+    }
+    const event = await trackEvent(wk.tenantId, {
+      externalId: rid.userId ?? undefined,
+      email: rid.email ?? undefined,
+      name: parsed.data.name,
+      metadata: parsed.data.metadata,
+    });
+    if (!event) return { ok: true, recorded: false }; // anonymous — nothing to attribute to
+    void bumpContactSeen(wk.tenantId, event.contact_id); // presence, best-effort
+    return reply.code(201).send({ ok: true, recorded: true, id: event.id, contactId: event.contact_id });
+  });
+
+  // Messenger widget: poll the messages of a widget conversation (two-way live chat). The widget
+  // key + its own generated conversationId (stored as external_channel_id on escalation) resolve
+  // the ticket; we return its messages so the customer sees agent replies.
+  app.post("/public/conversation", async (req, reply) => {
+    const parsed = PublicConversationInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const wk = await resolveWidgetKey(parsed.data.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    const data = await withTenant(wk.tenantId, async (c) => {
+      const t = await c.query(
+        // Open ticket first, newest first — a closed ticket can share the handle once the visitor wrote
+        // again, and an unordered LIMIT 1 read (and stamped) whichever the planner returned.
+        `SELECT id, status, assistant_enabled, contact_id FROM tickets WHERE channel_type = 'widget' AND external_channel_id = $1
+          ORDER BY (status = 'open') DESC, updated_at DESC LIMIT 1`,
+        [parsed.data.conversationId],
+      );
+      if (!t.rowCount) return null;
+      // The poll IS the visitor's heartbeat — bump presence (throttled) while the widget is open.
+      const cid = t.rows[0].contact_id as string | null;
+      if (cid) void bumpContactSeen(wk.tenantId, cid);
+      const m = await c.query(
+        `SELECT m.id, m.author_type, m.author_id, m.body, m.created_at,
+                u.name AS author_name, u.avatar_url AS author_avatar_url
+           FROM messages m
+           LEFT JOIN users u ON u.tenant_id = m.tenant_id AND u.id = m.author_id
+          WHERE m.ticket_id = $1 ORDER BY m.created_at ASC LIMIT 200`,
+        [t.rows[0].id],
+      );
+      // Read receipt: `viewing` is true only when the widget panel is OPEN on this exact thread
+      // (foreground poll). The customer is looking right now, so watermark the agent replies as
+      // seen — the agent console then renders a "Seen" receipt. Best-effort; runs last so a stamp
+      // hiccup can never break the transcript we just read.
+      if (parsed.data.viewing === true) {
+        // Stamp every widget ticket behind this handle, so an unseen reply on a sibling ticket can't keep
+        // the conversation "unseen" forever (the list marks it unseen across all of them).
+        await c.query(
+          `UPDATE messages m SET seen_at = now()
+             FROM tickets t
+            WHERE m.ticket_id = t.id AND t.channel_type = 'widget' AND t.external_channel_id = $1
+              AND m.author_type = 'agent' AND m.seen_at IS NULL`,
+          [parsed.data.conversationId],
+        ).catch(() => {});
+      }
+      return { ticketId: t.rows[0].id as string, status: t.rows[0].status as string, assistantEnabled: t.rows[0].assistant_enabled !== false, messages: m.rows };
+    });
+    // Unknown handle → say so (null), not "AI on": the widget used to read this as a mode flip, re-offer
+    // "Talk to a human" and wipe the transcript it had.
+    if (!data) return { status: null, assistantEnabled: null, messages: [] };
+    // Attachments per message (same seam the agent thread uses) — the widget renders images inline
+    // and files as chips, fetching bytes from /public/attachment scoped to this conversation.
+    const attByMsg = await attachmentsForTicket(wk.tenantId, data.ticketId);
+    // Full authoritative transcript — the widget renders FROM this (single source of truth), so it
+    // matches the agent console exactly. Only customer + agent turns surface (no internal notes/meta);
+    // `id` lets the widget dedupe a message it may also receive live over the edge socket.
+    return {
+      status: data.status,
+      assistantEnabled: data.assistantEnabled,
+      messages: (data.messages as Array<{ id: string; author_type: string; author_id: string | null; body: string; created_at: string; author_name: string | null; author_avatar_url: string | null }>)
+        .filter((x) => x.author_type === "customer" || x.author_type === "agent")
+        .map((x) => {
+          const isAgent = x.author_type === "agent";
+          // AI answers post as an agent message with NO author_id (see /public/ask). A human agent
+          // always carries an author_id → surface its name + avatar so the widget can render identity.
+          const isAi = isAgent && !x.author_id;
+          return {
+            id: x.id,
+            role: isAi ? "ai" : isAgent ? "agent" : "you",
+            body: x.body,
+            at: x.created_at,
+            authorName: isAgent && !isAi ? x.author_name : null,
+            authorAvatarUrl: isAgent && !isAi ? x.author_avatar_url : null,
+            attachments: (attByMsg.get(x.id) ?? []).map((a) => ({
+              id: a.id, filename: a.filename, contentType: a.content_type, size: a.size_bytes,
+            })),
+          };
+        }),
+    };
+  });
+
+  // List an IDENTIFIED visitor's past widget conversations (the Messages tab for a returning user).
+  // Scoped by widget key → tenant AND the visitor's email (the cross-channel unifier), so it only
+  // ever returns that person's own threads. Anonymous visitors (no email) get an empty list — their
+  // conversations live only in their browser. Each entry is enough to render the list + reopen (the
+  // conversationId is the widget handle); opening one hydrates the full transcript via /public/conversation.
+  app.post("/public/conversations", async (req, reply) => {
+    const body = (req.body ?? {}) as { key?: string; email?: string; userId?: string; userHash?: string; userJwt?: string };
+    if (!body.key) return reply.code(400).send({ error: "key is required" });
+    const wk = await resolveWidgetKey(body.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    const rid = resolveVerifiedIdentity(wk, {
+      userId: (body.userId ?? "").trim() || undefined,
+      email: (body.email ?? "").trim() || undefined,
+      userHash: body.userHash,
+      userJwt: body.userJwt,
+    });
+    if (!rid.email && !rid.userId) return { conversations: [] }; // anonymous — nothing server-side to list
+    // The history read is the sensitive one — it exposes another person's transcripts if the
+    // identity is spoofed (the IDOR this whole feature closes). When verification is enabled,
+    // require a valid proof (JWT or user_hash); when it's off, fall back to legacy identity trust
+    // (Intercom-parity: history is only guarded once you opt into identity verification).
+    if (wk.config.verifyIdentity && !rid.verified) {
+      return { conversations: [] };
+    }
+    const email = rid.email ?? "";
+    const userId = rid.userId ?? "";
+    const rows = await withTenant(wk.tenantId, async (c) => {
+      const contact = await c.query(
+        `SELECT id FROM contacts
+          WHERE (email <> '' AND lower(email) = lower($1)) OR (external_id IS NOT NULL AND external_id = $2)
+          LIMIT 1`,
+        [email, userId],
+      );
+      if (!contact.rowCount) return [];
+      // One row per conversation handle: a handle can be shared by several tickets (a closed one plus the
+      // one the visitor reopened by writing again) — pick the open/newest as the conversation, but treat
+      // it as unseen if ANY of its tickets has an unseen agent reply. `status` + `unseen_at` let the widget
+      // pop responsibly: never a closed conversation, and never the same reply twice.
+      const r = await c.query(
+        `SELECT * FROM (
+           SELECT DISTINCT ON (t.external_channel_id)
+                  t.external_channel_id AS cid, t.status, t.assistant_enabled, t.updated_at,
+                  (SELECT m.body FROM messages m
+                     WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
+                     ORDER BY m.created_at DESC LIMIT 1) AS last_body,
+                  (SELECT m.author_type FROM messages m
+                     WHERE m.ticket_id = t.id AND m.author_type IN ('customer','agent')
+                     ORDER BY m.created_at DESC LIMIT 1) AS last_author,
+                  (SELECT max(m.created_at) FROM messages m
+                     JOIN tickets t2 ON t2.id = m.ticket_id
+                    WHERE t2.channel_type = 'widget' AND t2.external_channel_id = t.external_channel_id
+                      AND t2.contact_id = $1 AND m.author_type = 'agent' AND m.seen_at IS NULL) AS unseen_at
+             FROM tickets t
+            WHERE t.channel_type = 'widget' AND t.external_channel_id IS NOT NULL AND t.contact_id = $1
+            ORDER BY t.external_channel_id, (t.status = 'open') DESC, t.updated_at DESC
+         ) conv
+         ORDER BY conv.updated_at DESC LIMIT 20`,
+        [contact.rows[0].id],
+      );
+      return r.rows;
+    });
+    return {
+      conversations: (rows as Array<{ cid: string; status: string; assistant_enabled: boolean; updated_at: string; last_body: string | null; last_author: string | null; unseen_at: string | Date | null }>).map((x) => ({
+        conversationId: x.cid,
+        status: x.status,
+        lastBody: x.last_body ?? "",
+        lastFromAgent: x.last_author === "agent",
+        assistantEnabled: x.assistant_enabled !== false,
+        updatedAt: x.updated_at,
+        unseen: x.unseen_at !== null,
+        // When the newest still-unseen agent reply was written — the widget pops only for a reply newer
+        // than the last one it already surfaced, so a stamp that fails can't re-pop the same reply.
+        unseenAt: x.unseen_at ? new Date(x.unseen_at).toISOString() : null,
+      })),
+    };
+  });
+
+  // Serve a widget attachment to the visitor (public). Scoped by widget key → tenant AND the
+  // conversation handle, so a visitor can only fetch files from THEIR OWN conversation — never
+  // guess another ticket's attachment id. Images serve inline (so <img src> works); everything
+  // else downloads. `cid` is the conversationId (external_channel_id) the widget already holds.
+  app.get("/public/attachment/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const q = req.query as { key?: string; cid?: string };
+    if (!q.key || !q.cid) return reply.code(400).send({ error: "key and cid are required" });
+    const wk = await resolveWidgetKey(q.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const meta = await withTenant(wk.tenantId, async (c) => {
+      const r = await c.query(
+        `SELECT a.storage_key, a.filename, a.content_type
+           FROM message_attachments a
+           JOIN tickets t ON t.id = a.ticket_id AND t.tenant_id = a.tenant_id
+          WHERE a.id = $1 AND t.channel_type = 'widget' AND t.external_channel_id = $2
+          LIMIT 1`,
+        [id, q.cid],
+      );
+      return r.rowCount ? (r.rows[0] as { storage_key: string; filename: string; content_type: string }) : null;
+    });
+    if (!meta) return reply.code(404).send({ error: "not found" });
+    const obj = await getObject(meta.storage_key);
+    if (!obj) return reply.code(404).send({ error: "not found" });
+    const ct = meta.content_type || obj.contentType;
+    const inline = ct.startsWith("image/") && ct !== "image/svg+xml";
+    return reply
+      .type(ct)
+      .header("cache-control", "private, max-age=3600")
+      .header("content-disposition", `${inline ? "inline" : "attachment"}; filename="${meta.filename.replace(/"/g, "")}"`)
+      .send(obj.body);
+  });
+
+  // Email read-receipt pixel. A reply email embeds <img src=".../public/seen/<agentMessageId>">;
+  // the first load stamps seen_at. No auth and no widget key — it's a bare 1x1 tracking pixel — so
+  // the message's tenant is resolved straight through the BYPASSRLS relayPool by its globally-unique
+  // UUID. Best-effort: email "Seen" only ever fires in clients that load remote images (Gmail/Outlook
+  // block by default), so a missing open never means "unread" — only a fired pixel is a positive
+  // signal. We always return the gif (even on a bad id / db hiccup) so reading is never disrupted.
+  app.get("/public/seen/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    await relayPool
+      .query(`UPDATE messages SET seen_at = now() WHERE id = $1 AND seen_at IS NULL`, [id])
+      .catch(() => {}); // non-uuid id / transient error → still serve the pixel
+    return reply
+      .header("content-type", "image/gif")
+      .header("cache-control", "no-store, no-cache, must-revalidate, private")
+      .send(PIXEL_GIF);
+  });
+
+  // Toggle the conversation's AI assistant on/off from the widget ("Talk to a human" mutes it,
+  // "Ask the assistant" turns it back on). Authoritative + immediate, so the widget and the agent
+  // console never disagree about who's answering. Origin-guarded like the other public lanes.
+  app.post("/public/assistant-mode", async (req, reply) => {
+    const body = (req.body ?? {}) as { key?: string; conversationId?: string; enabled?: boolean };
+    if (!body.key || !body.conversationId || typeof body.enabled !== "boolean") {
+      return reply.code(400).send({ error: "key, conversationId and enabled are required" });
+    }
+    const wk = await resolveWidgetKey(body.key);
+    if (!wk) return reply.code(401).send({ error: "invalid widget key" });
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!originAllowed(wk.allowedDomains, origin)) {
+      return reply.code(403).send({ error: "origin not allowed for this widget key" });
+    }
+    await setWidgetAssistantMode(wk.tenantId, body.conversationId, body.enabled);
+    return { ok: true, assistantEnabled: body.enabled };
+  });
+
+  // The embeddable messenger script. A site drops one <script src=".../widget.js" data-key="wk_…">
+  // tag; the IIFE injects a shadow-DOM chat bubble + panel that talks to the public lanes above.
+  // Served from the API so it has a stable, CORS-open origin. Long cache — it reads its config from
+  // its own tag at runtime, so the same file serves every tenant.
+  app.get("/widget.js", async (_req, reply) => {
+    reply
+      .header("content-type", "application/javascript; charset=utf-8")
+      .header("cache-control", "public, max-age=300");
+    return WIDGET_JS;
+  });
+
+  // The docs-site "Ask AI" embed (Wave 5 item 20) — same serving discipline as widget.js:
+  // stable CORS-open origin, short cache, config read from its own script tag.
+  app.get("/answers.js", async (_req, reply) => {
+    reply
+      .header("content-type", "application/javascript; charset=utf-8")
+      .header("cache-control", "public, max-age=300");
+    return ANSWERS_JS;
+  });
+
+  // Widget key management (authed, tenant-scoped). A tenant mints public keys for its embedded
+  // widget, each with an optional domain allowlist; the key is shown in the list (public by design,
+  // unlike a webhook secret).
+  app.get("/widget-keys", tenanted(async (tenantId) => ({ keys: await listWidgetKeys(tenantId) })));
+
+  app.post("/widget-keys", tenanted(async (tenantId, req, reply) => {
+    const parsed = WidgetKeyInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const created = await createWidgetKey(tenantId, {
+      label: parsed.data.label,
+      allowedDomains: parsed.data.allowedDomains,
+    });
+    return reply.code(201).send({ key: created });
+  }));
+
+  // Update a key's label / domain allowlist / messenger personalization (Settings → Messenger).
+  app.patch("/widget-keys/:key", tenanted(async (tenantId, req, reply) => {
+    const parsed = WidgetKeyUpdateInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const updated = await updateWidgetKey(tenantId, (req.params as { key: string }).key, {
+      label: parsed.data.label,
+      allowedDomains: parsed.data.allowedDomains,
+      config: parsed.data.config,
+    });
+    if (!updated) return reply.code(404).send({ error: "not found" });
+    return { key: updated };
+  }));
+
+  app.delete("/widget-keys/:key", tenanted(async (tenantId, req, reply) => {
+    const gone = await deleteWidgetKey(tenantId, (req.params as { key: string }).key);
+    if (!gone) return reply.code(404).send({ error: "not found" });
+    return { ok: true };
+  }));
+
+  // Set (bring-your-own) or rotate a key's identity-verification secret. Pass { secret } to paste
+  // an existing secret — e.g. your Intercom Identity Verification secret, so the user_hash your
+  // backend already generates validates here with no code change (same HMAC-SHA256, same message).
+  // Omit it to rotate to a fresh random secret. Every previously-issued hash then needs recomputing.
+  app.post("/widget-keys/:key/identity-secret", tenanted(async (tenantId, req, reply) => {
+    const body = (req.body ?? {}) as { secret?: string };
+    if (body.secret !== undefined && (typeof body.secret !== "string" || body.secret.trim().length < 8)) {
+      return reply.code(400).send({ error: "secret must be at least 8 characters" });
+    }
+    const updated = await setIdentitySecret(tenantId, (req.params as { key: string }).key, body.secret);
+    if (!updated) return reply.code(404).send({ error: "not found" });
+    return { key: updated };
+  }));
+}

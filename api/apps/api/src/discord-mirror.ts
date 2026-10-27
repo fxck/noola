@@ -1,0 +1,1294 @@
+import { RateLimitError } from "discord.js";
+import { relayPool, withTenant } from "@repo/db";
+import { addNote } from "./notes.js";
+import { persistInboundNoteAttachments, attachmentStorageForMessage } from "./attachments.js";
+import { getObject } from "./storage.js";
+import { ingestInbound } from "./ingest.js";
+import { notifyContactByEmailIfAway } from "./email.js";
+import { getChannelDriver } from "./channels/registry.js";
+import { translateOutboundReply, stampOutboundTranslation } from "./translate.js";
+import { getMirrorTransport, setDiscordTransportForTests, rateLimitWaitMs, type MirrorTransport, type MirrorFile } from "./discord-gateway.js";
+import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
+import { addParticipant } from "./participants.js";
+import { canonicalEmojiName, getReactionMap } from "./classification.js";
+import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
+import { markConversationSpam } from "./spam.js";
+import { mdToDiscord, plainThreadName } from "./channels/format.js";
+import { enqueueRelay, relayNonce, type RelayRow, type DeliverResult } from "./discord-relay-outbox.js";
+
+// Discord forum ops-mirror (PILOT-AND-DISCORD-PLAN Part 1). A ticket from ANY origin channel
+// (email/widget/…) can be selectively mirrored as ONE forum post in a Discord forum channel; the
+// team triages/answers from Discord, the customer never sees Discord. The post is a two-way mirror
+// of the ticket's REAL timeline:
+//  - inbound: every customer message (and console agent reply) appends into the post; forum tags
+//    track status/priority; close archives the post.
+//  - outbound: a responder's message in the post lands as an INTERNAL NOTE on the ticket by
+//    default; a 📤 reaction promotes it to a REPLY — dispatched through the existing channel
+//    registry to the ticket's ORIGIN channel. Nothing auto-sends (reply-vs-note duality, locked).
+//
+// Selection is NATIVE (not Studio-dependent): per-binding filter evaluated on ticket.created (with
+// one delayed re-check so seeded autotag/routing effects are visible) + a manual "Push to Discord".
+// Echo-guard: our own posts arrive as bot messages, which the gateway swallows for mirror threads;
+// promotion ingests with origin:'discord_mirror' so the relay hook skips re-posting it.
+
+export const PROMOTE_EMOJI = "📤";
+const PROMOTED_EMOJI = "✅";
+const TRIAGED_EMOJI = "🆗";
+
+export interface MirrorFilter {
+  priorities?: string[];
+  tags?: string[];
+  topics?: string[];
+  teamIds?: string[];
+  channels?: string[];
+}
+
+/** One extra link shown in the mirror-post header. `url` may carry {ticket_id}/{email}/{external_id}/
+ *  {company}/{name} placeholders, filled per ticket. */
+export interface QuickLink {
+  label: string;
+  url: string;
+}
+
+export interface MirrorBinding {
+  id: string;
+  tenant_id: string;
+  guild_id: string;
+  forum_channel_id: string;
+  enabled: boolean;
+  responder_role_id: string | null;
+  attribution_mode: "team" | "collaborator";
+  attribution_name: string | null;
+  filter: MirrorFilter;
+  quick_links: QuickLink[];
+}
+
+// Test seam: delegates to the gateway-level override so the mirror engine AND the VIP
+// thread-per-message path (discord.ts) share one injected mock.
+export function setMirrorTransportForTests(t: MirrorTransport | null): void {
+  setDiscordTransportForTests(t);
+}
+function transport(): MirrorTransport | null {
+  return getMirrorTransport();
+}
+
+/** The Noola display name for a resolved teammate seat — so a mirrored note/reply is attributed to
+ *  the real Noola user, not just the Discord display handle. */
+async function teammateName(tenantId: string, userId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [userId]);
+    return r.rowCount ? (r.rows[0].name as string) : null;
+  });
+}
+
+function asFilter(v: unknown): MirrorFilter {
+  if (v && typeof v === "object") return v as MirrorFilter;
+  if (typeof v === "string") {
+    try { return JSON.parse(v) as MirrorFilter; } catch { return {}; }
+  }
+  return {};
+}
+
+function asQuickLinks(v: unknown): QuickLink[] {
+  const raw = typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return []; } })() : v;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e): e is { label: unknown; url: unknown } => !!e && typeof e === "object")
+    .map((e) => ({ label: String(e.label ?? "").slice(0, 40), url: String(e.url ?? "").slice(0, 500) }))
+    .filter((e) => e.label && e.url);
+}
+
+function rowToBinding(r: Record<string, unknown>): MirrorBinding {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    guild_id: r.guild_id as string,
+    forum_channel_id: r.forum_channel_id as string,
+    enabled: r.enabled as boolean,
+    responder_role_id: (r.responder_role_id as string | null) ?? null,
+    attribution_mode: (r.attribution_mode as "team" | "collaborator") ?? "team",
+    attribution_name: (r.attribution_name as string | null) ?? null,
+    filter: asFilter(r.filter),
+    quick_links: asQuickLinks(r.quick_links),
+  };
+}
+
+/** The tenant's mirror bindings (relay-scoped table; tenant filter in the query). */
+export async function listMirrorBindings(tenantId: string): Promise<MirrorBinding[]> {
+  const r = await relayPool.query(
+    "SELECT * FROM discord_mirror_bindings WHERE tenant_id = $1 ORDER BY created_at ASC",
+    [tenantId],
+  );
+  return r.rows.map(rowToBinding);
+}
+
+/** Full-replace the tenant's bindings (Settings save model, same as classification config).
+ *  Deleting a binding cascades its ticket_mirror rows — the Discord posts stay, they just stop
+ *  being wired (acceptable: unbinding a forum IS "stop mirroring there"). */
+export async function replaceMirrorBindings(
+  tenantId: string,
+  bindings: Array<{
+    guildId: string; forumChannelId: string; enabled: boolean;
+    responderRoleId?: string | null; attributionMode?: "team" | "collaborator";
+    attributionName?: string | null; filter?: MirrorFilter; quickLinks?: QuickLink[];
+  }>,
+): Promise<MirrorBinding[]> {
+  const keep: string[] = [];
+  for (const b of bindings) {
+    const r = await relayPool.query(
+      `INSERT INTO discord_mirror_bindings
+         (tenant_id, guild_id, forum_channel_id, enabled, responder_role_id, attribution_mode, attribution_name, filter, quick_links)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
+       ON CONFLICT (tenant_id, forum_channel_id) DO UPDATE SET
+         guild_id = EXCLUDED.guild_id, enabled = EXCLUDED.enabled,
+         responder_role_id = EXCLUDED.responder_role_id, attribution_mode = EXCLUDED.attribution_mode,
+         attribution_name = EXCLUDED.attribution_name, filter = EXCLUDED.filter, quick_links = EXCLUDED.quick_links
+       RETURNING id`,
+      [tenantId, b.guildId, b.forumChannelId, b.enabled, b.responderRoleId ?? null,
+       b.attributionMode ?? "team", b.attributionName ?? null, JSON.stringify(b.filter ?? {}),
+       JSON.stringify(asQuickLinks(b.quickLinks ?? []))],
+    );
+    keep.push(r.rows[0].id as string);
+  }
+  await relayPool.query(
+    `DELETE FROM discord_mirror_bindings WHERE tenant_id = $1 AND NOT (id = ANY($2::uuid[]))`,
+    [tenantId, keep],
+  );
+  return listMirrorBindings(tenantId);
+}
+
+interface TicketBrief {
+  id: string;
+  subject: string;
+  status: string;
+  priority: string;
+  tags: string[];
+  topic: string | null;
+  team_id: string | null;
+  channel_type: string;
+  contact_name: string | null;
+  contact_email: string | null;
+  contact_external_id: string | null;
+  contact_company: string | null;
+}
+
+async function loadTicketBrief(tenantId: string, ticketId: string): Promise<TicketBrief | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT t.id, t.subject, t.status, t.priority, t.tags, t.topic, t.team_id, t.channel_type,
+              ct.name AS contact_name, ct.email AS contact_email,
+              ct.external_id AS contact_external_id, ct.company AS contact_company
+         FROM tickets t
+         LEFT JOIN contacts ct ON ct.tenant_id = t.tenant_id AND ct.id = t.contact_id
+        WHERE t.id = $1`,
+      [ticketId],
+    );
+    return r.rowCount ? (r.rows[0] as TicketBrief) : null;
+  });
+}
+
+/** Does the ticket match a binding's filter? Empty/absent facets match everything; a listed facet
+ *  requires membership (tags: ANY overlap). Discord-origin tickets never auto-mirror — the team is
+ *  already in Discord for those. */
+export function matchesMirrorFilter(t: TicketBrief, f: MirrorFilter): boolean {
+  if (t.channel_type === "discord") return false;
+  if (f.channels?.length && !f.channels.includes(t.channel_type)) return false;
+  if (f.priorities?.length && !f.priorities.includes(t.priority)) return false;
+  if (f.topics?.length && !(t.topic && f.topics.includes(t.topic))) return false;
+  if (f.teamIds?.length && !(t.team_id && f.teamIds.includes(t.team_id))) return false;
+  if (f.tags?.length && !f.tags.some((tag) => t.tags.includes(tag))) return false;
+  return true;
+}
+
+/** Forum tag names for a ticket's current state: status + priority (a stable, small set that stays
+ *  under Discord's 20-tags-per-forum cap). */
+function mirrorTagNames(t: { status: string; priority: string }): string[] {
+  return [t.status, t.priority];
+}
+
+function webBase(): string {
+  const w = process.env.WEB_BASE_URL;
+  return w ? w.replace(/\/+$/, "") : "";
+}
+
+function postTitle(t: TicketBrief): string {
+  return plainThreadName(t.subject || "") || "Support ticket";
+}
+
+/** Fill a quick-link url template with this ticket's values (URL-encoded). Returns null when the
+ *  template references a placeholder that has no value for this ticket, so we skip a would-be-broken
+ *  link (e.g. `/users/`) rather than render it. */
+function fillLink(url: string, t: TicketBrief): string | null {
+  const vals: Record<string, string | null> = {
+    ticket_id: t.id,
+    email: t.contact_email,
+    external_id: t.contact_external_id,
+    company: t.contact_company,
+    name: t.contact_name,
+  };
+  let missing = false;
+  const filled = url.replace(/\{(ticket_id|email|external_id|company|name)\}/g, (_m, k: string) => {
+    const v = vals[k];
+    if (!v) { missing = true; return ""; }
+    return encodeURIComponent(v);
+  });
+  return missing ? null : filled;
+}
+
+function postHeader(t: TicketBrief, quotedBody: string | null, quickLinks: QuickLink[] = []): string {
+  const who = t.contact_name || t.contact_email || "Unknown contact";
+  const lines = [
+    `**${t.subject || "Support ticket"}**`,
+    `From **${who}** · via ${t.channel_type} · priority **${t.priority}**`,
+  ];
+  // Contact metadata — only the parts we actually have, and email only when it isn't already the
+  // "who", so we never print a bare or duplicated field.
+  const meta: string[] = [];
+  if (t.contact_email && t.contact_email !== who) meta.push(`Email: ${t.contact_email}`);
+  if (t.contact_external_id) meta.push(`ID: ${t.contact_external_id}`);
+  if (t.contact_company) meta.push(`Company: ${t.contact_company}`);
+  if (meta.length) lines.push(meta.join(" · "));
+  if (quotedBody) lines.push("", quotedBody);
+  const base = webBase();
+  const links: string[] = [];
+  if (base) links.push(`Console: <${base}/tickets/${t.id}>`); // <> suppresses Discord's link-preview embed (matches the quick-links below)
+  // Per-binding quick-links (Backoffice, …). Wrap each url in <> so N links don't each spawn a link
+  // preview embed. A link whose placeholder has no value for this ticket is skipped.
+  for (const ql of quickLinks) {
+    const u = fillLink(ql.url, t);
+    if (u) links.push(`${ql.label}: <${u}>`);
+  }
+  if (links.length) lines.push("", links.join("\n"));
+  lines.push("", `_Messages here are internal notes. React ${PROMOTE_EMOJI} on a message to send it to the customer; ✅ closes, 🔄 reopens, 👀 assigns to you, 💤 snoozes, 🚫 marks spam._`);
+  return lines.join("\n");
+}
+
+export interface MirrorRef {
+  tenant_id: string;
+  ticket_id: string;
+  binding_id: string | null;
+  guild_id: string;
+  forum_channel_id: string;
+  post_thread_id: string;
+}
+
+/** The mirror row for a ticket (null when not mirrored / still pending). */
+export async function getTicketMirror(tenantId: string, ticketId: string): Promise<MirrorRef | null> {
+  const r = await relayPool.query(
+    "SELECT * FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 AND post_thread_id NOT LIKE 'pending:%'",
+    [tenantId, ticketId],
+  );
+  return r.rowCount ? (r.rows[0] as MirrorRef) : null;
+}
+
+/** @ping a teammate in a ticket's mirror thread when they're pulled into the issue (assigned or added
+ *  as a participant). No-ops silently when the ticket isn't mirrored, the seat has no Discord ID
+ *  mapped, or the transport is down — a notification is best-effort, never blocks the action. The ping
+ *  is scoped to EXACTLY that one user id, so nobody else is pinged. */
+export async function pingSeatInMirror(tenantId: string, ticketId: string, userId: string, verb: string): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId).catch(() => null);
+  if (!mirror) return;
+  const discordId = await discordIdForSeat(tenantId, userId).catch(() => null);
+  if (!discordId) return;
+  const tp = transport();
+  if (!tp) return;
+  await tp.postToThread(mirror.post_thread_id, `<@${discordId}> ${verb}`, undefined, [discordId]).catch(() => {});
+}
+
+/** Reverse lookup: is this Discord thread a mirror post? Runs pre-tenant (relay), gateway hot path. */
+export async function mirrorByThread(postThreadId: string): Promise<MirrorRef | null> {
+  const r = await relayPool.query("SELECT * FROM ticket_mirror WHERE post_thread_id = $1", [postThreadId]);
+  return r.rowCount ? (r.rows[0] as MirrorRef) : null;
+}
+
+async function loadBinding(bindingId: string): Promise<MirrorBinding | null> {
+  const r = await relayPool.query("SELECT * FROM discord_mirror_bindings WHERE id = $1", [bindingId]);
+  return r.rowCount ? rowToBinding(r.rows[0]) : null;
+}
+
+/**
+ * Create the forum post for a ticket under a binding. Idempotent: the pending-claim INSERT is the
+ * race guard (first caller proceeds, everyone else sees the row); transport failure rolls the claim
+ * back so a later retry can succeed. Returns the mirror row, or null (already mirrored / no
+ * transport / Discord refused).
+ */
+export async function mirrorTicket(tenantId: string, ticketId: string, binding: MirrorBinding): Promise<MirrorRef | null> {
+  const tp = transport();
+  if (!tp) return null;
+  const t = await loadTicketBrief(tenantId, ticketId);
+  if (!t) return null;
+
+  // A creation that crashed mid-flight (process restart) left its `pending:` claim behind forever, which
+  // blocked this ticket from ever being mirrored and parked every relay for it as "mirror not ready".
+  // A claim that old can't still be in progress — release it so this attempt can proceed.
+  await relayPool
+    .query(
+      "DELETE FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 AND post_thread_id LIKE 'pending:%' AND created_at < now() - interval '15 minutes'",
+      [tenantId, ticketId],
+    )
+    .catch(() => {});
+  const claim = await relayPool.query(
+    `INSERT INTO ticket_mirror (tenant_id, ticket_id, binding_id, guild_id, forum_channel_id, post_thread_id)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (tenant_id, ticket_id) DO NOTHING RETURNING ticket_id`,
+    [tenantId, ticketId, binding.id, binding.guild_id, binding.forum_channel_id, `pending:${ticketId}`],
+  );
+  if (!claim.rowCount) return getTicketMirror(tenantId, ticketId);
+
+  // Latest customer message seeds the post body (best-effort).
+  const latest = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT id, body FROM messages WHERE ticket_id = $1 AND author_type = 'customer' AND deleted_at IS NULL
+        ORDER BY created_at DESC LIMIT 1`,
+      [ticketId],
+    );
+    return r.rowCount ? (r.rows[0] as { id: string; body: string }) : null;
+  });
+
+  // Attach that seeding message's files to the initial forum post, so a ticket opened with a
+  // screenshot shows it on Discord from the start (not just in later replies).
+  const seed = latest ? await loadMirrorFiles(tenantId, latest.id) : { files: [], dropped: 0 };
+  const seedQuote = latest?.body ? fitQuote(latest.body, seed.files) : null;
+  const created = await tp
+    .createForumPost(
+      binding.forum_channel_id, postTitle(t),
+      postHeader(t, seedQuote?.quoted ?? null, binding.quick_links) + droppedNote(seed.dropped),
+      mirrorTagNames(t), seedQuote?.files ?? seed.files,
+    )
+    .catch(() => null);
+  if (!created) {
+    await relayPool.query("DELETE FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 AND post_thread_id LIKE 'pending:%'", [tenantId, ticketId]);
+    return null;
+  }
+  await relayPool.query(
+    "UPDATE ticket_mirror SET post_thread_id = $3 WHERE tenant_id = $1 AND ticket_id = $2",
+    [tenantId, ticketId, created.threadId],
+  );
+  return getTicketMirror(tenantId, ticketId);
+}
+
+/**
+ * Native auto-mirror evaluation — called from the domain-event seam on ticket.created /
+ * priority_changed / tagged / assigned. Already-mirrored tickets just re-sync their forum tags.
+ * On ticket.created the seeded autotag/routing/topic automations may not have landed yet, so a
+ * no-match schedules ONE delayed re-check (5s) before giving up; manual push always remains.
+ */
+export async function evaluateAutoMirror(tenantId: string, ticketId: string, opts?: { recheck?: boolean }): Promise<void> {
+  const existing = await getTicketMirror(tenantId, ticketId);
+  if (existing) {
+    requestMirrorSync(tenantId, ticketId);
+    return;
+  }
+  const bindings = (await listMirrorBindings(tenantId)).filter((b) => b.enabled);
+  if (!bindings.length) return;
+  const t = await loadTicketBrief(tenantId, ticketId);
+  if (!t || t.channel_type === "discord") return;
+  const match = bindings.find((b) => matchesMirrorFilter(t, b.filter));
+  if (match) {
+    await mirrorTicket(tenantId, ticketId, match);
+    return;
+  }
+  if (opts?.recheck) {
+    setTimeout(() => { void evaluateAutoMirror(tenantId, ticketId).catch(() => {}); }, 5000);
+  }
+}
+
+/**
+ * Backfill: mirror the EXISTING open inbox into the enabled bindings — "mirror every convo"
+ * means the inbox as it stands, not just tickets created after the binding was saved. Same
+ * selection as evaluateAutoMirror (first enabled binding whose filter matches; discord-origin
+ * never mirrors); already-mirrored tickets are skipped, so it's idempotent and safe to re-run.
+ * Sequential + capped (Discord forum-post creation is rate-limited). Fired on binding save.
+ */
+const BACKFILL_CAP = 100;
+export async function backfillMirrors(tenantId: string): Promise<{ mirrored: number; scanned: number }> {
+  const bindings = (await listMirrorBindings(tenantId)).filter((b) => b.enabled);
+  if (!bindings.length || !transport()) return { mirrored: 0, scanned: 0 };
+  const rows = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT t.id FROM tickets t
+        WHERE t.status = 'open' AND t.channel_type IS DISTINCT FROM 'discord'
+          AND NOT EXISTS (SELECT 1 FROM ticket_mirror m WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id)
+        ORDER BY t.updated_at DESC LIMIT $1`,
+      [BACKFILL_CAP],
+    );
+    return r.rows as Array<{ id: string }>;
+  });
+  let mirrored = 0;
+  for (const { id } of rows) {
+    const t = await loadTicketBrief(tenantId, id);
+    if (!t) continue;
+    const match = bindings.find((b) => matchesMirrorFilter(t, b.filter));
+    if (!match) continue;
+    const m = await mirrorTicket(tenantId, id, match).catch(() => null);
+    if (m) mirrored++;
+  }
+  return { mirrored, scanned: rows.length };
+}
+
+/** Why isn't this ticket mirrored (yet)? — the context-rail state read. `auto` = an enabled
+ *  binding's filter matches, so it will mirror on its own (backfill/next event); a manual push
+ *  is only meaningful when a binding exists but the filter does NOT match. */
+export async function mirrorEligibility(
+  tenantId: string,
+  ticketId: string,
+): Promise<{ hasBinding: boolean; discordOrigin: boolean; auto: boolean }> {
+  const bindings = (await listMirrorBindings(tenantId)).filter((b) => b.enabled);
+  if (!bindings.length) return { hasBinding: false, discordOrigin: false, auto: false };
+  const t = await loadTicketBrief(tenantId, ticketId);
+  if (!t) return { hasBinding: true, discordOrigin: false, auto: false };
+  if (t.channel_type === "discord") return { hasBinding: true, discordOrigin: true, auto: false };
+  return { hasBinding: true, discordOrigin: false, auto: bindings.some((b) => matchesMirrorFilter(t, b.filter)) };
+}
+
+/** Manual "Push to Discord": mirror regardless of filter, using the given binding or the first
+ *  enabled one. Returns the mirror (existing or new) or null with a reason. */
+export async function pushTicketToDiscord(
+  tenantId: string,
+  ticketId: string,
+  bindingId?: string | null,
+): Promise<{ mirror: MirrorRef | null; reason?: string }> {
+  const existing = await getTicketMirror(tenantId, ticketId);
+  if (existing) return { mirror: existing };
+  const bindings = (await listMirrorBindings(tenantId)).filter((b) => b.enabled);
+  const binding = bindingId ? bindings.find((b) => b.id === bindingId) : bindings[0];
+  if (!binding) return { mirror: null, reason: "no_binding" };
+  if (!transport()) return { mirror: null, reason: "discord_offline" };
+  const mirror = await mirrorTicket(tenantId, ticketId, binding);
+  return mirror ? { mirror } : { mirror: null, reason: "create_failed" };
+}
+
+/** Deep link to the forum post (Discord's canonical URL shape). */
+export function mirrorUrl(m: MirrorRef): string {
+  return `https://discord.com/channels/${m.guild_id}/${m.post_thread_id}`;
+}
+
+// ── D2: ticket timeline → forum post ──────────────────────────────────────────
+
+/**
+ * Relay a fresh ticket message into its mirror post (ingest post-commit hook). Customer messages
+ * and console agent replies both mirror — the post IS the timeline. Discord-origin tickets and
+ * promotion-minted messages (origin 'discord_mirror') never reach here. Re-reads the message row
+ * for the author name so the hook stays a fire-and-forget (tenantId, ids) call.
+ */
+// Discord free-tier upload ceiling is 25 MB, but we stay conservative (8 MB/file, ≤10 files) so a
+// mirror never fails the whole post on one oversized file. Oversized/too-many are dropped with a note.
+const MIRROR_ATTACH_MAX_BYTES = 8 * 1024 * 1024;
+const MIRROR_ATTACH_MAX_FILES = 10;
+
+/** Load a message's stored attachments as Discord-uploadable files (bytes streamed from object
+ *  storage), applying the size/count caps. `dropped` counts anything skipped so the caller can note
+ *  it in the mirrored text rather than silently losing it. */
+async function loadMirrorFiles(tenantId: string, messageId: string): Promise<{ files: MirrorFile[]; dropped: number }> {
+  const rows = await attachmentStorageForMessage(tenantId, messageId).catch(() => []);
+  const files: MirrorFile[] = [];
+  let dropped = 0;
+  for (const a of rows) {
+    if (files.length >= MIRROR_ATTACH_MAX_FILES || (a.size_bytes ?? 0) > MIRROR_ATTACH_MAX_BYTES) { dropped++; continue; }
+    const obj = await getObject(a.storage_key).catch(() => null);
+    if (!obj || obj.body.byteLength > MIRROR_ATTACH_MAX_BYTES) { dropped++; continue; }
+    files.push({ name: a.filename || "file", data: obj.body });
+  }
+  return { files, dropped };
+}
+
+/** " _(N attachments too large to mirror)_" suffix, or "" when nothing was dropped. */
+function droppedNote(dropped: number): string {
+  return dropped ? `\n_(${dropped} attachment${dropped > 1 ? "s" : ""} too large to mirror)_` : "";
+}
+
+/** A thin rule prepended to each relayed message so consecutive posts don't merge into one wall. */
+const MIRROR_DIVIDER = "──────────";
+
+// The transport splits a long post into 2000-char messages on line boundaries. A shorter line keeps its "> " in every piece.
+const QUOTE_LINE_MAX = 1900;
+// Discord takes about one message a second per channel, and a relay must land within the outbox's deadline.
+// A longer body is cut at a line, and the full text is attached as a file.
+const MAX_QUOTED_CHARS = 7_000;
+
+/** `line` in pieces of at most `max` UTF-16 units, never splitting a surrogate pair. */
+function wrapLine(line: string, max: number): string[] {
+  if (line.length <= max) return [line];
+  const out: string[] = [];
+  for (let i = 0; i < line.length; ) {
+    let end = Math.min(i + max, line.length);
+    if (end < line.length && /[\uD800-\uDBFF]/.test(line[end - 1])) end--;
+    out.push(line.slice(i, end));
+    i = end;
+  }
+  return out;
+}
+
+/** The quoted body within MAX_QUOTED_CHARS, plus `files` with the full text added when the body doesn't fit. */
+function fitQuote(body: string, files: MirrorFile[]): { quoted: string; files: MirrorFile[] } {
+  const quoted = quoteBlock(body);
+  if (quoted.length <= MAX_QUOTED_CHARS) return { quoted, files };
+  let cut = "";
+  for (const line of quoted.split("\n")) {
+    if (cut.length + line.length + 1 > MAX_QUOTED_CHARS) break;
+    cut += (cut ? "\n" : "") + line;
+  }
+  if (files.length >= MIRROR_ATTACH_MAX_FILES) return { quoted: `${cut}\n_(message continues - open the ticket in Noola for the rest)_`, files };
+  return {
+    quoted: `${cut}\n_(message continues - the full text is attached as message.txt)_`,
+    files: [...files, { name: "message.txt", data: Buffer.from(body, "utf8") }],
+  };
+}
+
+/** Render a relayed message body as a Discord blockquote: every line (blanks included, to preserve
+ *  paragraph spacing inside the quote) gets a "> " prefix, so the body reads as one visually-bracketed
+ *  block under its author header instead of flowing straight into the next message. */
+function quoteBlock(body: string): string {
+  return body
+    .split("\n")
+    .flatMap((line) => wrapLine(line, QUOTE_LINE_MAX))
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
+/** True if the ticket has ANY ticket_mirror row — including a still-`pending:` one mid-creation. The
+ *  relay enqueue gates on this so (a) the vast majority of tickets (no binding / discord-origin) never
+ *  enqueue a relay, and (b) a message that arrives while the forum post is still being created IS
+ *  enqueued (getTicketMirror would have excluded the pending row) — the deliverer then waits for the
+ *  post to finish, closing the relay-before-mirror-exists race. */
+async function ticketHasMirrorRow(tenantId: string, ticketId: string): Promise<boolean> {
+  const r = await relayPool
+    .query("SELECT 1 FROM ticket_mirror WHERE tenant_id = $1 AND ticket_id = $2 LIMIT 1", [tenantId, ticketId])
+    .catch(() => null);
+  return (r?.rowCount ?? 0) > 0;
+}
+
+/** Relay a fresh ticket message into its mirror post (ingest post-commit hook). Now DURABLE: it enqueues
+ *  onto the relay outbox instead of posting inline, so a degraded Discord connection or a process restart
+ *  can't lose the mirror copy — the drainer delivers it (and retries) via deliverMessageRelay below.
+ *  Idempotent by message id. No-ops instantly when the ticket isn't mirrored. */
+export async function relayTicketMessage(tenantId: string, ticketId: string, messageId: string): Promise<void> {
+  if (!(await ticketHasMirrorRow(tenantId, ticketId))) return;
+  await enqueueRelay("message", tenantId, ticketId, `message:${messageId}`, { messageId });
+}
+
+/**
+ * Relay an internal note authored IN NOOLA into the ticket's mirror thread, so the team collaborating
+ * in Discord sees the note the same way they see one typed in the thread. Durable via the relay outbox
+ * (deliverNoteRelay below). Echo-safe: it posts as the bot, and handleMirrorPostMessage swallows
+ * bot/webhook messages, so a note that ORIGINATED from Discord is never posted back. `dedupeKey` should
+ * be a stable id (the note id) so a retried enqueue doesn't double-post; call only from the Noola-side
+ * note path.
+ */
+export async function relayNoteToMirror(
+  tenantId: string,
+  ticketId: string,
+  note: { authorName?: string | null; body: string; dedupeKey: string },
+): Promise<void> {
+  if (!(await ticketHasMirrorRow(tenantId, ticketId))) return;
+  await enqueueRelay("note", tenantId, ticketId, `note:${note.dedupeKey}`, {
+    authorName: note.authorName ?? null,
+    body: note.body,
+  });
+}
+
+// ── relay outbox delivery (called by the drainer in discord-relay-outbox.ts) ─────────────────────────
+
+/** Dispatch one leased relay-outbox row to the right Discord write. Returns a DeliverResult the drainer
+ *  uses to mark delivered / back off / dead-letter. A missing transport or a not-yet-ready mirror is
+ *  RETRIABLE (bot reconnects, forum post finishes creating); a vanished source row is a terminal skip. */
+export async function deliverRelayRow(row: RelayRow): Promise<DeliverResult> {
+  if (row.kind === "reply") {
+    const { deliverReplyRelay } = await import("./discord.js");
+    return deliverReplyRelay(row);
+  }
+  const tp = transport();
+  if (!tp) return { ok: false, retriable: true, error: "no live discord transport" };
+  const mirror = await getTicketMirror(row.tenant_id, row.ticket_id);
+  if (!mirror) return { ok: false, retriable: true, error: "mirror post not ready" };
+
+  if (row.kind === "message") {
+    const messageId = String(row.payload.messageId ?? "");
+    if (!messageId) return { ok: false, retriable: false, error: "missing messageId" };
+    return deliverMessageRelay(tp, mirror, row.tenant_id, row.ticket_id, messageId, relayNonce(row.id));
+  }
+  if (row.kind === "note") {
+    return deliverNoteRelay(tp, mirror, (row.payload.authorName as string | null) ?? null, String(row.payload.body ?? ""), relayNonce(row.id));
+  }
+  if (row.kind === "react") {
+    return deliverReactRelay(tp, String(row.payload.threadId ?? ""), String(row.payload.discordMessageId ?? ""), String(row.payload.emoji ?? ""));
+  }
+  return { ok: false, retriable: false, error: `unknown relay kind ${(row as RelayRow).kind}` };
+}
+
+async function deliverMessageRelay(
+  tp: MirrorTransport,
+  mirror: MirrorRef,
+  tenantId: string,
+  ticketId: string,
+  messageId: string,
+  nonce: string,
+): Promise<DeliverResult> {
+  const row = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT m.body, m.author_type, COALESCE(m.auto, false) AS auto,
+              COALESCE((SELECT u.name FROM users u WHERE u.tenant_id = m.tenant_id AND u.id = m.author_id),
+                       m.author_external_name,
+                       (SELECT ct.name FROM contacts ct WHERE ct.tenant_id = m.tenant_id AND ct.id = m.author_contact_id)) AS author_name
+         FROM messages m WHERE m.id = $1 AND m.ticket_id = $2`,
+      [messageId, ticketId],
+    );
+    return r.rowCount ? r.rows[0] as { body: string; author_type: string; auto: boolean; author_name: string | null } : null;
+  }).catch(() => null);
+  // Message deleted before we could relay it → nothing to deliver; terminal, not an error.
+  if (!row) return { ok: true, retriable: false, error: "source message gone" };
+  const isCustomer = row.author_type === "customer";
+  const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
+  const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
+  const loaded = await loadMirrorFiles(tenantId, messageId);
+  const { quoted, files } = fitQuote(mdToDiscord(row.body), loaded.files);
+  try {
+    const posted = await tp.postToThread(
+      mirror.post_thread_id,
+      `${MIRROR_DIVIDER}\n${label}\n${quoted}${droppedNote(loaded.dropped)}`,
+      files,
+      undefined,
+      { nonce },
+    );
+    if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
+  // The write landed — report success NOW. The forum tag/archive sync used to be awaited here, inside
+  // the drainer's deadline; Discord rate-limits thread edits hard, so that sync routinely outlived the
+  // deadline and the drainer re-posted an already-delivered message on every retry (prod: one message
+  // posted 10x). The sync is background work with its own coalescing and never affects delivery.
+  requestMirrorSync(tenantId, ticketId);
+  return { ok: true, retriable: false };
+}
+
+async function deliverNoteRelay(tp: MirrorTransport, mirror: MirrorRef, authorName: string | null, body: string, nonce: string): Promise<DeliverResult> {
+  const name = authorName?.trim() || "Agent";
+  const label = `📝 **${name}** _(internal note)_:`;
+  try {
+    const { quoted, files } = fitQuote(mdToDiscord(body), []);
+    const posted = await tp.postToThread(mirror.post_thread_id, `${MIRROR_DIVIDER}\n${label}\n${quoted}`, files.length ? files : undefined, undefined, { nonce });
+    if (!posted) return { ok: false, retriable: true, error: "thread unreachable" };
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
+  return { ok: true, retriable: false };
+}
+
+async function deliverReactRelay(tp: MirrorTransport, threadId: string, discordMessageId: string, emoji: string): Promise<DeliverResult> {
+  if (!threadId || !discordMessageId || !emoji) return { ok: false, retriable: false, error: "missing react args" };
+  try {
+    const ok = await tp.react(threadId, discordMessageId, emoji);
+    return ok ? { ok: true, retriable: false } : { ok: false, retriable: true, error: "react not applied" };
+  } catch (e) {
+    return { ok: false, retriable: true, error: (e as Error)?.message ?? String(e) };
+  }
+}
+
+// ── coalesced forum-state sync ─────────────────────────────────────────────────────────────────────────
+// Every relayed message, reaction, patch and automation used to call syncMirrorState inline and await
+// it. Each call issues thread PATCHes (tags, archive); Discord rate-limits thread edits per channel, and
+// discord.js silently SLEEPS on the limit — so a burst of activity on one ticket stacked PATCHes that
+// held their callers for minutes (the relay deadline tripped and re-posted; a reaction's ✅ back-mark
+// waited behind them). Callers on hot paths now REQUEST a sync instead: requests for the same ticket
+// collapse into one run after a short quiet period, only one run per ticket is in flight at a time
+// (a request that arrives mid-run schedules exactly one follow-up), and nothing waits on it.
+const SYNC_DEBOUNCE_MS = 2_500;
+const SYNC_SLOW_WARN_MS = 30_000;
+// Node runs a timer above 2^31-1 ms immediately, so a rate-limit retry is capped well below that.
+const MAX_SYNC_RETRY_MS = 60 * 60_000;
+const syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const syncInFlight = new Set<string>();
+const syncRerun = new Set<string>();
+
+/** Ask for the ticket's mirror post to be brought in line with its current status/priority. Returns
+ *  immediately; bursts collapse into a single sync. Safe to call from any hot path. */
+export function requestMirrorSync(tenantId: string, ticketId: string, delayMs = SYNC_DEBOUNCE_MS): void {
+  const key = `${tenantId}:${ticketId}`;
+  const pending = syncTimers.get(key);
+  if (pending) clearTimeout(pending);
+  const timer = setTimeout(() => {
+    syncTimers.delete(key);
+    void runMirrorSync(tenantId, ticketId, key);
+  }, delayMs);
+  if (typeof timer.unref === "function") timer.unref();
+  syncTimers.set(key, timer);
+}
+
+async function runMirrorSync(tenantId: string, ticketId: string, key: string): Promise<void> {
+  if (syncInFlight.has(key)) {
+    syncRerun.add(key); // one follow-up after the current run settles picks up the latest state
+    return;
+  }
+  syncInFlight.add(key);
+  const slow = setTimeout(() => {
+    try { console.warn(`[discord-sync] still syncing ticket ${ticketId} after ${SYNC_SLOW_WARN_MS / 1000}s (Discord rate limit?)`); } catch { /* noop */ }
+  }, SYNC_SLOW_WARN_MS);
+  if (typeof slow.unref === "function") slow.unref();
+  try {
+    await syncMirrorState(tenantId, ticketId);
+  } catch (e) {
+    try { console.warn(`[discord-sync] ticket ${ticketId}: ${(e as Error)?.message ?? String(e)}`); } catch { /* noop */ }
+  } finally {
+    clearTimeout(slow);
+    syncInFlight.delete(key);
+    if (syncRerun.delete(key)) requestMirrorSync(tenantId, ticketId);
+  }
+}
+
+/** Run every requested-but-not-yet-started sync now and wait for it (tests; graceful shutdown). */
+export async function flushMirrorSyncs(): Promise<void> {
+  const pending = [...syncTimers.entries()];
+  for (const [key, timer] of pending) {
+    clearTimeout(timer);
+    syncTimers.delete(key);
+    const [tenantId, ticketId] = key.split(":");
+    await runMirrorSync(tenantId, ticketId, key);
+  }
+}
+
+/** Re-apply forum tags from the ticket's current status/priority; archive on closed, unarchive
+ *  otherwise (D4 lifecycle). Idempotent (no-op edits are skipped by the transport). Prefer
+ *  requestMirrorSync() on hot paths — this performs the Discord edits and can wait on rate limits. */
+export async function syncMirrorState(tenantId: string, ticketId: string): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const t = await loadTicketBrief(tenantId, ticketId);
+  if (!t) return;
+  const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+  const tag = await closeAction("tag", ctx, () => tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)));
+  const archive = await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, t.status === "closed"));
+  // discord.js fails fast on a long rate limit, so try again once it lifts.
+  const retryAfterMs = Math.max(tag.retryAfterMs ?? 0, archive.retryAfterMs ?? 0);
+  if (retryAfterMs > 0) requestMirrorSync(tenantId, ticketId, Math.min(retryAfterMs, MAX_SYNC_RETRY_MS));
+}
+
+/** Discord "you lack the permission" signals — Missing Permissions (50013) / Missing Access (50001).
+ *  A close action that fails this way is almost always the bot missing "Manage Posts" on the forum. */
+function isMissingPerms(e: unknown): boolean {
+  const code = (e as { code?: number | string } | null)?.code;
+  return code === 50013 || code === 50001 || /missing (permission|access)/i.test((e as Error)?.message ?? "");
+}
+
+/** Run one forum close action (tag/archive/lock) and — unlike the old `.catch(() => {})` — LOG the
+ *  real Discord error instead of hiding it, and flag a permission refusal so the caller can post a
+ *  single actionable notice. This is why closes looked "half-done": the notice posted, the archive
+ *  silently 50013'd. Returns whether it succeeded and whether it failed on a missing permission. */
+async function closeAction(
+  action: "tag" | "archive" | "lock",
+  ctx: { tenantId: string; ticketId: string; threadId: string },
+  fn: () => Promise<unknown>,
+): Promise<{ ok: boolean; missingPerms: boolean; retryAfterMs?: number }> {
+  try {
+    const out = await fn();
+    // The transport reports "couldn't reach the thread" as `false` rather than throwing — that used to
+    // count as success. (Tags return false when the forum has no matching tags; that's not a failure.)
+    if (out === false && action !== "tag") {
+      console.warn(`[discord-close] ${action} not applied tenant=${ctx.tenantId} ticket=${ctx.ticketId} thread=${ctx.threadId} (thread unreachable)`);
+      return { ok: false, missingPerms: false };
+    }
+    return { ok: true, missingPerms: false };
+  } catch (e) {
+    const missingPerms = isMissingPerms(e);
+    console.warn(
+      `[discord-close] ${action} failed tenant=${ctx.tenantId} ticket=${ctx.ticketId} thread=${ctx.threadId} missingPerms=${missingPerms}: ${(e as Error)?.message ?? String(e)}`,
+    );
+    const retryAfterMs = e instanceof RateLimitError ? rateLimitWaitMs(e) : undefined;
+    return { ok: false, missingPerms, retryAfterMs };
+  }
+}
+
+/** The one-line note we drop into the post when a close action was refused for lack of permission —
+ *  turns an invisible failure into something the team can act on. */
+const MANAGE_POSTS_HINT =
+  "⚠️ I marked this resolved in Noola, but couldn't archive/tag the post here — the Noola bot needs the **Manage Posts** permission in this forum (Server Settings → this forum → Permissions → the Noola bot's role → enable *Manage Posts*).";
+
+/**
+ * Fired on `ticket.closed` (via the domain-event seam). Makes a close VISIBLE in Discord instead of a
+ * silent archive:
+ *  - MIRRORED ticket: post a "✅ Resolved" notice into the forum post, then re-sync tags/archive.
+ *  - Discord-ORIGIN (intake) ticket closed IN NOOLA: reflect the close onto the origin thread (post a
+ *    notice + archive it). A later customer message reopens it via the ingest upsert.
+ * Skipped for the origin thread when the close came FROM Discord (source='discord') — the thread is
+ * already archived/locked there and re-posting would echo. Best-effort throughout.
+ */
+const THREAD_STATE_CLOSE_REASONS = new Set(["discord_archived", "discord_locked", "discord_solved_tag", "discord_thread_deleted"]);
+
+export async function onTicketClosed(
+  tenantId: string,
+  ticketId: string,
+  opts: { source?: string | null; closeReason?: string | null; agentName?: string | null } = {},
+): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId);
+  if (mirror) {
+    const tp = transport();
+    if (tp) {
+      const by = opts.agentName ? ` by ${opts.agentName}` : "";
+      await tp.postToThread(mirror.post_thread_id, `✅ **Resolved**${by} — closed in Noola.`).catch(() => {});
+      // Reflect the close onto the post (tag + archive), surfacing any permission refusal — the bot
+      // OWNS mirror posts, so this should normally succeed; when it doesn't, say why in the post.
+      const t = await loadTicketBrief(tenantId, ticketId);
+      const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+      let missingPerms = false;
+      if (t) missingPerms = (await closeAction("tag", ctx, () => tp.applyTags(mirror.post_thread_id, mirrorTagNames(t)))).missingPerms || missingPerms;
+      missingPerms = (await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, true))).missingPerms || missingPerms;
+      if (missingPerms) await tp.postToThread(mirror.post_thread_id, MANAGE_POSTS_HINT).catch(() => {});
+    }
+    return;
+  }
+  // A close that began on Discord only needs no write-back when the thread ITSELF already shows it
+  // (archived / locked / solved-tagged / deleted). A teammate's ✅ reaction or a deleted last message
+  // leaves the thread open — skipping those (the old blanket `source === 'discord'` check) meant the
+  // ticket closed in Noola while the thread stayed open with no notice, tag or archive.
+  if (opts.source === "discord" && THREAD_STATE_CLOSE_REASONS.has(opts.closeReason ?? "")) return;
+  await archiveIntakeThreadOnClose(tenantId, ticketId, opts.agentName ?? null);
+}
+
+/** Reflect a Noola-side close of a Discord-origin (intake) ticket back onto its origin thread:
+ *  a "resolved" notice + archive. A customer reply reopens the thread's ticket (ingest upsert). */
+/** Discord-side "solved" signals — a forum tag whose name matches marks a post resolved. */
+const SOLVED_TAG_RE = /solv|resolv|clos|done|complete|answered|fixed/i;
+
+async function archiveIntakeThreadOnClose(tenantId: string, ticketId: string, agentName: string | null): Promise<void> {
+  const t = await withTenant(tenantId, (c) =>
+    c.query(
+      "SELECT external_thread_id, external_parent_id, external_guild_id FROM tickets WHERE id = $1 AND channel_type = 'discord' AND external_thread_id IS NOT NULL",
+      [ticketId],
+    ),
+  );
+  if (!t.rowCount) return;
+  const threadId = t.rows[0].external_thread_id as string;
+  const extParent = t.rows[0].external_parent_id as string | null;
+  const extGuild = t.rows[0].external_guild_id as string | null;
+  const tp = transport();
+  if (!tp) return;
+
+  // Idempotency: if the origin thread is ALREADY archived, a close was already reflected here (e.g.
+  // it was closed on Discord and that close never synced back to Noola, so Noola only now fires its
+  // own close). Re-posting the "Marked resolved" notice + re-archiving would spam an already-resolved
+  // thread — and posting even re-activates it first. Skip entirely. Best-effort: only a definite
+  // `true` short-circuits; null/undefined (unknown, or a transport without the probe) falls through
+  // to today's behavior so we never SILENTLY drop a real close notice.
+  if ((await tp.threadArchived?.(threadId)) === true) return;
+
+  const by = agentName ? ` by ${agentName}` : "";
+
+  // Per-forum close config (the origin forum binding, if any): a chosen close_tag, whether to
+  // archive, whether to lock. Relay-scoped table — matched by the thread's parent forum + guild.
+  // No binding row → keep today's behavior (auto-detect Solved tag + archive, no lock).
+  let closeTag: string | null = null;
+  let closeArchive = true;
+  let closeLock = false;
+  if (extGuild && extParent) {
+    const b = await relayPool
+      .query(
+        "SELECT close_tag, close_archive, close_lock FROM discord_channel_bindings WHERE guild_id = $1 AND channel_id = $2",
+        [extGuild, extParent],
+      )
+      .catch(() => null);
+    if (b?.rowCount) {
+      closeTag = (b.rows[0].close_tag as string | null) ?? null;
+      closeArchive = (b.rows[0].close_archive as boolean) !== false;
+      closeLock = (b.rows[0].close_lock as boolean) === true;
+    }
+  }
+
+  const ctx = { tenantId, ticketId, threadId };
+  let missingPerms = false;
+
+  // TAG: an explicit per-binding close tag wins; otherwise auto-detect the forum's own
+  // "Solved/Resolved/Closed"-style tag. Needs Manage Posts on the forum — surfaced below if refused.
+  if (closeTag) {
+    missingPerms = (await closeAction("tag", ctx, () => tp.applyTags(threadId, [closeTag]))).missingPerms || missingPerms;
+  } else {
+    const tagNames = (await tp.forumTagNames?.(threadId).catch(() => [])) ?? [];
+    const solved = tagNames.find((n) => SOLVED_TAG_RE.test(n));
+    if (solved) missingPerms = (await closeAction("tag", ctx, () => tp.applyTags(threadId, [solved]))).missingPerms || missingPerms;
+  }
+
+  // Always post the visible "resolved" notice.
+  await tp.postToThread(threadId, `✅ Marked resolved${by}. Reply here if you still need help.`).catch(() => {});
+
+  // ARCHIVE (default on) LAST — posting a message re-activates the thread.
+  if (closeArchive) missingPerms = (await closeAction("archive", ctx, () => tp.setArchived(threadId, true))).missingPerms || missingPerms;
+  // LOCK (default off) after archive — a locked thread can't be replied to (harder to reopen).
+  if (closeLock) missingPerms = (await closeAction("lock", ctx, () => tp.setLocked ? tp.setLocked(threadId, true) : Promise.resolve())).missingPerms || missingPerms;
+
+  // A permission refusal is otherwise invisible — tell the team exactly what to grant.
+  if (missingPerms) await tp.postToThread(threadId, MANAGE_POSTS_HINT).catch(() => {});
+}
+
+/**
+ * Fired when a conversation is marked as spam — from the web Mark-as-spam route OR the 🚫 mirror
+ * reaction, both via markConversationSpam. Gives spam the SAME Discord visibility + close treatment a
+ * resolved ticket gets: post a "🚫 Marked as spam" notice into the forum post, then archive it, so a
+ * spammed conversation doesn't linger as an open ops-mirror thread. Notice FIRST (posting re-activates
+ * an archived thread), archive LAST. Best-effort — no-op when the ticket isn't mirrored or the
+ * transport is down; a permission refusal on archive surfaces the Manage-Posts hint.
+ */
+export async function onConversationSpam(
+  tenantId: string,
+  ticketId: string,
+  opts: { actorId?: string | null; blocked?: boolean } = {},
+): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId).catch(() => null);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const actorName = opts.actorId ? await teammateName(tenantId, opts.actorId).catch(() => null) : null;
+  const by = actorName ? ` by ${actorName}` : "";
+  const blockNote = opts.blocked ? " The sender was blocked." : "";
+  await tp.postToThread(mirror.post_thread_id, `🚫 **Marked as spam**${by} — hidden in Noola.${blockNote}`).catch(() => {});
+  const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+  const { missingPerms } = await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, true));
+  if (missingPerms) await tp.postToThread(mirror.post_thread_id, MANAGE_POSTS_HINT).catch(() => {});
+}
+
+/** Reverse of onConversationSpam: a conversation restored from spam reopens its mirror post — un-archive
+ *  it and post a "restored" notice, so the team sees it back in the forum. Best-effort. */
+export async function onConversationUnspam(tenantId: string, ticketId: string): Promise<void> {
+  const mirror = await getTicketMirror(tenantId, ticketId).catch(() => null);
+  if (!mirror) return;
+  const tp = transport();
+  if (!tp) return;
+  const ctx = { tenantId, ticketId, threadId: mirror.post_thread_id };
+  await closeAction("archive", ctx, () => tp.setArchived(mirror.post_thread_id, false));
+  await tp.postToThread(mirror.post_thread_id, "♻️ **Restored from spam** — back in Noola.").catch(() => {});
+}
+
+// ── D3: forum post → ticket (note by default, 📤 promotes to reply) ───────────
+
+export interface MirrorPostMessage {
+  guildId: string;
+  threadId: string | null;
+  discordMessageId: string;
+  authorId: string;
+  authorDisplayName: string | null;
+  content: string;
+  roleIds: string[];
+  attachments?: { url: string; filename: string; contentType: string; size: number }[];
+  isBotOrWebhook: boolean;
+}
+
+/**
+ * Gateway seam: a MessageCreate that lands in a mirror post thread is handled HERE and never
+ * reaches the customer-channel ingest (a mirror forum must not double as a customer channel).
+ * Returns {handled:false} for non-mirror threads so the gateway falls through to the normal path.
+ * A human message → internal note on the ticket + a ticket_mirror_messages row (the promotion
+ * ledger). Bot/webhook messages (our own relays) are swallowed — the echo-guard.
+ */
+export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ handled: boolean; noteId?: string }> {
+  if (!m.threadId) return { handled: false };
+  const mirror = await mirrorByThread(m.threadId);
+  if (!mirror) return { handled: false };
+  if (m.isBotOrWebhook) return { handled: true }; // our relays / other bots: never notes, never ingest
+  const body = (m.content ?? "").trim();
+  const attachments = m.attachments ?? [];
+  if (!body && attachments.length === 0) return { handled: true };
+  // A message seen again (a backfill re-reads the end of the previous leader's watch) already has its note.
+  const seen = await relayPool.query("SELECT 1 FROM ticket_mirror_messages WHERE discord_message_id = $1", [m.discordMessageId]);
+  if (seen.rowCount) return { handled: true };
+  // An attachment-only message (screenshot, no text) still becomes a note — label it with the file
+  // name(s) so the note isn't blank; the file itself attaches below.
+  const noteBody = body || attachments.map((a) => a.filename).join(", ") || "(attachment)";
+
+  const binding = mirror.binding_id ? await loadBinding(mirror.binding_id) : null;
+  // Resolve the Discord author to a Noola seat ONCE — reused to attribute the note AND gate promotion.
+  const agentId = await resolveTeammate(mirror.tenant_id, m.authorId);
+  // SECURITY: an UNSET responder role must NOT mean "the whole server is staff" — otherwise any
+  // server member's message could later be promoted to the customer or triage the ticket. Require the
+  // configured responder role OR an explicit teammate mark (agent_channel_identities).
+  const isResponder = binding?.responder_role_id
+    ? m.roleIds.includes(binding.responder_role_id) || Boolean(agentId)
+    : Boolean(agentId);
+
+  // Attribute the note to the resolved Noola user: author_id links it to their seat, and the name is
+  // their real Noola name — not just the Discord display handle (fixes "it's not aware it's me").
+  const seatName = agentId ? await teammateName(mirror.tenant_id, agentId) : null;
+  const name = seatName || m.authorDisplayName || "Discord teammate";
+  const note = await addNote(mirror.tenant_id, mirror.ticket_id, {
+    authorId: agentId ?? null,
+    authorName: `${name} (Discord)`,
+    body: noteBody,
+  }).catch(() => null);
+  // Carry any Discord attachments onto the note (best-effort, post-insert) so a screenshot posted in
+  // the mirror thread is visible on the ticket instead of being silently dropped.
+  if (note?.id && attachments.length) {
+    await persistInboundNoteAttachments(mirror.tenant_id, mirror.ticket_id, note.id, attachments).catch(() => {});
+  }
+
+  await relayPool.query(
+    `INSERT INTO ticket_mirror_messages
+       (discord_message_id, tenant_id, ticket_id, post_thread_id, author_discord_id, author_display_name, is_responder, body, note_id, author_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (discord_message_id) DO NOTHING`,
+    [m.discordMessageId, mirror.tenant_id, mirror.ticket_id, m.threadId, m.authorId, m.authorDisplayName, isResponder, noteBody, note?.id ?? null, agentId ?? null],
+  );
+  return { handled: true, noteId: note?.id };
+}
+
+export interface MirrorReaction {
+  guildId: string;
+  threadId: string;
+  discordMessageId: string;
+  reactorId: string;
+  emoji: string;
+  reactorRoleIds?: string[];
+}
+
+/**
+ * A reaction in a mirror post is a TRIAGE surface (the Slack-reaction-triage model, shared map):
+ *  - 📤 (reserved) promotes a responder's message to a customer reply — exactly once
+ *    (promoted_at claim), riding the EXISTING pipeline: ingestInbound(agent, origin
+ *    'discord_mirror') → translate → channel-registry dispatch to the ticket's origin channel.
+ *    Attribution: 'team' signs with the binding's attribution_name; 'collaborator' with the
+ *    Discord display name.
+ *  - any other mapped emoji (tenant's reaction-triage map, shared with Slack) applies its action
+ *    to the underlying ticket: close / reopen / assign-to-me / snooze / unassign. Thread-scoped —
+ *    reacting anywhere in the post (including the bot's starter message) triages the ticket.
+ * Role-gate for both: the REACTOR must hold the responder role when one is set, OR be an
+ * explicitly marked teammate (agent_channel_identities) — reacting is the action, so the gate
+ * sits on the reactor. Unknown emoji are ignored.
+ */
+export async function handleMirrorReaction(
+  r: MirrorReaction,
+): Promise<{ promoted: boolean; action?: string; reason?: string }> {
+  const mirror = await mirrorByThread(r.threadId);
+  if (!mirror) return { promoted: false, reason: "not_mirror" };
+  const binding = mirror.binding_id ? await loadBinding(mirror.binding_id) : null;
+
+  // Marked teammates pass the gate regardless of Discord roles; resolved once, reused by assign-me.
+  const agentId = await resolveTeammate(mirror.tenant_id, r.reactorId);
+  if (binding?.responder_role_id && !agentId) {
+    const roles = r.reactorRoleIds ?? (await transport()?.memberRoleIds(r.guildId, r.reactorId).catch(() => [])) ?? [];
+    if (!roles.includes(binding.responder_role_id)) return { promoted: false, reason: "not_responder" };
+  }
+
+  if (canonicalEmojiName(r.emoji) !== "outbox_tray") {
+    // Triage (close/reopen/snooze/assign/spam) acts on the WHOLE ticket, so only honor it on the post's
+    // STARTER message (the OP) — in a Discord forum post the starter message id equals the thread id
+    // (post_thread_id). Reacting ✅/👀/… on a mid-thread reply used to triage the ticket all the same,
+    // so a checkmark on ANY message closed it; require the OP. (📤 promote is deliberately the opposite —
+    // it targets a RESPONDER's message — so it lives past this gate, below.)
+    if (r.discordMessageId !== mirror.post_thread_id) {
+      return { promoted: false, reason: "not_starter_message" };
+    }
+    return applyMirrorTriage(mirror, r, agentId);
+  }
+
+  // Atomic promote claim — WHERE promoted_at IS NULL makes the double-react / two-reactors race safe.
+  const claim = await relayPool.query(
+    `UPDATE ticket_mirror_messages SET promoted_at = now()
+      WHERE discord_message_id = $1 AND is_responder AND promoted_at IS NULL
+      RETURNING tenant_id, ticket_id, body, note_id, author_display_name, author_discord_id, author_user_id`,
+    [r.discordMessageId],
+  );
+  if (!claim.rowCount) return { promoted: false, reason: "not_promotable" };
+  const row = claim.rows[0] as {
+    tenant_id: string; ticket_id: string; body: string; note_id: string | null;
+    author_display_name: string | null; author_discord_id: string | null; author_user_id: string | null;
+  };
+
+  // Attribute by the AUTHOR of the promoted message (not the reactor): a marked teammate → their Noola
+  // seat + real name + authorKind 'agent'; a genuinely seat-less responder stays 'community'. Falls
+  // back to the stored author_user_id, then a fresh resolve, then the reactor's seat.
+  const seatId =
+    row.author_user_id ??
+    (row.author_discord_id ? await resolveTeammate(row.tenant_id, row.author_discord_id) : null) ??
+    agentId;
+  const seatName = seatId ? await teammateName(row.tenant_id, seatId) : null;
+  const attribution =
+    binding?.attribution_mode === "collaborator"
+      ? seatName ?? row.author_display_name
+      : binding?.attribution_name ?? seatName ?? null;
+
+  const result = await ingestInbound({
+    tenantId: row.tenant_id,
+    ticketId: row.ticket_id,
+    body: row.body,
+    authorType: "agent",
+    authorKind: seatId ? "agent" : "community",
+    authorId: seatId ?? null,
+    authorExternalName: attribution ?? row.author_display_name ?? "Support",
+    origin: "discord_mirror",
+    idempotencyKey: `discord-mirror-promote:${r.discordMessageId}`,
+  });
+
+  // Durable ✅ confirmation, enqueued as soon as the reply is RECORDED. It used to be the last step, so
+  // any later failure (dispatch, bookkeeping) meant no ✅ — and promoted_at was already claimed, so the
+  // teammate couldn't retry. The drainer retries until it lands.
+  await enqueueRelay("react", row.tenant_id, result.ticketId, `react:${r.discordMessageId}:${PROMOTED_EMOJI}`, {
+    threadId: r.threadId,
+    discordMessageId: r.discordMessageId,
+    emoji: PROMOTED_EMOJI,
+  });
+
+  // A promoted message BECOMES the customer reply, so move any attachments the original Discord message
+  // carried from the internal note onto the reply (the widget + agent thread both render message
+  // attachments), then drop the now-duplicate note. The promote's own message.created event makes the
+  // web refetch messages + notes, so the reply appears with its image and the note disappears live.
+  if (row.note_id) {
+    await withTenant(row.tenant_id, async (c) => {
+      await c.query(
+        "UPDATE message_attachments SET message_id = $1, note_id = NULL WHERE note_id = $2 AND ticket_id = $3",
+        [result.messageId, row.note_id, row.ticket_id],
+      );
+      await c.query("DELETE FROM ticket_notes WHERE id = $1", [row.note_id]);
+    }).catch(() => {});
+  }
+
+  // A human promoted this Discord message to a customer reply — stand the assistant down on the ticket
+  // so ambient autoreply doesn't talk over the human (matches the console reply path). Idempotent.
+  await withTenant(row.tenant_id, async (c) => {
+    await c.query("UPDATE tickets SET assistant_enabled = false WHERE id = $1 AND assistant_enabled", [result.ticketId]);
+  }).catch(() => {});
+
+  const { dispatchBody, meta } = await translateOutboundReply(row.tenant_id, result.ticketId, row.body);
+  if (meta) void stampOutboundTranslation(row.tenant_id, result.messageId, meta);
+
+  const driver = getChannelDriver(result.channelType);
+  const out = driver?.dispatch
+    ? await driver.dispatch(
+        { tenantId: row.tenant_id, channelType: result.channelType, externalChannelId: result.externalChannelId, subject: result.subject, ticketId: result.ticketId, messageId: result.messageId },
+        dispatchBody,
+        // Read receipt: embed the pixel keyed to THIS agent message so an email open stamps seen_at —
+        // same as the web composer's reply route. Without it a promoted reply never shows "Seen".
+        { agentName: attribution, seenMessageId: result.messageId },
+      ).catch(() => ({ delivered: false as const, reason: "dispatch_error" }))
+    : { delivered: false as const, reason: "no-driver" };
+
+  // Widget/away fallback (parity with the web reply route): a widget reply has no outbound driver, so
+  // if the customer isn't currently in the widget and we have their email, ALSO email the promoted
+  // reply — otherwise an away customer never hears back until they reopen the widget. Best-effort.
+  if (!out.delivered && (result.channelType === "widget" || out.reason === "no-driver")) {
+    void notifyContactByEmailIfAway(row.tenant_id, {
+      ticketId: result.ticketId,
+      subject: result.subject,
+      body: dispatchBody,
+      agentName: attribution,
+      messageId: result.messageId,
+    }).catch(() => {});
+  }
+
+  await relayPool.query(
+    "UPDATE ticket_mirror_messages SET promoted_message_id = $2 WHERE discord_message_id = $1",
+    [r.discordMessageId, result.messageId],
+  );
+  return { promoted: true, reason: out.delivered ? undefined : out.reason };
+}
+
+/** Default snooze horizon for a reaction (no duration channel on an emoji): 1 day. */
+function snoozeUntil(): string {
+  return new Date(Date.now() + 86_400_000).toISOString();
+}
+
+/**
+ * Apply a mapped triage action to the mirrored ticket. Gate already passed in the caller. The
+ * mutation rides the same core engine as Slack triage (setTicketStatus/snoozeTicket/assignTicket);
+ * close emits ticket.closed so seeded automations (CSAT survey, …) behave like any other close.
+ * Confirms with a 🆗 react + forum tag/archive re-sync. Idempotent — re-reacting re-applies the
+ * same state.
+ */
+async function applyMirrorTriage(
+  mirror: MirrorRef,
+  r: MirrorReaction,
+  agentId: string | null,
+): Promise<{ promoted: boolean; action?: string; reason?: string }> {
+  const map = await getReactionMap(mirror.tenant_id);
+  const action = map[canonicalEmojiName(r.emoji)];
+  if (!action) return { promoted: false, reason: "unmapped_emoji" };
+  const { tenant_id: tenantId, ticket_id: ticketId } = mirror;
+
+  switch (action) {
+    case "close": {
+      // onlyIfChanged: a re-delivered or repeated ✅ must not re-post "Resolved" or re-send CSAT.
+      const closed = await setTicketStatus(tenantId, ticketId, "closed", { onlyIfChanged: true });
+      if (closed) {
+        // Mirror the web /tickets/:id/close route EXACTLY so a reaction-close isn't a half-close:
+        //  - index the resolved thread as a knowledge source (the old reaction path skipped this), and
+        //  - emit ticket.closed WITH the reactor's name so onTicketClosed posts "✅ Resolved by X"
+        //    (attribution was lost before → a bare, unattributed close) and CSAT/seeded automations fire.
+        const actorName = agentId ? await teammateName(tenantId, agentId) : null;
+        void import("./threads.js")
+          .then((m) => m.indexResolvedThread(tenantId, ticketId))
+          .catch(() => {});
+        void import("./automations.js")
+          .then((m) => m.emitDomainEvent(tenantId, "ticket.closed", { ticketId, actorName }))
+          .catch(() => {});
+      }
+      break;
+    }
+    case "reopen":
+      await setTicketStatus(tenantId, ticketId, "open", { onlyIfChanged: true });
+      break;
+    case "snooze":
+      await snoozeTicket(tenantId, ticketId, snoozeUntil());
+      break;
+    case "assign_me":
+      if (!agentId) {
+        await transport()
+          ?.postToThread(
+            mirror.post_thread_id,
+            "⚠️ Couldn't match your Discord account to a teammate — add your Discord ID in Settings → Members, then react again.",
+          )
+          .catch(() => {});
+        return { promoted: false, action, reason: "no_seat" };
+      }
+      // First 👀 claims the ticket (assignee); anyone reacting AFTER it's already assigned to someone
+      // else is looped in as a PARTICIPANT instead of silently stealing the assignment. Re-reacting as
+      // the current assignee is a no-op. There's one assignee_id — this is not multi-assignee.
+      {
+        const current = await withTenant(tenantId, async (c) => {
+          const r = await c.query("SELECT assignee_id FROM tickets WHERE id = $1", [ticketId]);
+          return r.rowCount ? ((r.rows[0].assignee_id as string | null) ?? null) : null;
+        });
+        if (!current) {
+          await assignTicket(tenantId, ticketId, agentId);
+        } else if (current !== agentId) {
+          await addParticipant(tenantId, ticketId, agentId).catch(() => null);
+        }
+      }
+      break;
+    case "unassign":
+      await assignTicket(tenantId, ticketId, null);
+      break;
+    case "spam":
+      // 🚫 from the mirror = the same "Mark as spam" as the web: hide the ticket, block the sender,
+      // drop the lead (defaults on). Reversible from the web Spam view. Attributed to the reactor.
+      // markConversationSpam already posts the spam notice + archives THIS post — so return early
+      // rather than fall through to syncMirrorState, which would un-archive it (spam ≠ status=closed).
+      // Ack FIRST: markConversationSpam archives this post, and Discord refuses reactions on an archived
+      // thread (the old order silently lost the 🆗).
+      await enqueueTriageAck(mirror, r.discordMessageId);
+      await markConversationSpam(tenantId, ticketId, { block: true, dropLead: true, actorId: agentId });
+      return { promoted: false, action };
+    default:
+      // 'note'/'priority' need a value an emoji can't carry — Slack-only kinds, ignored here.
+      return { promoted: false, action, reason: "unsupported_action" };
+  }
+
+  // Ack FIRST, durably. The 🆗 used to be sent inline AFTER an awaited forum sync: the sync archived the
+  // post on a close (Discord then rejects the reaction, and the failure was swallowed) or sat behind
+  // Discord's thread-edit rate limit — the "changed in Noola, not marked on Discord" reports. It now goes
+  // through the relay outbox (retried; the transport handles archived threads).
+  await enqueueTriageAck(mirror, r.discordMessageId);
+  // A close is reflected by onTicketClosed (notice + tags + archive); a second concurrent sync from here
+  // raced it. Everything else just requests a (coalesced) sync.
+  if (action !== "close") requestMirrorSync(tenantId, ticketId);
+  return { promoted: false, action };
+}
+
+/** Durably add the bot's 🆗 acknowledgment to a triaged message. Re-applies on every triage (a
+ *  finished ack row is reset to pending) — adding a reaction that's already there is a Discord no-op. */
+async function enqueueTriageAck(mirror: MirrorRef, discordMessageId: string): Promise<void> {
+  await enqueueRelay(
+    "react",
+    mirror.tenant_id,
+    mirror.ticket_id,
+    `react:${discordMessageId}:${TRIAGED_EMOJI}`,
+    { threadId: mirror.post_thread_id, discordMessageId, emoji: TRIAGED_EMOJI },
+    { reapply: true },
+  );
+}

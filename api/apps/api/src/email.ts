@@ -1,0 +1,788 @@
+import crypto from "node:crypto";
+import nodemailer from "nodemailer";
+import { relayPool, withTenant } from "@repo/db";
+import { ingestInbound, type IngestResult } from "./ingest.js";
+import { persistBufferAttachments } from "./attachments.js";
+import { renderReplyEmail } from "./emails/reply-email.js";
+import { prodSecret } from "./prod-secret.js";
+import { tenantEmailProviderCreds, tenantReplyAddress, type EmailProviderName } from "./email-provider.js";
+import { resolveFromIdentity } from "./email-sender.js";
+import { publicApiBase } from "./env.js";
+import { isSenderBlocked } from "./blocklist.js";
+import { stripInboundQuote } from "./email-quote.js";
+
+// The email channel — the second real channel after Discord, riding the same
+// ingestInbound() spine. Dev/stage use Mailpit (SMTP catch + HTTP API); a real
+// ESP goes behind this same seam at prod (swap SMTP_HOST / the poll source).
+//
+// Tenant resolution keys on the RECIPIENT (To) address — a tenant's support
+// inbox — via email_routes (unpolicied, BYPASSRLS relay, resolved before any
+// tenant context). The customer's From address keys the ticket (one thread per
+// customer). Idempotency is the email Message-ID.
+
+// Our own outbound is tagged so the inbound poller can never re-ingest it
+// (belt-and-suspenders on top of "To=customer resolves to no tenant route").
+export const ORIGIN_HEADER = "X-Noola-Origin";
+// Env is read at call time (not module load) so behavior tracks the live config
+// and tests can exercise the enabled/disabled paths deterministically.
+
+// ---- tenant routing (unpolicied, like discord_links) --------------------
+
+/** Resolve a tenant from the inbound recipient (support) address. */
+export async function resolveTenantByAddress(address: string): Promise<string | null> {
+  const r = await relayPool.query(
+    "SELECT tenant_id FROM email_routes WHERE address = $1",
+    [address.toLowerCase()],
+  );
+  return r.rowCount ? (r.rows[0].tenant_id as string) : null;
+}
+
+/** Set the tenant's support address — a single canonical value (the outbound From for
+ *  ticket replies, and the inbound recipient that routes back). REPLACES any prior binding
+ *  so setting a new address in Settings actually changes what tenantSupportAddress returns
+ *  (it reads one row); ON CONFLICT re-homes an address currently held by another tenant.
+ *  Wrapped in a txn so there's never a zero-address window. */
+export async function linkEmailRoute(address: string, tenantId: string): Promise<void> {
+  const c = await relayPool.connect();
+  try {
+    await c.query("BEGIN");
+    await c.query("DELETE FROM email_routes WHERE tenant_id = $1", [tenantId]);
+    await c.query(
+      "INSERT INTO email_routes (address, tenant_id) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET tenant_id = EXCLUDED.tenant_id",
+      [address.toLowerCase(), tenantId],
+    );
+    await c.query("COMMIT");
+  } catch (e) {
+    await c.query("ROLLBACK");
+    throw e;
+  } finally {
+    c.release();
+  }
+}
+
+/** The tenant's own support address (outbound From, so replies round-trip back). */
+export async function tenantSupportAddress(tenantId: string): Promise<string | null> {
+  const r = await relayPool.query(
+    "SELECT address FROM email_routes WHERE tenant_id = $1 ORDER BY created_at ASC LIMIT 1",
+    [tenantId],
+  );
+  return r.rowCount ? (r.rows[0].address as string) : null;
+}
+
+/** Drop our OWN inbound/support addresses from a reply-all Cc seed, case-insensitively (and de-dupe).
+ *  The customer emails TO support@, so it rides in on the parsed cc list; CC-ing it back onto the reply
+ *  forwards the outbound into Inbound Parse — a self-loop that spawns a duplicate ticket. `own` is the
+ *  tenant's support + reply addresses (either may be null). */
+export function stripOwnCcAddresses(cc: readonly unknown[], ...own: (string | null | undefined)[]): string[] {
+  const skip = new Set(own.filter((a): a is string => !!a).map((a) => a.toLowerCase()));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const a of cc) {
+    if (typeof a !== "string") continue;
+    const lc = a.trim().toLowerCase();
+    if (!lc || skip.has(lc) || seen.has(lc)) continue;
+    seen.add(lc);
+    out.push(a);
+  }
+  return out;
+}
+
+// ---- per-conversation reply addressing (P4) ------------------------------
+// Outbound replies set a SIGNED plus-address reply-to (support+t.<ticketid>.<sig>@domain) so a
+// customer's reply routes to the EXACT ticket — not merged by sender (a contact with two open
+// tickets replying to one previously landed on whichever conversation was open). The token is
+// self-authenticating (HMAC over the ticket uuid) — no schema, no lookup table; inbound verifies
+// the signature before trusting the id. Threading headers (Message-ID / In-Reply-To / References)
+// ride along so mail clients keep the conversation in one visual thread.
+
+/** The one SMTP transport factory. Dev/stage: bare Mailpit (no auth, no TLS). Prod: a real ESP
+ *  relay — SMTP_USER/SMTP_PASS enable AUTH, SMTP_SECURE=1 (or port 465) enables implicit TLS;
+ *  587 submission works via STARTTLS (nodemailer upgrades automatically when the server offers). */
+function smtpTransport(host: string, port: number): nodemailer.Transporter {
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: process.env.SMTP_SECURE === "1" || port === 465,
+    ...(user && pass ? { auth: { user, pass } } : {}),
+  });
+}
+
+/** BYO outbound: a tenant's own ESP account as the SMTP relay. Both supported providers are plain
+ *  SMTP, differing only in host + the fixed username (Resend: "resend"; SendGrid: "apikey"); the
+ *  password is the tenant's API key either way. Port 587 with STARTTLS (25/465 are blocked in the
+ *  Zerops runtime; env overrides host/port if a deployment needs something else). */
+function providerSmtpTransport(provider: EmailProviderName, apiKey: string): nodemailer.Transporter {
+  const spec =
+    provider === "sendgrid"
+      ? { host: process.env.SENDGRID_SMTP_HOST ?? "smtp.sendgrid.net", port: Number(process.env.SENDGRID_SMTP_PORT ?? 587), user: "apikey" }
+      : { host: process.env.RESEND_SMTP_HOST ?? "smtp.resend.com", port: Number(process.env.RESEND_SMTP_PORT ?? 587), user: "resend" };
+  return nodemailer.createTransport({
+    host: spec.host,
+    port: spec.port,
+    secure: spec.port === 465,
+    auth: { user: spec.user, pass: apiKey },
+  });
+}
+
+function emailTokenSecret(): string {
+  return prodSecret(
+    "EMAIL_TOKEN_SECRET (or AUTH_SECRET)",
+    process.env.EMAIL_TOKEN_SECRET || process.env.AUTH_SECRET,
+    "dev-insecure-secret-change-me",
+  );
+}
+
+function tokenSig(idHex: string): string {
+  return crypto.createHmac("sha256", emailTokenSecret()).update(idHex).digest("hex").slice(0, 10);
+}
+
+/** Signed per-ticket reply token: `<uuid-without-dashes>.<sig10>`. */
+export function ticketEmailToken(ticketId: string): string {
+  const id = ticketId.replace(/-/g, "").toLowerCase();
+  return `${id}.${tokenSig(id)}`;
+}
+
+/** The per-conversation reply address derived from the tenant's support address. */
+export function ticketReplyAddress(supportAddress: string, ticketId: string): string {
+  const [local, domain] = supportAddress.split("@");
+  return `${local}+t.${ticketEmailToken(ticketId)}@${domain}`;
+}
+
+/** Signed per-broadcast-recipient reply token: `<uuid-without-dashes>.<sig10>`. Same construction as
+ *  the ticket token but a distinct `+b.` namespace — a broadcast has no ticket at send time, so the
+ *  token points at the recipient row; a reply carrying it promotes to a ticket lazily (see
+ *  handleInboundEmail). */
+export function broadcastEmailToken(recipientId: string): string {
+  const id = recipientId.replace(/-/g, "").toLowerCase();
+  return `${id}.${tokenSig(id)}`;
+}
+
+/** The per-recipient reply address stamped on a broadcast email. A reply here routes back to us
+ *  carrying the recipient row id, so the materialized ticket is tagged with its broadcast origin. */
+export function broadcastReplyAddress(supportAddress: string, recipientId: string): string {
+  const [local, domain] = supportAddress.split("@");
+  return `${local}+b.${broadcastEmailToken(recipientId)}@${domain}`;
+}
+
+/** Parse an inbound recipient. Returns the base (route) address plus the VERIFIED ticket id when
+ *  the address carries a valid `+t.<id>.<sig>` token; a bad/forged signature yields ticketId null
+ *  (and routes by the base address like any other mail). Foreign plus-tags are stripped for the
+ *  base so `support+whatever@` still routes to the tenant. */
+export function parseInboundAddress(
+  address: string,
+): { base: string; ticketId: string | null; broadcastRecipientId: string | null } {
+  const a = address.trim();
+  // Two signed plus-tag namespaces share the same `<32hex>.<10hex>` shape: `+t.` (a ticket reply) and
+  // `+b.` (a broadcast-recipient reply, promoted to a ticket on arrival). Verify the signature over the
+  // id and hand back whichever id kind the tag carried.
+  const m = /^([^+@]+)\+([tb])\.([0-9a-f]{32})\.([0-9a-f]{10})@(.+)$/i.exec(a);
+  if (m) {
+    const [, local, kind, idRaw, sig, domain] = m;
+    const id = idRaw.toLowerCase();
+    const base = `${local}@${domain}`.toLowerCase();
+    try {
+      if (crypto.timingSafeEqual(Buffer.from(sig.toLowerCase()), Buffer.from(tokenSig(id)))) {
+        const uuid = `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
+        return kind.toLowerCase() === "b"
+          ? { base, ticketId: null, broadcastRecipientId: uuid }
+          : { base, ticketId: uuid, broadcastRecipientId: null };
+      }
+    } catch { /* length mismatch — treat as unsigned */ }
+    return { base, ticketId: null, broadcastRecipientId: null };
+  }
+  const g = /^([^+@]+)(\+[^@]*)?@(.+)$/.exec(a);
+  return {
+    base: g ? `${g[1]}@${g[3]}`.toLowerCase() : a.toLowerCase(),
+    ticketId: null,
+    broadcastRecipientId: null,
+  };
+}
+
+/** Angle-bracket-normalize an RFC 5322 Message-ID for In-Reply-To/References. */
+function angled(messageId: string): string {
+  const v = messageId.trim();
+  return v.startsWith("<") ? v : `<${v}>`;
+}
+
+// ---- inbound seam (testable without Mailpit) ----------------------------
+
+/** Curated technical headers snapshotted for the "view original" dialog. Providers expose these
+ *  differently (parsed map, name/value array, raw blob); each adapter normalizes into this shape. */
+export interface InboundHeaders {
+  from?: string;
+  to?: string;
+  cc?: string;
+  replyTo?: string;
+  subject?: string;
+  date?: string;
+  messageId?: string;
+  inReplyTo?: string;
+  references?: string;
+  authResults?: string; // Authentication-Results — the DKIM/SPF/DMARC verdicts
+  returnPath?: string;
+}
+
+export interface InboundEmail {
+  messageId: string; // email Message-ID header — the idempotency key
+  from: string; // customer address — the cross-channel identity + reply target
+  fromName?: string; // customer display name (From header), when present
+  to: string; // tenant support address — resolves the tenant
+  subject: string;
+  body: string; // plaintext part (preferred). Quote-stripped before persist.
+  /** Raw HTML part, when the email carried one. Used as the quote-strip fallback when there's no
+   *  usable plaintext body, and snapshotted onto meta.raw for the "view original" dialog. */
+  html?: string | null;
+  /** Curated technical headers (From/To/Date/Message-ID/DKIM…) snapshotted onto meta.raw so the
+   *  "view original" dialog can show them. Each adapter fills what its provider exposes. */
+  headers?: InboundHeaders | null;
+  /** Other recipients on the email (Cc + extra To, minus the support route) — stamped on the
+   *  message's meta so the agent composer can default to reply-all. */
+  cc?: string[];
+  /** Raw file attachments from the email — persisted into object-storage onto the message. */
+  attachments?: { filename: string; contentType: string; data: Buffer }[];
+}
+
+// Caps so a giant marketing/newsletter email can't bloat the message row unbounded.
+const RAW_TEXT_CAP = 64_000;
+const RAW_HTML_CAP = 256_000;
+
+/** Snapshot the untouched inbound (original text + HTML + curated headers) for the "view original"
+ *  dialog — but ONLY when it adds something the stripped bubble doesn't already show: an HTML part
+ *  or a stripped quote. A plain-text message with no quote needs no snapshot (nothing was hidden). */
+function buildRawSnapshot(
+  m: InboundEmail,
+  quoted: string | null,
+): { text?: string; html?: string; headers?: InboundHeaders } | null {
+  const hasHtml = !!(m.html && m.html.trim());
+  if (!hasHtml && !quoted) return null;
+  const raw: { text?: string; html?: string; headers?: InboundHeaders } = {};
+  if (m.body && m.body.trim()) raw.text = m.body.slice(0, RAW_TEXT_CAP);
+  if (hasHtml) raw.html = m.html!.slice(0, RAW_HTML_CAP);
+  if (m.headers && Object.values(m.headers).some((v) => v && v.trim())) raw.headers = m.headers;
+  return Object.keys(raw).length ? raw : null;
+}
+
+/** Post-ingest finish for an inbound email: persist attachments onto the message and stamp the
+ *  cc list into the message meta (both best-effort — a hiccup never loses the ticket). */
+async function finishInboundEmail(result: IngestResult, m: InboundEmail, quoted?: string | null): Promise<void> {
+  if (m.attachments?.length) {
+    await persistBufferAttachments(result.tenantId, result.ticketId, result.messageId, m.attachments.slice(0, 10))
+      .catch(() => {});
+  }
+  if (m.cc?.length) {
+    await withTenant(result.tenantId, async (c) => {
+      await c.query(
+        `UPDATE messages SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('cc', $2::jsonb) WHERE id = $1`,
+        [result.messageId, JSON.stringify(m.cc!.slice(0, 10))],
+      );
+    }).catch(() => {});
+  }
+  // Stamp the stripped quote + a raw snapshot (original text / HTML / headers) onto the message meta
+  // so a "view original" dialog can show exactly what arrived. Best-effort, capped, one merge.
+  const extra: Record<string, unknown> = {};
+  if (quoted) extra.quoted = quoted.slice(0, 100_000);
+  const raw = buildRawSnapshot(m, quoted ?? null);
+  if (raw) extra.raw = raw;
+  if (Object.keys(extra).length) {
+    await withTenant(result.tenantId, async (c) => {
+      await c.query(
+        `UPDATE messages SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE id = $1`,
+        [result.messageId, JSON.stringify(extra)],
+      );
+    }).catch(() => {});
+  }
+  // Ingest deferred the Discord ops-mirror relay when this email had attachments (deferMirror), so the
+  // mirror waits for the files. Now that they're persisted, fire the relay — it no-ops if the ticket
+  // isn't mirrored. No attachments → ingest already relayed inline, so we skip here.
+  if (m.attachments?.length) {
+    void import("./discord-mirror.js")
+      .then((mm) => mm.relayTicketMessage(result.tenantId, result.ticketId, result.messageId))
+      .catch(() => {});
+  }
+}
+
+/**
+ * Resolve the recipient's tenant, then ingest into ticket+message+outbox.
+ * Returns null when the To address maps to no tenant — which is also the echo
+ * guard: our own outbound (To = the customer) resolves to nothing, so it can
+ * never loop back into a ticket. The Message-ID is the idempotency key, so a
+ * re-polled message dedupes for free.
+ */
+export async function handleInboundEmail(
+  m: InboundEmail,
+  opts?: { tenantId?: string },
+): Promise<IngestResult | null> {
+  const parsed = parseInboundAddress(m.to);
+  // A caller that already knows the tenant (BYO per-tenant inbound handle — the handle IS the routing
+  // key, like Intercom's connected inbox) passes it explicitly; we trust it and never second-guess via
+  // the address table. Only the shared inbound lane (one URL for all tenants) falls back to address
+  // resolution, where an unrouted recipient genuinely has no owner.
+  const tenantId = opts?.tenantId ?? (await resolveTenantByAddress(parsed.base));
+  if (!tenantId) return null;
+
+  // Blocklist (spam): a blocked sender is dropped BEFORE any ticket/lead touch — the same quiet
+  // null-drop as an unrouted recipient, so the inbound route returns a 202 and nothing is created or
+  // reopened. Covers exact-address and domain blocks (see blocklist.ts).
+  if (m.from && (await isSenderBlocked(tenantId, "email", m.from))) return null;
+
+  // Strip the quoted reply history + signature the sender's mail client echoed back, so the
+  // conversation shows only what the customer typed THIS turn. The removed remainder rides
+  // onto messages.meta.quoted (in finishInboundEmail) for an optional "show quoted" expander.
+  const { visible: body, quoted } = stripInboundQuote({ text: m.body, html: m.html ?? null });
+
+  // Exact-ticket routing (P4): a verified reply-to token beats From-address threading — the reply
+  // lands on THAT ticket (reopening it if it closed meanwhile), so a contact with several open
+  // conversations can answer each one's email correctly. A `+b.` broadcast token resolves to the
+  // eager conversation opened for that recipient (0117), routed the same way. Token invalid / ticket
+  // gone → fall through to the normal contact threading below.
+  const broadcastTicketId = parsed.broadcastRecipientId
+    ? await resolveBroadcastReplyTicket(tenantId, parsed.broadcastRecipientId)
+    : null;
+  const routeTicketId = parsed.ticketId ?? broadcastTicketId;
+  if (routeTicketId) {
+    const exists = await withTenant(tenantId, async (c) => {
+      const r = await c.query("SELECT status FROM tickets WHERE id = $1", [routeTicketId]);
+      if (!r.rowCount) return false;
+      // Reopen if it closed meanwhile AND clear outbound_pending — the recipient's reply is exactly
+      // what promotes an eager broadcast conversation out of the Outbound lane into the active inbox.
+      await c.query(
+        "UPDATE tickets SET status = CASE WHEN status <> 'open' THEN 'open' ELSE status END, outbound_pending = false, updated_at = now() WHERE id = $1",
+        [routeTicketId],
+      );
+      return true;
+    }).catch(() => false);
+    if (exists) {
+      const result = await ingestInbound({
+        tenantId,
+        ticketId: routeTicketId,
+        body,
+        authorType: "customer",
+        idempotencyKey: `email:${m.messageId}`,
+        subject: m.subject || body.slice(0, 80),
+        channelType: "email",
+        externalChannelId: m.from.toLowerCase(),
+        identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
+        deferMirror: !!m.attachments?.length,
+      });
+      if (!result.replay) await finishInboundEmail(result, m, quoted);
+      return result;
+    }
+  }
+
+  const result = await ingestInbound({
+    tenantId,
+    body,
+    authorType: "customer",
+    idempotencyKey: `email:${m.messageId}`,
+    subject: m.subject || body.slice(0, 80),
+    channelType: "email",
+    externalChannelId: m.from.toLowerCase(),
+    // The From address is both the reply target and the cross-channel identity (email unifies).
+    identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
+    deferMirror: !!m.attachments?.length,
+  });
+  // A replayed (idempotency-deduped) message already carried its files/cc/quote the first time.
+  if (!result.replay) await finishInboundEmail(result, m, quoted);
+  // Broadcast lazy-promotion FALLBACK: only for a `+b.` reply whose recipient had NO eager conversation
+  // (pre-0117 sends). The reply materialized a ticket via contact-threading above; tag it with the
+  // broadcast it answered. Post-0117 sends resolve to their eager ticket and returned earlier.
+  if (parsed.broadcastRecipientId && !broadcastTicketId && !result.replay) {
+    await linkBroadcastReply(tenantId, result.ticketId, parsed.broadcastRecipientId).catch(() => {});
+  }
+  return result;
+}
+
+/** Resolve a `+b.` broadcast reply token to the eager conversation opened for that recipient at send
+ *  (0117), or null when the recipient predates eager conversations (pre-0117 send → lazy fallback). */
+async function resolveBroadcastReplyTicket(tenantId: string, recipientId: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT ticket_id FROM broadcast_recipients WHERE id = $1", [recipientId]);
+    return (r.rows[0]?.ticket_id as string | null) ?? null;
+  }).catch(() => null);
+}
+
+/** Tag a freshly-threaded reply with the broadcast it answered. The reply already resolved/created a
+ *  ticket via normal contact-threading; here we only record which broadcast (and recipient row) it
+ *  came from. First origin wins — the stamp writes only when currently null, so a later reply to a
+ *  different broadcast never overwrites the first. The recipient row is read under the tenant, so a
+ *  forged or foreign id resolves to nothing and no stamp is written. */
+async function linkBroadcastReply(tenantId: string, ticketId: string, recipientId: string): Promise<void> {
+  await withTenant(tenantId, async (c) => {
+    const r = await c.query("SELECT broadcast_id FROM broadcast_recipients WHERE id = $1", [recipientId]);
+    if (!r.rowCount) return;
+    await c.query(
+      `UPDATE tickets SET source_broadcast_id = $2, source_broadcast_recipient_id = $3
+        WHERE id = $1 AND source_broadcast_id IS NULL`,
+      [ticketId, r.rows[0].broadcast_id, recipientId],
+    );
+  });
+}
+
+// ---- outbound seam ------------------------------------------------------
+
+/**
+ * The single outbound-SMTP primitive — the ONE place we touch nodemailer. Sends one
+ * email via the configured transport (Mailpit in dev). From = the tenant's support
+ * address (so a reply round-trips back), tagged with the origin header so the inbound
+ * poller never re-ingests it. Subject is sent VERBATIM (callers that want reply
+ * semantics prepend "Re:" themselves). No-ops (with a reason) when there's no recipient
+ * or SMTP is unset, returning the same delivered/reason shape as the ticket-reply seam,
+ * so a caller can log per-send. Reused by routeEmailOutbound (ticket replies) and the
+ * broadcast mass-send. Env: SMTP_HOST (channel toggle), SMTP_PORT (default 1025).
+ */
+export async function sendOutboundEmail(
+  tenantId: string,
+  to: string | null | undefined,
+  subject: string,
+  body: string,
+  opts?: {
+    html?: string; attachments?: MailAttachment[]; unsubscribeUrl?: string;
+    /** Carbon-copy recipients (reply-all) — sent verbatim on the same message. */
+    cc?: string[];
+    /** Per-conversation addressing (P4): sets the signed reply-to + a deterministic Message-ID. */
+    replyToTicketId?: string | null;
+    /** The customer's last email Message-ID — threads the reply in their mail client. */
+    inReplyTo?: string | null;
+    /** Sender identity (teammate sending): the replying agent's display name + signup email. The From
+     *  becomes "<name> from <workspace>", and in teammate mode with a verified domain it sends from the
+     *  agent's own address. Reply-To/Message-ID stay on the support address regardless. */
+    agentName?: string | null;
+    agentEmail?: string | null;
+    /** Marketing send (broadcast): a per-recipient local token stamped into the Message-ID
+     *  (`<token@sending-domain>`) so a provider delivery-event webhook can match the event back to
+     *  the recipient row (0109). Mutually exclusive with replyToTicketId (a marketing send is not a
+     *  ticket reply). The returned `messageId` is the unangled full id the provider will echo. */
+    marketingId?: string | null;
+    /** Ticket-reply delivery tracking (0114): the internal messages.id, embedded into the reply's
+     *  Message-ID (`<t.<ticket-token>.m.<messageId>@domain>`) so a provider delivery event echoes it
+     *  and we can match it back to this exact reply row. The returned `messageId` is that unangled id.
+     *  Only meaningful alongside replyToTicketId. */
+    replyMessageId?: string | null;
+    /** Broadcast lazy-promotion: the broadcast_recipients row id. Stamps a signed `+b.` Reply-To so a
+     *  recipient's reply routes back carrying this id and promotes to a ticket tagged with its broadcast
+     *  origin (see handleInboundEmail). Independent of the marketing Message-ID (which tracks outbound
+     *  delivery events); a broadcast is not a ticket reply, so replyToTicketId stays null here. */
+    broadcastReplyRecipientId?: string | null;
+  },
+): Promise<{ delivered: boolean; reason?: string; messageId?: string }> {
+  if (!to) return { delivered: false, reason: "no-recipient" };
+  // BYO email provider: when the tenant brought their own key, send through THEIR ESP (Resend or
+  // SendGrid — their verified domains, reputation, quota). Otherwise the shared env SMTP relay (Mailpit
+  // in dev). A BYO key enables sending even where the shared SMTP_HOST is unset.
+  const creds = await tenantEmailProviderCreds(tenantId);
+  const smtpHost = process.env.SMTP_HOST;
+  if (!creds && !smtpHost) return { delivered: false, reason: "email-disabled" };
+  const support = (await tenantSupportAddress(tenantId)) ?? "support@noola.local";
+  // Reply-To routes on the INBOUND receiving domain when the tenant set one (forwarded support@ → their
+  // Inbound Parse domain, e.g. support@inbound.zerops.io); otherwise it stays on the support domain (the
+  // simple case where From and inbound share a domain). The From identity is independent — branded.
+  const replyBase = (await tenantReplyAddress(tenantId)) || support;
+  const replyDomain = replyBase.split("@")[1] ?? support.split("@")[1] ?? "noola.local";
+  // From = teammate identity (name always; address = teammate's own in teammate mode + verified domain,
+  // else the support address). Reply-To/Message-ID below stay pinned to the reply address so inbound
+  // routing + threading are unaffected by who the reply is From.
+  const fromIdentity = await resolveFromIdentity(tenantId, support, { agentName: opts?.agentName, agentEmail: opts?.agentEmail });
+  const tx = creds ? providerSmtpTransport(creds.provider, creds.apiKey) : smtpTransport(smtpHost!, Number(process.env.SMTP_PORT ?? 1025));
+  // Reply Message-ID (unangled). When the caller passes the internal messages.id we embed it
+  // (`t.<ticket-token>.m.<messageId>@domain`) so a provider delivery event, which echoes the
+  // Message-ID, matches straight back to this reply row (0114); otherwise fall back to the old
+  // timestamped form. Computed once so the stamped header and the returned id are identical.
+  const replyLocalId = opts?.replyToTicketId
+    ? `t.${ticketEmailToken(opts.replyToTicketId)}.${opts?.replyMessageId ? `m.${opts.replyMessageId}` : Date.now().toString(36)}@${replyDomain}`
+    : null;
+  await tx.sendMail({
+    from: fromIdentity,
+    to,
+    ...(opts?.cc?.length ? { cc: opts.cc } : {}),
+    subject,
+    text: body,
+    ...(opts?.replyToTicketId
+      ? {
+          replyTo: ticketReplyAddress(replyBase, opts.replyToTicketId),
+          messageId: `<${replyLocalId}>`,
+        }
+      : {}),
+    // Marketing send (0109): stamp a deterministic per-recipient Message-ID so a provider
+    // delivery-event webhook can match the event back to the recipient row. Skipped when this is
+    // a ticket reply (that path owns the Message-ID for threading).
+    ...(opts?.marketingId && !opts?.replyToTicketId ? { messageId: `<${opts.marketingId}@${replyDomain}>` } : {}),
+    // Broadcast lazy-promotion: a signed `+b.` Reply-To so a recipient's reply routes back carrying
+    // the recipient row id and materializes a ticket tagged with its broadcast origin. A ticket reply
+    // (replyToTicketId) owns Reply-To already, so this only applies to a fire-and-forget broadcast.
+    ...(opts?.broadcastReplyRecipientId && !opts?.replyToTicketId
+      ? { replyTo: broadcastReplyAddress(replyBase, opts.broadcastReplyRecipientId) }
+      : {}),
+    ...(opts?.inReplyTo ? { inReplyTo: angled(opts.inReplyTo), references: angled(opts.inReplyTo) } : {}),
+    // A rich HTML alternative (React Email render) when the caller supplies one — mail clients that
+    // can, show it; plaintext `text` stays the fallback. Attachments ride the same nodemailer send.
+    ...(opts?.html ? { html: opts.html } : {}),
+    ...(opts?.attachments?.length ? { attachments: opts.attachments } : {}),
+    headers: {
+      [ORIGIN_HEADER]: "agent",
+      // Marketing sends (broadcasts) carry the RFC 2369/8058 opt-out headers so mail clients
+      // surface their native "Unsubscribe" affordance; the POST target is the one-click lane.
+      ...(opts?.unsubscribeUrl
+        ? {
+            "List-Unsubscribe": `<${opts.unsubscribeUrl}>`,
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+          }
+        : {}),
+    },
+  });
+  // Return the unangled Message-ID the provider will echo: the reply id for a ticket reply (0114),
+  // else the marketing id for a broadcast send (0109). The caller persists it for webhook matching.
+  const echoedMessageId = replyLocalId ?? (opts?.marketingId ? `${opts.marketingId}@${replyDomain}` : undefined);
+  return { delivered: true, ...(echoedMessageId ? { messageId: echoedMessageId } : {}) };
+}
+
+/** A file attached to an outbound email (nodemailer's attachment shape, narrowed to what we send). */
+export interface MailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType?: string;
+}
+
+/**
+ * Send a transactional AUTH email (workspace invitation, etc.) over the same SMTP transport
+ * (Mailpit in dev/stage). Unlike sendOutboundEmail this is NOT tenant-support-routed — the
+ * From is a fixed system address (AUTH_EMAIL_FROM) — because an invite isn't a ticket reply
+ * and mustn't depend on the tenant having a support route. Carries the origin tag so the
+ * inbound poller ignores it (never re-ingested as a ticket). No-ops (with a reason) when SMTP
+ * is unset, so a setup without email still functions (the link is also returned via the API).
+ */
+export async function sendAuthEmail(
+  to: string,
+  subject: string,
+  body: string,
+): Promise<{ delivered: boolean; reason?: string }> {
+  const smtpHost = process.env.SMTP_HOST;
+  if (!smtpHost) return { delivered: false, reason: "email-disabled" };
+  const smtpPort = Number(process.env.SMTP_PORT ?? 1025);
+  const from = process.env.AUTH_EMAIL_FROM ?? "no-reply@noola.local";
+  try {
+    const tx = smtpTransport(smtpHost, smtpPort);
+    await tx.sendMail({ from, to, subject, text: body, headers: { [ORIGIN_HEADER]: "auth" } });
+    return { delivered: true };
+  } catch (err) {
+    // Never let a mail hiccup fail the invite/account operation this rides inside — the link
+    // is also returned via the API, so delivery is best-effort.
+    return { delivered: false, reason: `send-failed: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * Send an agent reply back to the customer as email. externalChannelId is the
+ * customer's address (the ticket's origin). Rides sendOutboundEmail with reply
+ * semantics (a "Re:" prefix unless the subject already carries one). The markdown
+ * body is rendered through the React Email reply template — HTML alternative +
+ * markdown-stripped plaintext; if rendering fails, falls back to the raw markdown
+ * with no HTML (a render hiccup never blocks the send). No-ops (with a reason)
+ * when the channel is disabled or there's no recipient.
+ */
+/** Absolute URL of the read-receipt pixel for one agent message. Uses this api's public origin
+ *  (API_BASE_URL in prod, else the Zerops subdomain). Email "Seen" is best-effort: it only fires in
+ *  clients that load remote images (Gmail/Outlook block by default), so a missing open never means
+ *  "unread". */
+function seenPixelUrl(messageId: string): string {
+  return `${publicApiBase()}/public/seen/${messageId}`;
+}
+
+export async function routeEmailOutbound(
+  routing: { tenantId: string; externalChannelId?: string | null; ticketId?: string | null },
+  subject: string,
+  body: string,
+  attachments?: MailAttachment[],
+  opts?: { agentName?: string | null; agentEmail?: string | null; cc?: string[]; seenMessageId?: string | null; replyMessageId?: string | null },
+): Promise<{ delivered: boolean; reason?: string; messageId?: string }> {
+  const subj = /^re:/i.test(subject) ? subject : `Re: ${subject}`;
+  // The tenant's flagged reply template (0072) restyles the frame; failures fall back to the
+  // stock personal look — a designer hiccup never blocks the send.
+  const tokens = await import("./email-templates.js")
+    .then((m) => m.getReplyTemplateTokens(routing.tenantId))
+    .catch(() => null);
+  // Read-receipt pixel (best-effort — image-blocking clients simply never fire it).
+  const pixelUrl = opts?.seenMessageId ? seenPixelUrl(opts.seenMessageId) : null;
+  const rendered = await renderReplyEmail(body, { ...opts, tokens, pixelUrl }).catch(() => null);
+  // P4 threading: reference the customer's last inbound email so their client threads the reply
+  // (In-Reply-To/References), and reply-to the signed per-ticket address so THEIR reply routes to
+  // exactly this conversation. Both best-effort — a lookup hiccup never blocks the send.
+  const inReplyTo = routing.ticketId
+    ? await withTenant(routing.tenantId, async (c) => {
+        const r = await c.query(
+          `SELECT idempotency_key FROM messages
+            WHERE ticket_id = $1 AND author_type = 'customer' AND channel_type = 'email'
+              AND idempotency_key LIKE 'email:%'
+            ORDER BY created_at DESC LIMIT 1`,
+          [routing.ticketId],
+        );
+        return r.rowCount ? (r.rows[0].idempotency_key as string).slice("email:".length) : null;
+      }).catch(() => null)
+    : null;
+  return sendOutboundEmail(routing.tenantId, routing.externalChannelId, subj, rendered?.text || body, {
+    ...(rendered?.html ? { html: rendered.html } : {}),
+    ...(attachments?.length ? { attachments } : {}),
+    ...(opts?.cc?.length ? { cc: opts.cc } : {}),
+    ...(opts?.agentName ? { agentName: opts.agentName } : {}),
+    ...(opts?.agentEmail ? { agentEmail: opts.agentEmail } : {}),
+    ...(opts?.replyMessageId ? { replyMessageId: opts.replyMessageId } : {}),
+    replyToTicketId: routing.ticketId ?? null,
+    inReplyTo,
+  });
+}
+
+/**
+ * Widget/away fallback (Intercom parity). The web widget has no outbound driver — it delivers agent
+ * replies by polling. So when a reply can't be pushed AND the contact isn't currently active in the
+ * widget (last_seen outside the 3-min online window) AND we have their email, ALSO send the reply as
+ * an email — otherwise an away customer never hears back until they happen to reopen the widget.
+ * Best-effort and no-op without an email or when the contact is live in the widget.
+ */
+export async function notifyContactByEmailIfAway(
+  tenantId: string,
+  args: { ticketId: string; subject: string | null; body: string; agentName?: string | null; messageId?: string | null },
+): Promise<void> {
+  const info = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT co.email,
+              (co.last_seen_at IS NOT NULL AND co.last_seen_at > now() - interval '3 minutes') AS online
+         FROM tickets t JOIN contacts co ON co.tenant_id = t.tenant_id AND co.id = t.contact_id
+        WHERE t.id = $1`,
+      [args.ticketId],
+    );
+    return r.rowCount ? (r.rows[0] as { email: string | null; online: boolean }) : null;
+  });
+  if (!info?.email || info.online) return;
+  const res = await routeEmailOutbound(
+    { tenantId, externalChannelId: info.email, ticketId: args.ticketId },
+    args.subject || "Support",
+    args.body,
+    undefined,
+    // best-effort read receipt + delivery tracking on the away-fallback email too (the message row is
+    // channel_type='widget', but once it goes out by email we track it like any reply email — 0114).
+    { agentName: args.agentName ?? null, ...(args.messageId ? { seenMessageId: args.messageId, replyMessageId: args.messageId } : {}) },
+  ).catch(() => null);
+  // Stamp the fallback reply's delivery head so the thread shows it actually went out by email (and
+  // later flips to delivered/bounced from the provider webhook), not just an unconfirmed widget reply.
+  if (args.messageId && res) {
+    await withTenant(tenantId, (c) =>
+      c.query("UPDATE messages SET provider_message_id = COALESCE($2, provider_message_id), delivery_status = $3 WHERE id = $1", [
+        args.messageId,
+        res.messageId ?? null,
+        res.delivered ? "sent" : "failed",
+      ]),
+    ).catch(() => {});
+  }
+}
+
+// ---- inbound poller (Mailpit; validated live) ---------------------------
+
+type Log = { info: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
+
+interface MailpitListItem { ID: string; Read: boolean }
+interface MailpitMessage {
+  ID: string;
+  MessageID: string;
+  From: { Address: string; Name: string };
+  To: { Address: string; Name: string }[];
+  Cc?: { Address: string; Name: string }[] | null;
+  Subject: string;
+  Text: string;
+  HTML?: string | null;
+  Headers?: Record<string, string[]>;
+  Attachments?: { PartID: string; FileName: string; ContentType: string; Size: number }[] | null;
+}
+
+/** Pull curated headers out of Mailpit's `Record<name, string[]>` header map (case-insensitive). */
+function mailpitHeaders(h: Record<string, string[]> | undefined): InboundHeaders | null {
+  if (!h) return null;
+  const lower = new Map(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v?.[0]]));
+  const get = (name: string) => lower.get(name) || undefined;
+  return {
+    from: get("from"), to: get("to"), cc: get("cc"), replyTo: get("reply-to"),
+    subject: get("subject"), date: get("date"), messageId: get("message-id"),
+    inReplyTo: get("in-reply-to"), references: get("references"),
+    authResults: get("authentication-results"), returnPath: get("return-path"),
+  };
+}
+
+// Per-file / per-message caps for inbound attachment ingestion — matches the widget's ceiling.
+const INBOUND_ATTACH_MAX_BYTES = 10 * 1024 * 1024;
+const INBOUND_ATTACH_MAX_FILES = 10;
+
+async function markRead(api: string, ids: string[]): Promise<void> {
+  await fetch(`${api}/api/v1/messages`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ IDs: ids, Read: true }),
+  });
+}
+
+/**
+ * Poll Mailpit for unread messages and funnel each through the inbound seam.
+ * Skips our own origin-tagged outbound; marks every processed message read so a
+ * later poll won't reconsider it (idempotency backstops any race). Best-effort:
+ * a transient Mailpit hiccup logs and the next tick retries.
+ */
+export async function pollEmail(log: Log): Promise<void> {
+  const api = process.env.MAILPIT_API_URL;
+  if (!api) return;
+  let list: { messages: MailpitListItem[] };
+  try {
+    const res = await fetch(`${api}/api/v1/messages?limit=50`);
+    if (!res.ok) throw new Error(`mailpit list ${res.status}`);
+    list = (await res.json()) as { messages: MailpitListItem[] };
+  } catch (err) {
+    log.warn({ err }, "email: mailpit list failed");
+    return;
+  }
+  for (const item of list.messages ?? []) {
+    if (item.Read) continue;
+    try {
+      const full = (await (await fetch(`${api}/api/v1/message/${item.ID}`)).json()) as MailpitMessage;
+      const origin = full.Headers?.[ORIGIN_HEADER]?.[0];
+      if (origin) {
+        await markRead(api, [item.ID]); // our own outbound — never ingest
+        continue;
+      }
+      const to = (full.To?.[0]?.Address ?? "").toLowerCase();
+      const from = (full.From?.Address ?? "").toLowerCase();
+      // Everyone else on the email (Cc + extra To recipients) minus the support route itself —
+      // the reply-all set the composer should default to.
+      const cc = [...(full.To ?? []).slice(1), ...(full.Cc ?? [])]
+        .map((a) => (a?.Address ?? "").toLowerCase())
+        .filter((a) => a && a !== to && a !== from);
+      // Download each attachment part from Mailpit (bytes ride the part endpoint).
+      const files: { filename: string; contentType: string; data: Buffer }[] = [];
+      for (const att of (full.Attachments ?? []).slice(0, INBOUND_ATTACH_MAX_FILES)) {
+        if (!att?.PartID || (att.Size ?? 0) > INBOUND_ATTACH_MAX_BYTES) continue;
+        try {
+          const part = await fetch(`${api}/api/v1/message/${item.ID}/part/${att.PartID}`);
+          if (!part.ok) continue;
+          files.push({
+            filename: att.FileName || "file",
+            contentType: att.ContentType || part.headers.get("content-type") || "application/octet-stream",
+            data: Buffer.from(await part.arrayBuffer()),
+          });
+        } catch { /* skip this file */ }
+      }
+      const r = await handleInboundEmail({
+        messageId: full.MessageID || item.ID,
+        from,
+        fromName: full.From?.Name || undefined,
+        to,
+        subject: full.Subject ?? "",
+        body: full.Text ?? "",
+        html: full.HTML ?? null,
+        headers: mailpitHeaders(full.Headers),
+        ...(cc.length ? { cc: [...new Set(cc)] } : {}),
+        ...(files.length ? { attachments: files } : {}),
+      });
+      await markRead(api, [item.ID]);
+      if (!r) log.warn(`email: no tenant route for recipient ${to} — ignored`);
+    } catch (err) {
+      log.error({ err, id: item.ID }, "email: inbound ingest failed");
+    }
+  }
+}

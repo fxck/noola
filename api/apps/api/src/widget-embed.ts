@@ -1,0 +1,1808 @@
+// The embeddable messenger widget, served verbatim at GET /widget.js. It is a self-contained
+// IIFE (shadow-DOM launcher + a multi-view panel: Home / Messages / Help) plus the Noola(...)
+// JS SDK (identify visitors, track activity, visibility controls) — Intercom-style. It reads its
+// config from its own <script data-noola-*> tag AND from GET /public/config (the admin's
+// Settings → Messenger personalization), and talks to the public lanes:
+//   GET  /public/config       — per-key personalization (accent / greeting / position / tabs)
+//   POST /public/ask          — AI answer (+ escalate:true to hand off to a human)
+//   POST /public/conversation — poll agent replies once escalated (two-way live chat)
+//   GET  /public/kb[/search]  — help center articles + search
+//   GET  /public/kb/:slug     — a single article
+//   POST /public/identify     — Noola('boot'|'update') → upsert the contact + last-seen, and fold
+//                               the anonymous contacts behind this browser's conversations into it
+//   POST /public/track        — Noola('track', name, meta) → a custom activity event
+// The SDK command queue is global as window.Noola(...). The plain <script data-noola-key> embed
+// (no boot call) still works exactly as before — an anonymous visitor.
+//
+// Colour scheme: the widget follows the OS (prefers-color-scheme) by default. A host that runs its
+// own light/dark toggle can pin it — data-noola-theme="dark|light" on the embed, {theme:'dark'} in
+// boot/update, or Noola('theme', 'dark'|'light'|'auto') live from the toggle handler.
+//
+// Written with single-quoted strings + concatenation only (no backticks / ${…}) so it survives
+// being embedded in this template literal.
+export const WIDGET_JS = String.raw`(function () {
+  'use strict';
+  // Loaded twice (a second <script> tag, an SPA re-injecting it)? A second copy would boot its own
+  // launcher, timers and pops, and window.Noola would only reach the newest copy. Keep the first.
+  if (window.__noolaWidgetLoaded) return;
+  window.__noolaWidgetLoaded = true;
+
+  // ---- config from the embedding <script> tag (fallback until /public/config resolves) ----
+  var script = document.currentScript || document.querySelector('script[data-noola-key]');
+  var scriptSrc = (script && script.src) || '';
+  var dataKey = script ? (script.getAttribute('data-noola-key') || '') : '';
+  var API = (script && (script.getAttribute('data-noola-api') || (scriptSrc ? new URL(scriptSrc).origin : ''))) || '';
+  API = API.replace(/\/+$/, '');
+  // Optional real-time lane: the Phoenix edge base URL (e.g. wss://edge.example.app). When set,
+  // agent replies stream in live over a WebSocket; polling stays on as a fallback.
+  var EDGE = ((script && script.getAttribute('data-noola-edge')) || '').replace(/\/+$/, '');
+
+  // Colour scheme: 'light' | 'dark' pin the widget regardless of the OS; anything else (incl.
+  // 'system' / 'auto' / unset) = follow prefers-color-scheme. Comes from data-noola-theme,
+  // Noola('boot'|'update',{theme}) or Noola('theme', value) — the host app can flip it live.
+  function normTheme(v) { v = (v == null ? '' : String(v)).toLowerCase(); return (v === 'light' || v === 'dark') ? v : 'auto'; }
+
+  var CFG = {
+    accent: (script && script.getAttribute('data-noola-accent')) || '#4f46e5',
+    title: (script && script.getAttribute('data-noola-title')) || 'Ask us anything',
+    greeting: 'Get an instant answer from our AI, or browse the help center.',
+    position: 'right',
+    theme: normTheme(script && script.getAttribute('data-noola-theme')),
+    tabs: { home: true, messages: true, help: true }
+  };
+
+  var KEY = dataKey;              // resolved widget key (data attr OR Noola('boot',{key}))
+  var mounted = false;
+  // Start-hidden: the data-noola-hidden attribute on the embed = no launcher bubble until you call
+  // Noola('show') or Noola('open') from your own button (the Intercom custom-launcher pattern). No flash.
+  var launcherHidden = !!(script && script.hasAttribute('data-noola-hidden'));
+  var panelOpen = false;
+  var configLoaded = false;
+
+  // ---- identity + conversations (persisted per key) ----
+  var identity = { email: null, name: null, user_id: null, user_hash: null, user_jwt: null, company: null, attributes: {} };
+  var convs = [];                 // [{ id, escalated, updatedAt, unread, msgs:[{role,body,id,at}] }]
+  var view = 'home';              // home | messages | help | thread | article
+  var threadId = null;            // conversation id when view === 'thread'
+  var articleSlug = null;
+  var busy = false;
+
+  // live lanes (scoped to the active escalated conversation)
+  var activeConvId = null;
+  var pollTimer = null;
+  var ws = null, wsHb = null, wsRef = 0;
+  // While an AI answer streams token-by-token (SSE), the poll/WS/hydrate reconcilers must NOT
+  // rebuild #log from the server — the answer isn't persisted until the stream's 'done', so a
+  // mid-stream hydrate would wipe the live bubble. Set to the conversation id during a stream.
+  var streamingConv = null;
+  // Bumped on every identity reset (shutdown / account switch). A response to a request started under the
+  // previous identity is dropped instead of writing that user's conversations into the new session.
+  var sessionGen = 0;
+  // In-flight latches for the human handoff / AI resume — memory only, never persisted (a reload during
+  // a request used to leave a stored "escalating" flag behind and the button silently dead).
+  var escalatingIds = {}, resumingIds = {};
+
+  // ---- storage helpers ----
+  function skey(sfx) { return 'noola_' + sfx + '_' + KEY; }
+  function loadJSON(k, fb) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch (e) { return fb; } }
+  function saveJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+  function loadIdentity() {
+    var s = loadJSON(skey('ident'), null);
+    if (s && typeof s === 'object') identity = { email: s.email || null, name: s.name || null, user_id: s.user_id || null, user_hash: s.user_hash || null, user_jwt: s.user_jwt || null, company: s.company || null, attributes: s.attributes || {} };
+  }
+  function saveIdentity() { saveJSON(skey('ident'), identity); }
+  function isIdentified() { return !!(identity.email || identity.user_id || identity.user_jwt); }
+  function emptyIdentity() { return { email: null, name: null, user_id: null, user_hash: null, user_jwt: null, company: null, attributes: {} }; }
+  // Who the stored conversations belong to: the user id when known, else the email.
+  function identityKey() { return identity.user_id ? 'u:' + String(identity.user_id) : (identity.email ? 'e:' + String(identity.email).toLowerCase() : ''); }
+  // True when boot/update options name a DIFFERENT person than the current identity (account switch).
+  // Only compares like with like, so adding an email to a user-id identity isn't a switch.
+  function isDifferentUser(a) {
+    if (!a || typeof a !== 'object') return false;
+    var uid = a.user_id != null ? a.user_id : a.userId;
+    if (uid != null && identity.user_id) return String(uid) !== String(identity.user_id);
+    if (uid == null && typeof a.email === 'string' && a.email && !identity.user_id && identity.email) return a.email.toLowerCase() !== String(identity.email).toLowerCase();
+    return false;
+  }
+  function ownerMismatch(owner) {
+    var me = identityKey();
+    return !!(owner && me && owner.charAt(0) === me.charAt(0) && owner !== me);
+  }
+  // The newest agent reply this visitor has already been shown (auto-opened or opened), per identity.
+  // A pop needs a reply NEWER than this, so a lost or failed seen-stamp can never re-pop the same reply.
+  function popMark() { var m = loadJSON(skey('popmark'), null); return (m && m.owner === identityKey()) ? (m.at || 0) : 0; }
+  function setPopMark(at) { if (at && at > popMark()) saveJSON(skey('popmark'), { owner: identityKey(), at: at }); }
+  function isEnded(status) { return status === 'closed' || status === 'resolved'; }
+  function newestAgentAt(c) {
+    var at = 0, ms = (c && c.msgs) || [];
+    for (var i = 0; i < ms.length; i++) { var m = ms[i]; if ((m.role === 'agent' || m.role === 'ai') && m.id && m.id !== 'preview' && m.at > at) at = m.at; }
+    return Math.max(at, (c && c.unseenAt) || 0);
+  }
+
+  function loadConvs() {
+    // Stored conversations belong to one identity — never load another user's list into this session.
+    if (ownerMismatch(loadJSON(skey('owner'), null))) {
+      convs = [];
+      try { localStorage.removeItem(skey('convs')); localStorage.removeItem(skey('owner')); } catch (e) {}
+      return;
+    }
+    convs = loadJSON(skey('convs'), null) || [];
+    if (!convs.length) {
+      // migrate the legacy single-conversation id (pre-multi-conversation widget)
+      var legacy = null; try { legacy = localStorage.getItem('noola_conv_' + KEY); } catch (e) {}
+      if (legacy) convs = [{ id: legacy, escalated: false, updatedAt: Date.now(), unread: 0, msgs: [] }];
+    }
+  }
+  function saveConvs() {
+    // Persist a trimmed COPY. Trimming the live list made every later poll see the older server messages
+    // as "new" and pop the messenger open again — on every poll.
+    var out = [];
+    for (var i = 0; i < convs.length && out.length < 20; i++) {
+      var c = convs[i], copy = {};
+      for (var k in c) if (c.hasOwnProperty(k) && k !== 'escalating') copy[k] = c[k];
+      if (copy.msgs && copy.msgs.length > 120) copy.msgs = copy.msgs.slice(-120);
+      out.push(copy);
+    }
+    saveJSON(skey('convs'), out);
+    saveJSON(skey('owner'), identityKey());
+  }
+  // Forget the current session's conversations + live lanes (shutdown, or a different user booting).
+  function resetSession() {
+    sessionGen++;
+    stopPoll(); closeWS();
+    convs = []; threadId = null; activeConvId = null; serverConvsSynced = false;
+    escalatingIds = {}; resumingIds = {};
+    if (view === 'thread') view = 'home';
+    try { localStorage.removeItem(skey('convs')); localStorage.removeItem(skey('owner')); localStorage.removeItem('noola_conv_' + KEY); } catch (e) {}
+    renderBadge();
+  }
+  function uuid() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('c' + Date.now() + Math.floor(Math.random() * 1e6)); }
+  function getConv(id) { for (var i = 0; i < convs.length; i++) if (convs[i].id === id) return convs[i]; return null; }
+  function newConv() { var c = { id: uuid(), escalated: false, updatedAt: Date.now(), unread: 0, msgs: [] }; convs.unshift(c); saveConvs(); return c; }
+  function touchedConvs() {
+    var out = []; for (var i = 0; i < convs.length; i++) if (convs[i].msgs && convs[i].msgs.length) out.push(convs[i]);
+    out.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+    return out;
+  }
+  // Pull an identified visitor's server-side conversation history into the local list, so a returning
+  // user sees their past chats on the Messages tab (not just the ones this browser started). Each
+  // server conversation becomes a stub with a one-line preview; opening it hydrates the full transcript.
+  var serverConvsSynced = false;
+  // cb(changed, list): list is the server's conversations on success, null on any failure — callers that
+  // act on it (the boot pop) must do nothing unless the sync actually succeeded.
+  function syncServerConvs(cb) {
+    if (!isIdentified()) { if (cb) cb(false, null); return; }
+    var gen = sessionGen;
+    fetch(API + '/public/conversations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, email: identity.email || undefined, userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined }) })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (gen !== sessionGen) return;   // identity changed while in flight
+        if (!d || !d.conversations) { if (cb) cb(false, null); return; }
+        var changed = false, listed = {};
+        for (var i = 0; i < d.conversations.length; i++) {
+          var sc = d.conversations[i];
+          listed[sc.conversationId] = 1;
+          var at = +new Date(sc.updatedAt) || Date.now();
+          var unseenAt = sc.unseenAt ? +new Date(sc.unseenAt) : 0;
+          var preview = sc.lastBody ? [{ role: sc.lastFromAgent ? 'agent' : 'me', id: 'preview', body: sc.lastBody, at: at }] : [];
+          var existing = getConv(sc.conversationId);
+          if (existing) {
+            var esc = sc.assistantEnabled === false, unseen = sc.unseen === true, st = sc.status || null;
+            if (existing.escalated !== esc || existing.unseen !== unseen || existing.status !== st || existing.unseenAt !== unseenAt) changed = true;
+            existing.escalated = esc; existing.unseen = unseen; existing.status = st; existing.unseenAt = unseenAt;
+            if (!existing.msgs.length && preview.length) { existing.msgs = preview; existing.updatedAt = at; changed = true; }
+          } else {
+            convs.push({ id: sc.conversationId, escalated: sc.assistantEnabled === false, status: sc.status || null, updatedAt: at, unread: 0, unseen: sc.unseen === true, unseenAt: unseenAt, msgs: preview });
+            changed = true;
+          }
+        }
+        // The server list is the truth for "unseen": a conversation it doesn't report can't still be unseen.
+        // (Left stale in localStorage, that flag re-popped an old conversation on every reload.)
+        for (var j = 0; j < convs.length; j++) if (!listed[convs[j].id] && convs[j].unseen) { convs[j].unseen = false; changed = true; }
+        if (changed) saveConvs();
+        if (cb) cb(changed, d.conversations);
+      })
+      .catch(function () { if (gen === sessionGen && cb) cb(false, null); });
+  }
+  function totalUnread() { var n = 0; for (var i = 0; i < convs.length; i++) n += (convs[i].unread || 0); return n; }
+
+  // ---- shadow-DOM shell ----
+  var host, root, styleEl, varStyle, wrapEl, bubbleEl, badgeEl, panelEl, stageEl, hdwrapEl, navEl;
+  var curScreen = null;        // the live (front-most) BODY screen; body queries scope to it
+  var curHeader = null;        // the live header .hd element (persistent shell); header queries scope to it
+  var pendingDir = 'none';     // transition direction for the next render (set by setView/openPanel)
+  var prevBadge = 0;
+
+  // Body queries scope to the active screen so a mid-transition outgoing screen (same ids) never matches.
+  function sel(s) { return curScreen ? curScreen.querySelector(s) : null; }
+  function selAll(s) { return curScreen ? curScreen.querySelectorAll(s) : []; }
+  // Header queries scope to the live header element (the persistent shell may hold an outgoing copy mid-morph).
+  function selHd(s) { return curHeader ? curHeader.querySelector(s) : null; }
+  function reducedMotion() { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
+
+  function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+  function relTime(ts) {
+    var d = (Date.now() - ts) / 1000;
+    if (d < 60) return 'just now';
+    if (d < 3600) return Math.floor(d / 60) + 'm ago';
+    if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+    return Math.floor(d / 86400) + 'd ago';
+  }
+
+  // Dark palette tokens, emitted twice below: under the OS media query (auto mode — only when the
+  // embed has NOT pinned data-noola-theme) AND under :host([data-noola-theme="dark"]) so a host can
+  // force dark against a light OS. Light is the bare :host default, so "light" needs no rule of its own.
+  var DARK_VARS =
+    '--bg:#0b0e13;--s1:#161b22;--s2:#1e2530;' +
+    '--fg:#f4f5f7;--fg2:rgba(255,255,255,.62);--fg3:rgba(255,255,255,.40);' +
+    '--bd:rgba(255,255,255,.09);--bd2:rgba(255,255,255,.16);--dv:rgba(255,255,255,.09);' +
+    '--send-idle:rgba(255,255,255,.12);--send-idle-fg:rgba(255,255,255,.55);--ghost-hover:rgba(255,255,255,.07);' +
+    '--hd-a:#0a1210;--hd-b:#0d1a16;--hd-c:#07100d;' +
+    '--shadow-panel:0 18px 56px rgba(0,0,0,.6),0 3px 10px rgba(0,0,0,.42);color-scheme:dark';
+
+  var CSS =
+    ':host,*{box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}' +
+    ':host{' +
+      '--ease:cubic-bezier(0.32,0.72,0,1);--spring:cubic-bezier(0.23,1,0.32,1);' +
+      '--ba-fg:#fff;' +
+      '--bg:#f5f6f8;--s1:#ffffff;--s2:#f1f1f3;' +
+      '--fg:#111418;--fg2:#5b6169;--fg3:#9ca3af;' +
+      '--bd:#e6e6e9;--bd2:#d3d5da;--dv:rgba(0,0,0,.06);' +
+      '--send-idle:#e5e7eb;--send-idle-fg:#9ca3af;--ghost-hover:rgba(0,0,0,.05);' +
+      '--hd-a:#0f1a16;--hd-b:#13241d;--hd-c:#0b1611;' +
+      '--shadow-sm:0 1px 2px rgba(16,24,40,.05);--shadow-card:0 1px 3px rgba(16,24,40,.07),0 1px 2px rgba(16,24,40,.04);' +
+      '--shadow-panel:0 16px 48px rgba(16,24,40,.18),0 3px 10px rgba(16,24,40,.08);' +
+      '--r:20px;--rp:22px;--rc:14px;--rb:18px;color-scheme:light}' +
+    '@media (prefers-color-scheme:dark){:host(:not([data-noola-theme])){' + DARK_VARS + '}}' +
+    ':host([data-noola-theme="dark"]){' + DARK_VARS + '}' +
+    '.noola{position:fixed;bottom:0;right:0;z-index:2147483000}' +
+    '.bubble{position:fixed;bottom:20px;right:20px;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;' +
+      'background:var(--ba);color:var(--ba-fg);box-shadow:0 8px 24px rgba(0,0,0,.22);display:grid;place-items:center;z-index:2147483001;' +
+      'transition:transform .2s var(--spring),box-shadow .2s var(--ease)}' +
+    '@media (hover:hover) and (pointer:fine){.bubble:hover{transform:scale(1.04);box-shadow:0 12px 30px rgba(0,0,0,.28)}}' +
+    '.bubble:active{transform:scale(.96)}' +
+    '.bubble .g{grid-area:1/1;display:grid;place-items:center;transition:opacity .18s var(--ease),transform .22s var(--spring)}' +
+    '.bubble .g svg{width:26px;height:26px;display:block}' +
+    '.bubble .gclose{opacity:0;transform:rotate(-90deg) scale(.6)}' +
+    '.bubble.open .gchat{opacity:0;transform:rotate(90deg) scale(.6)}' +
+    '.bubble.open .gclose{opacity:1;transform:none}' +
+    '.pos-left .bubble{left:20px;right:auto}' +
+    '.badge{position:fixed;bottom:56px;right:16px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#ef4444;color:#fff;' +
+      'font-size:11px;font-weight:700;line-height:20px;text-align:center;box-shadow:0 2px 6px rgba(0,0,0,.25);z-index:2147483002;display:none}' +
+    '.badge.pop{animation:badgepop .2s var(--spring)}' +
+    '@keyframes badgepop{0%{transform:scale(.5)}60%{transform:scale(1.18)}100%{transform:scale(1)}}' +
+    '.pos-left .badge{left:44px;right:auto}' +
+    '.panel{position:fixed;bottom:88px;right:20px;width:400px;max-width:calc(100vw - 32px);height:min(680px,calc(100vh - 116px));' +
+      'background:var(--bg);color:var(--fg);border-radius:var(--r);box-shadow:var(--shadow-panel);display:none;flex-direction:column;' +
+      'overflow:hidden;z-index:2147483001;transform-origin:bottom right;opacity:0;transform:translateY(8px) scale(.96);' +
+      'transition:opacity .28s var(--ease),transform .28s var(--ease)}' +
+    '@media (prefers-color-scheme:dark){:host(:not([data-noola-theme])) .panel{border:1px solid var(--bd)}}' +
+    ':host([data-noola-theme="dark"]) .panel{border:1px solid var(--bd)}' +
+    '.pos-left .panel{left:20px;right:auto;transform-origin:bottom left}' +
+    '.panel.on{opacity:1;transform:none}' +
+    // Persistent chrome: the header shell (#hdwrap) stays mounted and smoothly animates its HEIGHT
+    // between the tall home hero and the short sub-headers; its inner .hd cross-dissolves. Only the
+    // body (.stage) transitions per view, and the bottom nav is persistent — so nothing re-renders
+    // wholesale and buttons never flash on a tab switch.
+    '.hdwrap{position:relative;flex:0 0 auto;overflow:hidden;transition:height .34s var(--ease)}' +
+    '.hdwrap>.hd.leaving{position:absolute;top:0;left:0;right:0;z-index:1}' +
+    '.stage{position:relative;flex:1;overflow:hidden;display:flex}' +
+    '.screen{position:absolute;inset:0;display:flex;flex-direction:column;background:var(--bg);overflow:hidden}' +
+    '.screen.enter-tab{opacity:0;transform:translateY(4px);transition:opacity .15s var(--ease),transform .15s var(--ease)}' +
+    '.screen.enter-tab.active{opacity:1;transform:none}' +
+    '.screen.leave-tab{transition:opacity .15s var(--ease)}' +
+    '.screen.leave-tab.go{opacity:0}' +
+    '.screen.enter-fwd{transform:translateX(16px);opacity:0;transition:transform .26s var(--ease),opacity .22s var(--ease)}' +
+    '.screen.enter-fwd.active{transform:none;opacity:1}' +
+    '.screen.leave-fwd{transition:transform .26s var(--ease),opacity .2s var(--ease)}' +
+    '.screen.leave-fwd.go{transform:translateX(-10px);opacity:0}' +
+    '.screen.enter-back{transform:translateX(-16px);opacity:0;transition:transform .26s var(--ease),opacity .22s var(--ease)}' +
+    '.screen.enter-back.active{transform:none;opacity:1}' +
+    '.screen.leave-back{z-index:2;transition:transform .26s var(--ease),opacity .2s var(--ease)}' +
+    '.screen.leave-back.go{transform:translateX(16px);opacity:0}' +
+    // Header is a calm near-black surface in BOTH themes (Intercom-style), with only a faint accent
+    // glow — never a full brand-color wash. hd-a/b/c are theme-specific near-blacks.
+    '.hd{background:var(--hd-a);color:#fff;padding:14px 14px 15px;display:flex;align-items:flex-start;gap:10px;position:relative}' +
+    '.hd.grad{background-color:var(--hd-a);background-image:radial-gradient(135% 120% at 16% -10%,color-mix(in srgb,var(--ba) 40%,var(--hd-b)) 0%,var(--hd-b) 46%,var(--hd-c) 100%)}' +
+    // Light header for non-home screens (Intercom reserves the dark hero for Home only). Dark text,
+    // hairline base, ghost icon buttons — the body reads as one calm light surface top-to-bottom.
+    '.hd.plain{background:var(--s1);color:var(--fg);border-bottom:1px solid var(--bd);padding:15px 14px;align-items:center}' +
+    '.hd.home{flex-direction:column;align-items:stretch;gap:0;padding:18px 20px 24px}' +
+    '.hd.home .homeTop{display:flex;align-items:center;justify-content:flex-end;gap:12px;min-height:34px}' +
+    '.hd.home .faces{display:flex;align-items:center}' +
+    // Overlapping avatar cluster. Initials fall back to an OPAQUE lifted-header disc — never translucent,
+    // so overlapping discs don\'t bleed into each other. Photos fill; the AI mark is the one accent disc.
+    '.hd.home .faces .fc{width:32px;height:32px;border-radius:50%;border:2px solid var(--hd-b);background:color-mix(in srgb,#fff 15%,var(--hd-a));overflow:hidden;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.35)}' +
+    '.hd.home .faces .fc+.fc{margin-left:-10px}' +
+    '.hd.home .faces .fc.ai{background:var(--ba);color:#fff}' +
+    '.hd.home .faces .fc img{width:100%;height:100%;object-fit:cover}.hd.home .faces .fc svg{width:16px;height:16px}' +
+    // Home greeting: a dim personalized eyebrow + the admin\'s Panel title (bold headline) + the
+    // admin\'s greeting (dim subtitle). Everything an admin sets in Settings renders here.
+    '.hd.home .hgreet{margin-top:20px}' +
+    '.hd.home .eyebrow{font-size:15px;font-weight:500;letter-spacing:-.01em;color:rgba(255,255,255,.62)}' +
+    '.hd.home h2{margin:1px 0 0;font-size:26px;line-height:1.16;font-weight:600;letter-spacing:-.02em;color:#fff;text-wrap:balance}' +
+    '.hd.home .hsub{margin:9px 0 0;font-size:14px;line-height:1.45;color:rgba(255,255,255,.62);max-width:94%}' +
+    '.hd .htxt{min-width:0;flex:1}' +
+    '.hd h3{margin:0;font-size:16px;font-weight:600;letter-spacing:-.01em;line-height:1.25;color:#fff}' +
+    '.hd.plain h3{color:var(--fg)}' +
+    '.hd p{margin:3px 0 0;font-size:13px;color:rgba(255,255,255,.72);line-height:1.4}' +
+    '.hd.plain p{color:var(--fg2)}' +
+    '.hd .iconbtn{background:rgba(255,255,255,.14);border:none;color:#fff;width:32px;height:32px;border-radius:50%;cursor:pointer;display:grid;place-items:center;flex:0 0 auto;transition:background .15s var(--ease),transform .12s var(--spring)}' +
+    '.hd.plain .iconbtn{background:var(--s2);color:var(--fg2)}' +
+    '@media (hover:hover) and (pointer:fine){.hd .iconbtn:hover{background:rgba(255,255,255,.24)}.hd.plain .iconbtn:hover{background:var(--bd);color:var(--fg)}}' +
+    '.hd .iconbtn:active{transform:scale(.92)}' +
+    '.hd .iconbtn svg{width:18px;height:18px}' +
+    '.hd-id{display:flex;align-items:center;gap:10px;min-width:0;flex:1}' +
+    '.hd-id .idava{position:relative;flex:0 0 auto}' +
+    '.hd-id .idava .av{width:40px;height:40px;border-radius:50%;overflow:hidden;background:rgba(255,255,255,.16);display:grid;place-items:center;color:#fff;font-weight:600;font-size:15px}' +
+    '.hd.plain .hd-id .idava .av{background:var(--s2);color:var(--fg)}' +
+    '.hd-id .idava .av img{width:100%;height:100%;object-fit:cover;display:block}' +
+    // The AI mark is the green sparkle disc on every surface (home cluster, log, header) — one identity.
+    '.hd-id .idava .av.ai,.hd.plain .hd-id .idava .av.ai{background:var(--ba);color:#fff}' +
+    '.hd-id .idava .av svg{width:20px;height:20px}' +
+    '.hd-id .pres{position:absolute;right:-1px;bottom:-1px;width:11px;height:11px;border-radius:50%;background:#34d27b;box-shadow:0 0 0 2px var(--hd-a)}' +
+    '.hd.plain .hd-id .pres{box-shadow:0 0 0 2px var(--s1)}' +
+    '.hd-id .idtxt{min-width:0}' +
+    '.hd-id .idname{font-size:15px;font-weight:600;letter-spacing:-.01em;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.hd.plain .hd-id .idname{color:var(--fg)}' +
+    '.hd-id .idsub{font-size:12.5px;color:rgba(255,255,255,.72);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.hd.plain .hd-id .idsub{color:var(--fg2)}' +
+    '.body{flex:1;overflow-y:auto;background:var(--bg)}' +
+    // Bottom nav (Intercom-style): PERSISTENT across root views — only the active state toggles, so it
+    // never flashes. Collapses (max-height→0) when a thread/article takes over the panel.
+    '.tabbar{display:flex;background:var(--s1);border-top:1px solid var(--bd);padding-bottom:env(safe-area-inset-bottom,0);flex:0 0 auto;max-height:120px;opacity:1;overflow:hidden;transition:max-height .32s var(--ease),opacity .22s var(--ease),border-color .2s var(--ease)}' +
+    '.tabbar.navhide{max-height:0;opacity:0;pointer-events:none;border-top-color:transparent}' +
+    '.tabbar button{flex:1;border:none;background:none;cursor:pointer;min-height:56px;padding:9px 4px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;color:var(--fg3);font-size:11px;font-weight:600;transition:color .15s var(--ease)}' +
+    '.tabbar button svg{width:22px;height:22px;transition:transform .2s var(--spring)}' +
+    '.tabbar button.act{color:var(--ba)}' +
+    '.tabbar button.act svg{transform:translateY(-1px)}' +
+    '@media (hover:hover) and (pointer:fine){.tabbar button:not(.act):hover{color:var(--fg2)}}' +
+    '.card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rc);box-shadow:var(--shadow-card);margin:0 16px 16px;overflow:hidden}' +
+    '.card-h{padding:14px 16px 6px;font-size:13px;font-weight:600;color:var(--fg)}' +
+    '.rowlink{display:flex;align-items:center;gap:10px;min-height:52px;padding:10px 16px;border-top:1px solid var(--dv);cursor:pointer;font-size:15px;color:var(--fg);transition:background .12s var(--ease)}' +
+    '.rowlink:first-child{border-top:none}' +
+    '@media (hover:hover) and (pointer:fine){.rowlink:hover{background:var(--s2)}.rowlink:hover .chev{transform:translateX(2px)}}' +
+    '.rowlink .rt{min-width:0;flex:1}' +
+    '.rowlink .rtitle{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.rowlink .rsub{font-size:13px;color:var(--fg2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}' +
+    '.rowlink .chev{color:var(--fg3);flex:0 0 auto;display:flex;transition:transform .15s var(--spring)}' +
+    '.rowlink .chev svg{width:16px;height:16px;display:block}' +
+    '.dot{width:8px;height:8px;border-radius:50%;background:var(--ba);flex:0 0 auto}' +
+    '.cta{display:flex;align-items:center;justify-content:center;gap:8px;margin:16px 16px 4px;padding:0 16px;min-height:48px;border-radius:var(--rp);' +
+      'background:var(--ba);color:var(--ba-fg);border:none;cursor:pointer;font-size:15px;font-weight:600;width:calc(100% - 32px);transition:transform .14s var(--spring),filter .15s var(--ease)}' +
+    '@media (hover:hover) and (pointer:fine){.cta:hover{filter:brightness(1.06)}}' +
+    '.cta:active{transform:scale(.98)}' +
+    '.cta svg{width:18px;height:18px}' +
+    '.search{margin:0 16px 16px;display:flex;align-items:center;gap:10px;background:var(--s1);border:1px solid var(--bd);border-radius:var(--rp);padding:11px 14px;transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}' +
+    '.search:focus-within{border-color:var(--ba);box-shadow:0 0 0 3px color-mix(in srgb,var(--ba) 15%,transparent)}' +
+    '.search svg{width:17px;height:17px;color:var(--fg3);flex:0 0 auto}' +
+    '.search input{flex:1;border:none;outline:none;font:inherit;font-size:15px;background:none;color:var(--fg)}' +
+    '.sect{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--fg3);margin:20px 16px 8px}' +
+    '.empty{padding:28px 20px;text-align:center;color:var(--fg2);font-size:14px;line-height:1.5}' +
+    '.log{padding:16px 16px 12px;display:flex;flex-direction:column;gap:2px;min-height:0}' +
+    '.mrow{display:flex;gap:8px;align-items:flex-start;max-width:100%}' +
+    '.mrow.left{justify-content:flex-start}' +
+    '.mrow.right{justify-content:flex-end}' +
+    '.mrow+.mrow{margin-top:2px}' +
+    '.mrow.gs{margin-top:24px}' +
+    '.log>.mrow:first-child{margin-top:2px}' +
+    // Avatar TOP-aligns with the name/first line (never bottom-floats on tall answers).
+    '.mava{width:28px;height:28px;flex:0 0 auto;align-self:flex-start;margin-top:2px}' +
+    '.mava .av{width:28px;height:28px;border-radius:50%;overflow:hidden;display:grid;place-items:center;font-size:11px;font-weight:600;color:#fff;background:var(--fg3)}' +
+    '.mava .av.ai{background:var(--ba)}' +
+    '.mava .av img{width:100%;height:100%;object-fit:cover;display:block}' +
+    '.mava .av svg{width:15px;height:15px;color:#fff}' +
+    '.mstack{min-width:0;max-width:min(80%,340px);display:flex;flex-direction:column;gap:4px}' +
+    '.mrow.right .mstack{align-items:flex-end}' +
+    '.mwho{font-size:12px;font-weight:600;color:var(--fg2);margin:0 0 1px 3px;display:flex;gap:6px;align-items:baseline}' +
+    '.mwho .t{color:var(--fg3);font-weight:400;font-size:11px}' +
+    '.rowm{padding:10px 14px;border-radius:var(--rb);font-size:15px;line-height:1.47;white-space:normal;word-wrap:break-word;overflow-wrap:anywhere;max-width:100%}' +
+    '.rowm p{margin:0}.rowm p+p{margin-top:8px}' +
+    '.rowm ul,.rowm ol{margin:6px 0;padding-left:20px}.rowm li{margin:2px 0}.rowm li::marker{color:var(--fg3)}' +
+    '.rowm.me li::marker{color:rgba(255,255,255,.7)}' +
+    '.rowm .mdh{font-weight:600;letter-spacing:-.01em;margin:8px 0 3px;font-size:15px}.rowm .mdh:first-child{margin-top:0}' +
+    '.rowm em{font-style:italic}' +
+    // Streaming: a soft blur/opacity handoff as the first token replaces the thinking dots (one bubble
+    // grows); tokens are APPENDED (no per-token fade). A subtle text-colored caret trails the text.
+    '.rowm.streaming{animation:streamin .2s var(--ease)}' +
+    '@keyframes streamin{from{filter:blur(2px);opacity:.6}to{filter:none;opacity:1}}' +
+    '.caret{display:inline-block;width:2px;height:1.05em;margin-left:1px;vertical-align:-2px;border-radius:1px;background:currentColor;opacity:.5;animation:caret 1s steps(1) infinite}' +
+    '@keyframes caret{50%{opacity:0}}' +
+    // Accent budget: the USER bubble is the only colored surface in the thread; AI/agent are neutral.
+    '.rowm.me{background:var(--ba);color:#fff;border-bottom-right-radius:6px}' +
+    '.rowm.agent{background:var(--s2);color:var(--fg);box-shadow:var(--shadow-sm)}' +
+    '.rowm.ai{background:var(--s2);color:var(--fg);box-shadow:var(--shadow-sm)}' +
+    '@media (prefers-color-scheme:dark){:host(:not([data-noola-theme])) .rowm.ai,:host(:not([data-noola-theme])) .rowm.agent{box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}}' +
+    ':host([data-noola-theme="dark"]) .rowm.ai,:host([data-noola-theme="dark"]) .rowm.agent{box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}' +
+    '.mrow.left .rowm{border-bottom-left-radius:6px}' +
+    '.rowm code{background:rgba(127,127,127,.16);border-radius:4px;padding:0 4px;font-size:.92em;font-family:ui-monospace,Menlo,Consolas,monospace}' +
+    '.rowm.me code{background:rgba(255,255,255,.24)}' +
+    '.rowm a{color:inherit;text-decoration:underline;text-underline-offset:2px}' +
+    '.mrow.msg-enter{opacity:0;transform:translateY(8px) scale(.98);transition:opacity .22s var(--spring),transform .22s var(--spring)}' +
+    '.mrow.left.msg-enter{transform-origin:bottom left}.mrow.right.msg-enter{transform-origin:bottom right}' +
+    '.mrow.msg-enter.in{opacity:1;transform:none}' +
+    '.note{align-self:center;font-size:12px;color:var(--fg2);background:var(--s1);border:1px solid var(--bd);border-radius:999px;padding:4px 12px;margin:12px 0 2px}' +
+    '.src{align-self:flex-start;font-size:11px;color:var(--fg2);margin:-1px 0 0 36px}' +
+    '.talk{align-self:flex-start;margin:12px 0 2px 36px;display:inline-flex;align-items:center;gap:6px;padding:8px 14px;font-size:13px;' +
+      'font-weight:500;color:var(--fg);background:var(--s1);border:1px solid var(--bd);border-radius:999px;cursor:pointer;box-shadow:var(--shadow-sm);' +
+      'transition:background .15s var(--ease),border-color .15s var(--ease),transform .12s var(--spring)}' +
+    '@media (hover:hover) and (pointer:fine){.talk:hover{background:var(--s2);border-color:var(--bd2)}}' +
+    '.talk:active{transform:scale(.97)}' +
+    '.talk svg{width:15px;height:15px;display:block;color:var(--ba)}' +
+    '.think span{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--fg3);margin:0 1px;animation:bd 1.2s ease-in-out infinite}' +
+    '.think span:nth-child(2){animation-delay:.18s}.think span:nth-child(3){animation-delay:.36s}' +
+    '@keyframes bd{0%,100%{opacity:.35}50%{opacity:1}}' +
+    '.foot{border-top:1px solid var(--bd);padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;background:var(--s1)}' +
+    '.footrow{display:flex;gap:4px;align-items:center;background:var(--s1);border:1px solid var(--bd);border-radius:var(--rp);padding:5px 6px;transition:border-color .16s var(--ease),box-shadow .16s var(--ease)}' +
+    '.footrow:focus-within{border-color:var(--ba);box-shadow:0 0 0 3px color-mix(in srgb,var(--ba) 15%,transparent)}' +
+    '.foot textarea{flex:1;resize:none;border:none;background:none;padding:8px 6px;font:inherit;font-size:15px;line-height:1.4;max-height:104px;outline:none;color:var(--fg);align-self:center}' +
+    '.foot textarea::placeholder{color:var(--fg3)}' +
+    // Ghost icon buttons; the send button is the composer\'s ONLY color event, and only once armed.
+    '.footrow button{border:none;background:none;cursor:pointer;flex:0 0 auto;display:grid;place-items:center;transition:transform .16s var(--spring),background-color .16s var(--ease),color .16s var(--ease)}' +
+    '.footrow button:active{transform:scale(.9)}' +
+    '.attbtn{width:36px;height:36px;border-radius:50%;color:var(--fg3)}' +
+    '@media (hover:hover) and (pointer:fine){.attbtn:hover{background:var(--ghost-hover);color:var(--fg2)}}' +
+    '.attbtn svg{width:20px;height:20px;display:block}' +
+    '#send{width:34px;height:34px;border-radius:50%;background:var(--send-idle);color:var(--send-idle-fg)}' +
+    '#send svg{width:18px;height:18px;display:block}' +
+    '#send.ready{background:var(--ba);color:#fff}' +
+    '@media (hover:hover) and (pointer:fine){#send.ready:hover{filter:brightness(1.07)}}' +
+    '#send:disabled{cursor:default}' +
+    '.attprev{display:flex;flex-wrap:wrap;gap:8px}' +
+    '.attprev:empty{display:none}' +
+    '.attchip{position:relative;display:flex;align-items:center;gap:6px;max-width:180px;border:1px solid var(--bd);border-radius:10px;padding:6px 9px;background:var(--s2);font-size:12px;color:var(--fg2)}' +
+    '.attchip svg{width:15px;height:15px;flex:none;color:var(--fg3)}' +
+    '.attchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+    '.attchip .rm{position:absolute;top:-6px;right:-6px;width:18px;height:18px;min-width:0;padding:0;border-radius:50%;background:var(--fg);color:var(--bg);display:grid;place-items:center;cursor:pointer;border:none}' +
+    '.attchip .rm svg{width:10px;height:10px;color:var(--bg)}' +
+    '.attthumb{position:relative;width:76px;height:76px;border-radius:12px;overflow:hidden;border:1px solid var(--bd);background:var(--s2)}' +
+    '.attthumb img{width:100%;height:100%;object-fit:cover;display:block}' +
+    '.attthumb .rm{position:absolute;top:4px;right:4px;width:20px;height:20px;min-width:0;padding:0;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;display:grid;place-items:center;cursor:pointer;border:none;backdrop-filter:blur(2px)}' +
+    '.attthumb .rm svg{width:11px;height:11px;color:#fff}' +
+    '.rowm .att-img{display:block;margin-top:6px;border-radius:12px;overflow:hidden;max-width:220px;border:1px solid rgba(127,127,127,.16)}' +
+    '.rowm .att-img img{display:block;max-width:100%;max-height:220px;object-fit:contain}' +
+    '.rowm .att-file{display:flex;align-items:center;gap:7px;margin-top:6px;text-decoration:none;color:inherit;border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:7px 10px;font-size:13px;max-width:220px}' +
+    '.rowm.me .att-file{border-color:rgba(255,255,255,.35)}' +
+    '.rowm .att-file svg{width:16px;height:16px;flex:none;opacity:.8}' +
+    '.rowm .att-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+    '.art{padding:20px 20px 28px;background:var(--bg);min-height:100%}' +
+    '.art h1{font-size:20px;margin:0 0 12px;letter-spacing:-.01em;color:var(--fg)}' +
+    '.art .art-body{font-size:15px;line-height:1.6;color:var(--fg2);white-space:pre-wrap;word-wrap:break-word}' +
+    '.brand{padding:10px 16px 16px;text-align:center;font-size:11px;color:var(--fg3);background:transparent}' +
+    // Thin, auto-hiding scrollbars in the shadow root.
+    '.body,.log,.art{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--fg3) 45%,transparent) transparent}' +
+    '.body::-webkit-scrollbar,.log::-webkit-scrollbar,.art::-webkit-scrollbar{width:8px;height:8px}' +
+    '.body::-webkit-scrollbar-thumb,.log::-webkit-scrollbar-thumb,.art::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--fg3) 40%,transparent);border-radius:99px;border:2px solid transparent;background-clip:padding-box}' +
+    '@media (hover:hover) and (pointer:fine){.body:hover::-webkit-scrollbar-thumb,.log:hover::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--fg3) 65%,transparent);background-clip:padding-box}}' +
+    '.body::-webkit-scrollbar-track,.log::-webkit-scrollbar-track,.art::-webkit-scrollbar-track{background:transparent}' +
+    // Quick-reply chips (neutral surface; accent stays budgeted).
+    '.qrs{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0 2px 36px}' +
+    '.qr{border:1px solid var(--bd);background:var(--s1);color:var(--fg);font:inherit;font-size:13px;font-weight:500;padding:7px 13px;border-radius:999px;cursor:pointer;transition:background .15s var(--ease),transform .12s var(--spring)}' +
+    '@media (hover:hover) and (pointer:fine){.qr:hover{background:var(--s2)}}.qr:active{transform:scale(.97)}' +
+    // Conversation-ended divider (a hairline label, not a bubble).
+    '.ended{align-self:center;display:flex;align-items:center;gap:12px;width:calc(100% - 24px);margin:20px 0 8px;color:var(--fg3);font-size:12.5px}' +
+    '.ended::before,.ended::after{content:"";flex:1;height:1px;background:var(--dv)}' +
+    // Home primary card: neutral tile, stacked title+subtitle (never inline), circular accent-glyph mark.
+    '.askcard{display:flex;align-items:center;gap:12px;margin:0 16px 16px;padding:12px 14px;border-radius:var(--rc);background:var(--s1);border:1px solid var(--bd);box-shadow:var(--shadow-card);cursor:pointer;width:calc(100% - 32px);text-align:left;font:inherit;transition:transform .12s var(--spring),border-color .15s var(--ease),box-shadow .16s var(--ease)}' +
+    '@media (hover:hover) and (pointer:fine){.askcard:hover{border-color:var(--bd2);box-shadow:0 4px 16px rgba(16,24,40,.08)}}.askcard:active{transform:scale(.99)}' +
+    '.askcard .ic{width:40px;height:40px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;background:var(--s2);color:var(--ba)}.askcard .ic svg{width:20px;height:20px}' +
+    '.askcard .at{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}.askcard .att{font-weight:600;font-size:15px;color:var(--fg);letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.askcard .ats{font-size:13px;color:var(--fg2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.askcard .chev{color:var(--fg3);flex:0 0 auto}.askcard .chev svg{width:18px;height:18px;display:block}' +
+    // Mini overlapping face cluster on the ask card (the AI mark + up to two real agents) — the
+    // "AI Agent & team" signal Intercom puts on its primary card.
+    '.askcard .fcs{display:flex;align-items:center;flex:0 0 auto}' +
+    '.askcard .fcs .fc{width:26px;height:26px;border-radius:50%;border:2px solid var(--s1);background:var(--s2);overflow:hidden;display:grid;place-items:center;color:var(--fg2);font-size:10px;font-weight:600}' +
+    '.askcard .fcs .fc+.fc{margin-left:-9px}' +
+    '.askcard .fcs .fc.ai{background:var(--ba);color:#fff}' +
+    '.askcard .fcs .fc img{width:100%;height:100%;object-fit:cover}.askcard .fcs .fc svg{width:14px;height:14px}' +
+    '@media (prefers-reduced-motion:reduce){' +
+      '*{transition-duration:.01ms!important;animation-duration:.01ms!important;animation-iteration-count:1!important}' +
+      '.mrow.msg-enter,.screen.enter-tab,.screen.enter-back,.screen.enter-fwd,.panel.on{opacity:1!important;transform:none!important}' +
+      '.bubble.open .gchat{opacity:0!important}.bubble .gclose{opacity:0!important}.bubble.open .gclose{opacity:1!important}' +
+      '.caret{animation:none!important}}';
+
+  function iconChat() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>'; }
+  function iconClose() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>'; }
+  function iconBack() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>'; }
+  function iconSearch() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>'; }
+  function iconChev() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>'; }
+  function iconHome() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5 12 3l9 6.5V21H3z"/></svg>'; }
+  function iconMsgs() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8z"/></svg>'; }
+  function iconHelp() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>'; }
+  function iconSend() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5l7 7-7 7M21 12H3"/></svg>'; }
+  function iconArrowUp() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>'; }
+  function iconUser() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21a8 8 0 1 0-16 0"/><circle cx="12" cy="7" r="4"/></svg>'; }
+  function iconSparkle() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.6L18.5 9.5 13.9 11.4 12 16l-1.9-4.6L5.5 9.5 10.1 7.6z"/></svg>'; }
+  // Noola\'s face: the brand "oo" mark — an open ring (the conversation loop) beside a filled dot
+  // (the answer/signal). Same geometry as the app nav mark; monochrome on the accent disc.
+  function iconNoola() { return '<svg viewBox="0 0 24 24" fill="none"><circle cx="7" cy="12" r="4.1" fill="none" stroke="currentColor" stroke-width="2.2"/><circle cx="16.4" cy="12" r="4.35" fill="currentColor"/></svg>'; }
+  function iconClip() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg>'; }
+  function iconFile() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>'; }
+  function iconX() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>'; }
+
+  function mount() {
+    if (mounted) return;
+    mounted = true;
+    host = document.createElement('div');
+    host.setAttribute('aria-live', 'polite');
+    document.body.appendChild(host);
+    root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+
+    styleEl = document.createElement('style'); styleEl.textContent = CSS; root.appendChild(styleEl);
+    varStyle = document.createElement('style'); root.appendChild(varStyle);
+
+    wrapEl = document.createElement('div');
+    wrapEl.className = 'noola';
+    wrapEl.innerHTML =
+      '<button class="bubble" aria-label="Open messenger">' +
+        '<span class="g gchat">' + iconChat() + '</span><span class="g gclose">' + iconClose() + '</span>' +
+      '</button>' +
+      '<span class="badge" aria-hidden="true"></span>' +
+      '<div class="panel" role="dialog" aria-label="Support messenger">' +
+        '<div class="hdwrap" id="hdwrap"></div>' +
+        '<div class="stage"></div>' +
+        '<nav class="tabbar navhide" id="nav" aria-label="Sections"></nav>' +
+      '</div>';
+    root.appendChild(wrapEl);
+
+    bubbleEl = wrapEl.querySelector('.bubble');
+    badgeEl = wrapEl.querySelector('.badge');
+    panelEl = wrapEl.querySelector('.panel');
+    stageEl = panelEl.querySelector('.stage');
+    hdwrapEl = panelEl.querySelector('.hdwrap');
+    navEl = panelEl.querySelector('#nav');
+    bubbleEl.addEventListener('click', function () { panelOpen ? closePanel() : openPanel(); });
+
+    applyConfig();
+    if (launcherHidden) bubbleEl.style.display = 'none'; // start-hidden embed — no launcher until shown
+    renderBadge();
+    resumeLive();
+    bootSyncPop();
+  }
+
+  function applyConfig() {
+    if (!varStyle) return;
+    varStyle.textContent = ':host{--ba:' + CFG.accent + '}';
+    // Pin the colour scheme on the shadow host: 'light'/'dark' set data-noola-theme (which the CSS
+    // above keys off, beating the OS media query); anything else clears it → follow the OS.
+    if (host && host.setAttribute) {
+      if (CFG.theme === 'light' || CFG.theme === 'dark') host.setAttribute('data-noola-theme', CFG.theme);
+      else host.removeAttribute('data-noola-theme');
+    }
+    wrapEl.className = 'noola' + (CFG.position === 'left' ? ' pos-left' : '');
+    // keep the default view on an enabled tab
+    var tabs = enabledTabs();
+    if ((view === 'home' || view === 'messages' || view === 'help') && tabs.indexOf(view) === -1) view = tabs[0] || 'home';
+    buildNav();
+    if (panelOpen) setNav(view);
+  }
+
+  function enabledTabs() {
+    var t = []; if (CFG.tabs.home) t.push('home'); if (CFG.tabs.messages) t.push('messages'); if (CFG.tabs.help) t.push('help');
+    if (!t.length) t.push('home');
+    return t;
+  }
+
+  function renderBadge() {
+    if (!badgeEl) return;
+    var n = totalUnread();
+    if (n > 0 && !panelOpen && !launcherHidden) {
+      badgeEl.textContent = n > 9 ? '9+' : String(n);
+      badgeEl.style.display = 'block';
+      if (n !== prevBadge && !reducedMotion()) { badgeEl.classList.remove('pop'); void badgeEl.offsetWidth; badgeEl.classList.add('pop'); }
+    } else badgeEl.style.display = 'none';
+    prevBadge = n;
+  }
+
+  // Fire a window event so a host page can react (Intercom onShow/onHide parity):
+  //   window.addEventListener('noola:open', fn) / 'noola:close'.
+  function emit(name) { try { window.dispatchEvent(new CustomEvent('noola:' + name)); } catch (e) {} }
+
+  function openPanel() {
+    mount();
+    if (panelOpen) return;
+    panelOpen = true;
+    emit('open');
+    bubbleEl.classList.add('open');
+    panelEl.style.display = 'flex';
+    pendingDir = 'none';
+    render();                       // build the first screen (no slide)
+    void panelEl.offsetWidth;       // reflow so the enter transition runs from the closed state
+    requestAnimationFrame(function () { if (panelOpen) panelEl.classList.add('on'); });
+    renderBadge();
+    // Fold in the identified visitor's server-side history once, so Home's recent card + Messages
+    // reflect past chats from any device — then re-render the open view if anything was added.
+    if (!serverConvsSynced && isIdentified()) {
+      serverConvsSynced = true;
+      syncServerConvs(function (changed) { if (changed && panelOpen) { pendingDir = 'none'; render(); } });
+    }
+  }
+  function closePanel() {
+    if (!panelOpen) return;
+    panelOpen = false;
+    emit('close');
+    if (bubbleEl) bubbleEl.classList.remove('open');
+    if (panelEl) {
+      panelEl.classList.remove('on');
+      var p = panelEl;
+      var hide = function () { if (!panelOpen) p.style.display = 'none'; };
+      var t = setTimeout(hide, 260);
+      p.addEventListener('transitionend', function te(e) {
+        if (e.target === p) { p.removeEventListener('transitionend', te); clearTimeout(t); hide(); }
+      });
+    }
+    renderBadge();
+  }
+
+  // An inbound agent reply the visitor hasn't seen — pop the messenger open to that thread
+  // (Intercom-style) so they actually see the reply, not just a badge. Fires both for live arrivals
+  // and for messages that landed while they were away (surfaced on the first reconcile after load).
+  // Works even when the launcher is hidden (custom-launcher embeds). Panel-closed only; markRead
+  // clears the badge and the reconcile persists the message, so it pops at most once per new message.
+  function autoOpenThread(convId, replyAt) {
+    if (panelOpen) return;
+    var c = getConv(convId);
+    if (!c || isEnded(c.status)) return;   // an ended conversation never pops
+    setPopMark(replyAt || newestAgentAt(c)); // surfaced — this reply can't pop again
+    view = 'thread'; threadId = convId; pendingDir = 'none';
+    openPanel();          // shows the panel + renders the thread (wire scrolls to the latest message)
+    markRead(convId);     // they're viewing it now — clear the unread badge
+  }
+
+  // On boot, an identified visitor's unseen agent reply can live ONLY on the server — they were away,
+  // or on a fresh browser with nothing cached — and resumeLive() only watches locally-cached
+  // conversations, so it would never surface. Pull the server list once and pop the newest thread the
+  // server marks UNSEEN (an agent message past the read watermark). Opening it stamps it seen, so it
+  // pops at most once. Identified visitors only — anonymous ones have no server-side history.
+  function bootSyncPop() {
+    if (!isIdentified() || panelOpen || serverConvsSynced) return;
+    serverConvsSynced = true;
+    syncServerConvs(function (_changed, list) {
+      // Act only on a sync that succeeded, and only on what the server just reported: an OPEN conversation
+      // whose unseen agent reply is newer than the last one already surfaced. (Scanning cached local flags
+      // popped an old — even closed — conversation on every reload, including another account's.)
+      if (panelOpen || !list) return;
+      var mark = popMark(), best = null;
+      for (var i = 0; i < list.length; i++) {
+        var sc = list[i], at = sc.unseenAt ? +new Date(sc.unseenAt) : 0;
+        if (!sc.unseen || !at || at <= mark || isEnded(sc.status)) continue;
+        if (!best || at > best.at) best = { id: sc.conversationId, at: at };
+      }
+      if (best) autoOpenThread(best.id, best.at);
+    });
+  }
+
+  // Roots (tabbed) vs leaves (drilled-into) — decides the transition style.
+  function isRoot(v) { return v === 'home' || v === 'messages' || v === 'help'; }
+  function classifyDir(prev, next) {
+    if (isRoot(prev) && !isRoot(next)) return 'forward';
+    if (!isRoot(prev) && isRoot(next)) return 'back';
+    if (!isRoot(prev) && !isRoot(next)) return 'forward';
+    return 'tab';
+  }
+
+  function setView(v, arg) {
+    pendingDir = classifyDir(view, v);
+    view = v;
+    if (v === 'thread') { threadId = arg; markRead(arg); }
+    if (v === 'article') articleSlug = arg;
+    render();
+  }
+
+  // ---- rendering ----
+  function render() {
+    if (!panelEl || !panelOpen || !stageEl) return;
+    var built = view === 'thread' ? renderThread() : view === 'article' ? renderArticle() :
+      view === 'messages' ? renderMessages() : view === 'help' ? renderHelp() : renderHome();
+    var dir = pendingDir; pendingDir = 'none';
+    // Persistent chrome: morph the header shell + toggle the persistent nav; only the body screen
+    // is appended + transitioned. Nothing else re-renders, so buttons never flash on a tab switch.
+    swapHeader(built.header, dir === 'none');
+    setNav(view);
+    var screen = document.createElement('div');
+    screen.className = 'screen';
+    screen.innerHTML = built.body;
+    var outgoing = curScreen;
+    stageEl.appendChild(screen);
+    curScreen = screen;                 // body queries scope here; header queries scope to curHeader
+    if (built.wire) built.wire();
+    transitionScreens(screen, outgoing, dir);
+    // live lane follows the open escalated thread
+    if (view === 'thread') { var c = getConv(threadId); if (c && c.escalated) startLive(threadId); }
+  }
+
+  function transitionScreens(incoming, outgoing, dir) {
+    if (!outgoing) return;              // first screen — nothing to cross with
+    if (dir === 'none' || reducedMotion()) { if (outgoing.parentNode) outgoing.parentNode.removeChild(outgoing); return; }
+    var enterCls = dir === 'forward' ? 'enter-fwd' : dir === 'back' ? 'enter-back' : 'enter-tab';
+    var leaveCls = dir === 'forward' ? 'leave-fwd' : dir === 'back' ? 'leave-back' : 'leave-tab';
+    incoming.classList.add(enterCls);
+    outgoing.classList.add(leaveCls);
+    requestAnimationFrame(function () { requestAnimationFrame(function () {
+      incoming.classList.add('active');
+      outgoing.classList.add('go');
+    }); });
+    var done = false;
+    function cleanup() {
+      if (done) return; done = true;
+      incoming.classList.remove(enterCls, 'active');
+      if (outgoing.parentNode) outgoing.parentNode.removeChild(outgoing);
+    }
+    incoming.addEventListener('transitionend', function (e) { if (e.target === incoming && (e.propertyName === 'transform' || e.propertyName === 'opacity')) cleanup(); });
+    setTimeout(cleanup, 360);          // fallback if transitionend is missed
+  }
+
+  function header(title, sub, opts) {
+    opts = opts || {};
+    var left = opts.back ? '<button class="iconbtn" id="bk" aria-label="Back">' + iconBack() + '</button>' : '';
+    var h =
+      '<div class="hd plain">' + left +
+        '<div class="htxt"><h3>' + esc(title) + '</h3>' + (sub ? '<p>' + esc(sub) + '</p>' : '') + '</div>' +
+        '<button class="iconbtn" id="cl" aria-label="Close">' + iconClose() + '</button>' +
+      '</div>';
+    return h;
+  }
+  function wireHeader() {
+    var cl = selHd('#cl'); if (cl) cl.addEventListener('click', closePanel);
+    var bk = selHd('#bk'); if (bk) bk.addEventListener('click', function () { setView(backTarget()); });
+  }
+  function backTarget() { var t = enabledTabs(); return t.indexOf('messages') !== -1 ? 'messages' : t[0]; }
+
+  // ---- persistent bottom nav (built once per config; only the active state toggles on tab switch) ----
+  function buildNav() {
+    if (!navEl) return;
+    var tabs = enabledTabs();
+    var icons = { home: iconHome, messages: iconMsgs, help: iconHelp }, labels = { home: 'Home', messages: 'Messages', help: 'Help' };
+    if (tabs.length < 2) { navEl.innerHTML = ''; return; }
+    var b = '';
+    for (var i = 0; i < tabs.length; i++) {
+      var t = tabs[i];
+      b += '<button data-tab="' + t + '" aria-label="' + labels[t] + '">' + icons[t]() + '<span>' + labels[t] + '</span></button>';
+    }
+    navEl.innerHTML = b;
+    var btns = navEl.querySelectorAll('button');
+    for (var j = 0; j < btns.length; j++) (function (btn) {
+      btn.addEventListener('click', function () { if (btn.getAttribute('data-tab') !== view) setView(btn.getAttribute('data-tab')); });
+    })(btns[j]);
+  }
+  // Show the nav (root views only) + mark the active tab — never rebuilds, so no button flash.
+  function setNav(v) {
+    if (!navEl) return;
+    var tabs = enabledTabs();
+    var show = (v === 'home' || v === 'messages' || v === 'help') && tabs.length >= 2;
+    navEl.classList.toggle('navhide', !show);
+    if (!show) return;
+    var btns = navEl.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].className = (btns[i].getAttribute('data-tab') === v ? 'act' : '');
+  }
+
+  // Morph the persistent header shell to a new header: animate #hdwrap HEIGHT (tall hero <-> short
+  // sub-header) while the outgoing .hd cross-dissolves under the incoming one. instant skips it
+  // (first open / reduced motion).
+  function buildHd(html) { var d = document.createElement('div'); d.innerHTML = html; return d.firstChild; }
+  function swapHeader(html, instant) {
+    if (!hdwrapEl) return;
+    // Drop any outgoing header still mid-morph from a fast previous switch, so rapid tab taps can\'t
+    // stack stale .hd copies in the shell.
+    var stale = hdwrapEl.querySelectorAll('.hd.leaving');
+    for (var s = 0; s < stale.length; s++) if (stale[s].parentNode) stale[s].parentNode.removeChild(stale[s]);
+    var neu = buildHd(html);
+    if (!curHeader || !curHeader.parentNode || instant || reducedMotion()) {
+      while (hdwrapEl.firstChild) hdwrapEl.removeChild(hdwrapEl.firstChild);
+      hdwrapEl.appendChild(neu); curHeader = neu; hdwrapEl.style.height = 'auto';
+      return;
+    }
+    var old = curHeader;
+    var oldH = hdwrapEl.offsetHeight;
+    old.classList.add('leaving');                 // take the outgoing header out of flow (overlay)
+    neu.style.opacity = '0';
+    hdwrapEl.appendChild(neu);
+    var newH = neu.offsetHeight;                   // measured with only neu in flow
+    hdwrapEl.style.height = oldH + 'px';
+    void hdwrapEl.offsetWidth;                     // reflow so the height transition runs from oldH
+    hdwrapEl.style.height = newH + 'px';
+    old.style.transition = 'opacity .22s var(--ease)';
+    neu.style.transition = 'opacity .3s var(--ease)';
+    requestAnimationFrame(function () { requestAnimationFrame(function () { old.style.opacity = '0'; neu.style.opacity = '1'; }); });
+    curHeader = neu;
+    var done = false;
+    function cleanup() {
+      if (done) return; done = true;
+      if (old.parentNode) hdwrapEl.removeChild(old);
+      hdwrapEl.style.height = 'auto';
+      neu.style.position = ''; neu.style.transition = ''; neu.style.opacity = '';
+    }
+    hdwrapEl.addEventListener('transitionend', function te(e) { if (e.target === hdwrapEl && e.propertyName === 'height') { hdwrapEl.removeEventListener('transitionend', te); cleanup(); } });
+    setTimeout(cleanup, 480);
+  }
+
+  // The support team shown in the home header cluster (the "staffed" signal). Loaded once from
+  // /public/team; null = not fetched yet, [] = fetched empty. Real agent names/avatars only.
+  var team = null, teamSynced = false;
+  function loadTeam(cb) {
+    if (team !== null) { if (cb) cb(false); return; }
+    fetch(API + '/public/team?key=' + encodeURIComponent(KEY)).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+      var t = (d && d.team) || [];
+      team = t;
+      if (cb) cb(t.length > 0);
+    }).catch(function () { team = []; if (cb) cb(false); });
+  }
+  // The home header's stacked avatar cluster: the AI mark (a solid accent disc) leading up to three
+  // real agent faces — a photo if the agent has one, else initials on a clean disc. Falls back to
+  // any agent the visitor has already talked to, then to just the AI mark. Never fake stock faces.
+  function homeFaces(max, noAi) {
+    max = max || 3;
+    var faces = [];
+    if (team && team.length) {
+      for (var i = 0; i < team.length && faces.length < max; i++) faces.push(team[i]);
+    } else {
+      var seen = {};
+      for (var c = 0; c < convs.length && faces.length < max; c++) {
+        var ms = convs[c].msgs || [];
+        for (var j = 0; j < ms.length && faces.length < max; j++) {
+          var m = ms[j];
+          if (m.authorAvatarUrl && !seen[m.authorAvatarUrl]) { seen[m.authorAvatarUrl] = 1; faces.push({ name: m.authorName || '', avatarUrl: m.authorAvatarUrl }); }
+        }
+      }
+    }
+    // noAi = human faces only (used where a Noola mark already appears elsewhere on the surface).
+    if (noAi && !faces.length) return '';
+    var out = noAi ? '' : '<span class="fc ai">' + iconNoola() + '</span>';
+    for (var k = 0; k < faces.length; k++) {
+      var f = faces[k];
+      if (f.avatarUrl) out += '<span class="fc"><img src="' + esc(avatarUrl(f.avatarUrl)) + '" alt=""></span>';
+      else out += '<span class="fc">' + esc(initials(f.name) || '') + '</span>';
+    }
+    return out;
+  }
+  function renderHome() {
+    var recent = touchedConvs()[0];
+    var recentCard = '';
+    if (recent) {
+      var last = recent.msgs[recent.msgs.length - 1];
+      recentCard =
+        '<div class="card"><div class="rowlink" data-conv="' + esc(recent.id) + '">' +
+          (recent.unread ? '<span class="dot"></span>' : '') +
+          '<div class="rt"><div class="rtitle">Recent conversation</div><div class="rsub">' + esc((last && last.body) || '') + '</div></div>' +
+          '<span class="chev">' + iconChev() + '</span>' +
+        '</div></div>';
+    }
+    // Home header renders exactly what the admin set in Settings → Messenger: a personalized eyebrow,
+    // the Panel title (headline), and the greeting (subtitle). No hardcoded copy.
+    var hi = isIdentified() && identity.name ? esc(String(identity.name).split(/\s+/)[0]) : null;
+    var homeHead =
+      '<div class="hd grad home">' +
+        '<div class="homeTop">' +
+          '<div class="faces">' + homeFaces(3) + '</div>' +
+          '<button class="iconbtn" id="cl" aria-label="Close">' + iconClose() + '</button>' +
+        '</div>' +
+        '<div class="hgreet">' +
+          (hi ? '<div class="eyebrow">Hi ' + hi + '.</div>' : '') +
+          '<h2>' + esc(CFG.title) + '</h2>' +
+          (CFG.greeting ? '<p class="hsub">' + esc(CFG.greeting) + '</p>' : '') +
+        '</div>' +
+      '</div>';
+    var cardFaces = homeFaces(3, true); // human faces only — the ask card already leads with the Noola mark
+    var body =
+      '<div class="body">' +
+        '<button class="askcard" id="startc" style="margin-top:16px">' +
+          '<span class="ic">' + iconNoola() + '</span>' +
+          '<span class="at"><span class="att">Ask a question</span><span class="ats">Noola &amp; the team · instant answers</span></span>' +
+          (cardFaces ? '<span class="fcs">' + cardFaces + '</span>' : '<span class="chev">' + iconChev() + '</span>') +
+        '</button>' +
+        recentCard +
+        (CFG.tabs.help ? (
+          '<div class="search" id="hsearch"><span>' + iconSearch() + '</span><input id="hq" placeholder="Search for help" autocomplete="off"></div>' +
+          '<div class="sect">Top articles</div><div id="tophelp"><div class="empty">Loading…</div></div>'
+        ) : '') +
+        '<div class="brand">Powered by Noola</div>' +
+      '</div>';
+    return { header: homeHead, body: body, wire: function () {
+      wireHeader();
+      var sc = sel('#startc'); if (sc) sc.addEventListener('click', startConversation);
+      var rc = sel('.rowlink[data-conv]'); if (rc) rc.addEventListener('click', function () { setView('thread', rc.getAttribute('data-conv')); });
+      var hq = sel('#hq'); if (hq) hq.addEventListener('keydown', function (e) { if (e.key === 'Enter') { helpSeed = hq.value; setView('help'); } });
+      if (CFG.tabs.help) loadTopArticles();
+      // Fill the header cluster with the real team once (progressive — the Noola mark shows immediately).
+      if (!teamSynced) { teamSynced = true; loadTeam(function (changed) { if (changed && panelOpen && view === 'home') { pendingDir = 'none'; render(); } }); }
+    } };
+  }
+  function loadTopArticles() {
+    fetchKB('/public/kb').then(function (d) {
+      var el = sel('#tophelp'); if (!el) return;
+      var arts = (d && d.articles) || [];
+      if (!arts.length) { el.innerHTML = '<div class="empty">No articles yet.</div>'; return; }
+      el.innerHTML = '<div class="card">' + arts.slice(0, 4).map(articleRow).join('') + '</div>';
+      wireArticleRows(el);
+    }).catch(function () { var el = sel('#tophelp'); if (el) el.innerHTML = ''; });
+  }
+  function articleRow(a) {
+    return '<div class="rowlink" data-slug="' + esc(a.slug) + '"><div class="rt"><div class="rtitle">' + esc(a.title) + '</div></div><span class="chev">' + iconChev() + '</span></div>';
+  }
+  function wireArticleRows(scope) {
+    var rows = scope.querySelectorAll('.rowlink[data-slug]');
+    for (var i = 0; i < rows.length; i++) (function (r) { r.addEventListener('click', function () { setView('article', r.getAttribute('data-slug')); }); })(rows[i]);
+  }
+
+  function renderMessages() {
+    var list = touchedConvs();
+    var rows = list.length ? list.map(function (c) {
+      var last = c.msgs[c.msgs.length - 1];
+      return '<div class="rowlink" data-conv="' + esc(c.id) + '">' +
+        (c.unread ? '<span class="dot"></span>' : '') +
+        '<div class="rt"><div class="rtitle">' + esc((last && last.body) || 'Conversation') + '</div>' +
+        '<div class="rsub">' + esc(c.escalated ? 'With the team' : 'Noola') + ' · ' + relTime(c.updatedAt || Date.now()) + '</div></div>' +
+        '<span class="chev">' + iconChev() + '</span></div>';
+    }).join('') : '';
+    var body =
+      '<div class="body">' +
+        '<button class="cta" id="startc" style="margin-top:16px"><span>Start a new conversation</span>' + iconSend() + '</button>' +
+        (rows ? '<div class="card">' + rows + '</div>' : '<div class="empty">No conversations yet.<br>Start one above.</div>') +
+      '</div>';
+    return { header: header('Messages'), body: body, wire: function () {
+      wireHeader();
+      var sc = sel('#startc'); if (sc) sc.addEventListener('click', startConversation);
+      var rows2 = selAll('.rowlink[data-conv]');
+      for (var i = 0; i < rows2.length; i++) (function (r) { r.addEventListener('click', function () { setView('thread', r.getAttribute('data-conv')); }); })(rows2[i]);
+      // First visit to Messages: pull the identified visitor's server history, then re-render the list
+      // once if it added anything (guard flag prevents a render loop).
+      if (!serverConvsSynced) {
+        serverConvsSynced = true;
+        syncServerConvs(function (changed) { if (changed && view === 'messages') { pendingDir = 'none'; render(); } });
+      }
+    } };
+  }
+
+  // Start a fresh conversation from the home "Ask a question" card (and the Messages "Start a new
+  // conversation" button). Reuse the most-recent conversation ONLY when it's still blank (no
+  // messages) so repeated taps don't pile up empty conversations — otherwise always open a new one.
+  // Previously the home card resumed the latest conversation regardless of state, so "new" landed on
+  // an old/closed thread.
+  function startConversation() {
+    var r = touchedConvs()[0];
+    var c = (r && (!r.msgs || r.msgs.length === 0)) ? r : newConv();
+    setView('thread', c.id);
+  }
+
+  // The contents of the message log for a conversation — intro (fresh AI convo only), the message
+  // rows, and the mode toggle. Factored out so a live hydrate can rebuild #log in place without a
+  // full screen re-render (keeps the composer + scroll steady).
+  // Avatar identity for a left-side (agent/AI) message. AI answers post as an agent with no
+  // author_id (see /public/conversation) — we render them with a sparkle glyph, humans with their
+  // uploaded avatar or initials, so the visitor can always tell the AI from a person.
+  function initials(name) {
+    if (!name) return '';
+    var p = String(name).trim().split(/\s+/);
+    var a = (p[0] || '')[0] || '';
+    var b = p.length > 1 ? ((p[p.length - 1] || '')[0] || '') : '';
+    return (a + b).toUpperCase();
+  }
+  // Agent avatar_url is stored API-relative ('/avatar/<uuid>.jpg', served by the API's public
+  // GET /avatar/*). The widget lives on a THIRD-PARTY origin, so a bare '/avatar/...' would resolve
+  // against the customer's own site (404). Prefix it with the API base the widget booted from.
+  function avatarUrl(u) { return (u && u.charAt(0) === '/') ? API + u : u; }
+  function avatarInner(m) {
+    if (m.role === 'ai') return '<span class="av ai">' + iconNoola() + '</span>';
+    if (m.authorAvatarUrl) return '<span class="av"><img src="' + esc(avatarUrl(m.authorAvatarUrl)) + '" alt=""></span>';
+    var ini = initials(m.authorName);
+    return '<span class="av">' + (ini ? esc(ini) : iconUser()) + '</span>';
+  }
+  function whoName(m) { return m.role === 'ai' ? 'Noola' : (m.authorName || 'Support'); }
+  function sideOf(m) { return m.role === 'me' ? 'right' : 'left'; }
+  // Group consecutive turns from the same author (Intercom-style): one avatar + name per run.
+  function groupKey(m) { return m.role === 'me' ? 'me' : m.role === 'ai' ? 'ai' : ('agent:' + (m.authorName || m.authorAvatarUrl || '')); }
+  // One message row. Left rows carry an avatar column + a name/time label on the first of a group;
+  // continuation rows keep an empty avatar spacer so bubbles stay aligned. Right rows (the visitor)
+  // never show an avatar. system 'note' lines are centered; empty rows are skipped by the caller.
+  function mrowHtml(m, gs, at) {
+    if (m.role === 'note') return '<div class="note">' + esc(m.body) + '</div>';
+    if (m.role === 'src') return '<div class="src">' + esc(m.body) + '</div>';
+    var cls = m.role === 'me' ? 'me' : m.role === 'agent' ? 'agent' : 'ai';
+    var atts = (m.attachments && m.attachments.length) ? m.attachments.map(attHtml).join('') : '';
+    var onlyFiles = atts && m.attachments.map(function (a) { return a.filename; }).join(', ') === m.body;
+    var body = (m.body && !onlyFiles) ? md(m.body) : '';
+    var bubble = '<div class="rowm ' + cls + '">' + body + atts + '</div>';
+    if (m.role === 'me') return '<div class="mrow right' + (gs ? ' gs' : '') + '"><div class="mstack">' + bubble + '</div></div>';
+    var ava = '<div class="mava">' + (gs ? avatarInner(m) : '') + '</div>';
+    var who = gs ? '<div class="mwho">' + esc(whoName(m)) + (at ? ' <span class="t">' + esc(relTime(at)) + '</span>' : '') + '</div>' : '';
+    return '<div class="mrow left' + (gs ? ' gs' : '') + '">' + ava + '<div class="mstack">' + who + bubble + '</div></div>';
+  }
+  function threadLogHtml(c) {
+    var out = '';
+    if (!c.msgs.length && !c.escalated) {
+      out += mrowHtml({ role: 'ai', body: 'Hi, I’m Noola — your AI assistant. Ask me anything and I’ll answer instantly from the help center. Want a teammate instead? Tap “Talk to a human” any time.' }, true, null);
+    }
+    var prev = null;
+    for (var i = 0; i < c.msgs.length; i++) {
+      var m = c.msgs[i];
+      // Skip empty rows (no body AND no attachments) so a stray empty bubble can never render.
+      var hasAtt = m.attachments && m.attachments.length;
+      if (m.role !== 'note' && m.role !== 'src' && (!m.body || !String(m.body).trim()) && !hasAtt) continue;
+      var side = sideOf(m);
+      var gs = !prev || sideOf(prev) !== side || groupKey(prev) !== groupKey(m) || (m.at && prev.at && (m.at - prev.at > 5 * 60 * 1000));
+      out += mrowHtml(m, gs, m.at);
+      prev = m;
+    }
+    // A resolved/closed ticket shows an "ended" divider (Intercom-style) above the toggle; the
+    // visitor can still ask again, which reopens the thread server-side on the next turn.
+    if (c.status === 'resolved' || c.status === 'closed') out += '<div class="ended">This conversation has ended</div>';
+    // The toggle switches modes: when the assistant is muted (escalated) offer "Ask Noola" to resume
+    // it; otherwise offer "Talk to a human". We show "Talk to a human" whenever NOT escalated — even
+    // after a human has replied — so a customer who resumed the AI (or whose thread a human dipped
+    // into) can always escalate again. (The earlier version hid it once any agent had replied, which
+    // stranded the customer with no way back to a human after resuming.)
+    // While the request is in flight the button is disabled and says so — a button that "did nothing"
+    // got tapped again, and each tap used to post another handoff message.
+    var toggle = c.escalated
+      ? '<button class="talk" id="resume" type="button"' + (resumingIds[c.id] ? ' disabled aria-busy="true"' : '') + '>' + iconNoola() + '<span>Ask Noola</span></button>'
+      : '<button class="talk" id="talk" type="button"' + (escalatingIds[c.id] ? ' disabled aria-busy="true"' : '') + '>' + iconUser() + '<span>' + (escalatingIds[c.id] ? 'Connecting you…' : 'Talk to a human') + '</span></button>';
+    return out + toggle;
+  }
+  function refreshLog(convId) {
+    if (!(panelOpen && view === 'thread' && threadId === convId)) return;
+    var c = getConv(convId); if (!c) return;
+    var log = sel('#log'); if (!log) return;
+    var atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.innerHTML = threadLogHtml(c);
+    wireThreadLog(c);
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+  function wireThreadLog(c) {
+    var talkb = sel('#talk'); if (talkb) talkb.addEventListener('click', function () { escalate(c.id); });
+    var resumeb = sel('#resume'); if (resumeb) resumeb.addEventListener('click', function () { resumeAssistant(c.id); });
+  }
+  // Pull the authoritative transcript from the server and reconcile the local copy to it, so the
+  // widget shows EXACTLY what the agent console shows (single source of truth). Only rebuilds the DOM
+  // when the message set actually changed (by id) or the AI mode flipped — most polls are no-ops.
+  function hydrateThread(convId, cb) {
+    // Don't reconcile a conversation whose AI answer is mid-stream — the persisted answer doesn't
+    // exist yet, so rebuilding from the server would erase the live streaming bubble.
+    if (streamingConv === convId) { if (cb) cb(); return; }
+    var gen = sessionGen;
+    var startConv = getConv(convId);
+    var modeSeqAtStart = startConv ? (startConv.modeSeq || 0) : 0;
+    // Read receipt: tell the server we are actively LOOKING at this thread only on a foreground poll
+    // (panel open + this exact conversation on screen). Background/closed polls send false, so agent
+    // replies are stamped seen only when the customer is genuinely viewing them.
+    var viewingReq = panelOpen && view === 'thread' && threadId === convId;
+    fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId, viewing: viewingReq }) })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (gen !== sessionGen) return;
+        var c = getConv(convId); if (!c || !d) { if (cb) cb(); return; }
+        // The server doesn't know this conversation (null) → keep what we have. It used to be read as
+        // "AI on", which re-offered "Talk to a human" and wiped the local transcript.
+        if (d.assistantEnabled === null && d.status === null) { if (cb) cb(); return; }
+        var wasEsc = !!c.escalated;
+        // A poll that started before a local escalate/resume took effect carries the OLD mode — ignore it,
+        // or the button flips back for a few seconds and invites a second tap.
+        if ((c.modeSeq || 0) === modeSeqAtStart && typeof d.assistantEnabled === 'boolean') c.escalated = d.assistantEnabled === false;
+        c.status = d.status || null;
+        var server = (d.messages || []).map(function (m) { return { role: m.role === 'agent' ? 'agent' : m.role === 'ai' ? 'ai' : 'me', id: m.id, body: m.body, attachments: m.attachments || [], at: m.at ? +new Date(m.at) : Date.now(), authorName: m.authorName || null, authorAvatarUrl: m.authorAvatarUrl || null }; });
+        var localIds = c.msgs.map(function (m) { return m.id || ''; }).join('|');
+        var serverIds = server.map(function (m) { return m.id; }).join('|');
+        var changed = localIds !== serverIds;
+        var poppable = false, freshAt = 0;
+        if (changed) {
+          // If the visitor isn't looking at this thread, count freshly-arrived agent/AI turns as unread
+          // for the launcher badge (a background poll reconciles silently otherwise).
+          var viewing = panelOpen && view === 'thread' && threadId === convId;
+          if (!viewing) {
+            // "Fresh" = newer than the newest server message we already had — not "an id we don't have".
+            // The cached copy is capped at 120 messages and a synced conversation starts as a preview with
+            // no ids, so id-diffing counted OLD replies as new and popped the messenger on every poll.
+            var known = {}, newestKnown = 0, hadReal = false;
+            for (var i = 0; i < c.msgs.length; i++) {
+              var lm = c.msgs[i];
+              if (lm.id && lm.id !== 'preview') { known[lm.id] = 1; hadReal = true; if (lm.at > newestKnown) newestKnown = lm.at; }
+            }
+            var fresh = 0;
+            if (hadReal) {
+              for (var j = 0; j < server.length; j++) {
+                var sm = server[j];
+                if ((sm.role === 'agent' || sm.role === 'ai') && !known[sm.id] && sm.at > newestKnown) { fresh++; if (sm.at > freshAt) freshAt = sm.at; }
+              }
+            }
+            if (fresh) {
+              c.unread = (c.unread || 0) + fresh; renderBadge();
+              if (!panelOpen && !isEnded(c.status) && freshAt > popMark()) poppable = true;
+            }
+          }
+          c.msgs = server; c.updatedAt = Date.now();
+        }
+        var viewingNow = panelOpen && view === 'thread' && threadId === convId;
+        if (wasEsc !== c.escalated) {
+          // Mode flipped — the header subtitle AND the toggle both change, so re-render the whole
+          // thread screen (refreshLog only owns #log, which would leave the header stale).
+          saveConvs();
+          if (viewingNow) { pendingDir = 'none'; render(); }
+        } else if (changed) {
+          saveConvs(); refreshLog(convId);
+        }
+        // An agent reply the visitor hasn't seen — arrived live, OR while they were away and now
+        // surfaced on the first reconcile after (re)load — pop the messenger open to it, panel-closed
+        // only. Done after msgs/escalated reconcile so the opened thread shows the message.
+        if (poppable && !panelOpen) autoOpenThread(convId, freshAt);
+        if (cb) cb();
+      })
+      .catch(function () { if (cb) cb(); });
+  }
+
+  // Thread header with a human/AI identity block (avatar + presence + status) instead of a bare
+  // title — the surface the visitor is actually talking to. Shows the latest human agent in the
+  // thread if there is one, else the AI assistant. Reuses the #bk/#cl ids that wireHeader() binds.
+  function threadHeader(c) {
+    var back = enabledTabs().length > 1;
+    var agent = null; for (var i = c.msgs.length - 1; i >= 0; i--) { if (c.msgs[i].role === 'agent') { agent = c.msgs[i]; break; } }
+    var name, avInner, sub;
+    if (c.escalated) {
+      name = agent ? (agent.authorName || 'Support') : 'Our team';
+      avInner = agent ? avatarInner(agent) : '<span class="av">' + iconUser() + '</span>';
+      sub = 'Connected · we’ll reply here';
+    } else {
+      name = agent ? (agent.authorName || 'Support') : 'Noola';
+      avInner = agent ? avatarInner(agent) : '<span class="av ai">' + iconNoola() + '</span>';
+      sub = agent ? 'A teammate is replying' : 'AI assistant · replies instantly';
+    }
+    return '<div class="hd plain">' +
+      (back ? '<button class="iconbtn" id="bk" aria-label="Back">' + iconBack() + '</button>' : '') +
+      '<div class="hd-id"><div class="idava">' + avInner + '<span class="pres"></span></div>' +
+        '<div class="idtxt"><div class="idname">' + esc(name) + '</div><div class="idsub">' + esc(sub) + '</div></div></div>' +
+      '<button class="iconbtn" id="cl" aria-label="Close">' + iconClose() + '</button>' +
+    '</div>';
+  }
+  function renderThread() {
+    var c = getConv(threadId) || newConv();
+    threadId = c.id;
+    var body =
+      // #log IS the scroll container (has .body's flex:1 + overflow-y:auto AND .log's flex layout).
+      // The old nested .body>.log put overflow on .body while every scrollTop call targeted #log —
+      // a no-op — so long/old transcripts opened pinned at the top. Merged, #log scrolls for real.
+      '<div class="body log" id="log">' + threadLogHtml(c) + '</div>' +
+      '<div class="foot">' +
+        '<div class="attprev" id="attprev"></div>' +
+        '<div class="footrow">' +
+          '<button class="attbtn" id="attach" type="button" aria-label="Attach a file">' + iconClip() + '</button>' +
+          '<textarea id="q" rows="1" placeholder="Type a message"></textarea>' +
+          '<button id="send" type="button" aria-label="Send message">' + iconArrowUp() + '</button>' +
+          '<input type="file" id="fileinput" multiple accept="image/*,.pdf,.txt,.csv,.doc,.docx,.zip,.log" style="display:none">' +
+        '</div>' +
+      '</div>';
+    return { header: threadHeader(c), body: body, wire: function () {
+      wireHeader();
+      pending = [];                              // fresh composer per thread open
+      var q = sel('#q'), send = sel('#send');
+      var log = sel('#log'); if (log) log.scrollTop = log.scrollHeight;
+      wireThreadLog(c);
+      send.addEventListener('click', function () { sendMsg(c.id); });
+      q.addEventListener('input', function () { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 96) + 'px'; syncSendState(); });
+      q.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(c.id); } });
+      var attach = sel('#attach'), fi = sel('#fileinput');
+      if (attach && fi) attach.addEventListener('click', function () { fi.click(); });
+      if (fi) fi.addEventListener('change', function () { addFiles(fi.files); fi.value = ''; });
+      renderAttPrev();
+      syncSendState();
+      q.focus();
+      // Reconcile against the server on open, then keep the thread live (poll + WS) regardless of mode
+      // so agent replies AND AI answers stream in and both interfaces stay in lockstep.
+      hydrateThread(c.id);
+      startLive(c.id);
+    } };
+  }
+
+  // ---- composer attachments (pending until the message is sent) ----
+  var pending = [];              // [{ dataUrl, filename, contentType, isImage }]
+  var ATT_MAX_BYTES = 15 * 1024 * 1024, ATT_MAX_COUNT = 5;
+  function addFiles(fileList) {
+    if (!fileList) return;
+    for (var i = 0; i < fileList.length; i++) {
+      if (pending.length >= ATT_MAX_COUNT) break;
+      (function (file) {
+        if (!file || file.size === 0 || file.size > ATT_MAX_BYTES) return;
+        var r = new FileReader();
+        r.onload = function () {
+          pending.push({ dataUrl: String(r.result), filename: file.name || 'file', contentType: file.type || 'application/octet-stream', isImage: (file.type || '').indexOf('image/') === 0 });
+          renderAttPrev();
+        };
+        r.readAsDataURL(file);
+      })(fileList[i]);
+    }
+  }
+  function renderAttPrev() {
+    var box = sel('#attprev'); if (!box) return;
+    box.innerHTML = pending.map(function (p, i) {
+      // Images get a large tile preview (Intercom-style); other files a compact chip.
+      if (p.isImage) {
+        return '<span class="attthumb"><img src="' + p.dataUrl + '" alt="' + esc(p.filename) + '">' +
+          '<button class="rm" type="button" data-i="' + i + '" aria-label="Remove">' + iconX() + '</button></span>';
+      }
+      return '<span class="attchip">' + iconFile() + '<span>' + esc(p.filename) + '</span>' +
+        '<button class="rm" type="button" data-i="' + i + '" aria-label="Remove">' + iconX() + '</button></span>';
+    }).join('');
+    var rms = box.querySelectorAll('.rm');
+    for (var k = 0; k < rms.length; k++) (function (b) { b.addEventListener('click', function () { pending.splice(+b.getAttribute('data-i'), 1); renderAttPrev(); syncSendState(); }); })(rms[k]);
+  }
+  // XSS-safe markdown for chat bubbles: a small line parser (headings, bullet/ordered lists,
+  // paragraphs) with inline bold / italic / code / links. Everything is escaped BEFORE any markup
+  // is added, so no user/model text can inject HTML. AI answers come back in markdown; rendering it
+  // is what makes an answer read as a crafted reply instead of a wall of asterisks.
+  function mdInline(t) {
+    t = esc(t);
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    t = t.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return t;
+  }
+  function md(s) {
+    var text = String(s == null ? '' : s);
+    var lines = text.split('\n');
+    var html = '', listType = null, para = [];
+    function flushPara() { if (para.length) { html += '<p>' + para.join('<br>') + '</p>'; para = []; } }
+    function closeList() { if (listType) { html += '</' + listType + '>'; listType = null; } }
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      var h = /^(#{1,3})\s+(.*)$/.exec(ln);
+      var ul = /^\s*[-*]\s+(.*)$/.exec(ln);
+      var ol = /^\s*\d+\.\s+(.*)$/.exec(ln);
+      if (h) { flushPara(); closeList(); html += '<div class="mdh">' + mdInline(h[2]) + '</div>'; }
+      else if (ul) { flushPara(); if (listType !== 'ul') { closeList(); html += '<ul>'; listType = 'ul'; } html += '<li>' + mdInline(ul[1]) + '</li>'; }
+      else if (ol) { flushPara(); if (listType !== 'ol') { closeList(); html += '<ol>'; listType = 'ol'; } html += '<li>' + mdInline(ol[1]) + '</li>'; }
+      else if (!ln.trim()) { flushPara(); closeList(); }
+      else { closeList(); para.push(mdInline(ln)); }
+    }
+    flushPara(); closeList();
+    return html || esc(text);
+  }
+  // A message attachment, served from the scoped public lane (key + conversation handle). Images
+  // render inline; everything else is a downloadable file chip.
+  function attHtml(a) {
+    var isImg = a.contentType && a.contentType.indexOf('image/') === 0 && a.contentType !== 'image/svg+xml';
+    // Optimistic (just-picked) attachment: no server id yet — show the local data URL, no link.
+    if (a._local) {
+      if (isImg) return '<span class="att-img"><img src="' + a._local + '" alt="' + esc(a.filename) + '"></span>';
+      return '<span class="att-file">' + iconFile() + '<span>' + esc(a.filename) + '</span></span>';
+    }
+    var url = API + '/public/attachment/' + encodeURIComponent(a.id) + '?key=' + encodeURIComponent(KEY) + '&cid=' + encodeURIComponent(threadId);
+    if (isImg) return '<a class="att-img" href="' + url + '" target="_blank" rel="noopener"><img src="' + url + '" alt="' + esc(a.filename) + '" loading="lazy"></a>';
+    return '<a class="att-file" href="' + url + '" target="_blank" rel="noopener" download>' + iconFile() + '<span>' + esc(a.filename) + '</span></a>';
+  }
+  // Standalone single row (optimistic sends + error line). The next hydrate re-renders the whole
+  // log with proper grouping, so a lone row only needs to look right on its own → treat as group-start.
+  function msgHtml(m) { return mrowHtml(m, true, m.at); }
+  function appendMsg(convId, m, live) {
+    var c = getConv(convId); if (!c) return;
+    c.msgs.push(m); c.updatedAt = Date.now(); saveConvs();
+    if (panelOpen && view === 'thread' && threadId === convId) {
+      var log = sel('#log');
+      if (log) {
+        var wrap = document.createElement('div'); wrap.innerHTML = msgHtml(m);
+        var node = wrap.firstChild;
+        var animate = !reducedMotion() && (m.role === 'me' || m.role === 'agent' || m.role === 'ai');
+        if (animate && node.classList) node.classList.add('msg-enter');
+        var talk = log.querySelector('.talk');
+        if (talk && (m.role === 'me' || m.role === 'agent' || m.role === 'ai')) log.insertBefore(node, talk);
+        else log.appendChild(node);
+        log.scrollTop = log.scrollHeight;
+        if (animate && node.classList) requestAnimationFrame(function () { requestAnimationFrame(function () { node.classList.add('in'); }); });
+      }
+    } else if (live && (m.role === 'agent')) {
+      c.unread = (c.unread || 0) + 1; saveConvs(); renderBadge();
+    }
+  }
+  // Clear the SERVER-side unseen watermark (agent replies with seen_at IS NULL) for a thread the
+  // visitor is now viewing. markRead alone only clears the LOCAL badge; the server-side unseen flag is
+  // what bootSyncPop reads, and its only other stamp — startLive's viewing:true poll — never runs for
+  // NON-escalated threads (render() gates startLive on c.escalated). Without this, an agent/AI reply on
+  // a non-escalated thread re-pops the messenger on every reload even after the visitor has seen it.
+  // Fire-and-forget, no render: opening the thread IS viewing it, so viewing:true is honest; the server
+  // no-ops when already stamped (the seen_at IS NULL guard).
+  function stampSeen(convId) {
+    if (!convId) return;
+    try {
+      fetch(API + '/public/conversation', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: KEY, conversationId: convId, viewing: true }) }).catch(function () {});
+    } catch (e) {}
+  }
+  function markRead(convId) {
+    var c = getConv(convId);
+    if (c) {
+      var dirty = false;
+      if (c.unread) { c.unread = 0; dirty = true; }
+      if (c.unseen) { c.unseen = false; dirty = true; }
+      setPopMark(newestAgentAt(c));   // they've seen everything up to here — don't pop it again
+      if (dirty) { saveConvs(); renderBadge(); }
+    }
+    stampSeen(convId);   // also clear the server-side unseen watermark, so the boot-pop doesn't repeat
+  }
+
+  function sendMsg(convId) {
+    var c = getConv(convId); if (!c) return;
+    var q = sel('#q'); if (!q) return;
+    var text = q.value.trim();
+    var files = pending.slice();
+    if ((!text && !files.length) || busy) return;   // nothing to send
+    q.value = ''; q.style.height = 'auto';
+    pending = []; renderAttPrev();
+    // Optimistic bubble: show the text plus local previews of the just-picked files (hydrate then
+    // swaps them for the persisted, server-served attachments).
+    var optAtts = files.map(function (f) { return { id: null, filename: f.filename, contentType: f.contentType, _local: f.dataUrl }; });
+    appendMsg(convId, { role: 'me', body: text, attachments: optAtts, at: Date.now() });
+    busy = true; syncSendState();   // disable + drop the "armed" accent while the turn is in flight
+
+    // The server decides who answers from the conversation's authoritative AI mode: in AI mode it
+    // replies; in human mode (or an attachment-only turn) it just persists the message for the team.
+    // We never pass an escalate flag here — a plain message in human mode is simply queued to the agent.
+    // One idempotency token per send attempt, carried on BOTH the stream and plain lanes below. A
+    // transport retry of the same turn reuses it so the server persists the visitor message once.
+    var clientMessageId = (self.crypto && self.crypto.randomUUID)
+      ? self.crypto.randomUUID()
+      : 'w-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    var body = { key: KEY, question: text, conversationId: convId, clientMessageId: clientMessageId };
+    if (files.length) body.attachments = files.map(function (f) { return { dataUrl: f.dataUrl, filename: f.filename }; });
+    if (identity.email) body.email = identity.email;
+    if (identity.name) body.name = identity.name;
+    if (identity.user_id) body.userId = identity.user_id;
+    if (identity.user_hash) body.userHash = identity.user_hash;
+    if (identity.user_jwt) body.userJwt = identity.user_jwt;
+    var unbusy = function () { busy = false; var sb = sel('#send'); if (sb) sb.disabled = false; syncSendState(); var qq = sel('#q'); if (qq) qq.focus(); };
+    trackActivity('conversation_message', { conversationId: convId });
+
+    // AI-mode text turns stream the answer token-by-token over SSE (perceived-instant). Human mode,
+    // escalated threads, and attachment-only turns keep the plain /public/ask lane (nothing to stream).
+    if (!c.escalated && text) { streamAiAnswer(convId, body, unbusy); return; }
+
+    fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      // Render nothing by hand — pull the persisted turn(s) from the server so the widget shows
+      // exactly what the agent console shows (single source of truth, no duplicate/again bubbles).
+      .then(function () { hydrateThread(convId); })
+      .catch(function () { appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); })
+      .finally(unbusy);
+  }
+
+  // ---- SSE streaming of the AI answer -------------------------------------
+  // Read a POST Server-Sent-Events response frame-by-frame. Handlers: onEvent(name,data) per SSE
+  // frame, onJson(obj) if the server answered non-stream JSON (deferred/not-AI), onError(err).
+  function streamSSE(url, body, h) {
+    fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        var ct = res.headers.get('content-type') || '';
+        if (ct.indexOf('text/event-stream') === -1) {
+          return res.json().then(function (j) { if (h.onJson) h.onJson(j); }).catch(function () { if (h.onError) h.onError(); });
+        }
+        if (!res.body || !res.body.getReader) {   // no streaming reader → read whole, then parse frames
+          return res.text().then(function (txt) { parseFrames(txt, h); });
+        }
+        var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
+        function pump() {
+          return reader.read().then(function (r) {
+            if (r.done) { if (buf.trim()) emitFrame(buf, h); return; }
+            buf += dec.decode(r.value, { stream: true });
+            var idx;
+            while ((idx = buf.indexOf('\n\n')) >= 0) { var f = buf.slice(0, idx); buf = buf.slice(idx + 2); emitFrame(f, h); }
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function (e) { if (h.onError) h.onError(e); });
+  }
+  function emitFrame(frame, h) {
+    var event = 'message', data = '';
+    var lines = frame.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      if (ln.indexOf('event:') === 0) event = ln.slice(6).trim();
+      else if (ln.indexOf('data:') === 0) data += ln.slice(5).trim();
+    }
+    if (!data) return;                         // ':' heartbeat comments carry no data
+    var parsed = null; try { parsed = JSON.parse(data); } catch (e) {}
+    if (h.onEvent) h.onEvent(event, parsed);
+  }
+  function parseFrames(txt, h) { var fs = txt.split('\n\n'); for (var i = 0; i < fs.length; i++) if (fs[i].trim()) emitFrame(fs[i], h); }
+
+  // Stream an AI answer into the log: thinking-dots → a live bubble that fills token-by-token with a
+  // caret, then on 'done' stamp the server message id (so poll/WS never double-render) and reconcile.
+  function streamAiAnswer(convId, body, done) {
+    var log = sel('#log');
+    var thinking = null, bubbleRow = null, bubble = null, acc = '', raf = 0, doneCalled = false, stick = true;
+    var msg = { role: 'ai', id: null, body: '', at: Date.now() };
+    streamingConv = convId;
+    if (log) {
+      thinking = document.createElement('div');
+      thinking.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconNoola() + '</span></div><div class="mstack"><div class="rowm ai think"><span></span><span></span><span></span></div></div></div>';
+      log.appendChild(thinking); log.scrollTop = log.scrollHeight;
+    }
+    function atBottom() { return log ? (log.scrollHeight - log.scrollTop - log.clientHeight < 60) : true; }
+    function paint() {
+      raf = 0; if (!bubble) return;
+      bubble.innerHTML = md(acc) + '<span class="caret"></span>';
+      if (stick && log) log.scrollTop = log.scrollHeight;
+    }
+    function mount() {
+      if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); thinking = null;
+      var wrap = document.createElement('div');
+      wrap.innerHTML = '<div class="mrow left gs"><div class="mava"><span class="av ai">' + iconNoola() + '</span></div><div class="mstack"><div class="mwho">' + esc('Noola') + '</div><div class="rowm ai streaming"></div></div></div>';
+      bubbleRow = wrap.firstChild;
+      if (!reducedMotion() && bubbleRow.classList) bubbleRow.classList.add('msg-enter');
+      if (log) { var talk = log.querySelector('.talk'); if (talk) log.insertBefore(bubbleRow, talk); else log.appendChild(bubbleRow); }
+      bubble = bubbleRow.querySelector('.rowm');
+      if (!reducedMotion() && bubbleRow.classList) requestAnimationFrame(function () { requestAnimationFrame(function () { bubbleRow.classList.add('in'); }); });
+    }
+    function onDelta(t) { if (!bubble) mount(); stick = atBottom(); acc += t; if (!raf) raf = requestAnimationFrame(paint); }
+    function commit(id) {
+      var c = getConv(convId);
+      msg.body = acc; msg.id = id || ('s' + Date.now());
+      if (c) { c.msgs.push(msg); c.updatedAt = Date.now(); saveConvs(); }
+    }
+    function finish(id) {
+      if (doneCalled) return; doneCalled = true; streamingConv = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (bubble) bubble.classList.remove('streaming');
+      if (bubble) bubble.innerHTML = md(acc);      // drop the caret
+      if (acc) commit(id);
+      hydrateThread(convId);                       // reconcile now that the answer is persisted
+      if (done) done();
+    }
+    function fail() {
+      if (doneCalled) return; doneCalled = true; streamingConv = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking);
+      if (acc) { if (bubble) { bubble.classList.remove('streaming'); bubble.innerHTML = md(acc); } commit(null); }
+      else { if (bubbleRow && bubbleRow.parentNode) bubbleRow.parentNode.removeChild(bubbleRow); appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); }
+      if (done) done();
+    }
+    streamSSE(API + '/public/ask/stream', body, {
+      onEvent: function (event, data) {
+        if (event === 'delta') { if (data && data.t) onDelta(data.t); }
+        else if (event === 'done') finish(data && data.messageId);
+        else if (event === 'error') fail();
+      },
+      onJson: function () { streamingConv = null; if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); hydrateThread(convId); if (done) done(); },
+      onError: fail
+    });
+  }
+
+  // Enable/lift the send button only when there's something to send (text or a pending attachment)
+  // and we're not mid-request — the Intercom "send lights up" affordance.
+  function syncSendState() {
+    var q = sel('#q'), send = sel('#send'); if (!send) return;
+    var has = !!((q && q.value.trim()) || pending.length);
+    send.disabled = busy || !has;
+    if (send.classList) send.classList.toggle('ready', has && !busy);
+  }
+
+  // Human handoff: mute the assistant on this conversation (server-authoritative, set before the
+  // handoff message is ingested so no bot reply races it) and post a customer-side marker that
+  // surfaces the thread in the agents' "needs reply" queue — the full AI transcript stays on the
+  // same ticket. UI reflects the new mode once the server has confirmed it (no optimistic race).
+  function escalate(convId) {
+    var c = getConv(convId); if (!c || c.escalated || escalatingIds[convId] || busy) return;
+    // Synchronous in-flight latch (memory only) + a disabled "Connecting you…" button.
+    escalatingIds[convId] = true;
+    c.modeSeq = (c.modeSeq || 0) + 1;
+    refreshLog(convId);
+    // Stable per handoff attempt (bumped only when the visitor hands back to the AI): a retry of the same
+    // handoff is collapsed server-side into one message. The server also no-ops if already escalated.
+    var b = { key: KEY, question: 'I’d like to talk to a human, please.', conversationId: convId, escalate: true, clientMessageId: 'esc-' + convId + '-' + (c.escSeq || 0) };
+    if (identity.email) b.email = identity.email;
+    if (identity.name) b.name = identity.name;
+    if (identity.user_id) b.userId = identity.user_id;
+    if (identity.user_hash) b.userHash = identity.user_hash;
+    if (identity.user_jwt) b.userJwt = identity.user_jwt;
+    trackActivity('requested_human', { conversationId: convId });
+    var gen = sessionGen;
+    fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) })
+      .then(function (r) { if (!r.ok) throw new Error('escalate failed: ' + r.status); return r.json(); })
+      .then(function (d) {
+        delete escalatingIds[convId];
+        if (gen !== sessionGen) return;
+        var cc = getConv(convId); if (!cc) return;   // re-read: a boot may have replaced the list meanwhile
+        cc.escalated = !!(d && (d.escalated || d.alreadyEscalated));
+        cc.modeSeq = (cc.modeSeq || 0) + 1;
+        saveConvs();
+        if (view === 'thread' && threadId === convId) { pendingDir = 'none'; render(); }
+        if (cc.escalated) startLive(convId);
+      })
+      .catch(function () { delete escalatingIds[convId]; refreshLog(convId); });
+  }
+
+  // Bring the AI back ("Ask Noola"): un-mute the assistant server-side, then reflect it. The whole
+  // transcript is intact on the ticket, so the AI answers the next question with full context.
+  function resumeAssistant(convId) {
+    var c = getConv(convId); if (!c || !c.escalated || resumingIds[convId] || busy) return;
+    resumingIds[convId] = true;
+    c.modeSeq = (c.modeSeq || 0) + 1;
+    refreshLog(convId);
+    var gen = sessionGen;
+    fetch(API + '/public/assistant-mode', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: KEY, conversationId: convId, enabled: true }) })
+      .then(function (r) { if (!r.ok) throw new Error('resume failed: ' + r.status); return r.json(); })
+      .then(function () {
+        delete resumingIds[convId];
+        if (gen !== sessionGen) return;
+        var cc = getConv(convId); if (!cc) return;
+        cc.escalated = false; cc.escSeq = (cc.escSeq || 0) + 1; cc.modeSeq = (cc.modeSeq || 0) + 1;
+        saveConvs();
+        if (view === 'thread' && threadId === convId) { pendingDir = 'none'; render(); var qq = sel('#q'); if (qq) qq.focus(); }
+      })
+      .catch(function () { delete resumingIds[convId]; refreshLog(convId); });
+  }
+
+  // ---- live lane (poll + WS) scoped to one escalated conversation ----
+  function resumeLive() {
+    // Keep one conversation live while the panel is closed so an inbound agent reply arrives in real
+    // time (badge + auto-open). Prefer the newest ESCALATED thread (a human is engaged there); fall
+    // back to the newest thread with any history, so an agent who jumps into an AI thread is caught too.
+    var esc2 = null, touched = null;
+    for (var i = 0; i < convs.length; i++) {
+      var c = convs[i];
+      if (!(c.msgs && c.msgs.length)) continue;              // never-used conversations need no live lane
+      if (!touched || (c.updatedAt || 0) > (touched.updatedAt || 0)) touched = c;
+      if (c.escalated && (!esc2 || (c.updatedAt || 0) > (esc2.updatedAt || 0))) esc2 = c;
+    }
+    var live = esc2 || touched;
+    if (live) startLive(live.id);
+  }
+  function startLive(convId) {
+    if (activeConvId !== convId) { stopPoll(); closeWS(); activeConvId = convId; }
+    if (!pollTimer) { poll(); pollTimer = setInterval(poll, 6000); }
+    connectWS();
+  }
+  function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+  // A live agent/AI message arrived over the socket. If the visitor is looking at that thread, pull
+  // the authoritative transcript (single render path); otherwise record it as unread for the badge.
+  function onAgent(convId, id, bodyTxt) {
+    var c = getConv(convId); if (!c) return;
+    if (panelOpen && view === 'thread' && threadId === convId) { hydrateThread(convId); return; }
+    var mkey = id || ('b' + bodyTxt);
+    for (var i = 0; i < c.msgs.length; i++) if (c.msgs[i].id === mkey) return; // dedupe poll <-> socket
+    c.msgs.push({ role: 'agent', id: mkey, body: bodyTxt, at: Date.now() });
+    c.unread = (c.unread || 0) + 1; c.updatedAt = Date.now(); saveConvs(); renderBadge();
+    if (!panelOpen) autoOpenThread(convId);   // pop the messenger open on an inbound agent reply
+  }
+  // Poll = reconcile the open thread against the server (customer + agent + AI, correctly ordered).
+  function poll() { if (activeConvId) hydrateThread(activeConvId); }
+  function connectWS() {
+    if (!EDGE || ws || !activeConvId) return;
+    // Every handler is bound to THIS socket and THIS conversation. A socket closed when the live lane
+    // moved to another conversation used to fire its onclose later and clobber the new socket, and route
+    // messages to whatever conversation was active by then.
+    var conv = activeConvId;
+    var topic = 'widget:' + conv;
+    var url = EDGE + '/widget-socket/websocket?vsn=2.0.0&key=' + encodeURIComponent(KEY);
+    var sock;
+    try { sock = new WebSocket(url); } catch (e) { return; }
+    ws = sock;
+    sock.onopen = function () {
+      if (ws !== sock) return;
+      sock.send(JSON.stringify(['1', '1', topic, 'phx_join', { key: KEY }]));
+      wsHb = setInterval(function () { if (ws === sock && sock.readyState === 1) sock.send(JSON.stringify([null, 'hb' + (++wsRef), 'phoenix', 'heartbeat', {}])); }, 30000);
+    };
+    sock.onmessage = function (ev) { if (ws !== sock) return; var f; try { f = JSON.parse(ev.data); } catch (e) { return; } if (f && f[2] === topic && f[3] === 'message' && f[4]) onAgent(conv, f[4].id, f[4].body); };
+    sock.onclose = function () { if (ws !== sock) return; if (wsHb) { clearInterval(wsHb); wsHb = null; } ws = null; if (activeConvId === conv) setTimeout(connectWS, 3000); };
+    sock.onerror = function () { try { sock.close(); } catch (e) {} };
+  }
+  function closeWS() { if (wsHb) { clearInterval(wsHb); wsHb = null; } if (ws) { try { ws.close(); } catch (e) {} ws = null; } }
+
+  // ---- Help center ----
+  var helpTimer = null;
+  function renderHelp() {
+    var body =
+      '<div class="body">' +
+        '<div class="search" style="margin-top:16px"><span>' + iconSearch() + '</span><input id="hq" placeholder="Search for articles" autocomplete="off"></div>' +
+        '<div id="hres"><div class="sect">Browse</div><div id="hbrowse"><div class="empty">Loading…</div></div></div>' +
+      '</div>';
+    return { header: header('Help center', 'Search our knowledge base'), body: body, wire: function () {
+      wireHeader();
+      var hq = sel('#hq');
+      if (typeof helpSeed === 'string' && helpSeed) { hq.value = helpSeed; runHelpSearch(helpSeed); helpSeed = null; }
+      else loadBrowse();
+      hq.addEventListener('input', function () { if (helpTimer) clearTimeout(helpTimer); var v = hq.value; helpTimer = setTimeout(function () { runHelpSearch(v); }, 250); });
+      hq.focus();
+    } };
+  }
+  var helpSeed = null;
+  function loadBrowse() {
+    fetchKB('/public/kb').then(function (d) {
+      var el = sel('#hbrowse'); if (!el) return;
+      var arts = (d && d.articles) || [];
+      if (!arts.length) { el.innerHTML = '<div class="empty">No articles published yet.</div>'; return; }
+      el.innerHTML = '<div class="card">' + arts.map(articleRow).join('') + '</div>';
+      wireArticleRows(el);
+    }).catch(function () {});
+  }
+  function runHelpSearch(q) {
+    q = (q || '').trim();
+    var res = sel('#hres'); if (!res) return;
+    if (q.length < 2) { res.innerHTML = '<div class="sect">Browse</div><div id="hbrowse"></div>'; loadBrowse(); return; }
+    fetchKB('/public/kb/search?q=' + encodeURIComponent(q)).then(function (d) {
+      var arts = (d && d.articles) || [];
+      res.innerHTML = '<div class="sect">' + arts.length + ' result' + (arts.length === 1 ? '' : 's') + '</div>' +
+        (arts.length ? '<div class="card">' + arts.map(articleRow).join('') + '</div>' : '<div class="empty">No matching articles.</div>');
+      wireArticleRows(res);
+    }).catch(function () {});
+  }
+
+  function renderArticle() {
+    var body = '<div class="body"><div class="art" id="art"><div class="empty">Loading…</div></div></div>';
+    return { header: header('Article', null, { back: true }), body: body, wire: function () {
+      wireHeader();
+      var bk = selHd('#bk'); if (bk) { bk.onclick = function () { setView('help'); }; }
+      fetchKB('/public/kb/' + encodeURIComponent(articleSlug)).then(function (d) {
+        var el = sel('#art'); if (!el) return;
+        var a = d && d.article;
+        if (!a) { el.innerHTML = '<div class="empty">Article not found.</div>'; return; }
+        el.innerHTML = '<h1>' + esc(a.title) + '</h1><div class="art-body">' + esc(a.body || a.content || '') + '</div>';
+      }).catch(function () { var el = sel('#art'); if (el) el.innerHTML = '<div class="empty">Couldn’t load this article.</div>'; });
+    } };
+  }
+
+  function fetchKB(path) {
+    var sep = path.indexOf('?') === -1 ? '?' : '&';
+    return fetch(API + path + sep + 'key=' + encodeURIComponent(KEY)).then(function (r) { return r.ok ? r.json() : null; });
+  }
+
+  // ---- config bootstrap ----
+  function loadConfig() {
+    if (configLoaded || !KEY) return;
+    fetch(API + '/public/config?key=' + encodeURIComponent(KEY)).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+      configLoaded = true;
+      if (d && d.config) {
+        var c = d.config;
+        if (c.accent) CFG.accent = c.accent;
+        if (c.title) CFG.title = c.title;
+        if (c.greeting) CFG.greeting = c.greeting;
+        if (c.position) CFG.position = c.position;
+        if (c.tabs) CFG.tabs = { home: !!c.tabs.home, messages: !!c.tabs.messages, help: !!c.tabs.help };
+      }
+      applyConfig();
+      if (panelOpen) render();
+    }).catch(function () {});
+  }
+
+  // ---- identity / activity SDK plumbing ----
+  var KNOWN = { key: 1, api: 1, api_base: 1, email: 1, name: 1, user_id: 1, userId: 1, user_hash: 1, userHash: 1, user_jwt: 1, userJwt: 1, intercom_user_jwt: 1, company: 1 };
+  function ingestIdentity(opts) {
+    if (!opts || typeof opts !== 'object') return;
+    if (typeof opts.email === 'string') identity.email = opts.email;
+    if (typeof opts.name === 'string') identity.name = opts.name;
+    var uid = opts.user_id != null ? opts.user_id : opts.userId;
+    if (uid != null) identity.user_id = String(uid);
+    // Intercom-parity identity proof — the CURRENT signed JWT (intercom_user_jwt / user_jwt) OR the
+    // LEGACY HMAC user_hash. Either is passed straight through to the api, which verifies it.
+    var uh = opts.user_hash != null ? opts.user_hash : opts.userHash;
+    if (uh != null) identity.user_hash = String(uh);
+    var jwt = opts.intercom_user_jwt != null ? opts.intercom_user_jwt : (opts.user_jwt != null ? opts.user_jwt : opts.userJwt);
+    if (jwt != null) identity.user_jwt = String(jwt);
+    // company: a plain name string OR an Intercom-style { company_id, name, plan, domain } object —
+    // forwarded as-is to /public/identify (the server dedups on company_id, external_id-first).
+    if (typeof opts.company === 'string') identity.company = opts.company;
+    else if (opts.company && typeof opts.company === 'object') identity.company = opts.company;
+    for (var k in opts) { if (opts.hasOwnProperty(k) && !KNOWN[k]) identity.attributes[k] = opts[k]; }
+    saveIdentity();
+  }
+  function currentPage() { return { url: location.href, title: document.title }; }
+  // Live-enrichment signals the browser knows exactly (Intercom-parity): timezone, arrival
+  // referrer, UI language. The server derives browser/OS/geo from the request itself.
+  function clientCtx() {
+    var tz; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+    return { timezone: tz || undefined, referrer: document.referrer || undefined, language: (navigator && navigator.language) || undefined };
+  }
+  // The conversation handles this browser holds. Sent on identify so the server can fold the
+  // ANONYMOUS contact behind each one into the person who just identified — the lead -> user
+  // conversion. A visitor who chats before signing up keeps their history; handles already folded
+  // (or owned by someone else) are a server-side no-op, so this is safe to send every time.
+  function localConvIds() {
+    var out = [];
+    for (var i = 0; i < convs.length && out.length < 20; i++) if (convs[i] && convs[i].id) out.push(String(convs[i].id));
+    return out;
+  }
+  function sendIdentify(extra) {
+    if (!isIdentified() || !KEY) return;
+    var attrs = {}; for (var k in identity.attributes) if (identity.attributes.hasOwnProperty(k)) attrs[k] = identity.attributes[k];
+    if (extra) for (var k2 in extra) if (extra.hasOwnProperty(k2)) attrs[k2] = extra[k2];
+    var cc = clientCtx();
+    var cids = localConvIds();
+    fetch(API + '/public/identify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      key: KEY, email: identity.email || undefined, name: identity.name || undefined,
+      userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined,
+      company: identity.company || undefined, attributes: attrs, page: currentPage(),
+      conversationIds: cids.length ? cids : undefined,
+      timezone: cc.timezone, referrer: cc.referrer, language: cc.language
+    }) }).catch(function () {});
+  }
+  function trackActivity(name, metadata) {
+    if (!isIdentified() || !KEY) return;
+    fetch(API + '/public/track', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      key: KEY, email: identity.email || undefined, userId: identity.user_id || undefined, userHash: identity.user_hash || undefined, userJwt: identity.user_jwt || undefined, name: name, metadata: metadata || {}
+    }) }).catch(function () {});
+  }
+
+  var navTimer = null, lastUrl = location.href, activityHooked = false;
+  function recordPageView() {
+    sendIdentify();
+    trackActivity('viewed_page', currentPage());
+  }
+  function hookActivity() {
+    if (activityHooked) return; activityHooked = true;
+    function onNav() {
+      if (location.href === lastUrl) return; lastUrl = location.href;
+      if (navTimer) clearTimeout(navTimer);
+      navTimer = setTimeout(recordPageView, 800);
+    }
+    ['pushState', 'replaceState'].forEach(function (m) {
+      var orig = history[m]; if (typeof orig === 'function') history[m] = function () { var r = orig.apply(this, arguments); onNav(); return r; };
+    });
+    window.addEventListener('popstate', onNav);
+    window.addEventListener('hashchange', onNav);
+  }
+
+  // ---- public SDK dispatcher: window.Noola(cmd, a, b) ----
+  function dispatch(cmd, a, b) {
+    switch (cmd) {
+      case 'boot': {
+        if (a && a.key) KEY = String(a.key);
+        if (a && (a.api || a.api_base)) API = String(a.api || a.api_base).replace(/\/+$/, '');
+        if (a && a.theme != null) CFG.theme = normTheme(a.theme);
+        if (!KEY) { console.warn('[noola] boot: missing key'); return; }
+        loadIdentity();
+        // Booting a DIFFERENT user than the one stored (account switch without shutdown): start clean, so
+        // the previous user's identity proof, attributes and conversations don't leak into this session.
+        if (isDifferentUser(a)) { identity = emptyIdentity(); resetSession(); }
+        ingestIdentity(a || {}); loadConvs();
+        if (mounted) { renderBadge(); resumeLive(); bootSyncPop(); if (panelOpen) { pendingDir = 'none'; render(); } }
+        else mount();
+        loadConfig();
+        if (!launcherHidden && bubbleEl) bubbleEl.style.display = 'grid';
+        hookActivity(); recordPageView();
+        break;
+      }
+      case 'update': {
+        if (a && a.theme != null) { CFG.theme = normTheme(a.theme); applyConfig(); }
+        var switched = isDifferentUser(a);
+        if (switched) { identity = emptyIdentity(); resetSession(); }
+        var wasIdentified = isIdentified();
+        ingestIdentity(a || {}); sendIdentify();
+        // A new (or newly identified) user: pick up their conversations now, not on the next reload.
+        if (mounted && (switched || (!wasIdentified && isIdentified()))) { resumeLive(); bootSyncPop(); if (panelOpen) { pendingDir = 'none'; render(); } }
+        break;
+      }
+      // Host-driven colour scheme, e.g. Noola('theme', 'dark') from the app's own theme toggle.
+      // Pure CSS-variable swap on the shadow host — the browser repaints, no re-render needed.
+      case 'theme': { CFG.theme = normTheme(a); applyConfig(); break; }
+      case 'track': { if (typeof a === 'string' && a) trackActivity(a, b || {}); break; }
+      case 'show': { launcherHidden = false; mount(); if (bubbleEl) bubbleEl.style.display = 'grid'; renderBadge(); break; }
+      case 'hide': { launcherHidden = true; closePanel(); if (bubbleEl) bubbleEl.style.display = 'none'; if (badgeEl) badgeEl.style.display = 'none'; break; }
+      case 'open': { openPanel(); break; }
+      case 'close': { closePanel(); break; }
+      case 'shutdown': {
+        try { localStorage.removeItem(skey('ident')); } catch (e) {}
+        identity = emptyIdentity();
+        closePanel();
+        resetSession();   // conversations, live lanes, in-flight callbacks, sync flag
+        break;
+      }
+      default: console.warn('[noola] unknown command: ' + cmd);
+    }
+  }
+
+  // Drain any queue captured by the loader snippet before this script ran, then go live.
+  var existing = window.Noola;
+  var queued = (existing && existing.q) ? existing.q.slice() : [];
+  var hadBoot = false;
+  window.Noola = function () { dispatch.apply(null, [].slice.call(arguments)); };
+  window.Noola.q = [];
+  for (var i = 0; i < queued.length; i++) { if (queued[i] && queued[i][0] === 'boot') hadBoot = true; dispatch.apply(null, [].slice.call(queued[i])); }
+
+  // Plain <script data-noola-key> embed (no boot call) → auto-boot anonymously so the widget
+  // shows up exactly as before, and background activity/identity plumbing is ready if a later
+  // Noola('boot',{...}) identifies the visitor.
+  if (!hadBoot && KEY) {
+    loadIdentity(); loadConvs();
+    mount(); loadConfig();
+    hookActivity(); recordPageView();
+  }
+})();`;
