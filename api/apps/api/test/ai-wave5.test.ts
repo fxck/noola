@@ -350,6 +350,7 @@ async function main() {
       && ov.policy.publicSourceKinds.includes("document"));
 
   // ---- restore: policy off so later suites/demo aren't affected; drop the test connection.
+  await clean();
   await putPolicy(A, { mode: "off", min_agreement: 2, channel_modes: { synthetic: "auto", discord: "auto" }, min_confidence: null }, { sweep: false });
   const conns = await superPool.query("SELECT id FROM slack_connections WHERE team_id = 'TWAVE5'");
   for (const row of conns.rows) await deleteSlackConnection(A, row.id as string);

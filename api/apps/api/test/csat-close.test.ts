@@ -60,6 +60,10 @@ async function main() {
     await superPool.query(`DELETE FROM contacts WHERE tenant_id = $1`, [T]);
     await superPool.query(`DELETE FROM slack_connections WHERE tenant_id = $1`, [T]);
     await superPool.query(`DELETE FROM survey_settings WHERE tenant_id = $1`, [T]);
+    // Classification defaults are seeded on first use and have no foreign key to tenants.
+    for (const table of ["slack_reaction_map", "topic_rules", "risk_keywords", "classification_settings"]) {
+      await superPool.query(`DELETE FROM ${table} WHERE tenant_id = $1`, [T]);
+    }
     await superPool.query(`DELETE FROM tenants WHERE id = $1`, [T]);
   };
   await clean();

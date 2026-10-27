@@ -77,6 +77,8 @@ async function main() {
     );
     await superPool.query("DELETE FROM broadcast_recipients WHERE broadcast_id IN (SELECT id FROM broadcasts WHERE subject LIKE 'BTEST%')");
     await superPool.query("DELETE FROM broadcasts WHERE subject LIKE 'BTEST%'");
+    // A sent broadcast opens a conversation per recipient.
+    await superPool.query("DELETE FROM tickets WHERE subject LIKE 'BTEST%'");
     await superPool.query("DELETE FROM contacts WHERE company = 'BcastTestCo' OR email LIKE 'btest-%'");
   };
   await clean();
