@@ -38,10 +38,11 @@ BEGIN
   END IF;
 END $$;
 
--- The approval queue gains the confidence-floor hold reason.
+-- The approval queue's hold reasons. Every deploy re-runs this file, so it holds the full list:
+-- low_confidence is the confidence floor, malformed_output an AI draft with broken note or no-reply tags.
 ALTER TABLE autoreply_queue DROP CONSTRAINT IF EXISTS autoreply_queue_reason_ck;
 ALTER TABLE autoreply_queue ADD CONSTRAINT autoreply_queue_reason_ck
-  CHECK (reason IN ('suggest_only', 'weak_retrieval', 'low_confidence'));
+  CHECK (reason IN ('suggest_only', 'weak_retrieval', 'low_confidence', 'malformed_output'));
 
 -- ── 1b. Slack answer-bot flag ────────────────────────────────────────────────
 -- true = @mentions of the bot get a grounded RAG answer in-thread (no ticket); plain
