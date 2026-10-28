@@ -165,25 +165,89 @@ func hostTag(hostname string) string {
 // sandboxName is unique per attempt: a requeued job's next sandbox never collides with the last.
 func sandboxName(job Job) string { return newIdempotencyKey(sandboxPrefix + firstN(job.RunID, 8)) }
 
-// namedBase is a base the Box already has (the shell base, `default`), by name: its digest is read
-// once and again only after a create answers that the Box no longer has it.
+// defaultBaseImage is the image a Box's own setup (`zbox setup`, zcp's) pulls as `default`: Ubuntu
+// with Python 3, Node.js, gcc and git. A Box imported without that setup — production's — has no
+// base at all, so the runner pulls it there itself.
+const defaultBaseImage = "https://storage.cdn.zerops.app/4ga3k-boxstorage/zbox/zbox-base.tar.gz"
+
+var errShellBasePulling = errors.New("the shell sandbox base is still being pulled")
+
+// shellPullRetry spaces this runner's pulls of a base whose pull failed.
+var shellPullRetry = time.Minute
+
+// namedBase is a base by name (the shell base, `default`): its digest is read once and again only
+// after a create answers that the Box no longer has it. A Box with no READY base of that name gets
+// image pulled under it, in the background, while Digest answers errShellBasePulling.
 type namedBase struct {
-	name   string
-	mu     sync.Mutex
-	digest string
+	name  string
+	image string // pulled when the Box has no READY base of this name; "" = never pull
+
+	mu         sync.Mutex
+	digest     string
+	pulling    bool
+	pullErr    error // this runner's last pull failed
+	pullFailed time.Time
 }
 
 func (n *namedBase) Digest(ctx context.Context, box *Box) (string, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.digest == "" {
-		d, err := box.BaseDigest(ctx, n.name)
-		if err != nil {
-			return "", err
-		}
-		n.digest = d
+	if n.digest != "" {
+		return n.digest, nil
 	}
-	return n.digest, nil
+	if n.pulling {
+		return "", errShellBasePulling
+	}
+	bases, err := box.Bases(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, b := range bases {
+		if b.Name != n.name {
+			continue
+		}
+		switch b.Status {
+		case "READY":
+			n.digest = b.Digest
+			return n.digest, nil
+		case "PULLING", "FLATTENING": // another runner's pull
+			return "", errShellBasePulling
+		}
+	}
+	if n.image == "" {
+		return "", fmt.Errorf("box has no READY base named %q", n.name)
+	}
+	if n.pullErr != nil && time.Since(n.pullFailed) < shellPullRetry {
+		return "", n.pullErr
+	}
+	n.pulling = true
+	go n.pull(box)
+	return "", errShellBasePulling
+}
+
+func (n *namedBase) pull(box *Box) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	logf("the Box has no base %q: pulling it from %s", n.name, n.image)
+	t0 := time.Now()
+	op, err := box.PullBase(ctx, n.image, n.name)
+	if err == nil && op.Status != "FINISHED" {
+		_, err = box.WaitOperation(ctx, op.ID)
+	}
+	var digest string
+	if err == nil {
+		digest, err = box.BaseDigest(ctx, n.name)
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pulling = false
+	if err != nil {
+		n.pullErr, n.pullFailed = fmt.Errorf("pull of base %q failed: %w", n.name, err), time.Now()
+		logf("%v", n.pullErr)
+		return
+	}
+	n.digest, n.pullErr = digest, nil
+	logf("shell base %s (%s) pulled in %s", n.name, firstN(digest, 19), time.Since(t0).Round(time.Second))
 }
 
 func (n *namedBase) Forget(digest string) {
@@ -467,7 +531,10 @@ func runShell(ctx context.Context, msg jetstream.Msg, job Job) (output, failure 
 		return "", "", &configError{err}
 	}
 	digest, err := shellBase.Digest(ctx, box)
-	if err != nil {
+	switch {
+	case errors.Is(err, errShellBasePulling):
+		return "", "", err
+	case err != nil:
 		return "", "", &startError{fmt.Errorf("shell base %q: %w", shellBase.name, err)}
 	}
 	script := strings.TrimSpace(job.Cmd)
@@ -742,8 +809,8 @@ func handleJob(ctx context.Context, msg jetstream.Msg) {
 		logf("run %s cannot run: %v", job.RunID, err)
 		markResult(rec, job, "failed", "", err.Error())
 		_ = msg.Term()
-	case errors.Is(err, errFlowBaseBuilding) || isStartError(err):
-		// Nothing of the job ran yet — usually a Box at capacity, or the flow base still building.
+	case errors.Is(err, errFlowBaseBuilding) || errors.Is(err, errShellBasePulling) || isStartError(err):
+		// Nothing of the job ran yet — usually a Box at capacity, or its base still building or pulling.
 		// Requeue it (runner_runs stays 'queued') until its delivery budget is spent.
 		if deliveries(msg) >= maxDeliver {
 			logf("run %s could not start after %d tries: %v", job.RunID, maxDeliver, err)
@@ -756,6 +823,9 @@ func handleJob(ctx context.Context, msg jetstream.Msg) {
 		case errors.Is(err, errFlowBaseBuilding):
 			delay = 15 * time.Second
 			logf("run %s waits for the flow sandbox base %s", job.RunID, flow.Name)
+		case errors.Is(err, errShellBasePulling):
+			delay = 15 * time.Second
+			logf("run %s waits for the shell sandbox base %s", job.RunID, shellBase.name)
 		case isWorkspaceFull(err):
 			logf("run %s waits — the Box is full", job.RunID)
 		default:
@@ -820,12 +890,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	shellBase = &namedBase{name: envStr("RUNNER_SHELL_BASE", "default")}
-	digest, err := shellBase.Digest(ctx, box)
-	if err != nil {
-		log.Fatalf("[runner] Box at %s: shell base %q: %v — exiting for restart", boxURL, shellBase.name, err)
+	// The shell base: a Box imported without its setup has none, and it is pulled here, in the
+	// background — shell jobs wait in the queue meanwhile. RUNNER_SHELL_BASE_IMAGE=none never pulls.
+	image := envStr("RUNNER_SHELL_BASE_IMAGE", defaultBaseImage)
+	if image == "none" {
+		image = ""
 	}
-	logf("Box %s ready · shell base %s (%s) · network %s", boxURL, shellBase.name, firstN(digest, 19), networkMode)
+	shellBase = &namedBase{name: envStr("RUNNER_SHELL_BASE", "default"), image: image}
+	switch digest, err := shellBase.Digest(ctx, box); {
+	case errors.Is(err, errShellBasePulling):
+		logf("Box %s ready · shell base %s pulling · network %s", boxURL, shellBase.name, networkMode)
+	case err != nil:
+		log.Fatalf("[runner] Box at %s: shell base %q: %v — exiting for restart", boxURL, shellBase.name, err)
+	default:
+		logf("Box %s ready · shell base %s (%s) · network %s", boxURL, shellBase.name, firstN(digest, 19), networkMode)
+	}
 	host, _ := os.Hostname()
 	sandboxPrefix = "noola-" + hostTag(host) + "-"
 	sweepOrphans(ctx)

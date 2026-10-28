@@ -214,6 +214,15 @@ func (b *Box) BaseDigest(ctx context.Context, name string) (string, error) {
 	return "", fmt.Errorf("box has no READY base named %q", name)
 }
 
+// PullBase starts a pull of imageRef (an image tarball URL or a registry reference) into a base
+// that takes name, moved from any base that held it; the answer is the PULL_BASE operation to wait on.
+func (b *Box) PullBase(ctx context.Context, imageRef, name string) (BoxOperation, error) {
+	var op BoxOperation
+	body := map[string]string{"imageRef": imageRef, "name": name}
+	err := b.do(ctx, http.MethodPost, "/base", nil, newIdempotencyKey("pull-"+name), body, &op)
+	return op, err
+}
+
 // BuildBase starts a Dockerfile build of a base from a .tar.gz build context (Dockerfile at its
 // root) under name; the answer is the BUILD_BASE operation to wait on.
 func (b *Box) BuildBase(ctx context.Context, name string, contextTarGz []byte) (BoxOperation, error) {

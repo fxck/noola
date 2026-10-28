@@ -74,6 +74,9 @@ type fakeBox struct {
 	processErr int    // HTTP status /process answers with, 0 = start
 	builds     []string
 	buildReady chan string // a build waits for its name on this channel, nil = ready at once
+	pulls      []string    // "<name> <imageRef>" of each pull
+	pullOps    map[string]string
+	pullReady  chan bool // a pull waits on this channel (true = READY, false = FAILED), nil = ready at once
 	execs      []string
 }
 
@@ -83,6 +86,8 @@ func newFakeBox(t *testing.T) *fakeBox {
 		bases: []BoxBase{{Name: "default", Digest: "sha256:default", Status: "READY"}},
 		boxes: map[string]*fakeSandbox{},
 		sess:  map[string]*fakeSession{},
+
+		pullOps: map[string]string{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
@@ -155,7 +160,56 @@ func (f *fakeBox) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 202, BoxOperation{ID: opID, Kind: "BUILD_BASE", Status: "RUNNING"})
 
+	case r.Method == "POST" && path == "/base":
+		var req struct{ ImageRef, Name string }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ImageRef == "" || r.Header.Get("Idempotency-Key") == "" {
+			writeErr(w, 400, "invalidUserInput")
+			return
+		}
+		f.pulls = append(f.pulls, req.Name+" "+req.ImageRef)
+		for i := range f.bases { // the name moves to the new base
+			if f.bases[i].Name == req.Name {
+				f.bases[i].Name = ""
+			}
+		}
+		digest := fmt.Sprintf("sha256:pulled-%d", len(f.pulls))
+		f.bases = append(f.bases, BoxBase{Name: req.Name, Digest: digest, Status: "PULLING"})
+		opID := f.id("op-pull-")
+		f.pullOps[opID] = digest
+		settle := func(ok bool) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for i := range f.bases {
+				if f.bases[i].Digest == digest {
+					f.bases[i].Status = map[bool]string{true: "READY", false: "FAILED"}[ok]
+				}
+			}
+		}
+		if f.pullReady == nil {
+			defer func() { go settle(true) }()
+		} else {
+			ch := f.pullReady
+			go func() { settle(<-ch) }()
+		}
+		writeJSON(w, 200, BoxOperation{ID: opID, Kind: "PULL_BASE", Status: "RUNNING"})
+
 	case r.Method == "GET" && len(parts) == 2 && parts[0] == "operation":
+		if digest, ok := f.pullOps[parts[1]]; ok {
+			status := "RUNNING"
+			for _, b := range f.bases {
+				if b.Digest == digest {
+					status = map[string]string{"READY": "FINISHED", "FAILED": "FAILED"}[b.Status]
+				}
+			}
+			if status == "" {
+				status = "RUNNING"
+				f.mu.Unlock()
+				time.Sleep(20 * time.Millisecond)
+				f.mu.Lock()
+			}
+			writeJSON(w, 200, BoxOperation{ID: parts[1], Kind: "PULL_BASE", Status: status, Error: map[bool]string{true: "image unreachable"}[status == "FAILED"]})
+			return
+		}
 		if strings.HasPrefix(parts[1], "op-build-") {
 			// The build finishes once the fake marks its base READY.
 			for _, b := range f.bases {
@@ -337,6 +391,12 @@ func (f *fakeBox) runProc(sb *fakeSandbox, s *fakeSession, req ExecRequest) {
 	f.mu.Lock()
 	s.Status, s.ExitCode = "CLOSED", code
 	f.mu.Unlock()
+}
+
+func (f *fakeBox) pullCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pulls)
 }
 
 func (f *fakeBox) sandboxes() []*fakeSandbox {
@@ -586,6 +646,126 @@ func TestFlowBaseFailedBuildIsReported(t *testing.T) {
 	_, err := fb.Digest(context.Background(), f.client())
 	if !errors.Is(err, errFlowBaseFailed) || !strings.Contains(err.Error(), "npm install failed") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// ── the shell base ───────────────────────────────────────────────────────────
+
+// waitDigest calls Digest until it answers something other than errShellBasePulling.
+func waitDigest(t *testing.T, n *namedBase, box *Box) (string, error) {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		d, err := n.Digest(context.Background(), box)
+		if !errors.Is(err, errShellBasePulling) {
+			return d, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the shell base is still pulling")
+	return "", nil
+}
+
+func TestShellBasePresentIsNotPulled(t *testing.T) {
+	f := newFakeBox(t)
+	n := &namedBase{name: "default", image: "https://example.test/base.tar.gz"}
+	if d, err := n.Digest(context.Background(), f.client()); err != nil || d != "sha256:default" {
+		t.Fatalf("digest %q (%v)", d, err)
+	}
+	if n := f.pullCount(); n != 0 {
+		t.Fatalf("pulls = %d, want none", n)
+	}
+}
+
+func TestShellBaseMissingIsPulledOnce(t *testing.T) {
+	f := newFakeBox(t)
+	f.bases = nil // a Box imported without its setup: no base at all
+	f.pullReady = make(chan bool, 1)
+	n := &namedBase{name: "default", image: "https://example.test/base.tar.gz"}
+	box := f.client()
+	for i := 0; i < 2; i++ {
+		if _, err := n.Digest(context.Background(), box); !errors.Is(err, errShellBasePulling) {
+			t.Fatalf("Digest %d: %v, want pulling", i, err)
+		}
+	}
+	for i := 0; i < 300 && f.pullCount() == 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Another runner on the same Box sees the pull under way and starts none of its own.
+	other := &namedBase{name: "default", image: "https://example.test/base.tar.gz"}
+	if _, err := other.Digest(context.Background(), box); !errors.Is(err, errShellBasePulling) {
+		t.Fatalf("other runner: %v, want pulling", err)
+	}
+	f.pullReady <- true
+	d, err := waitDigest(t, n, box)
+	if err != nil || d != "sha256:pulled-1" {
+		t.Fatalf("digest %q (%v)", d, err)
+	}
+	f.mu.Lock()
+	pulls := append([]string(nil), f.pulls...)
+	f.mu.Unlock()
+	if len(pulls) != 1 || pulls[0] != "default https://example.test/base.tar.gz" {
+		t.Fatalf("pulls = %v, want one of default", pulls)
+	}
+	if d2, err := waitDigest(t, other, box); err != nil || d2 != d {
+		t.Fatalf("other runner: %q %v", d2, err)
+	}
+}
+
+func TestShellBaseFailedPullIsRetried(t *testing.T) {
+	defer func(d time.Duration) { shellPullRetry = d }(shellPullRetry)
+	shellPullRetry = time.Hour
+	f := newFakeBox(t)
+	f.bases = []BoxBase{{Name: "default", Digest: "sha256:broken", Status: "FAILED"}}
+	f.pullReady = make(chan bool, 2)
+	n := &namedBase{name: "default", image: "https://example.test/base.tar.gz"}
+	box := f.client()
+	f.pullReady <- false
+	if _, err := waitDigest(t, n, box); err == nil || !strings.Contains(err.Error(), "image unreachable") {
+		t.Fatalf("failed pull: %v", err)
+	}
+	// Within shellPullRetry the failure is answered without another pull…
+	if _, err := n.Digest(context.Background(), box); err == nil || errors.Is(err, errShellBasePulling) {
+		t.Fatalf("Digest after the failure: %v", err)
+	}
+	if n := f.pullCount(); n != 1 {
+		t.Fatalf("pulls = %d, want 1", n)
+	}
+	// …and after it the base is pulled again.
+	n.mu.Lock()
+	n.pullFailed = time.Now().Add(-2 * time.Hour)
+	n.mu.Unlock()
+	f.pullReady <- true
+	if d, err := waitDigest(t, n, box); err != nil || d != "sha256:pulled-2" {
+		t.Fatalf("second pull: %q %v", d, err)
+	}
+}
+
+func TestShellBaseWithoutImageIsNotPulled(t *testing.T) {
+	f := newFakeBox(t)
+	f.bases = nil
+	n := &namedBase{name: "default"}
+	if _, err := n.Digest(context.Background(), f.client()); err == nil || errors.Is(err, errShellBasePulling) {
+		t.Fatalf("err = %v", err)
+	}
+	if n := f.pullCount(); n != 0 {
+		t.Fatalf("pulls = %d, want none", n)
+	}
+}
+
+// A shell job that comes while its base pulls waits in the queue: nothing of it runs.
+func TestShellJobWaitsForThePull(t *testing.T) {
+	f := newFakeBox(t)
+	f.bases = nil
+	f.pullReady = make(chan bool, 1)
+	box = f.client()
+	shellBase = &namedBase{name: "default", image: "https://example.test/base.tar.gz"}
+	t.Cleanup(func() { box, shellBase = nil, nil; f.pullReady <- true })
+	_, _, err := runShell(context.Background(), nil, Job{RunID: "run-1", Cmd: "echo hi"})
+	if !errors.Is(err, errShellBasePulling) {
+		t.Fatalf("err = %v, want pulling", err)
+	}
+	if len(f.boxes) != 0 {
+		t.Fatalf("a sandbox was created while the base pulled")
 	}
 }
 
