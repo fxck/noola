@@ -1,10 +1,14 @@
-// ── Noola flow-runner containerized executor (Studio→Studio fold, Phase 3a) ────
-// Runs ONE Studio automation graph to completion inside an ephemeral container, driving a local
-// headless Chromium with a Claude agent (Stagehand v3). Launched by the Go runner worker via
-// `docker run --rm --network=host` (one container per flow job), so every run is a fresh, bounded,
-// self-cleaning sandbox. Progress is published to NATS `run.<RUN_ID>` (relayed to the canvas SSE in
-// a later phase); the authoritative structured output — produced items (result_json) + a per-node
-// trace (node_events) — is written back to the shared `runner_runs` row this run belongs to.
+// ── Noola flow-runner sandboxed executor (Studio→Studio fold, Phase 3a) ─────────
+// Runs ONE Studio automation graph to completion inside its own Zerops Box sandbox, driving a local
+// headless Chromium with a Claude agent (Stagehand v3). The Go runner creates one sandbox per flow
+// job from a base built from this directory's Dockerfile, runs this executor in it, and terminates
+// it, so every run is a fresh, bounded, self-cleaning microVM.
+//
+// The sandbox holds no NATS, database or storage credentials. Everything this executor reports goes
+// to EVENTS_FILE, one JSON event per line, which the runner tails while it runs: progress events it
+// relays to NATS `run.<RUN_ID>` as they are, `state` — the produced items (result_json) and a
+// per-node trace (node_events) — it writes to the run's `runner_runs` row, and `replay` tells it the
+// replay was uploaded (to REPLAY_PUT_URL, a presigned PUT for exactly that object).
 //
 // This mirrors the api's in-process item semantics (automations/items.ts) inline rather than
 // importing that module, because items.ts transitively pulls the api's DB/conditions layer into the
@@ -15,16 +19,16 @@
 // are `type:"item"` with `config.kind`; the entry is `type:"trigger"`. Domain action/agent/branch
 // nodes are NOT executed here in 3a (they need the api's tenant/DB context) — they're skipped.
 //
-// Env: RUN_ID, TENANT_ID, GRAPH (JSON), INPUT (seed item JSON), ANTHROPIC_API_KEY, NATS_*, DB_*.
+// Env: RUN_ID, TENANT_ID, GRAPH_FILE (JSON graph), INPUT_FILE (seed item JSON), EVENTS_FILE,
+// ANTHROPIC_API_KEY, REPLAY_PUT_URL + REPLAY_KEY. GRAPH / INPUT in env still work for a local run;
+// without EVENTS_FILE the events go to stdout.
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { openSync, readFileSync, writeSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Stagehand } from "@browserbasehq/stagehand";
 import { chromium } from "playwright";
 import { z } from "zod";
-import { connect, StringCodec, type NatsConnection } from "nats";
-import pg from "pg";
 // The item data-plane + deterministic node library + shared helpers live in @repo/flow-core (the
 // SAME implementation the api runs in-process). esbuild inlines it into this container bundle. Only
 // the browser + AI-browser nodes below are container-only; everything deterministic is delegated.
@@ -41,8 +45,6 @@ import {
 } from "@repo/flow-core";
 
 const RUN_ID = process.env.RUN_ID ?? "";
-const TENANT_ID = process.env.TENANT_ID ?? "";
-const sc = StringCodec();
 const log = (...a: unknown[]) => console.log(`[flow-exec ${RUN_ID.slice(0, 8) || "????????"}]`, ...a);
 
 type Ctx = Record<string, unknown> & { vars: Record<string, unknown> };
@@ -60,9 +62,18 @@ const MODEL_IDS: Record<string, string> = {
 };
 const DEFAULT_MODEL = "anthropic/claude-sonnet-5";
 
+// A file named by <name>_FILE, else the <name> env itself (local runs).
+function readInput(name: string): string {
+  const file = process.env[`${name}_FILE`];
+  if (file) {
+    try { return readFileSync(file, "utf8"); } catch { return ""; }
+  }
+  return process.env[name] ?? "";
+}
+
 function parseGraph(): Graph {
   let g: unknown;
-  try { g = JSON.parse(process.env.GRAPH || "{}"); } catch { g = null; }
+  try { g = JSON.parse(readInput("GRAPH") || "{}"); } catch { g = null; }
   const gg = g as Partial<Graph> | null;
   if (!gg || !Array.isArray(gg.nodes)) return { nodes: [], edges: [] };
   return { nodes: gg.nodes, edges: Array.isArray(gg.edges) ? gg.edges : [] };
@@ -71,8 +82,9 @@ function parseGraph(): Graph {
 function seedItems(): Item[] {
   // INPUT is the seed item {json,text} the api built from ctx. Absent → empty item.
   try {
-    if (process.env.INPUT) {
-      const parsed = JSON.parse(process.env.INPUT) as Partial<Item>;
+    const input = readInput("INPUT");
+    if (input) {
+      const parsed = JSON.parse(input) as Partial<Item>;
       if (parsed && typeof parsed === "object" && ("json" in parsed || "text" in parsed)) {
         return [{ json: parsed.json ?? {}, text: String(parsed.text ?? "") }];
       }
@@ -84,40 +96,18 @@ function seedItems(): Item[] {
 
 async function main(): Promise<void> {
   if (!RUN_ID) { console.error("[flow-exec] RUN_ID missing — nothing to run"); process.exit(1); }
-  if (!process.env.NATS_HOST) { console.error("[flow-exec] NATS_HOST missing — cannot publish progress"); process.exit(1); }
 
   const graph = parseGraph();
   const seed = seedItems();
   const needsBrowser = graph.nodes.some((n) => n.type === "item" && FLOW_BROWSER_KINDS.has(String(n.config?.kind ?? "")));
 
-  // NATS progress channel.
-  let nc: NatsConnection | null = null;
-  try {
-    nc = await connect({
-      servers: `${process.env.NATS_HOST}:${process.env.NATS_PORT}`,
-      user: process.env.NATS_USER,
-      pass: process.env.NATS_PASS,
-      name: `flow-exec-${RUN_ID.slice(0, 8)}`,
-    });
-  } catch (e) {
-    log("NATS connect failed (progress disabled):", e instanceof Error ? e.message : e);
-  }
-  const subject = `run.${RUN_ID}`;
+  // The event stream the runner tails. Written synchronously, one whole line per write, so the
+  // runner never reads an event out of order and every event is on disk before the process exits.
+  const eventsFd = process.env.EVENTS_FILE ? openSync(process.env.EVENTS_FILE, "a", 0o600) : 1;
   const publish = (e: Record<string, unknown>): void => {
-    try { nc?.publish(subject, sc.encode(JSON.stringify(e))); } catch { /* keep running */ }
+    try { writeSync(eventsFd, JSON.stringify(e) + "\n"); } catch { /* keep running */ }
   };
-  log("publishing progress to", subject, needsBrowser ? "· browser" : "· no browser");
-
-  // Postgres — same DB_* env the worker uses (a BYPASSRLS super role), so we can write this
-  // tenant's runner_runs row directly. Degrade gracefully if unreachable.
-  const pool = new pg.Pool({
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT || 5432),
-    user: process.env.DB_USER,
-    password: process.env.DB_PASS,
-    database: process.env.DB_NAME,
-    max: 2,
-  });
+  log("writing events to", process.env.EVENTS_FILE || "stdout", needsBrowser ? "· browser" : "· no browser");
 
   const events: NodeEvent[] = [];
   const outputs: Record<string, { items: Item[] }> = {};
@@ -130,22 +120,17 @@ async function main(): Promise<void> {
   const seedJson = seed[0]?.json;
   const ctx: Ctx = { ...(seedJson && typeof seedJson === "object" ? (seedJson as Record<string, unknown>) : {}), vars: {} };
 
+  // The run's structured output so far, as a `state` event the runner writes to runner_runs; its
+  // error is the run's own, recorded on the row when the run fails.
   let lastPersist = 0;
   const persist = async (final = false): Promise<void> => {
     const now = Date.now();
     if (!final && now - lastPersist < 1500) return;
     lastPersist = now;
-    try {
-      await pool.query(
-        "UPDATE runner_runs SET result_json=$3::jsonb, node_events=$4::jsonb WHERE tenant_id=$1 AND id=$2",
-        [TENANT_ID, RUN_ID, JSON.stringify({ items: lastItems }), JSON.stringify(events)],
-      );
-    } catch (e) {
-      log("persist failed:", e instanceof Error ? e.message : e);
-    }
+    publish({ type: "state", resultJson: { items: lastItems }, nodeEvents: events, error: firstError?.message ?? null });
   };
 
-  // Anthropic key injected by the worker (resolved from the tenant's integrations at the exec host).
+  // The tenant's Anthropic key, resolved by the runner and passed in this sandbox's env file.
   const apiKey = process.env.ANTHROPIC_API_KEY || "";
   const stagehand = new Stagehand({
     env: "LOCAL",
@@ -193,12 +178,14 @@ async function main(): Promise<void> {
     if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
   };
 
-  // Encode the frame spool → webm → object storage → replay_key. Best-effort throughout: a
-  // missing ffmpeg/storage config or a failed upload yields no replay, never a failed run.
-  // The container is ephemeral, so no cleanup needed — it dies with the filesystem.
+  // Encode the frame spool → webm → the presigned PUT → a `replay` event, on which the runner sets
+  // replay_key. Best-effort throughout: no ffmpeg, no upload URL or a failed upload yields no
+  // replay, never a failed run. The sandbox is terminated after the run, so no cleanup needed.
   const finalizeReplay = async (): Promise<void> => {
     if (frameIdx === 0) return;
-    if (!process.env.STORAGE_ENDPOINT || !process.env.STORAGE_BUCKET) return;
+    const putUrl = process.env.REPLAY_PUT_URL;
+    const key = process.env.REPLAY_KEY;
+    if (!putUrl || !key) return;
     const out = `${REPLAY_DIR}/out.webm`;
     const encoded = await new Promise<boolean>((resolve) => {
       const ff = spawn(
@@ -212,18 +199,9 @@ async function main(): Promise<void> {
     });
     if (!encoded) { log("replay: ffmpeg encode failed — skipped"); return; }
     const body = await readFile(out);
-    const key = `runs/${TENANT_ID}/${RUN_ID}.webm`;
-    const s3 = new S3Client({
-      region: process.env.STORAGE_REGION ?? "us-east-1",
-      endpoint: process.env.STORAGE_ENDPOINT,
-      forcePathStyle: true,
-      credentials: {
-        accessKeyId: process.env.STORAGE_ACCESS_KEY ?? "",
-        secretAccessKey: process.env.STORAGE_SECRET_KEY ?? "",
-      },
-    });
-    await s3.send(new PutObjectCommand({ Bucket: process.env.STORAGE_BUCKET, Key: key, Body: body, ContentType: "video/webm" }));
-    await pool.query("UPDATE runner_runs SET replay_key=$3 WHERE tenant_id=$1 AND id=$2", [TENANT_ID, RUN_ID, key]);
+    const res = await fetch(putUrl, { method: "PUT", body, headers: { "Content-Type": "video/webm" } });
+    if (!res.ok) throw new Error(`upload answered ${res.status}`);
+    publish({ type: "replay", key });
     log("replay uploaded:", key, `${body.length}b`, `${frameIdx} frames`);
   };
 
@@ -547,25 +525,14 @@ async function main(): Promise<void> {
     publish({ type: "error", message: firstError.message });
   } finally {
     await persist(true);
-    // Record the run's own error on the row (status is owned by the Go worker's markResult).
-    if (firstError) {
-      try {
-        await pool.query(
-          "UPDATE runner_runs SET error=COALESCE(error, $3) WHERE tenant_id=$1 AND id=$2",
-          [TENANT_ID, RUN_ID, firstError.message],
-        );
-      } catch { /* best-effort */ }
-    }
     stopFrames();
     publish({ type: "run-done", status, failedCount, failedNodeId: firstError ? firstError.nodeId : null, durationMs: Date.now() - t0run });
-    // Replay AFTER run-done so the canvas gets its terminal event promptly; the worker only
-    // writes the terminal row once the container exits, so replay_key is set by then.
+    // Replay AFTER run-done so the canvas gets its terminal event promptly; the runner only
+    // writes the terminal row once this process exits, so replay_key is set by then.
     try { await withTimeout(finalizeReplay(), 45_000, "replay finalize"); } catch (e) { log("replay skipped:", e instanceof Error ? e.message : String(e)); }
     try { if (browserReady) await stagehand.close(); } catch { /* ignore */ }
-    try { await pool.end(); } catch { /* ignore */ }
-    try { await nc?.drain(); } catch { /* ignore */ }
     log("done — status", status);
-    // Exit non-zero on a hard error so the worker marks the run failed; partials exit 0 (per-node
+    // Exit non-zero on a hard error so the runner marks the run failed; partials exit 0 (per-node
     // trace carries the failures) so a mostly-successful browser flow still surfaces its items.
     process.exit(status === "error" ? 1 : 0);
   }

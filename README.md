@@ -13,7 +13,7 @@ and even that is bring-your-own-key.
 - **AI answers grounded in your content** — retrieval-augmented generation over your knowledge base, with a self-hosted embedding sidecar so nothing but the final LLM call leaves your infra.
 - **Bring-your-own model key** — the provider key is per-tenant and encrypted at rest; no shared vendor dependency.
 - **Visual automation Studio** — compose automations and AI agents on a live multiplayer canvas, run them, and watch each step stream with a saved replay.
-- **Isolated execution** — one ephemeral `docker run --rm` container per automation run, guaranteed cleanup.
+- **Isolated execution** — one Zerops Box sandbox (its own microVM) per automation run, terminated when the run ends.
 - **Teams, routing, SLA & broadcasts** — round-robin/skill routing, SLA policies with business hours, tracked outbound broadcasts, and an analytics suite.
 - **Enterprise-ready** — TOTP 2FA, SSO + SCIM provisioning, per-tenant data retention, IP allowlists and GDPR export/erase.
 
@@ -27,7 +27,7 @@ A monorepo of seven runtime services over six managed stores:
 | **edge** | Elixir 1.16 · Phoenix Channels | fans the api's events out to browsers over WebSockets and hosts the Studio's collaborative (Yjs) canvas. |
 | **embedder** | Node 24 | a self-hosted all-MiniLM sidecar; the model is baked at build time, so the runtime is keyless and offline. |
 | **geo** | Node 24 | a self-hosted IP→location sidecar for live contact enrichment; the DB-IP City Lite database is baked at build, so lookups stay keyless and in-infra. |
-| **runner** | Docker-in-VM · Go | consumes automation-run jobs from NATS JetStream and launches one ephemeral container per run. |
+| **runner** | Go · Zerops Box | consumes automation-run jobs from NATS JetStream and runs each in its own Box sandbox, terminated after the run. |
 | **web** | Vite · React 19 · TanStack | the console SPA; reaches the api and edge over their public subdomains. |
 | **site** | Vite · React 19 · TanStack | the public marketing site, served as static nginx — separate from the console. |
 
@@ -35,7 +35,7 @@ A monorepo of seven runtime services over six managed stores:
                        ┌──────────────── NATS JetStream ────────────────┐
                        │                                                 │
   web ──REST(Bearer)──▶ api ──emit──▶ (events) ──▶ edge ──WebSocket──▶ web   (realtime + Studio canvas)
-                       │  │                                  runner ──▶ ephemeral run containers
+                       │  │                                  runner ──▶ one Box sandbox per run
                        │  ├── embedder ──vectors──▶ Qdrant
                        │  └── geo ──▶ ip → contact location
                        └── PostgreSQL · Valkey · Typesense · object storage
@@ -90,7 +90,7 @@ api/             Node/Fastify API — domain core, auth, RAG, REST + events (Bun
 edge/            Elixir/Phoenix — realtime WebSocket fan-out + collaborative canvas
 embedder/        Node — self-hosted all-MiniLM embedding sidecar
 geo/             Node — self-hosted IP→location sidecar (DB-IP City Lite, baked at build)
-runner/          Go — Docker-in-VM automation-run worker
+runner/          Go — automation-run worker (one Zerops Box sandbox per run)
 web/             Vite + React 19 SPA — the console
 site/            Vite + React 19 — the public marketing site (static nginx)
 zerops.yaml      build/run setups for every service (*dev + *prod)

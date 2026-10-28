@@ -67,6 +67,12 @@ services:
     type: object-storage
     objectStorageSize: 10
     priority: 10
+  # Zerops Box — the runner runs each job in its own sandbox here (a microVM per run).
+  # A Box needs region prg1. After import it has no base yet: finish its setup with
+  # `zbox setup` (the `default` base the runner's shell jobs boot from).
+  - hostname: box
+    type: ubuntu/zbox@1
+    priority: 10
 
   # shared always-on services
   - hostname: embedder
@@ -82,7 +88,7 @@ services:
     minContainers: 1
     maxContainers: 1
   - hostname: runner
-    type: docker@26.1.5
+    type: go@1.22
     buildFromGit: https://github.com/fxck/noola
     zeropsSetup: runnerprod
     minContainers: 1
