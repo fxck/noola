@@ -476,6 +476,12 @@ zerops:
       cache: true
     run:
       base: go@1.22
+      # GET /health (runner/health.go): the Box reachable, the shell and flow bases READY, NATS
+      # connected; 200, else 503. No healthCheck on it: a base the Box takes minutes to pull or
+      # build would only get the runner restarted.
+      ports:
+        - port: 8080
+          httpSupport: true
       envVariables:
         NATS_HOST: broker
         NATS_PORT: ${broker_port}

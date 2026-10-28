@@ -163,6 +163,13 @@ func (f *flowBase) Digest(ctx context.Context, box *Box) (string, error) {
 	return "", errFlowBaseBuilding
 }
 
+// state is this runner's own side of the base: a build under way, and why its build failed.
+func (f *flowBase) state() (building bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.building, f.failed
+}
+
 // Forget drops a cached digest the Box no longer has (a create answered baseNotFound), so the next
 // Digest looks again and builds the base anew if it is gone.
 func (f *flowBase) Forget(digest string) {

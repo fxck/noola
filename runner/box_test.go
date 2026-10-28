@@ -273,6 +273,10 @@ func (f *fakeBox) serve(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "sandboxNotFound")
 			return
 		}
+		if r.Method == "GET" && len(parts) == 2 {
+			writeJSON(w, 200, BoxSandbox{ID: sb.id, Name: sb.name, Status: sb.status})
+			return
+		}
 		if r.Method == "DELETE" && len(parts) == 2 {
 			if r.Header.Get("Idempotency-Key") == "" {
 				writeErr(w, 400, "invalidUserInput")

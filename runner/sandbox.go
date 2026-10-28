@@ -29,6 +29,7 @@ type SandboxFile struct {
 }
 
 type SandboxJob struct {
+	RunID       string // the run it is for, in the log and in /health
 	Name        string // sandbox name: noola-<runner host>-<run id>, so a restarted runner finds its orphans
 	BaseDigest  string
 	NetworkMode string
@@ -87,9 +88,13 @@ func runSandboxJob(ctx context.Context, box *Box, job SandboxJob) (res SandboxRe
 		AbsoluteTTLSeconds: int(job.Timeout.Seconds()) + 300,
 	}, newIdempotencyKey("noola-create"))
 	if id != "" {
+		recentSandboxes.add(sandboxRef{ID: id, Name: job.Name, Run: job.RunID})
+		logf("sandbox %s created for run %s", id, job.RunID)
 		defer func() {
 			if terr := box.terminateDetached(id); terr != nil {
 				logf("sandbox %s terminate failed: %v", id, terr)
+			} else {
+				logf("sandbox %s terminated", id)
 			}
 		}()
 	}

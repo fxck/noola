@@ -250,6 +250,13 @@ func (n *namedBase) pull(box *Box) {
 	logf("shell base %s (%s) pulled in %s", n.name, firstN(digest, 19), time.Since(t0).Round(time.Second))
 }
 
+// state is this runner's own side of the base: a pull under way, and why its last one failed.
+func (n *namedBase) state() (pulling bool, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.pulling, n.pullErr
+}
+
 func (n *namedBase) Forget(digest string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -546,6 +553,7 @@ func runShell(ctx context.Context, msg jetstream.Msg, job Job) (output, failure 
 	out := &tailBuffer{max: maxResult}
 	var carry []byte
 	res, err := runSandboxJob(ctx, box, SandboxJob{
+		RunID:       job.RunID,
 		Name:        sandboxName(job),
 		BaseDigest:  digest,
 		NetworkMode: networkMode,
@@ -661,6 +669,7 @@ func runFlow(ctx context.Context, msg jetstream.Msg, job Job) (output, failure s
 	}
 	beat := heartbeat(msg)
 	res, err := runSandboxJob(ctx, box, SandboxJob{
+		RunID:       job.RunID,
 		Name:        sandboxName(job),
 		BaseDigest:  digest,
 		NetworkMode: networkMode,
@@ -949,6 +958,25 @@ func main() {
 		log.Fatalf("[runner] NATS connect: %v", err)
 	}
 	logf("connected to NATS at %s · global cap %d", nc.ConnectedUrl(), globalMax)
+
+	// GET /health, and its summary logged whenever it changes (health.go).
+	health := &healthCheck{
+		box: box, shell: shellBase, flow: flow, flowErr: flowErr,
+		nats: nc.IsConnected, db: db != nil,
+		runs: func() int { return len(globalSem) }, maxRuns: globalMax,
+		sandboxes: recentSandboxes,
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/health", health)
+	healthAddr := ":" + envStr("RUNNER_HEALTH_PORT", "8080")
+	go func() {
+		srv := &http.Server{Addr: healthAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		logf("health at %s/health", healthAddr)
+		if err := srv.ListenAndServe(); err != nil {
+			logf("health server: %v", err)
+		}
+	}()
+	go health.watch(ctx, 15*time.Second)
 
 	js, err := jetstream.New(nc)
 	if err != nil {

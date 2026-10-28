@@ -342,6 +342,13 @@ func (b *Box) Sandboxes(ctx context.Context, status string) ([]BoxSandbox, error
 	return res.Items, nil
 }
 
+// Sandbox answers one sandbox as the Box lists it now, TERMINATED ones too.
+func (b *Box) Sandbox(ctx context.Context, sandboxID string) (BoxSandbox, error) {
+	var sb BoxSandbox
+	err := b.do(ctx, http.MethodGet, "/sandbox/"+url.PathEscape(sandboxID), nil, "", nil, &sb)
+	return sb, err
+}
+
 // terminateDetached terminates a sandbox on a context of its own, so a job whose context already
 // ended (timeout, shutdown) still frees its sandbox.
 func (b *Box) terminateDetached(sandboxID string) error {
