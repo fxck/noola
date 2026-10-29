@@ -66,6 +66,13 @@ for (const [name, pool] of [
       err instanceof Error ? err.message : err,
     );
   });
+  // A connection that drops while in use emits an error, which crashes the process when nothing listens.
+  // The query in flight still fails, and the pool discards the connection when it's released.
+  pool.on("connect", (client) => {
+    client.on("error", (err) => {
+      console.error(`[db] client error on ${name}Pool (connection discarded on release):`, err instanceof Error ? err.message : err);
+    });
+  });
 }
 
 /**

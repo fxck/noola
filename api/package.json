@@ -86,6 +86,7 @@
     "test:multilingual-retrieval": "tsx apps/api/test/multilingual-retrieval.test.ts",
     "test:model-jobs": "tsx apps/api/test/model-jobs.test.ts",
     "test:docs-search": "tsx apps/api/test/docs-search.test.ts",
+    "test:db-connection": "tsx apps/api/test/db-connection.test.ts",
     "test:channels": "tsx apps/api/test/channels.test.ts",
     "test:tails": "tsx apps/api/test/tails.test.ts",
     "test:flow-guards": "tsx apps/api/test/flow-guards.test.ts",
