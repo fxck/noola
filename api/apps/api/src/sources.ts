@@ -164,10 +164,11 @@ export type Connector = (config: Record<string, unknown>, ctx?: ConnectorCtx) =>
 // hit/miss, per-page outcome), rather than guessing from a bare page count.
 
 /** One page's fate during a crawl. `markdown` = the clean `.md` twin was indexed; `ingested` =
- *  the HTML/text page itself; `failed` = fetch/parse returned nothing (skipped). */
+ *  the HTML/text page itself; `failed` = fetch/parse returned nothing (skipped); `not_found` = a listed
+ *  Markdown URL that served the site's HTML not-found page (skipped). */
 export interface CrawlLogEntry {
   url: string;
-  outcome: "ingested" | "markdown" | "failed";
+  outcome: "ingested" | "markdown" | "failed" | "not_found";
   contentType?: string;
   bytes?: number;
 }
@@ -206,7 +207,7 @@ export function newCrawlLog(): CrawlLog {
 function logCrawlPage(crawl: CrawlLog | undefined, e: CrawlLogEntry): void {
   if (!crawl) return;
   if (e.outcome === "failed") crawl.pagesFailed += 1;
-  else crawl.pagesFetched += 1;
+  else if (e.outcome !== "not_found") crawl.pagesFetched += 1;
   if (e.bytes) crawl.totalBytes += e.bytes;
   if (crawl.entries.length < CRAWL_LOG_MAX_ENTRIES) crawl.entries.push(e);
   else crawl.entriesTruncated = true;
@@ -493,6 +494,14 @@ export function markdownVariantUrl(u: URL): URL | null {
   return cand;
 }
 
+/** The page a listed `.md` URL is the Markdown copy of: `/a/b.md` is `/a/b`, `/a/index.md` is `/a/`. Null for other URLs. */
+export function pageOfMarkdownUrl(u: URL): URL | null {
+  if (!/\.md$/i.test(u.pathname)) return null;
+  const page = new URL(u.toString());
+  page.pathname = u.pathname.replace(/\/index\.md$/i, "/").replace(/\.md$/i, "");
+  return page;
+}
+
 /** A `.md` endpoint that soft-404s often returns the SPA shell (HTML) with a 200 — reject that so we
  *  fall back to the real page instead of indexing an app skeleton. */
 export function looksLikeHtml(body: string): boolean {
@@ -623,6 +632,20 @@ export async function fetchUrlUnits(config: Record<string, unknown>, ctx?: Conne
       const key = lu.toString();
       if (seen.has(key)) continue;
       seen.add(key);
+      // llms.txt lists each page's Markdown copy, so the copy is indexed and cited as the page it belongs to.
+      const page = llms.length ? pageOfMarkdownUrl(lu) : null;
+      if (page) {
+        if (seen.has(page.toString())) continue;
+        seen.add(page.toString());
+        const md = await fetchPage(lu);
+        if (!md) logCrawlPage(crawl, { url: key, outcome: "failed" });
+        // A listed Markdown URL that serves HTML is the site's not-found page, often its homepage.
+        else if (md.contentType === "text/html" || (md.body.trimStart().startsWith("<") && looksLikeHtml(md.body))) {
+          logCrawlPage(crawl, { url: key, outcome: "not_found" });
+        }
+        else ingestPage({ ...md, url: page.toString(), contentType: "text/markdown" });
+        continue;
+      }
       const p = await fetchPagePreferMarkdown(lu);
       if (p) ingestPage(p);
       else logCrawlPage(crawl, { url: key, outcome: "failed" });

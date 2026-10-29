@@ -45,7 +45,7 @@ export interface SourceConfig {
 /** One page's fate during a crawl (server-side telemetry, surfaced in the detail's Crawl log). */
 export interface CrawlLogEntry {
   url: string;
-  outcome: "ingested" | "markdown" | "failed";
+  outcome: "ingested" | "markdown" | "failed" | "not_found";
   contentType?: string;
   bytes?: number;
 }

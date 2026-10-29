@@ -9,6 +9,9 @@ import {
   parseLlmsTxt,
   markdownVariantUrl,
   looksLikeHtml,
+  fetchUrlUnits,
+  newCrawlLog,
+  pageOfMarkdownUrl,
   type Precheck,
   type ConnectorUnit,
 } from "../src/sources.js";
@@ -147,6 +150,47 @@ async function main() {
 
   await clean();
   await superPool.end();
+  // ── llms.txt Markdown copies: indexed as their pages, HTML not-found pages skipped ──
+  {
+    check("a listed .md is the copy of its page", pageOfMarkdownUrl(new URL("https://d.example/a/b.md"))?.toString() === "https://d.example/a/b");
+    check("a listed index.md is the copy of its folder", pageOfMarkdownUrl(new URL("https://d.example/a/index.md"))?.toString() === "https://d.example/a/");
+    check("a page URL has no Markdown copy to map", pageOfMarkdownUrl(new URL("https://d.example/a/b")) === null);
+
+    const ORIGIN = "https://docs.mdtest.example";
+    const HOME = "<!doctype html><html><head><title>Home</title></head><body>Welcome</body></html>";
+    const site: Record<string, [string, string]> = {
+      "/": [HOME, "text/html"],
+      "/llms.txt": ["- [Cron](/zerops-yaml/cron.md)\n- [Missing](/quickstart/quickstart.md)\n- [Guides](/guides/index.md)\n- [Home](/index.md)\n- [Embed](/embed.md)", "text/plain"],
+      "/zerops-yaml/cron.md": ["# Cron\nRun jobs on a schedule.", "text/plain"],
+      "/quickstart/quickstart.md": [HOME, "text/html"],
+      "/guides/index.md": ["# Guides\nAll guides.", "text/markdown"],
+      "/embed.md": ["# Embed\nPaste this: <html><head></head></html>", "text/plain"],
+      "/index.md": ["# Home\nWelcome.", "text/markdown"],
+    };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = new URL(String(url));
+      if (u.origin !== ORIGIN) return realFetch(url);
+      const hit = site[u.pathname];
+      return hit ? new Response(hit[0], { status: 200, headers: { "content-type": hit[1] } }) : new Response("nope", { status: 404 });
+    }) as typeof fetch;
+    try {
+      const crawl = newCrawlLog();
+      const units = await fetchUrlUnits({ url: `${ORIGIN}/` }, { tenantId: A, existingKeys: new Set(), crawl });
+      const keys = units.map((u) => u.key);
+      check("a listed Markdown copy is keyed to its page", keys.includes(`${ORIGIN}/zerops-yaml/cron`) && !keys.some((k) => k.endsWith(".md")));
+      check("a listed index.md is keyed to its folder", keys.includes(`${ORIGIN}/guides/`));
+      check("the copy is indexed as Markdown", units.find((u) => u.key === `${ORIGIN}/zerops-yaml/cron`)?.contentType === "text/markdown");
+      check("a listed .md serving HTML is not indexed", !keys.some((k) => k.includes("quickstart")));
+      check("and the crawl log says it was not found", crawl.entries.some((e) => e.url.endsWith("/quickstart/quickstart.md") && e.outcome === "not_found"));
+      check("the start page is indexed once", keys.filter((k) => k === `${ORIGIN}/`).length === 1);
+      check("a Markdown page that only mentions HTML is indexed", keys.includes(`${ORIGIN}/embed`));
+      check("a not-found page doesn't count as fetched", crawl.pagesFetched === units.length, { fetched: crawl.pagesFetched, units: units.length });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
   await appPool.end();
   await relayPool.end();
 
