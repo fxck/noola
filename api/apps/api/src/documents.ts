@@ -35,6 +35,8 @@ export interface ChunkHit {
    *  (with domain) it was crawled from — threaded through so a citation/answer can link to the real
    *  source instead of a bare path. Null for manual uploads; a repo path for github docs. */
   source_key?: string | null;
+  /** How many chunks the parent document has. */
+  chunk_count: number;
 }
 
 const DOC_COLS = "id, filename, content_type, char_count, chunk_count, status, source_id, created_at, updated_at";
@@ -117,7 +119,7 @@ export async function hydrateChunks(tenantId: string, ids: string[]): Promise<Ch
   if (ids.length === 0) return [];
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `SELECT dc.id, dc.document_id, dc.chunk_index, dc.text, d.filename, d.source_key
+      `SELECT dc.id, dc.document_id, dc.chunk_index, dc.text, d.filename, d.source_key, d.chunk_count
          FROM document_chunks dc JOIN documents d ON d.id = dc.document_id
         WHERE dc.id = ANY($1::uuid[]) ORDER BY array_position($1::uuid[], dc.id)`,
       [ids],

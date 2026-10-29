@@ -19,6 +19,8 @@ import { InboxPage } from "@/routes/inbox";
 import { TicketsPage } from "@/routes/tickets";
 import { ConversationPage } from "@/routes/conversation";
 import { AnalyticsPage } from "@/routes/analytics";
+import { AiTracesPage } from "@/routes/ai-traces";
+import { isTraceCategory, type TraceCategory } from "@/lib/traces";
 import { KbPage } from "@/routes/kb";
 import { SourcesPage } from "@/routes/sources";
 import { ContactsPage } from "@/routes/contacts-list";
@@ -410,6 +412,34 @@ const analyticsRoute = createRoute({
   component: AnalyticsPage,
 });
 
+interface AiTracesSearch {
+  page?: number;
+  outcome?: TraceCategory;
+  q?: string;
+  /** Calendar days (YYYY-MM-DD), both inclusive. */
+  from?: string;
+  to?: string;
+}
+
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+const aiTracesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/ai-traces",
+  // Deep-linkable, shareable filtered views - the list mirrors its state into the URL.
+  validateSearch: (search: Record<string, unknown>): AiTracesSearch => ({
+    page: typeof search.page === "number" && search.page >= 1 ? Math.floor(search.page) : undefined,
+    outcome: isTraceCategory(search.outcome) ? search.outcome : undefined,
+    q: typeof search.q === "string" ? search.q : undefined,
+    from: typeof search.from === "string" && DAY.test(search.from) ? search.from : undefined,
+    to: typeof search.to === "string" && DAY.test(search.to) ? search.to : undefined,
+  }),
+  beforeLoad: ({ context }) => {
+    if (!context.auth.isAuthed) throw redirect({ to: "/login" });
+  },
+  component: AiTracesPage,
+});
+
 // Old standalone Insight/testing surfaces — folded into the Analytics hub and
 // Studio's Test bench. Redirects keep deep links alive.
 const topicsRoute = createRoute({
@@ -755,6 +785,7 @@ const routeTree = rootRoute.addChildren([
   qaRoute,
   simulationsRoute,
   analyticsRoute,
+  aiTracesRoute,
   queueRoute,
   studioRoute,
   settingsIndexRoute,

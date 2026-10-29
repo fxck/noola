@@ -1,6 +1,7 @@
 import { withTenant } from "@repo/db";
+import { hasOutcomeTag, parseDraftOutcome, type DraftOutcome } from "./ai-outcome.js";
 
-// draft_traces: the durable record of every drafted reply — the query, the retrieved
+// draft_traces: the record of every drafted reply, kept for each workspace's trace retention — the query, the retrieved
 // sources + fused scores, the draft, model + tokens + latency, and (back-filled) the
 // gate decision and the human outcome. It's both the audit trail and the eval
 // baseline — Opik's PATTERN, self-hosted. `TRACE_SINK` optionally mirrors each trace
@@ -9,10 +10,22 @@ import { withTenant } from "@repo/db";
 
 export interface TraceSource {
   kind: string;
+  /** The chunk id for a document source, the article or ticket id otherwise. */
   id: string;
   title: string;
   score: number;
   rank: number;
+  /** For a document source: its document, and its page when the document came from a URL. */
+  documentId?: string;
+  url?: string;
+  /** Where the keyword and meaning searches ranked the source, from 1. A search that didn't find it leaves its rank out. */
+  keywordRank?: number;
+  meaningRank?: number;
+  /** For a document source: which of the document's passages it is, from 0, and how many it has. */
+  passage?: number;
+  passages?: number;
+  /** The start of the source's text. */
+  excerpt?: string;
 }
 
 export interface DraftTraceInput {
@@ -171,4 +184,191 @@ function buildOtlpSpan(traceId: string, input: DraftTraceInput): unknown {
       },
     ],
   };
+}
+
+// ---- Admin trace viewer --------------------------------------------------------
+
+export interface TraceSummary {
+  id: string;
+  createdAt: string;
+  ticketId: string | null;
+  messageId: string | null;
+  model: string;
+  query: string;
+  draftPreview: string;
+  gateOutcome: string | null;
+  gateReason: string | null;
+  /** How many sources the draft was grounded on. Zero means the model answered with nothing to go on. */
+  sourceCount: number;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  latencyMs: number | null;
+}
+
+export interface TraceDetail extends TraceSummary {
+  draft: string;
+  /** What Noola made of the draft's answer tags. A draft without tags is a plain reply. */
+  parsed: DraftOutcome;
+  sources: TraceSource[];
+  topScore: number | null;
+  agreement: number | null;
+  confidence: number | null;
+  embedModel: string | null;
+  riskTags: string[];
+  humanOutcome: string | null;
+  decisions: { outcome: string; reason: string; source: string; sentMessageId: string | null; createdAt: string }[];
+}
+
+const SUMMARY_COLS = `t.id, t.created_at, t.ticket_id, t.message_id, t.model, left(t.query, 200) AS query, left(t.draft, 200) AS draft_preview,
+  t.gate_outcome, t.gate_reason, jsonb_array_length(t.sources) AS source_count, t.tokens_in, t.tokens_out, t.latency_ms`;
+
+type SummaryRow = {
+  id: string; created_at: Date; ticket_id: string | null; message_id: string | null; model: string; query: string; draft_preview: string;
+  gate_outcome: string | null; gate_reason: string | null; source_count: number;
+  tokens_in: number | null; tokens_out: number | null; latency_ms: number | null;
+};
+
+function toSummary(r: SummaryRow): TraceSummary {
+  return {
+    id: r.id, createdAt: r.created_at.toISOString(), ticketId: r.ticket_id, messageId: r.message_id, model: r.model, query: r.query,
+    draftPreview: r.draft_preview, gateOutcome: r.gate_outcome, gateReason: r.gate_reason, sourceCount: r.source_count,
+    tokensIn: r.tokens_in, tokensOut: r.tokens_out, latencyMs: r.latency_ms,
+  };
+}
+
+/** Every AI draft on a ticket, newest first, including drafts that sent nothing. */
+export async function listTicketTraces(tenantId: string, ticketId: string): Promise<TraceSummary[]> {
+  const r = await withTenant(tenantId, (c) =>
+    c.query<SummaryRow>(`SELECT ${SUMMARY_COLS} FROM draft_traces t WHERE t.ticket_id = $1 ORDER BY t.created_at DESC, t.id DESC LIMIT 200`, [ticketId]),
+  );
+  return r.rows.map(toSummary);
+}
+
+/** What Noola did with a draft, as the workspace trace list filters it. The web's TRACE_CATEGORIES mirror this list. */
+export const TRACE_CATEGORIES = ["sent", "held", "note_only", "no_reply", "handoff", "no_sources", "no_decision"] as const;
+export type TraceCategory = (typeof TRACE_CATEGORIES)[number];
+
+// The first matching branch wins, so a grounding-guard deflection counts as "no_sources" even when the widget sent it.
+const CATEGORY_SQL = `CASE
+  WHEN t.model = 'grounding-guard' THEN 'no_sources'
+  WHEN t.gate_outcome = 'auto_sent' THEN 'sent'
+  WHEN t.gate_reason IN ('no_reply_needed', 'no_reply_suggested') THEN 'no_reply'
+  WHEN t.gate_reason = 'note_only' THEN 'note_only'
+  WHEN t.gate_reason = 'handoff' THEN 'handoff'
+  WHEN t.gate_outcome IS NOT NULL THEN 'held'
+  ELSE 'no_decision' END`;
+
+export interface TraceListRow extends TraceSummary {
+  ticketSubject: string | null;
+}
+
+export interface TraceListQuery {
+  page: number;
+  pageSize: number;
+  outcome: TraceCategory | null;
+  /** Matched case-insensitively anywhere in the customer's text. */
+  q: string | null;
+  from: Date | null;
+  /** Exclusive. */
+  to: Date | null;
+}
+
+const TRACE_PAGE_SIZE_MAX = 100;
+
+function badRequest(message: string): Error {
+  return Object.assign(new Error(message), { statusCode: 400 });
+}
+
+/** Reads the list filters from a request's query string. Throws a 400 error on any value it can't use. */
+export function parseTraceListQuery(q: Record<string, unknown>): TraceListQuery {
+  const int = (key: string, fallback: number, max: number): number => {
+    if (q[key] === undefined || q[key] === "") return fallback;
+    const n = Number(q[key]);
+    if (!Number.isInteger(n) || n < 1 || n > max) throw badRequest(`${key} must be an integer from 1 to ${max}`);
+    return n;
+  };
+  const date = (key: string): Date | null => {
+    if (q[key] === undefined || q[key] === "") return null;
+    const d = new Date(String(q[key]));
+    if (Number.isNaN(d.getTime())) throw badRequest(`${key} must be an ISO date`);
+    return d;
+  };
+  const outcome = q.outcome === undefined || q.outcome === "" ? null : String(q.outcome);
+  if (outcome !== null && !(TRACE_CATEGORIES as readonly string[]).includes(outcome)) {
+    throw badRequest(`outcome must be one of ${TRACE_CATEGORIES.join(", ")}`);
+  }
+  const text = typeof q.q === "string" ? q.q.trim() : "";
+  if (text.length > 200) throw badRequest("q must be at most 200 characters");
+  return {
+    page: int("page", 1, 100_000),
+    pageSize: int("pageSize", 50, TRACE_PAGE_SIZE_MAX),
+    outcome: outcome as TraceCategory | null,
+    q: text || null,
+    from: date("from"),
+    to: date("to"),
+  };
+}
+
+/** One page of the workspace's traces, newest first, with the ticket subject when the draft belongs to a ticket. */
+export async function listTraces(tenantId: string, f: TraceListQuery): Promise<{ traces: TraceListRow[]; total: number }> {
+  const conds: string[] = [];
+  const params: unknown[] = [];
+  const where = (sql: string, value: unknown) => {
+    params.push(value);
+    conds.push(sql.replace("?", `$${params.length}`));
+  };
+  // No sources found also matches a draft the model wrote without sources, which the categories file under what it did.
+  if (f.outcome === "no_sources") conds.push("(t.model = 'grounding-guard' OR jsonb_array_length(t.sources) = 0)");
+  else if (f.outcome) where(`${CATEGORY_SQL} = ?`, f.outcome);
+  if (f.q) where("t.query ILIKE ?", `%${f.q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+  if (f.from) where("t.created_at >= ?", f.from);
+  if (f.to) where("t.created_at < ?", f.to);
+  const filter = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  return withTenant(tenantId, async (c) => {
+    const count = await c.query<{ total: number }>(`SELECT count(*)::int AS total FROM draft_traces t ${filter}`, params);
+    const rows = await c.query<SummaryRow & { ticket_subject: string | null }>(
+      `SELECT ${SUMMARY_COLS}, k.subject AS ticket_subject
+         FROM draft_traces t LEFT JOIN tickets k ON k.id = t.ticket_id
+         ${filter}
+         ORDER BY t.created_at DESC, t.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, f.pageSize, (f.page - 1) * f.pageSize],
+    );
+    return { traces: rows.rows.map((r) => ({ ...toSummary(r), ticketSubject: r.ticket_subject })), total: count.rows[0].total };
+  });
+}
+
+/** One trace with its sources, the parsed answer tags and the decisions made on it. Null once retention deleted it. */
+export async function getTrace(tenantId: string, traceId: string): Promise<TraceDetail | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query<SummaryRow & {
+      draft: string; sources: TraceSource[]; top_score: number | null; agreement: number | null;
+      confidence: number | null; embed_model: string | null; risk_tags: string[]; outcome: string | null; full_query: string;
+    }>(
+      `SELECT ${SUMMARY_COLS}, t.query AS full_query, t.draft, t.sources, t.top_score, t.agreement, t.confidence, t.embed_model, t.risk_tags, t.outcome
+         FROM draft_traces t WHERE t.id = $1`,
+      [traceId],
+    );
+    const t = r.rows[0];
+    if (!t) return null;
+    const d = await c.query<{ outcome: string; reason: string; source: string; sent_message_id: string | null; created_at: Date }>(
+      "SELECT outcome, reason, source, sent_message_id, created_at FROM autoreply_decisions WHERE trace_id = $1 ORDER BY created_at",
+      [traceId],
+    );
+    return {
+      ...toSummary(t),
+      query: t.full_query,
+      draft: t.draft,
+      parsed: hasOutcomeTag(t.draft) ? parseDraftOutcome(t.draft) : { kind: "ok", reply: t.draft.trim(), note: null, noReply: false, handoff: false },
+      sources: t.sources ?? [],
+      topScore: t.top_score,
+      agreement: t.agreement,
+      confidence: t.confidence,
+      embedModel: t.embed_model,
+      riskTags: t.risk_tags ?? [],
+      humanOutcome: t.outcome,
+      decisions: d.rows.map((x) => ({
+        outcome: x.outcome, reason: x.reason, source: x.source, sentMessageId: x.sent_message_id, createdAt: x.created_at.toISOString(),
+      })),
+    };
+  });
 }

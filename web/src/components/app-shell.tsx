@@ -53,6 +53,7 @@ const NAV_TITLES: Partial<Record<NavKey, string>> = {
   broadcasts: "Broadcasts",
   features: "Feature requests",
   analytics: "Analytics",
+  traces: "AI traces",
   settings: "Settings",
 };
 

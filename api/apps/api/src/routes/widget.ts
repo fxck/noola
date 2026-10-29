@@ -17,7 +17,7 @@ import { createAttachment, claimAttachments, attachmentsForTicket, type Attachme
 import { putBuffer, getObject } from "../storage.js";
 import { indexTicket } from "../search.js";
 import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
-import { settleWidgetAnswer, suggestionMeta } from "../autoreply.js";
+import { settleWidgetAnswer, suggestionMeta, traceWidgetReply } from "../autoreply.js";
 import { withoutOutcomeTags } from "../ai-outcome.js";
 import { wantsHuman, type DraftImage } from "../model.js";
 import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
@@ -354,6 +354,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           JSON.stringify(suggestionMeta(s, "widget")),
         ]);
       }).catch(() => {});
+      await traceWidgetReply(wk.tenantId, s, answer.handoff);
       if (answer.handoff) await awaitHuman(wk.tenantId, inbound.ticketId);
       return {
         answer: answer.reply,
@@ -520,6 +521,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
           JSON.stringify(suggestionMeta(suggestion, "widget")),
         ]);
       }).catch(() => {});
+      await traceWidgetReply(wk.tenantId, suggestion, answer.handoff);
       // Paused before "done", so the widget's reload shows the human queue under the reply.
       if (answer.handoff) await awaitHuman(wk.tenantId, inbound.ticketId);
       send("done", {

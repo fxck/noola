@@ -10,9 +10,11 @@ import {
   MoreHorizontal,
   PanelRight,
   RotateCcw,
+  ScanSearch,
   ShieldBan,
   Sparkles,
 } from "lucide-react";
+import { useAuth } from "@/auth/auth";
 import type { Ticket } from "@/lib/tickets";
 import { Popover } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
@@ -23,6 +25,7 @@ import { SnoozePanel } from "@/components/snooze-panel";
 import { FeatureLinkPanel } from "@/components/feature-link-panel";
 import { MergePanel } from "@/components/merge-panel";
 import { SpamDialog } from "@/components/inbox/spam-dialog";
+import { TicketTracesDialog } from "@/components/inbox/ticket-traces-dialog";
 import { cn } from "@/lib/utils";
 
 const ACTIONS = [
@@ -61,9 +64,12 @@ export function ThreadActions({
   onToggleOpen: () => void;
   onMutated: () => void;
 }) {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin" || user?.role === "owner";
   const [snoozeOpen, setSnoozeOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [spamOpen, setSpamOpen] = useState(false);
+  const [tracesOpen, setTracesOpen] = useState(false);
   const [panel, setPanel] = useState<ActionKey | null>(null);
   const snoozed =
     !!ticket.snoozed_until && new Date(ticket.snoozed_until).getTime() > Date.now();
@@ -141,6 +147,19 @@ export function ThreadActions({
                 <span className="flex-1">{a.label}</span>
               </button>
             ))}
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMoreOpen(false);
+                  setTracesOpen(true);
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-small transition-colors hover:bg-accent"
+              >
+                <ScanSearch className="size-3.5 shrink-0 text-muted-foreground" />
+                <span className="flex-1">AI traces</span>
+              </button>
+            )}
             {/* Destructive triage — separated from the AI/workflow panels above. Opens its own
                 confirm dialog (with block + drop-lead choices) rather than an in-popover panel. */}
             <div className="my-1 h-px bg-border/60" />
@@ -217,6 +236,7 @@ export function ThreadActions({
       onClose={() => setSpamOpen(false)}
       onSpammed={onMutated}
     />
+    {tracesOpen && <TicketTracesDialog ticketId={ticket.id} onClose={() => setTracesOpen(false)} />}
     </>
   );
 }

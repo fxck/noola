@@ -605,13 +605,20 @@ export async function getContainment(tenantId: string, weeks = 8): Promise<Conta
         GROUP BY 1 ORDER BY 1`,
       [windowWeeks],
     );
-    // Deflected: live public questions that never attached to a ticket.
+    // Deflected: live public questions that never attached to a ticket. Traces past the retention are counted per day in draft_trace_counts.
     const deflR = await c.query(
-      `SELECT to_char(date_trunc('week', created_at), 'YYYY-MM-DD') AS week, count(*)::int AS n
-         FROM draft_traces
-        WHERE source = 'live' AND ticket_id IS NULL
-          AND created_at > now() - make_interval(weeks => $1)
-        GROUP BY 1 ORDER BY 1`,
+      `SELECT week, sum(n)::int AS n FROM (
+         SELECT to_char(date_trunc('week', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week, count(*) AS n
+           FROM draft_traces
+          WHERE source = 'live' AND ticket_id IS NULL
+            AND created_at > now() - make_interval(weeks => $1)
+          GROUP BY 1
+         UNION ALL
+         SELECT to_char(date_trunc('week', day::timestamp), 'YYYY-MM-DD'), sum(deflected)
+           FROM draft_trace_counts
+          WHERE day > ((now() - make_interval(weeks => $1)) AT TIME ZONE 'UTC')::date
+          GROUP BY 1) per_week
+        GROUP BY week ORDER BY week`,
       [windowWeeks],
     );
 

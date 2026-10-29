@@ -557,13 +557,18 @@ export interface TenantPolicies {
   retentionDays: number | null;
   ipAllowlist: string[];
   require2fa: boolean;
+  /** Days an AI draft trace is kept, 1-365. */
+  traceRetentionDays: number;
 }
 
 export async function fetchPolicies(): Promise<TenantPolicies> {
   return api<TenantPolicies>("/settings/policies");
 }
 
-export async function savePolicies(patch: Partial<TenantPolicies>): Promise<TenantPolicies> {
+/** A null trace retention goes back to the default. */
+export type TenantPoliciesPatch = Partial<Omit<TenantPolicies, "traceRetentionDays">> & { traceRetentionDays?: number | null };
+
+export async function savePolicies(patch: TenantPoliciesPatch): Promise<TenantPolicies> {
   return api<TenantPolicies>("/settings/policies", { method: "PUT", body: JSON.stringify(patch) });
 }
 

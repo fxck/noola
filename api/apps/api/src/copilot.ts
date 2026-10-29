@@ -94,10 +94,22 @@ function rrfMerge<T>(
   return { items, scores };
 }
 
+/** Where each search ranked a source, from 1. A search that didn't find the source leaves its rank out. */
+export interface SearchRanks {
+  keyword?: number;
+  meaning?: number;
+}
+
+interface Ranked<T> {
+  items: T[];
+  scores: Map<string, number>;
+  ranks: Map<string, SearchRanks>;
+}
+
 /**
  * Hybrid retrieval for one knowledge surface: run the keyword ranker (Typesense)
  * and the vector ranker (Qdrant) in parallel, then RRF-fuse. A null query vector
- * (embedder down) degrades to keyword-only. Returns fused items + fused scores.
+ * (embedder down) degrades to keyword-only. Returns fused items + fused scores, and each search's rank for the trace.
  */
 async function hybrid<T>(
   keyword: () => Promise<T[]>,
@@ -106,14 +118,17 @@ async function hybrid<T>(
   queryVector: number[] | null,
   hydrate: (ids: string[]) => Promise<T[]>,
   idOf: (t: T) => string,
-): Promise<{ items: T[]; scores: Map<string, number> }> {
+): Promise<Ranked<T>> {
   const [kw, vec] = await Promise.all([
     keyword(),
     queryVector
       ? vectorSearch(collection, tenantId, queryVector, 20, VEC_FLOOR).then(hydrate).catch(() => [])
       : Promise.resolve<T[]>([]),
   ]);
-  return rrfMerge([vec, kw], idOf);
+  const ranks = new Map<string, SearchRanks>();
+  vec.forEach((item, i) => ranks.set(idOf(item), { meaning: i + 1 }));
+  kw.forEach((item, i) => ranks.set(idOf(item), { keyword: i + 1, ...ranks.get(idOf(item)) }));
+  return { ...rrfMerge([vec, kw], idOf), ranks };
 }
 
 export interface Citation {
@@ -210,6 +225,12 @@ export interface SuggestOpts {
   images?: DraftImage[];
   /** The ambient autoreply and the widget let a hosted model add a note for the team or decide that no reply is needed. */
   outcomes?: boolean;
+}
+
+const EXCERPT_CHARS = 240;
+
+function rankFields(r: SearchRanks | undefined): { keywordRank?: number; meaningRank?: number } {
+  return { keywordRank: r?.keyword, meaningRank: r?.meaning };
 }
 
 const EMPTY_RETRIEVAL: RetrievalSummary = { topScore: 0, citedKinds: [], agreement: 0, perCitation: [] };
@@ -385,7 +406,7 @@ async function prepareDraft(
   const scope = opts.forceScope
     ? new Set(opts.forceScope)
     : await audienceScope(tenantId, opts.audience ?? "agent");
-  const NONE = { items: [] as never[], scores: new Map<string, number>() };
+  const NONE = { items: [] as never[], scores: new Map<string, number>(), ranks: new Map<string, SearchRanks>() };
   const queryVector = (await embeddingDriver.embed([query]))?.[0] ?? null;
   const [artR, thrR, chkR] = await Promise.all([
     scope.has("kb")
@@ -446,6 +467,14 @@ async function prepareDraft(
     ...threadTop.map((t) => ({ kind: "thread" as const, id: t.ticket_id, score: thrR.scores.get(t.ticket_id) ?? 0 })),
     ...chunkTop.map((ch) => ({ kind: "document" as const, id: ch.id, score: chkR.scores.get(ch.id) ?? 0 })),
   ];
+  // What the trace viewer shows per source, in the order of perCitation.
+  const traceDetails = [
+    ...kbTop.map((a) => ({ ...rankFields(artR.ranks.get(a.id)), excerpt: clip(a.body, EXCERPT_CHARS) })),
+    ...threadTop.map((t) => ({ ...rankFields(thrR.ranks.get(t.ticket_id)), excerpt: clip(t.text, EXCERPT_CHARS) })),
+    ...chunkTop.map((ch) => ({
+      ...rankFields(chkR.ranks.get(ch.id)), excerpt: clip(ch.text, EXCERPT_CHARS), passage: ch.chunk_index, passages: ch.chunk_count,
+    })),
+  ];
   const citedKinds = [...new Set(perCitation.map((p) => p.kind))];
   const retrieval: RetrievalSummary = {
     topScore: perCitation.reduce((m, p) => Math.max(m, p.score), 0),
@@ -485,6 +514,8 @@ async function prepareDraft(
   const finalize = async (result: DraftResult, model: string, latencyMs: number): Promise<Suggestion> => {
     const traceSources = perCitation.map((p, i) => ({
       kind: p.kind, id: p.id, title: citations[i]?.title ?? "", score: p.score, rank: i,
+      ...(p.kind === "document" ? { documentId: citations[i]?.id, url: citations[i]?.url } : {}),
+      ...traceDetails[i],
     }));
     const traceId = await recordDraftTrace({
       tenantId, ticketId, messageId, query, sources: traceSources, retrieval,
