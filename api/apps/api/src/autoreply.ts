@@ -630,6 +630,7 @@ async function evaluateForMessage(
   // answerer (automations reply / on-demand) already posted this turn ⇒ stand down (do not re-check,
   // do not post). Taken at the LAST moment so a gate-bail never consumes the turn's single claim.
   if (!(await claimAnswer(tenantId, messageId, "autoreply"))) {
+    await stampGate("suppressed", "claimed_elsewhere");
     const id = await decide({
       messageId, ticketId, outcome: "suppressed", reason: "claimed_elsewhere",
       agreement, topScore, confidence, riskTags, sentMessageId: null, traceId: suggestion.traceId,
@@ -665,7 +666,7 @@ async function evaluateForMessage(
     await deliverDiscordReply({ tenantId, ticketId, messageId: sent.messageId, channelId: ctx.externalChannelId }, replyText).catch(() => {});
   }
 
-  await stampGate("auto_sent", "sent");
+  await stampGate("auto_sent", outcome.handoff ? "sent_with_handoff" : "sent");
   const id = await decide({
     messageId, ticketId, outcome: "auto_sent", reason: "sent",
     agreement, topScore, confidence, riskTags, sentMessageId: sent.messageId, traceId: suggestion.traceId,
@@ -681,6 +682,11 @@ async function evaluateForMessage(
 
 export type WidgetAnswer = { kind: "reply"; reply: string; handoff: boolean } | { kind: "none" } | { kind: "handoff" };
 
+/** Records a widget reply on its trace. The caller runs it once the reply is stored, so a failed send isn't recorded as sent. */
+export async function traceWidgetReply(tenantId: string, s: Suggestion, handoff: boolean): Promise<void> {
+  if (s.traceId) await updateTraceGate(tenantId, s.traceId, { outcome: "auto_sent", reason: handoff ? "sent_with_handoff" : "sent", riskTags: [] });
+}
+
 /**
  * Applies the outcome tags of the widget's own answer, which answers outside the ambient autoreply.
  * "No reply" hands the turn to the visitor. A handoff, a note without a reply, or broken tags mean a teammate
@@ -690,6 +696,9 @@ export type WidgetAnswer = { kind: "reply"; reply: string; handoff: boolean } | 
 export async function settleWidgetAnswer(tenantId: string, ticketId: string, messageId: string, s: Suggestion): Promise<WidgetAnswer> {
   if (!s.outcomes) return { kind: "reply", reply: s.draft, handoff: false };
   const outcome = parseDraftOutcome(s.draft);
+  const gate = async (outcome: string, reason: string) => {
+    if (s.traceId) await updateTraceGate(tenantId, s.traceId, { outcome, reason, riskTags: [] });
+  };
   const decision = (outcome: DecisionInput["outcome"], reason: string) =>
     recordDecision(tenantId, {
       messageId, ticketId, outcome, reason, source: "on_demand",
@@ -697,6 +706,7 @@ export async function settleWidgetAnswer(tenantId: string, ticketId: string, mes
       riskTags: [], sentMessageId: null, traceId: s.traceId,
     });
   if (outcome.kind === "malformed") {
+    await gate("suppressed", "malformed_output");
     if (await decision("suppressed", "malformed_output")) {
       await enqueueSuggestion(tenantId, {
         ticketId, messageId, draftBody: s.draft, meta: suggestionMeta(s, "suggested"), reason: "malformed_output",
@@ -708,10 +718,9 @@ export async function settleWidgetAnswer(tenantId: string, ticketId: string, mes
     if (outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
     return { kind: "reply", reply: outcome.reply, handoff: outcome.handoff };
   }
-  const id = await decision(
-    outcome.noReply ? "suppressed" : "assist",
-    outcome.noReply ? "no_reply_needed" : outcome.note ? "note_only" : "handoff",
-  );
+  const reason = outcome.noReply ? "no_reply_needed" : outcome.note ? "note_only" : "handoff";
+  await gate(outcome.noReply ? "suppressed" : "assist", reason);
+  const id = await decision(outcome.noReply ? "suppressed" : "assist", reason);
   if (id && outcome.note) await postAiNote(tenantId, ticketId, outcome.note);
   if (!outcome.noReply) return { kind: "handoff" };
   await handTurnToCustomer(tenantId, ticketId);

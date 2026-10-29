@@ -43,7 +43,7 @@ function parseTags(raw: string): string[] {
  *  fallback: the keyword tag rules (projected managed automations) own the always-on baseline, so
  *  a fallback here would just duplicate them. Backs the `ai_tag` engine action. */
 export async function suggestTagsAI(tenantId: string, subject: string, body: string): Promise<string[]> {
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "general" });
   if (!driver.complete) return [];
   try {
     const raw = await driver.complete(

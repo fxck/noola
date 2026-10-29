@@ -47,7 +47,7 @@ function parseTopic(raw: string): string | null {
 /** Classify via the tenant driver, falling back to the deterministic rule topic on any failure or
  *  when the driver has no generative `complete`. */
 export async function classifyTopic(tenantId: string, subject: string, body: string): Promise<string> {
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "general" });
   if (driver.complete) {
     try {
       const raw = await driver.complete(

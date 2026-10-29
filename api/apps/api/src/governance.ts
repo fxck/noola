@@ -11,6 +11,7 @@ import { recordAudit } from "./audit.js";
 //                     unsubscribe, SCIM) never pass through `tenanted`, so they're unaffected.
 //   require_2fa     → workspace wants every member enrolled; surfaced to the SPA (soft gate:
 //                     the app nags/blocks in the shell) + on the members roster for admins.
+//   trace_retention_days → the AI trace sweep deletes draft traces older than this, 90 days when unset.
 
 type Log = { info: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
 
@@ -18,9 +19,13 @@ export interface TenantPolicies {
   retentionDays: number | null;
   ipAllowlist: string[];
   require2fa: boolean;
+  /** Null keeps the platform default, TRACE_RETENTION_DEFAULT_DAYS. */
+  traceRetentionDays: number | null;
 }
 
-const DEFAULTS: TenantPolicies = { retentionDays: null, ipAllowlist: [], require2fa: false };
+export const TRACE_RETENTION_DEFAULT_DAYS = 90;
+
+const DEFAULTS: TenantPolicies = { retentionDays: null, ipAllowlist: [], require2fa: false, traceRetentionDays: null };
 
 function mapRow(r: Record<string, unknown> | undefined): TenantPolicies {
   if (!r) return { ...DEFAULTS };
@@ -28,12 +33,15 @@ function mapRow(r: Record<string, unknown> | undefined): TenantPolicies {
     retentionDays: r.retention_days == null ? null : Number(r.retention_days),
     ipAllowlist: Array.isArray(r.ip_allowlist) ? (r.ip_allowlist as string[]).map(String) : [],
     require2fa: Boolean(r.require_2fa),
+    traceRetentionDays: r.trace_retention_days == null ? null : Number(r.trace_retention_days),
   };
 }
 
 export async function getPolicies(tenantId: string): Promise<TenantPolicies> {
   return withTenant(tenantId, async (c) => {
-    const r = await c.query("SELECT retention_days, ip_allowlist, require_2fa FROM tenant_policies WHERE tenant_id = current_tenant()");
+    const r = await c.query(
+      "SELECT retention_days, ip_allowlist, require_2fa, trace_retention_days FROM tenant_policies WHERE tenant_id = current_tenant()",
+    );
     return mapRow(r.rows[0] as Record<string, unknown> | undefined);
   });
 }
@@ -44,15 +52,16 @@ export async function putPolicies(tenantId: string, patch: Partial<TenantPolicie
     retentionDays: patch.retentionDays !== undefined ? patch.retentionDays : current.retentionDays,
     ipAllowlist: patch.ipAllowlist !== undefined ? patch.ipAllowlist : current.ipAllowlist,
     require2fa: patch.require2fa !== undefined ? patch.require2fa : current.require2fa,
+    traceRetentionDays: patch.traceRetentionDays !== undefined ? patch.traceRetentionDays : current.traceRetentionDays,
   };
   await withTenant(tenantId, async (c) => {
     await c.query(
-      `INSERT INTO tenant_policies (tenant_id, retention_days, ip_allowlist, require_2fa, updated_at)
-       VALUES (current_tenant(), $1, $2::jsonb, $3, now())
+      `INSERT INTO tenant_policies (tenant_id, retention_days, ip_allowlist, require_2fa, trace_retention_days, updated_at)
+       VALUES (current_tenant(), $1, $2::jsonb, $3, $4, now())
        ON CONFLICT (tenant_id) DO UPDATE
          SET retention_days = EXCLUDED.retention_days, ip_allowlist = EXCLUDED.ip_allowlist,
-             require_2fa = EXCLUDED.require_2fa, updated_at = now()`,
-      [next.retentionDays, JSON.stringify(next.ipAllowlist), next.require2fa],
+             require_2fa = EXCLUDED.require_2fa, trace_retention_days = EXCLUDED.trace_retention_days, updated_at = now()`,
+      [next.retentionDays, JSON.stringify(next.ipAllowlist), next.require2fa, next.traceRetentionDays],
     );
   });
   bustPolicyCache(tenantId);
@@ -131,6 +140,61 @@ export async function cachedPolicies(tenantId: string): Promise<TenantPolicies> 
 export async function tenantIpAllowed(tenantId: string, ip: string): Promise<boolean> {
   const p = await cachedPolicies(tenantId);
   return ipAllowed(ip, p.ipAllowlist);
+}
+
+// ---- AI trace retention sweep ------------------------------------------------
+
+const TRACE_SWEEP_BATCH = 5000;
+
+/**
+ * Deletes AI draft traces older than each workspace's trace retention, the default included.
+ * Each batch is counted into draft_trace_counts in the same statement, so reports that count drafts stay exact.
+ * Small batches keep each delete short, so a large first sweep doesn't hold long locks.
+ */
+export async function runTraceRetentionSweep(log: Log): Promise<void> {
+  let tenants: { id: string; days: number }[];
+  try {
+    const r = await relayPool.query<{ id: string; days: number }>(
+      `SELECT t.id, COALESCE(p.trace_retention_days, $1)::int AS days
+         FROM tenants t LEFT JOIN tenant_policies p ON p.tenant_id = t.id`,
+      [TRACE_RETENTION_DEFAULT_DAYS],
+    );
+    tenants = r.rows;
+  } catch (err) {
+    log.warn({ err }, "trace retention: tenant discovery failed");
+    return;
+  }
+  for (const t of tenants) {
+    try {
+      let removed = 0;
+      for (;;) {
+        const r = await withTenant(t.id, (c) =>
+          c.query<{ n: number }>(
+            `WITH gone AS (
+               DELETE FROM draft_traces WHERE id IN (
+                 SELECT id FROM draft_traces WHERE created_at < now() - make_interval(days => $1) LIMIT $2)
+               RETURNING created_at, source, ticket_id),
+             counted AS (
+               INSERT INTO draft_trace_counts (tenant_id, day, drafts, deflected)
+               SELECT current_tenant(), (created_at AT TIME ZONE 'UTC')::date, count(*),
+                      count(*) FILTER (WHERE source = 'live' AND ticket_id IS NULL)
+                 FROM gone GROUP BY 2
+               ON CONFLICT (tenant_id, day) DO UPDATE
+                 SET drafts = draft_trace_counts.drafts + EXCLUDED.drafts,
+                     deflected = draft_trace_counts.deflected + EXCLUDED.deflected)
+             SELECT count(*)::int AS n FROM gone`,
+            [t.days, TRACE_SWEEP_BATCH],
+          ),
+        );
+        const n = r.rows[0]?.n ?? 0;
+        removed += n;
+        if (n < TRACE_SWEEP_BATCH) break;
+      }
+      if (removed > 0) log.info({ tenantId: t.id, removed }, "trace retention: swept old traces");
+    } catch (err) {
+      log.warn({ err, tenantId: t.id }, "trace retention: sweep failed");
+    }
+  }
 }
 
 // ---- data retention sweep ----------------------------------------------------

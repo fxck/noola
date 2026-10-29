@@ -25,6 +25,8 @@ async function main() {
     host: process.env.DB_HOST, port: Number(process.env.DB_PORT ?? 5432),
     database: process.env.DB_NAME, user: process.env.DB_SUPER_USER, password: process.env.DB_SUPER_PASSWORD, max: 1,
   });
+  // A connection the server drops must not crash the run before the finally restores TestCo's model and policy.
+  superPool.on("error", () => {});
   if ((await getModelConfig(A)).provider !== "managed") throw new Error("TestCo has a hosted model, which this test would overwrite");
 
   let pieces: string[] = [];
@@ -97,6 +99,8 @@ async function main() {
     const quiet = await ask(["<no_", "reply/>"]);
     check("no reply sends nothing to the visitor", quiet.shown === "" && quiet.done.quiet === true && quiet.done.messageId === null && quiet.replies.length === 0, quiet.done);
     check("no reply hands the turn to the visitor", quiet.ticket.whose_turn === "customer" && quiet.decisions[0]?.reason === "no_reply_needed", quiet);
+    const quietTrace = await superPool.query("SELECT gate_reason, draft FROM draft_traces WHERE message_id = (SELECT id FROM messages WHERE ticket_id = $1 AND author_type = 'customer' LIMIT 1)", [quiet.done.conversationId]);
+    check("the trace records the decision and keeps what the model wrote", quietTrace.rows[0]?.gate_reason === "no_reply_needed" && quietTrace.rows[0]?.draft === "<no_reply/>", quietTrace.rows);
 
     // A closing "thanks" takes the ticket out of the needs-reply queue, and the handoff puts it back.
     const handoff = await ask(["<internal>I don't know this one. A teammate should answer.</internal>"], "Thanks, but the AIWIDGET reports export still fails");
@@ -127,7 +131,7 @@ async function main() {
     globalThis.fetch = realFetch;
     await putModelConfig(A, { provider: "managed" });
     await putPolicy(A, policyBefore, { sweep: false });
-    for (const table of ["autoreply_queue", "autoreply_decisions", "ticket_notes", "messages"]) {
+    for (const table of ["autoreply_queue", "autoreply_decisions", "ticket_notes", "draft_traces", "messages"]) {
       await superPool.query(`DELETE FROM ${table} WHERE ticket_id IN (${tickets})`, [A]);
     }
     await superPool.query(`DELETE FROM tickets WHERE id IN (${tickets})`, [A]);

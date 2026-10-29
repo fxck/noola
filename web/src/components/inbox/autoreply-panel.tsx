@@ -9,37 +9,32 @@ import { cn } from "@/lib/utils";
 // AI acted or held on each inbound. Stays quiet (renders nothing) when the endpoint is absent or
 // there are no decisions, so it never clutters a normal conversation.
 export function AutoreplyPanel({ ticketId, refreshKey }: { ticketId: string; refreshKey: number }) {
-  const [rows, setRows] = useState<AutoreplyDecision[] | null>(null);
-  const [failed, setFailed] = useState(false);
+  // Keyed by ticket, so a switch never shows the previous ticket's decisions while the new ones load.
+  const [loaded, setLoaded] = useState<{ ticketId: string; rows: AutoreplyDecision[] } | null>(null);
 
   useEffect(() => {
     let live = true;
-    setFailed(false);
     fetchAutoreplyDecisions(ticketId)
-      .then((d) => live && setRows(d))
-      .catch(() => live && setFailed(true));
+      .then((d) => live && setLoaded({ ticketId, rows: d }))
+      .catch(() => live && setLoaded({ ticketId, rows: [] }));
     return () => {
       live = false;
     };
   }, [ticketId, refreshKey]);
 
-  // Endpoint not wired yet, or nothing to show → stay quiet rather than clutter.
-  if (failed) return null;
-  if (rows && rows.length === 0) return null;
+  // The panel appears only once there are decisions, so turning on nerd mode never flashes an empty one.
+  const rows = loaded?.ticketId === ticketId ? loaded.rows : [];
+  if (rows.length === 0) return null;
 
   return (
     <div className="shrink-0 border-b bg-muted/20 px-4 py-2 sm:px-6">
       <div className="mx-auto max-w-3xl">
         <NerdStats title="autoreply decisions">
-          {rows === null ? (
-            <span className="text-muted-foreground">loading…</span>
-          ) : (
-            <div className="space-y-1.5">
-              {rows.map((d, i) => (
-                <DecisionRow key={d.id ?? i} d={d} />
-              ))}
-            </div>
-          )}
+          <div className="space-y-1.5">
+            {rows.map((d, i) => (
+              <DecisionRow key={d.id ?? i} d={d} />
+            ))}
+          </div>
         </NerdStats>
       </div>
     </div>
@@ -49,7 +44,7 @@ export function AutoreplyPanel({ ticketId, refreshKey }: { ticketId: string; ref
 /** Turn a raw decision row into a plain-language line + a tone. */
 function describeDecision(d: AutoreplyDecision): { text: string; held: boolean } {
   const outcome = String(d.outcome ?? "").toLowerCase();
-  if (outcome === "sent") return { text: "AI replied automatically", held: false };
+  if (outcome === "auto_sent" || outcome === "sent") return { text: "AI replied automatically", held: false };
   const reason = d.reason ?? "";
   if (reason === "no_reply_needed") return { text: "AI decided no reply is needed", held: false };
   if (reason === "no_reply_suggested") return { text: "AI suggests no reply is needed", held: true };

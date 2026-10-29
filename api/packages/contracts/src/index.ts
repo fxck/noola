@@ -442,6 +442,12 @@ export const ModelConfigInput = z.object({
   endpoint: z.string().url().max(500).nullish(),
   model: z.string().min(1).max(200).nullish(),
   apiKey: z.string().max(1000).optional(),
+  /** Thinking levels and the search and general jobs' models. Omitted keeps the saved value, null clears it. */
+  effort: z.string().max(20).nullish(),
+  searchModel: z.string().max(200).nullish(),
+  searchEffort: z.string().max(20).nullish(),
+  generalModel: z.string().max(200).nullish(),
+  generalEffort: z.string().max(20).nullish(),
 });
 export type ModelConfigInput = z.infer<typeof ModelConfigInput>;
 
@@ -807,6 +813,8 @@ export const PersonaInput = z.object({
   signature: z.string().max(500).optional(),
   guardrails: z.string().max(2000).optional(),
   instructions: z.string().max(2000).optional(),
+  /** Null resets to the default rules. */
+  handoffRules: z.string().max(4000).nullable().optional(),
 });
 export type PersonaInput = z.infer<typeof PersonaInput>;
 
@@ -1509,13 +1517,21 @@ export type AutomationAuthorInput = z.infer<typeof AutomationAuthorInput>;
 
 // ── Wave 4: conversational reach (multilingual + channel registry) ───────────
 
-/** PUT /settings/translation — the workspace's own language + whether to auto-translate agent
- *  replies into the customer's detected language on send. workspaceLocale is an ISO-639-1 code. */
+/** PUT /settings/translation: the workspace language (ISO-639-1) and translation of conversations for the team. */
 export const TranslationSettingsInput = z.object({
   workspaceLocale: z.string().trim().min(2).max(8),
   autoTranslate: z.boolean(),
 });
 export type TranslationSettingsInput = z.infer<typeof TranslationSettingsInput>;
+
+/** PUT /settings/docs-search: whether a model writes the docs-search query, the product description, and an
+ *  optional replacement prompt (null or empty uses the default). */
+export const DocsSearchSettingsInput = z.object({
+  rewrite: z.boolean(),
+  product: z.string().max(500),
+  prompt: z.string().max(4000).nullable(),
+});
+export type DocsSearchSettingsInput = z.infer<typeof DocsSearchSettingsInput>;
 
 // ── Wave 5: custom data events ───────────────────────────────────────────────
 

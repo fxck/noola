@@ -9,12 +9,14 @@ import {
   Lightbulb,
   Users,
   BarChart3,
+  ScanSearch,
   Search,
   Settings as SettingsIcon,
   PanelLeftClose,
   PanelLeftOpen,
   type LucideIcon,
 } from "lucide-react";
+import { useAuth } from "@/auth/auth";
 import { NoolaMark } from "@/components/noola-mark";
 import { openCommandPalette } from "@/components/command-palette";
 import { QueueBadge } from "@/components/queue/queue-badge";
@@ -34,9 +36,10 @@ export type NavKey =
   | "features"
   | "broadcasts"
   | "analytics"
+  | "traces"
   | "settings";
 
-type NavEntry = { key: NavKey; to: string; label: string; icon: LucideIcon; badge?: "queue" };
+type NavEntry = { key: NavKey; to: string; label: string; icon: LucideIcon; badge?: "queue"; adminOnly?: boolean };
 
 // Grouped by what the operator is *doing*, not alphabetically — the four bands
 // mirror the north-star's console / knowledge / growth / insight registers.
@@ -67,6 +70,7 @@ const NAV_GROUPS: { heading: string; items: NavEntry[] }[] = [
     heading: "Insight",
     items: [
       { key: "analytics", to: "/analytics", label: "Analytics", icon: BarChart3 },
+      { key: "traces", to: "/ai-traces", label: "AI traces", icon: ScanSearch, adminOnly: true },
     ],
   },
 ];
@@ -133,6 +137,8 @@ export function NavRailContent({
   /** Global cluster (live status, user block) rendered above Settings. */
   footer?: (collapsed: boolean) => ReactNode;
 }) {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin" || user?.role === "owner";
   const collapseBtn = onToggleCollapse && (
     <button
       type="button"
@@ -201,7 +207,7 @@ export function NavRailContent({
                 {group.heading}
               </p>
             )}
-            {group.items.map((item) => (
+            {group.items.filter((item) => isAdmin || !item.adminOnly).map((item) => (
               <NavItem
                 key={item.key}
                 item={item}

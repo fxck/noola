@@ -104,7 +104,7 @@ export interface AuthorResult {
 export async function authorAutomation(tenantId: string, prompt: string): Promise<AuthorResult> {
   const clean = (prompt ?? "").trim();
   if (!clean) return { error: "Describe what the automation should do." };
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "general" });
   if (typeof driver.complete !== "function") {
     return { error: "AI flow authoring needs a hosted model — connect one in Settings → Model." };
   }

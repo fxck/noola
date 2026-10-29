@@ -130,7 +130,7 @@ export async function scoreTicket(tenantId: string, ticketId: string): Promise<Q
   let scored = base;
   let model = "rule";
 
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "general" });
   if (driver.complete) {
     const transcript = data.msgs
       .map((m) => `${m.author_type === "customer" ? "Customer" : "Agent"}: ${m.body}`)

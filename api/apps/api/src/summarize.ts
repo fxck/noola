@@ -49,7 +49,7 @@ export async function summarizeTicket(tenantId: string, ticketId: string): Promi
     .join("\n")
     .slice(0, 12000);
 
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "general" });
   if (typeof driver.complete === "function") {
     try {
       const out = await driver.complete(SYSTEM_PROMPT, transcript);

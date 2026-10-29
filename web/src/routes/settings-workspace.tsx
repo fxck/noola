@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Building2, Clock, Loader2, Network, SendHorizonal, ShieldCheck, Upload, X } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/auth/auth";
-import { fetchPolicies, fetchSendDelay, MAX_SEND_DELAY_SECONDS, saveSendDelay, savePolicies, type TenantPolicies } from "@/lib/settings";
+import { fetchPolicies, fetchSendDelay, MAX_SEND_DELAY_SECONDS, saveSendDelay, savePolicies, type TenantPolicies, type TenantPoliciesPatch } from "@/lib/settings";
 import { SettingsPage } from "@/components/settings-page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -225,6 +225,7 @@ function PoliciesCards() {
   const isAdmin = user?.role === "admin" || user?.role === "owner";
   const [policies, setPolicies] = useState<TenantPolicies | null>(null);
   const [retention, setRetention] = useState("");
+  const [traceRetention, setTraceRetention] = useState("");
   const [ips, setIps] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -233,17 +234,19 @@ function PoliciesCards() {
       .then((p) => {
         setPolicies(p);
         setRetention(p.retentionDays == null ? "" : String(p.retentionDays));
+        setTraceRetention(String(p.traceRetentionDays));
         setIps(p.ipAllowlist.join("\n"));
       })
       .catch(() => setPolicies(null));
   }, []);
 
-  async function save(patch: Partial<TenantPolicies>) {
+  async function save(patch: TenantPoliciesPatch) {
     setBusy(true);
     try {
       const p = await savePolicies(patch);
       setPolicies(p);
       setRetention(p.retentionDays == null ? "" : String(p.retentionDays));
+      setTraceRetention(String(p.traceRetentionDays));
       setIps(p.ipAllowlist.join("\n"));
       toast.success("Policy saved.");
     } catch (err) {
@@ -256,6 +259,9 @@ function PoliciesCards() {
   if (!policies) return null;
 
   const retentionDirty = retention !== (policies.retentionDays == null ? "" : String(policies.retentionDays));
+  const traceRetentionDirty = traceRetention !== String(policies.traceRetentionDays);
+  // An empty field goes back to the default.
+  const traceRetentionValid = traceRetention === "" || (/^\d+$/.test(traceRetention) && Number(traceRetention) >= 1 && Number(traceRetention) <= 365);
   const ipsDirty = ips.split("\n").map((s) => s.trim()).filter(Boolean).join("\n") !== policies.ipAllowlist.join("\n");
 
   return (
@@ -288,6 +294,29 @@ function PoliciesCards() {
                   Save
                 </Button>
               )}
+            </div>
+            <div className="mt-5 border-t pt-4">
+              <Label htmlFor="trace-retention" className="text-xs font-medium">Keep AI traces for</Label>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                AI traces record what the model wrote for each draft, for debugging. Older traces are deleted automatically.
+              </p>
+              <div className="mt-3 flex items-center gap-2">
+                <Input
+                  id="trace-retention"
+                  inputMode="numeric"
+                  className="h-8 w-28"
+                  value={traceRetention}
+                  disabled={!isAdmin}
+                  onChange={(e) => setTraceRetention(e.target.value.replace(/\D/g, ""))}
+                />
+                <span className="text-xs text-muted-foreground">days (1-365, empty for the default of 90)</span>
+                {isAdmin && traceRetentionDirty && (
+                  <Button size="sm" variant="outline" className="h-8" disabled={busy || !traceRetentionValid}
+                    onClick={() => void save({ traceRetentionDays: traceRetention === "" ? null : Number(traceRetention) })}>
+                    Save
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
         </div>

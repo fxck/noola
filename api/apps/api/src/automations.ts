@@ -794,7 +794,7 @@ export async function runAgent(
   // Per-node model selection (dogfood L0-F2): the node/run's chosen model, resolved through the
   // tenant's hosted provider+key. Falls back to the tenant default when unset or on a managed baseline.
   const driver: AgentDriverLike =
-    agentDriverOverride ?? (await resolveModelDriver(tenantId, config.model ? { model: config.model } : undefined));
+    agentDriverOverride ?? (await resolveModelDriver(tenantId, { model: config.model ?? undefined, job: "general" }));
   const executed: ActionResult[] = [];
   const transcript: string[] = [];
   const trace: AgentStep[] = [];

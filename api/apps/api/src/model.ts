@@ -10,7 +10,7 @@
 // an agent's "let me look into it" keeps the ball on our side.
 
 import { requireEnv } from "./env.js";
-import { DRAFT_OUTCOMES_SYSTEM } from "./ai-outcome.js";
+import { DRAFT_OUTCOMES_SYSTEM, NO_SOURCES_SYSTEM } from "./ai-outcome.js";
 
 export type WhoseTurn = "us" | "customer";
 
@@ -62,6 +62,8 @@ export interface DraftReplyInput {
   persona?: string;
   /** Lets the draft carry a note for the team or say that no reply is needed (ai-outcome.ts). The rule baseline ignores it. */
   outcomes?: boolean;
+  /** When the model helps and when it hands off. Used only with outcomes. */
+  handoffRules?: string;
 }
 
 /** A drafted reply plus the signals the autoreply gate + trace store need: how
@@ -108,7 +110,14 @@ export interface ModelServingDriver {
    * has no generative reasoning, so callers MUST feature-detect (`if (driver.complete)`)
    * and fall back to a deterministic path when it's absent.
    */
-  complete?(system: string, user: string): Promise<string>;
+  complete?(system: string, user: string, opts?: CompleteOptions): Promise<string>;
+  /** The thinking level a hosted model runs at, when the workspace chose one. */
+  readonly effort?: string | null;
+}
+
+export interface CompleteOptions {
+  /** Throw when the model stops at its output limit, for callers that must never use a cut-off answer. */
+  rejectTruncated?: boolean;
 }
 
 // Business-risk classification for the autoreply gate — a deterministic backstop
@@ -281,6 +290,8 @@ export interface ChatModelOptions {
   endpoint?: string | null; // base URL; defaults per provider
   model: string;
   apiKey: string;
+  /** The thinking level the provider runs the model at. Null leaves the model's own default. */
+  effort?: string | null;
 }
 
 const DRAFT_SYSTEM =
@@ -301,8 +312,13 @@ const DRAFT_MAX_TOKENS = 1500;
 // Current Claude models think before they answer, and the thinking counts against max_tokens.
 // The ceiling itself costs nothing, only the tokens the model produces, thinking included.
 const ANTHROPIC_DRAFT_MAX_TOKENS = 8000;
+// An OpenAI reasoning model's thinking counts against its limit too.
+const REASONING_MAX_TOKENS = 8000;
 // An OpenAI account also lists embedding, audio and image models, which can't draft a reply.
 const NOT_A_CHAT_MODEL = /embedding|whisper|tts|audio|realtime|transcribe|dall-e|image|moderation|davinci|babbage/i;
+
+/** The fixed parts of the draft prompt, for the settings page that shows the whole prompt. */
+export const DRAFT_PROMPT_PARTS = { always: DRAFT_SYSTEM, answerForms: DRAFT_OUTCOMES_SYSTEM, noSources: NO_SOURCES_SYSTEM };
 
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const sources = input.sources
@@ -310,9 +326,11 @@ function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
     .join("\n\n");
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.
-  const persona = input.persona?.trim();
-  const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${DRAFT_OUTCOMES_SYSTEM}` : DRAFT_SYSTEM;
-  const base = persona ? `${persona}\n\n${rules}` : rules;
+  const outcomes = sources ? DRAFT_OUTCOMES_SYSTEM : `${DRAFT_OUTCOMES_SYSTEM}\n\n${NO_SOURCES_SYSTEM}`;
+  const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${outcomes}` : DRAFT_SYSTEM;
+  // The handoff rules only apply when the model can hand off, and they go before the fixed rules.
+  const lead = [input.persona?.trim(), input.outcomes ? input.handoffRules?.trim() : ""].filter(Boolean).join("\n\n");
+  const base = lead ? `${lead}\n\n${rules}` : rules;
   const system = sources ? `${base}\n\nSources:\n${sources}` : base;
   const latest = input.customerMessage || "(the customer has not written anything yet)";
   // Render prior turns as a labeled transcript so the model can see the conversation — without it a
@@ -354,10 +372,26 @@ function openaiUserContent(user: string, images?: DraftImage[]): unknown {
 
 export class HttpChatModelDriver implements ModelServingDriver {
   readonly name: string;
+  readonly effort: string | null;
   private readonly rule = new RuleModelDriver();
 
   constructor(private readonly opts: ChatModelOptions) {
     this.name = `${opts.provider}:${opts.model}`;
+    this.effort = opts.effort ?? null;
+  }
+
+  // Claude 4.6 to 4.8 models think only when asked, and the level alone would just trim the answer.
+  private anthropicEffort(): Record<string, unknown> {
+    return this.effort ? { thinking: { type: "adaptive" }, output_config: { effort: this.effort } } : {};
+  }
+
+  // OpenAI's reasoning models, the only ones that take a thinking level, reject max_tokens and a set temperature.
+  // A custom OpenAI-compatible endpoint never gets a level, as its support for one is unknown.
+  private openaiLimits(): Record<string, unknown> {
+    if (this.effort && this.opts.provider === "openai") {
+      return { max_completion_tokens: REASONING_MAX_TOKENS, reasoning_effort: this.effort };
+    }
+    return { max_tokens: DRAFT_MAX_TOKENS, temperature: 0.3 };
   }
 
   classifyWhoseTurn(input: WhoseTurnInput): Promise<WhoseTurn> {
@@ -417,7 +451,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
 
   /** Raw completion for the agent-node tool loop — same wire shapes as draftReply,
    *  no source-grounding system prompt (the caller owns the whole prompt). */
-  async complete(system: string, user: string): Promise<string> {
+  async complete(system: string, user: string, opts: CompleteOptions = {}): Promise<string> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 25_000);
     try {
@@ -425,6 +459,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         this.opts.provider === "anthropic"
           ? await this.anthropic(system, user, undefined, ctrl.signal)
           : await this.openaiCompatible(system, user, undefined, ctrl.signal);
+      if (opts.rejectTruncated && r.truncated) throw new Error("completion stopped at the output limit");
       return r.text.trim();
     } finally {
       clearTimeout(timer);
@@ -464,15 +499,14 @@ export class HttpChatModelDriver implements ModelServingDriver {
     user: string,
     images: DraftImage[] | undefined,
     signal: AbortSignal,
-  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number }> {
+  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number; truncated: boolean }> {
     const res = await fetch(`${this.base()}/chat/completions`, {
       method: "POST",
       signal,
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
-        temperature: 0.3,
+        ...this.openaiLimits(),
         messages: [
           { role: "system", content: system },
           { role: "user", content: openaiUserContent(user, images) },
@@ -481,13 +515,14 @@ export class HttpChatModelDriver implements ModelServingDriver {
     });
     if (!res.ok) throw new Error(`chat ${res.status}: ${clip(await res.text(), 200)}`);
     const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     return {
       text: data.choices?.[0]?.message?.content ?? "",
       tokensIn: data.usage?.prompt_tokens,
       tokensOut: data.usage?.completion_tokens,
+      truncated: data.choices?.[0]?.finish_reason === "length",
     };
   }
 
@@ -496,7 +531,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
     user: string,
     images: DraftImage[] | undefined,
     signal: AbortSignal,
-  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number }> {
+  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number; truncated: boolean }> {
     const res = await fetch(`${this.base()}/messages`, {
       method: "POST",
       signal,
@@ -508,6 +543,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       body: JSON.stringify({
         model: this.opts.model,
         max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
+        ...this.anthropicEffort(),
         system,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],
       }),
@@ -515,12 +551,14 @@ export class HttpChatModelDriver implements ModelServingDriver {
     if (!res.ok) throw new Error(`anthropic ${res.status}: ${clip(await res.text(), 200)}`);
     const data = (await res.json()) as {
       content?: Array<{ text?: string }>;
+      stop_reason?: string;
       usage?: { input_tokens?: number; output_tokens?: number };
     };
     return {
       text: data.content?.map((b) => b.text ?? "").join("") ?? "",
       tokensIn: data.usage?.input_tokens,
       tokensOut: data.usage?.output_tokens,
+      truncated: data.stop_reason === "max_tokens",
     };
   }
 
@@ -561,6 +599,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       body: JSON.stringify({
         model: this.opts.model,
         max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
+        ...this.anthropicEffort(),
         system,
         stream: true,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],
@@ -601,8 +640,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
-        temperature: 0.3,
+        ...this.openaiLimits(),
         stream: true,
         stream_options: { include_usage: true },
         messages: [

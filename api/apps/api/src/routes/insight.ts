@@ -5,7 +5,9 @@ import { getOverview, getWorkload, getSlaReport, getOpsDashboard, getCsatReport,
 import { listTopics, ticketsForTopic, reclassifyGeneral } from "../topics.js";
 import { listScores, qaSummary, scoreTicket, backfillScores, qaByAgent, qaCsatCorrelation } from "../qa.js";
 import { runSimulation, listSimulations, getSimulation } from "../simulate.js";
-import { getPersona, putPersona } from "../persona.js";
+import { getPersona, putPersona, personaPrompt } from "../persona.js";
+import { DEFAULT_HANDOFF_RULES } from "../ai-outcome.js";
+import { DRAFT_PROMPT_PARTS } from "../model.js";
 import { listAudit, verifyAuditChain } from "../audit.js";
 import { listKnowledgeGaps, updateKnowledgeGap } from "../gaps.js";
 
@@ -125,7 +127,11 @@ export default async function insightRoutes(app: FastifyInstance): Promise<void>
 
   // ---- Agent persona (admin-only mutation; the assistant's voice) -------------
   // GET returns the tenant persona (or defaults); PUT upserts. PUT /persona is in ADMIN_ROUTES.
-  app.get("/persona", tenanted(async (tenantId) => ({ persona: await getPersona(tenantId) })));
+  // The defaults and the fixed prompt let the page show the whole prompt the model gets.
+  app.get("/persona", tenanted(async (tenantId) => {
+    const persona = await getPersona(tenantId);
+    return { persona, defaultHandoffRules: DEFAULT_HANDOFF_RULES, prompt: { persona: personaPrompt(persona), ...DRAFT_PROMPT_PARTS } };
+  }));
 
   app.put("/persona", tenanted(async (tenantId, req, reply) => {
     const parsed = PersonaInput.safeParse(req.body);

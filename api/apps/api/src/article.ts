@@ -64,7 +64,7 @@ export async function draftArticleFromTicket(tenantId: string, ticketId: string)
     .join("\n")
     .slice(0, 12000);
 
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "general" });
   if (typeof driver.complete === "function") {
     try {
       const parsed = parseDraft(await driver.complete(SYSTEM_PROMPT, transcript));

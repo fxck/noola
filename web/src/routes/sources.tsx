@@ -1409,6 +1409,13 @@ function OutcomeBadge({ outcome }: { outcome: CrawlLogEntry["outcome"] }) {
       </span>
     );
   }
+  if (outcome === "not_found") {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1 text-muted-foreground" title="The listed Markdown URL served the site's not-found page, so it was skipped">
+        <X className="size-3" /> not found
+      </span>
+    );
+  }
   if (outcome === "failed") {
     return (
       <span className="inline-flex shrink-0 items-center gap-1 text-destructive" title="Fetch/parse failed — skipped">

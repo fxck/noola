@@ -12,6 +12,7 @@ import { routeFloor, roleAtLeast } from "./rbac.js";
 import { ensureTicketsCollection, reindexAllTickets, ensureKbCollection, reindexAllArticles, ensureChunksCollection, reindexAllChunks } from "./search.js";
 import { ensureThreadsCollection, reindexAllThreads } from "./threads.js";
 import { ensureVectorCollections, reindexAllVectors } from "./vector.js";
+import { redetectTicketLocales } from "./locale.js";
 import { startDiscord } from "./discord-gateway.js";
 import { drainDiscordRelay } from "./discord-relay-outbox.js";
 import { drainScheduledReplies } from "./scheduled-replies.js";
@@ -22,7 +23,7 @@ import { runScheduledSourceRefresh } from "./sources.js";
 import { wakeSnoozedTickets } from "./tickets.js";
 import { runBroadcastScheduler } from "./broadcast-scheduler.js";
 import { runZeropsCatalogScheduler } from "./zerops-catalog.js";
-import { runRetentionSweep } from "./governance.js";
+import { runRetentionSweep, runTraceRetentionSweep } from "./governance.js";
 import { pollEmail } from "./email.js";
 import { pollTelegram } from "./telegram.js";
 // ---- Route plugins (domain modules; see ./routes/*.ts) ----
@@ -462,6 +463,7 @@ void ensureThreadsCollection()
 void ensureVectorCollections()
   .then(() => reindexAllVectors(app.log))
   .catch((err) => app.log.warn({ err }, "qdrant ensure/backfill failed"));
+void redetectTicketLocales(app.log).catch((err) => app.log.warn({ err }, "ticket language re-detection failed"));
 setInterval(() => void drainOutbox(), 500);
 // Discord ops-mirror relay outbox (0113): deliver mirror messages/notes + promote ✅ reacts durably,
 // surviving degraded Discord connections and process restarts. Single-flight internally; 1s cadence.
@@ -507,6 +509,9 @@ setInterval(() => void runZeropsCatalogScheduler(app.log), 60 * 60_000);
 // no-op for tenants without a window; 6h cadence (idempotent), first pass shortly after boot.
 setTimeout(() => void runRetentionSweep(app.log), 120_000);
 setInterval(() => void runRetentionSweep(app.log), 6 * 60 * 60_000);
+// AI draft traces past each workspace's trace retention, on the same cadence.
+setTimeout(() => void runTraceRetentionSweep(app.log), 150_000);
+setInterval(() => void runTraceRetentionSweep(app.log), 6 * 60 * 60_000);
 // Inbound email: poll Mailpit (dev/stage) for new customer mail. No-ops when
 // MAILPIT_API_URL is unset (like initNats/startDiscord without a backend).
 if (process.env.MAILPIT_API_URL) setInterval(() => void pollEmail(app.log), 3000);

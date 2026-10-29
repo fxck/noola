@@ -40,6 +40,7 @@ function shellConfig(pathname: string): {
   if (seg === "features") return { active: "features" };
   if (seg === "broadcasts") return { active: "broadcasts" };
   if (seg === "analytics") return { active: "analytics" };
+  if (seg === "ai-traces") return { active: "traces" };
   if (seg === "studio") return { active: "studio" };
   if (seg === "settings") return { active: "settings" };
   return { active: "inbox" };

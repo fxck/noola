@@ -1,4 +1,4 @@
-import { withTenant } from "@repo/db";
+import { withTenant, relayPool } from "@repo/db";
 
 // Wave 4: conversational reach — language detection. A deterministic, always-on classifier that
 // names the primary language of a conversation (ISO 639-1). Free, air-gap-safe, no model call:
@@ -18,6 +18,10 @@ export const LANGUAGE_NAMES: Record<string, string> = {
   pt: "Portuguese",
   it: "Italian",
   nl: "Dutch",
+  cs: "Czech",
+  sk: "Slovak",
+  pl: "Polish",
+  hu: "Hungarian",
   ru: "Russian",
   uk: "Ukrainian",
   zh: "Chinese",
@@ -60,9 +64,13 @@ const STOPWORDS: Record<string, string[]> = {
   es: ["el", "la", "los", "las", "que", "de", "y", "es", "un", "una", "por", "para", "con", "no", "se", "su", "como", "hola", "gracias", "pero"],
   fr: ["le", "la", "les", "de", "et", "un", "une", "que", "pour", "pas", "vous", "je", "est", "avec", "bonjour", "merci", "mais", "ce", "sur", "nous"],
   de: ["der", "die", "das", "und", "ist", "ich", "nicht", "ein", "eine", "sie", "mit", "für", "auf", "wie", "hallo", "danke", "aber", "auch", "haben", "mein"],
-  pt: ["o", "a", "os", "as", "de", "que", "e", "um", "uma", "para", "com", "não", "por", "se", "como", "olá", "obrigado", "mas", "meu", "você"],
+  pt: ["o", "está", "os", "as", "de", "que", "e", "um", "uma", "para", "com", "não", "por", "se", "como", "olá", "obrigado", "mas", "meu", "você"],
   it: ["il", "la", "di", "che", "e", "un", "una", "per", "non", "con", "come", "sono", "ciao", "grazie", "ma", "questo", "mio", "sono", "anche", "molto"],
   nl: ["de", "het", "een", "en", "is", "van", "ik", "niet", "je", "dat", "met", "voor", "hoe", "hallo", "bedankt", "maar", "mijn", "ook", "wij", "kan"],
+  cs: ["je", "se", "na", "že", "jsem", "není", "jak", "ale", "pro", "jsou", "když", "nebo", "prosím", "děkuji", "dobrý", "mám", "můj", "už", "také", "bych"],
+  sk: ["je", "sa", "na", "že", "som", "nie", "ako", "ale", "pre", "sú", "keď", "alebo", "prosím", "ďakujem", "dobrý", "mám", "môj", "už", "tiež", "by"],
+  pl: ["mogę", "w", "nie", "się", "na", "że", "jest", "jak", "ale", "dla", "czy", "jestem", "proszę", "dziękuję", "mam", "mój", "moje", "też", "bardzo", "dzień"],
+  hu: ["szeretnék", "az", "és", "hogy", "nem", "tudok", "egy", "van", "meg", "de", "ez", "csak", "már", "kérem", "köszönöm", "szia", "vagy", "nincs", "jó", "napot"],
 };
 
 const WORD_RE = /[\p{L}]+/gu;
@@ -111,6 +119,9 @@ export function detectLanguage(text: string | null | undefined): string | null {
   return null;
 }
 
+/** Raise this when the detector names languages differently, so the startup re-detection revisits every ticket. */
+export const LOCALE_DETECTOR_VERSION = 2;
+
 /**
  * Detect and stamp the ticket's locale from a customer message — but only once. The migration keeps
  * locale stable per conversation (it reflects the customer's language, set by their first message),
@@ -127,8 +138,8 @@ export async function updateTicketLocale(
   try {
     const r = await withTenant(tenantId, (c) =>
       c.query(
-        "UPDATE tickets SET locale = $1 WHERE id = $2 AND locale IS NULL RETURNING locale",
-        [detected, ticketId],
+        "UPDATE tickets SET locale = $1, locale_version = $3 WHERE id = $2 AND locale IS NULL RETURNING locale",
+        [detected, ticketId, LOCALE_DETECTOR_VERSION],
       ),
     );
     // If the row already had a locale, RETURNING is empty — read it back so callers get the truth.
@@ -140,4 +151,54 @@ export async function updateTicketLocale(
   } catch {
     return null;
   }
+}
+
+type ReLog = { info?: (o: unknown, m?: string) => void; warn?: (o: unknown, m?: string) => void };
+
+/**
+ * Re-detects the language of every ticket that an older detector named, from its first customer messages.
+ * A ticket whose messages name no language gets none, so nothing translates its replies into a wrong one.
+ */
+export async function redetectTicketLocales(log?: ReLog): Promise<number> {
+  let after = "00000000-0000-0000-0000-000000000000";
+  let changed = 0;
+  for (;;) {
+    // The relay role reads across workspaces but can't write tickets, so each workspace's batch is written under its own tenant.
+    const r = await relayPool.query<{ tenant_id: string; id: string; locale: string | null; bodies: string[] | null }>(
+      `SELECT t.tenant_id, t.id, t.locale,
+              (SELECT array_agg(f.body ORDER BY f.created_at)
+                 FROM (SELECT m.body, m.created_at FROM messages m
+                        WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id
+                          AND m.author_type = 'customer' AND m.deleted_at IS NULL
+                        ORDER BY m.created_at LIMIT 5) f) AS bodies
+         FROM tickets t
+        WHERE (t.locale_version IS NULL OR t.locale_version < $1) AND t.id > $2
+        ORDER BY t.id LIMIT 500`,
+      [LOCALE_DETECTOR_VERSION, after],
+    );
+    if (r.rows.length === 0) break;
+    after = r.rows[r.rows.length - 1].id;
+    const byTenant = new Map<string, { ids: string[]; locales: (string | null)[] }>();
+    for (const row of r.rows) {
+      const locale = (row.bodies ?? []).map((b) => detectLanguage(b)).find((l) => l !== null) ?? null;
+      if (locale !== row.locale) changed++;
+      const batch = byTenant.get(row.tenant_id) ?? { ids: [], locales: [] };
+      batch.ids.push(row.id);
+      batch.locales.push(locale);
+      byTenant.set(row.tenant_id, batch);
+    }
+    for (const [tenantId, batch] of byTenant) {
+      await withTenant(tenantId, (c) =>
+        c.query(
+          // A ticket that ingest or another api instance has updated since the read keeps its newer language.
+          `UPDATE tickets SET locale = v.locale, locale_version = $3
+             FROM unnest($1::uuid[], $2::text[]) AS v(id, locale)
+            WHERE tickets.id = v.id AND (tickets.locale_version IS NULL OR tickets.locale_version < $3)`,
+          [batch.ids, batch.locales, LOCALE_DETECTOR_VERSION],
+        ),
+      );
+    }
+  }
+  if (changed) log?.info?.({ changed }, "ticket languages re-detected");
+  return changed;
 }
