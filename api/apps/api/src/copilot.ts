@@ -4,10 +4,12 @@ import { resolveModelDriver } from "./modelconfig.js";
 import { personaFragment } from "./persona.js";
 import { searchArticles, hydrateArticles } from "./kb.js";
 import { searchDocuments, listDocuments, hydrateChunks } from "./documents.js";
+import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
 import { searchResolvedThreads, hydrateThreads } from "./threads.js";
 import { vectorSearch, type VectorCollection } from "./vector.js";
 import { recordDraftTrace } from "./trace.js";
 import { isContentGap, recordKnowledgeGap } from "./gaps.js";
+import { searchQueryFor } from "./docs-search.js";
 
 // Copilot: the retrieval-augmented suggested reply. Given a ticket (or a bare
 // query, for eval), it takes the latest customer message, retrieves the most
@@ -40,7 +42,7 @@ const STOP = new Set(
 
 /** Reduce free text to distinctive content words, longest (most specific) first. */
 export function keywords(text: string): string[] {
-  const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  const words = text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
   const kept = words.filter((w) => w.length > 2 && !STOP.has(w));
   return [...new Set(kept)].sort((a, b) => b.length - a.length);
 }
@@ -98,6 +100,8 @@ function rrfMerge<T>(
 export interface SearchRanks {
   keyword?: number;
   meaning?: number;
+  /** With a search query, whether the query, the customer's message or both found the source. */
+  foundBy?: "query" | "message" | "both";
 }
 
 interface Ranked<T> {
@@ -129,6 +133,38 @@ async function hybrid<T>(
   vec.forEach((item, i) => ranks.set(idOf(item), { meaning: i + 1 }));
   kw.forEach((item, i) => ranks.set(idOf(item), { keyword: i + 1, ...ranks.get(idOf(item)) }));
   return { ...rrfMerge([vec, kw], idOf), ranks };
+}
+
+/**
+ * The search query's results ranked ahead of the message's own, which count at half weight for the order only.
+ * The scores stay unhalved, so the gate and the gap detector see how well the docs actually matched.
+ */
+export function mergeQueryRuns<T>(query: Ranked<T>, message: Ranked<T>, idOf: (t: T) => string): Ranked<T> {
+  const halved = new Map([...message.scores].map(([id, score]) => [id, score / 2]));
+  const { items } = mergeBest(query, { items: message.items, scores: halved }, idOf);
+  // A source that both runs found shows the ranks of the run that gave its score.
+  const ranks = new Map<string, SearchRanks>();
+  for (const [id, r] of message.ranks) ranks.set(id, { ...r, foundBy: "message" });
+  for (const [id, r] of query.ranks) {
+    const fromMessage = ranks.get(id);
+    const better = fromMessage && (message.scores.get(id) ?? 0) > (query.scores.get(id) ?? 0) ? fromMessage : r;
+    ranks.set(id, { ...better, foundBy: fromMessage ? "both" : "query" });
+  }
+  return { items, scores: mergeBest(query, message, idOf).scores, ranks };
+}
+
+/** Two retrievals of one surface, each item at its better score. A score is never summed across them, so the gate's thresholds keep their meaning. */
+export function mergeBest<T>(
+  a: { items: T[]; scores: Map<string, number> },
+  b: { items: T[]; scores: Map<string, number> },
+  idOf: (t: T) => string,
+): { items: T[]; scores: Map<string, number> } {
+  const scores = new Map(a.scores);
+  for (const [id, score] of b.scores) scores.set(id, Math.max(score, scores.get(id) ?? 0));
+  const seen = new Map<string, T>();
+  for (const item of [...a.items, ...b.items]) if (!seen.has(idOf(item))) seen.set(idOf(item), item);
+  const items = [...seen.values()].sort((x, y) => (scores.get(idOf(y)) ?? 0) - (scores.get(idOf(x)) ?? 0));
+  return { items, scores };
 }
 
 export interface Citation {
@@ -229,8 +265,8 @@ export interface SuggestOpts {
 
 const EXCERPT_CHARS = 240;
 
-function rankFields(r: SearchRanks | undefined): { keywordRank?: number; meaningRank?: number } {
-  return { keywordRank: r?.keyword, meaningRank: r?.meaning };
+function rankFields(r: SearchRanks | undefined): { keywordRank?: number; meaningRank?: number; foundBy?: SearchRanks["foundBy"] } {
+  return { keywordRank: r?.keyword, meaningRank: r?.meaning, foundBy: r?.foundBy };
 }
 
 const EMPTY_RETRIEVAL: RetrievalSummary = { topScore: 0, citedKinds: [], agreement: 0, perCitation: [] };
@@ -271,11 +307,11 @@ export async function suggestForQuery(
   }
 
   const prep = await prepareDraft(tenantId, query, opts, started);
-  // Public groundedness guard: never let a customer-facing answer free-form when retrieval found
-  // nothing in scope (empty KB + Documents off = the firewall/nftables hallucination). Deflect + record.
-  if (opts.audience === "public" && prep.groundingCount === 0) {
-    return prep.finalize({ text: PUBLIC_NO_GROUNDING_DEFLECTION, confidence: 0 }, "grounding-guard", 0);
-  }
+  // A public answer with no sources gets the fixed deflection.
+  // A hosted model that can tag its answer may answer instead, if safeWithoutSources accepts it.
+  const ungrounded = opts.audience === "public" && prep.groundingCount === 0;
+  const deflect = () => prep.finalize({ text: PUBLIC_NO_GROUNDING_DEFLECTION, confidence: 0 }, "grounding-guard", 0);
+  if (ungrounded && !prep.answersWithoutSources) return deflect();
   const draftStarted = Date.now();
   let result: DraftResult;
   let model: string;
@@ -283,9 +319,11 @@ export async function suggestForQuery(
     result = await prep.driver.draftReply(prep.draftInput);
     model = prep.driver.name;
   } catch {
+    if (ungrounded) return deflect();
     result = await modelDriver.draftReply(prep.draftInput);
     model = `${modelDriver.name} (fallback)`;
   }
+  if (ungrounded && !safeWithoutSources(result.text)) return deflect();
   return prep.finalize(result, model, Date.now() - draftStarted);
 }
 
@@ -308,10 +346,16 @@ export async function* suggestForQueryStream(
   }
 
   const prep = await prepareDraft(tenantId, query, opts, started);
-  // Public groundedness guard (streaming sibling): deflect whole rather than stream an ungrounded answer.
+  // A public answer with no sources is drafted whole and checked before anything reaches the customer.
   if (opts.audience === "public" && prep.groundingCount === 0) {
-    yield { delta: PUBLIC_NO_GROUNDING_DEFLECTION };
-    return prep.finalize({ text: PUBLIC_NO_GROUNDING_DEFLECTION, confidence: 0 }, "grounding-guard", 0);
+    const draftStarted = Date.now();
+    const dr = prep.answersWithoutSources ? await prep.driver.draftReply(prep.draftInput).catch(() => null) : null;
+    if (!dr || !safeWithoutSources(dr.text)) {
+      yield { delta: PUBLIC_NO_GROUNDING_DEFLECTION };
+      return prep.finalize({ text: PUBLIC_NO_GROUNDING_DEFLECTION, confidence: 0 }, "grounding-guard", 0);
+    }
+    yield { delta: dr.text };
+    return prep.finalize(dr, prep.driver.name, Date.now() - draftStarted);
   }
   const draftStarted = Date.now();
   let text = "";
@@ -391,9 +435,11 @@ async function prepareDraft(
   draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[]; outcomes?: boolean };
   citations: Citation[];
   retrieval: RetrievalSummary;
-  /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model would
-   *  have to free-form — the entry points deflect instead of letting it hallucinate. */
+  /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model has nothing to ground on,
+   *  so the entry points deflect unless the model's answer states nothing (safeWithoutSources). */
   groundingCount: number;
+  /** A hosted model asked for answer tags can answer without sources, as it can skip a thank-you or ask what the customer needs. */
+  answersWithoutSources: boolean;
   finalize: (result: DraftResult, model: string, latencyMs: number) => Promise<Suggestion>;
 }> {
   const source = opts.source ?? "live";
@@ -407,27 +453,44 @@ async function prepareDraft(
     ? new Set(opts.forceScope)
     : await audienceScope(tenantId, opts.audience ?? "agent");
   const NONE = { items: [] as never[], scores: new Map<string, number>(), ranks: new Map<string, SearchRanks>() };
-  const queryVector = (await embeddingDriver.embed([query]))?.[0] ?? null;
-  const [artR, thrR, chkR] = await Promise.all([
-    scope.has("kb")
-      ? hybrid(
-          () => retrieve((q) => searchArticles(tenantId, q), query, (a) => `${a.title} ${a.body}`),
-          "kb", tenantId, queryVector, (ids) => hydrateArticles(tenantId, ids), (a) => a.id,
-        )
-      : Promise.resolve(NONE),
-    scope.has("thread")
-      ? hybrid(
-          () => retrieve((q) => searchResolvedThreads(tenantId, q), query, (t) => `${t.subject} ${t.text}`),
-          "threads", tenantId, queryVector, (ids) => hydrateThreads(tenantId, ids), (t) => t.ticket_id,
-        )
-      : Promise.resolve(NONE),
-    scope.has("document")
-      ? hybrid(
-          () => retrieve((q) => searchDocuments(tenantId, q), query, (ch) => ch.text),
-          "chunks", tenantId, queryVector, (ids) => hydrateChunks(tenantId, ids), (ch) => ch.id,
-        )
-      : Promise.resolve(NONE),
+  const retrieveAll = async (text: string) => {
+    const queryVector = (await embeddingDriver.embed([text]))?.[0] ?? null;
+    return Promise.all([
+      scope.has("kb")
+        ? hybrid(
+            () => retrieve((q) => searchArticles(tenantId, q), text, (a) => `${a.title} ${a.body}`),
+            "kb", tenantId, queryVector, (ids) => hydrateArticles(tenantId, ids), (a) => a.id,
+          )
+        : Promise.resolve(NONE),
+      scope.has("thread")
+        ? hybrid(
+            () => retrieve((q) => searchResolvedThreads(tenantId, q), text, (t) => `${t.subject} ${t.text}`),
+            "threads", tenantId, queryVector, (ids) => hydrateThreads(tenantId, ids), (t) => t.ticket_id,
+          )
+        : Promise.resolve(NONE),
+      scope.has("document")
+        ? hybrid(
+            () => retrieve((q) => searchDocuments(tenantId, q), text, (ch) => ch.text),
+            "chunks", tenantId, queryVector, (ids) => hydrateChunks(tenantId, ids), (ch) => ch.id,
+          )
+        : Promise.resolve(NONE),
+    ]);
+  };
+  // Conversation history (best-effort) so the draft is context-aware — a follow-up must see the
+  // prior turns, not answer blind. Ticket-scoped; a bare query (raw /suggest, eval) → no history.
+  const history = ticketId ? await loadHistory(tenantId, ticketId, messageId).catch(() => []) : [];
+  // A model-written search query matches the docs better than a long or foreign message, so its results lead.
+  const [original, searchQuery] = await Promise.all([
+    retrieveAll(query),
+    searchQueryFor(tenantId, query, history).catch(() => null),
   ]);
+  let [artR, thrR, chkR] = original;
+  if (searchQuery) {
+    const [art2, thr2, chk2] = await retrieveAll(searchQuery);
+    artR = mergeQueryRuns(art2, artR, (a) => a.id);
+    thrR = mergeQueryRuns(thr2, thrR, (t) => t.ticket_id);
+    chkR = mergeQueryRuns(chk2, chkR, (ch) => ch.id);
+  }
 
   const kbTop = artR.items.slice(0, MAX_ARTICLES);
   const threadTop = thrR.items.slice(0, MAX_THREADS);
@@ -502,9 +565,6 @@ async function prepareDraft(
   // The tenant's configured voice (persona.ts) steers the hosted draft; empty/unconfigured is a
   // no-op. Best-effort — a persona lookup failure must never block a draft.
   const persona = await personaFragment(tenantId).catch(() => "");
-  // Conversation history (best-effort) so the draft is context-aware — a follow-up must see the
-  // prior turns, not answer blind. Ticket-scoped; a bare query (raw /suggest, eval) → no history.
-  const history = ticketId ? await loadHistory(tenantId, ticketId, messageId).catch(() => []) : [];
   // Current-turn images (widget screenshots) ride along to a vision model as image content-blocks —
   // extra context on TOP of the text-driven retrieval, never a substitute for grounding.
   const draftInput = { customerMessage: query, sources: grounding, persona, history, images: opts.images, outcomes: opts.outcomes };
@@ -518,14 +578,17 @@ async function prepareDraft(
       ...traceDetails[i],
     }));
     const traceId = await recordDraftTrace({
-      tenantId, ticketId, messageId, query, sources: traceSources, retrieval,
+      tenantId, ticketId, messageId, query, searchQuery, sources: traceSources, retrieval,
       draft: result.text, model, embedModel: embeddingDriver.name,
       confidence: result.confidence ?? null, tokensIn: result.tokensIn ?? null,
       tokensOut: result.tokensOut ?? null, latencyMs: Date.now() - started, source,
     });
     // Content-gap detection: weak retrieval means the KB couldn't answer this — record it
     // (clustered, best-effort) so it surfaces in the Sources worklist and routes back to authoring.
-    if (isContentGap(retrieval.agreement, retrieval.topScore)) {
+    // A message the model chose not to answer, such as a thank-you, asked nothing the docs could miss.
+    const parsed = result.outcomes === true && hasOutcomeTag(result.text) ? parseDraftOutcome(result.text) : null;
+    const noReply = parsed?.kind === "ok" && parsed.noReply;
+    if (isContentGap(retrieval.agreement, retrieval.topScore) && !noReply) {
       void recordKnowledgeGap(tenantId, {
         query, confidence: result.confidence ?? null, topScore: retrieval.topScore,
         agreement: retrieval.agreement, source, ticketId,
@@ -539,14 +602,29 @@ async function prepareDraft(
     };
   };
 
-  return { driver, draftInput, citations, retrieval, groundingCount: grounding.length, finalize };
+  const answersWithoutSources = draftInput.outcomes === true && typeof driver.complete === "function";
+  return { driver, draftInput, citations, retrieval, groundingCount: grounding.length, answersWithoutSources, finalize };
 }
 
-/** Shown to a PUBLIC asker (widget / autoreply) when retrieval returned NOTHING in scope. The draft
- *  system prompt already says to answer "grounded ONLY in the provided sources" — with zero sources a
- *  hosted model still free-forms (the observed nftables/firewall hallucination), so we short-circuit
- *  before the model call with an honest deflection that routes to a human, rather than invent an
- *  answer. Agent-assist drafts are exempt (an agent can write from an empty draft). */
+// Longer than this, a reply without sources is explaining something, which it has nothing to base on.
+const UNGROUNDED_REPLY_MAX = 400;
+
+/**
+ * Whether an answer written without sources is safe to send: it states nothing about the product.
+ * That is no reply, a note for the team alone, or a short reply that asks a question or hands off.
+ */
+export function safeWithoutSources(draft: string): boolean {
+  const parsed = hasOutcomeTag(draft) ? parseDraftOutcome(draft) : { kind: "ok" as const, reply: draft.trim(), noReply: false, handoff: false };
+  if (parsed.kind !== "ok") return false;
+  if (parsed.noReply || !parsed.reply.trim()) return true;
+  const reply = parsed.reply.trim();
+  return reply.length <= UNGROUNDED_REPLY_MAX && (parsed.handoff || /[?？؟]["')\]」]*$/.test(reply));
+}
+
+/**
+ * Sent to a public asker when retrieval found nothing and no hosted model's answer passes safeWithoutSources.
+ * A prompt alone doesn't stop a model inventing facts without sources, so this check is in code.
+ */
 const PUBLIC_NO_GROUNDING_DEFLECTION =
   "I don't have anything in our documentation about that yet, so I don't want to guess and risk giving you the wrong answer. I've flagged it for the team — if you'd like, ask to talk to a human and a teammate will help you out.";
 

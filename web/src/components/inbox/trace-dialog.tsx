@@ -121,6 +121,7 @@ function SourceTitle({ s }: { s: TraceSource }) {
 }
 
 const SOURCE_KINDS: Record<string, string> = { kb: "article", thread: "conversation", document: "document" };
+const FOUND_BY: Record<string, string> = { query: "AI query", message: "Message", both: "Both" };
 
 // A source that only one of the two searches found scores at most 1/61 in the api's fusion.
 const ONE_SEARCH_MAX = 1 / 61 + 1e-9;
@@ -144,6 +145,7 @@ const RANK_CELL = "w-14 shrink-0 text-right font-mono tabular-nums";
 
 function SourceList({ sources }: { sources: TraceSource[] }) {
   const ranked = sources.some((s) => s.keywordRank != null || s.meaningRank != null);
+  const withQuery = sources.some((s) => s.foundBy != null);
   return (
     <div className="space-y-1">
       <p className="text-xs text-muted-foreground">{sourcesSummary(sources)}</p>
@@ -157,6 +159,7 @@ function SourceList({ sources }: { sources: TraceSource[] }) {
         ) : (
           <span className="w-32 shrink-0 text-right">Match</span>
         )}
+        {withQuery && <span className={RANK_CELL} title="Which search text found it">Found by</span>}
       </div>
       <ul className="space-y-2">
         {sources.map((s, i) => (
@@ -176,6 +179,14 @@ function SourceList({ sources }: { sources: TraceSource[] }) {
               ) : (
                 <span className="w-32 shrink-0 text-right text-muted-foreground">
                   {s.score > ONE_SEARCH_MAX ? "both searches" : s.score > 0 ? "one search" : "—"}
+                </span>
+              )}
+              {withQuery && (
+                <span
+                  className={cn(RANK_CELL, "font-sans text-muted-foreground")}
+                  title={s.foundBy === "both" ? "The ranks are from the search text that scored it higher" : undefined}
+                >
+                  {s.foundBy ? FOUND_BY[s.foundBy] : "—"}
                 </span>
               )}
             </div>
@@ -299,6 +310,12 @@ function TraceBody({ t }: { t: TraceDetail }) {
           {t.query || <span className="text-muted-foreground">(empty)</span>}
         </p>
       </Section>
+
+      {t.searchQuery && (
+        <Section title="Searched the docs as">
+          <p className="whitespace-pre-wrap break-words rounded-lg border bg-muted/30 px-3 py-2 text-sm text-foreground">{t.searchQuery}</p>
+        </Section>
+      )}
 
       <Section title="Model's raw output">
         <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed text-foreground">

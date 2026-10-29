@@ -81,6 +81,23 @@ export async function deleteArticle(id: string): Promise<void> {
   await api(`/kb/${id}`, { method: "DELETE" });
 }
 
+export interface ArticleLanguage {
+  /** The detected language of the text, or null when there isn't enough to tell. */
+  locale: string | null;
+  workspaceLocale: string;
+  /** Only a hosted AI model can translate. */
+  canTranslate: boolean;
+}
+
+export async function detectArticleLanguage(text: string): Promise<ArticleLanguage> {
+  return api<ArticleLanguage>("/kb/language", { method: "POST", body: JSON.stringify({ text }) });
+}
+
+/** The title and body translated into the workspace language. */
+export async function translateArticle(title: string, body: string): Promise<{ title: string; body: string; locale: string }> {
+  return api("/kb/translate", { method: "POST", body: JSON.stringify({ title, body }) });
+}
+
 // ---- Collections --------------------------------------------------------
 export async function fetchCollections(): Promise<KbCollection[]> {
   return (await api<{ collections: KbCollection[] }>("/kb/collections")).collections;

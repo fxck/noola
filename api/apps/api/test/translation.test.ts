@@ -1,5 +1,5 @@
 import { appPool, relayPool, withTenant } from "@repo/db";
-import { detectLanguage, localeName } from "../src/locale.js";
+import { detectLanguage, localeName, redetectTicketLocales, LOCALE_DETECTOR_VERSION } from "../src/locale.js";
 import {
   getTranslationSettings,
   putTranslationSettings,
@@ -35,12 +35,19 @@ const CASES: LangCase[] = [
   { text: "Olá, não consigo entrar na minha conta, obrigado", want: "pt", note: "portuguese" },
   { text: "Ciao, non riesco ad accedere al mio account, grazie", want: "it", note: "italian" },
   { text: "Hallo, ik kan niet inloggen op mijn account, bedankt", want: "nl", note: "dutch" },
+  { text: "Dobrý den, nemůžu se přihlásit ke svému účtu, děkuji", want: "cs", note: "czech" },
+  { text: "Jak zruším předplatné?", want: "cs", note: "short czech question" },
+  { text: "Dobrý deň, neviem sa prihlásiť do svojho účtu, ďakujem", want: "sk", note: "slovak" },
+  { text: "Dzień dobry, nie mogę zalogować się na moje konto, dziękuję", want: "pl", note: "polish" },
+  { text: "Jó napot, nem tudok belépni a fiókomba, köszönöm", want: "hu", note: "hungarian" },
   { text: "Здравствуйте, я не могу войти в свою учётную запись", want: "ru", note: "russian (cyrillic)" },
   { text: "Доброго дня, я не можу увійти до свого облікового запису", want: "uk", note: "ukrainian (unique letters)" },
   { text: "こんにちは、アカウントにログインできません", want: "ja", note: "japanese (kana)" },
   { text: "안녕하세요, 제 계정에 로그인할 수 없습니다", want: "ko", note: "korean (hangul)" },
   { text: "您好，我无法登录我的帐户", want: "zh", note: "chinese (han)" },
   { text: "مرحبا، لا أستطيع تسجيل الدخول إلى حسابي", want: "ar", note: "arabic" },
+  { text: "Is there a free plan?", want: "en", note: "short english question with a and is" },
+  { text: "I need a refund", want: null, note: "english article a is not portuguese" },
   { text: "hi", want: null, note: "too short → null" },
   { text: "?!.", want: null, note: "no letters → null" },
 ];
@@ -102,6 +109,55 @@ async function main() {
   check("outbound: on but no model → passthrough + no meta (degrade, not break)", on.dispatchBody === "Here is your answer" && on.meta === null);
 
   await withTenant(A, (c) => c.query("DELETE FROM tickets WHERE id = $1", [ticketId]));
+
+  // ---- Part 4: re-detection of tickets an older detector named ----
+  const oldTicket = async (locale: string | null, bodies: string[], opts: { author?: string; deleted?: boolean } = {}) =>
+    withTenant(A, async (c) => {
+      const id = (await c.query(
+        "INSERT INTO tickets (tenant_id, subject, channel_type, locale) VALUES (current_tenant(), 'TLREDETECT', 'synthetic', $1) RETURNING id",
+        [locale],
+      )).rows[0].id as string;
+      for (const [i, body] of bodies.entries()) {
+        await c.query(
+          `INSERT INTO messages (tenant_id, ticket_id, author_type, body, created_at, deleted_at)
+             VALUES (current_tenant(), $1, $4, $2, now() + $3 * interval '1 second', CASE WHEN $5 THEN now() END)`,
+          [id, body, i, opts.author ?? "customer", opts.deleted ?? false],
+        );
+      }
+      return id;
+    });
+  const czechAsPt = await oldTicket("pt", ["Dobrý den, nemůžu se přihlásit ke svému účtu, děkuji"]);
+  const englishAsPt = await oldTicket("pt", ["I need a refund for the last invoice please"]);
+  const unclear = await oldTicket("pt", ["ok"]);
+  const laterMessage = await oldTicket(null, ["?", "Dzień dobry, nie mogę zalogować się na moje konto, dziękuję"]);
+  const agentOnly = await oldTicket("pt", ["Dobrý den, nemůžu se přihlásit ke svému účtu, děkuji"], { author: "agent" });
+  const deletedOnly = await oldTicket("pt", ["Dobrý den, nemůžu se přihlásit ke svému účtu, děkuji"], { deleted: true });
+  const noMessages = await oldTicket("pt", []);
+  const ids = [czechAsPt, englishAsPt, unclear, laterMessage, agentOnly, deletedOnly, noMessages];
+  const state = async () =>
+    Object.fromEntries((await withTenant(A, (c) =>
+      c.query("SELECT id, locale, locale_version FROM tickets WHERE id = ANY($1)", [ids]),
+    )).rows.map((r) => [r.id, r]));
+
+  await redetectTicketLocales();
+  const after = await state();
+  check("re-detection corrects a Czech ticket named Portuguese", after[czechAsPt].locale === "cs");
+  check("re-detection corrects an English ticket named Portuguese", after[englishAsPt].locale === "en");
+  check("a ticket with nothing to detect gets no language", after[unclear].locale === null);
+  check("re-detection reads past a first message with no language", after[laterMessage].locale === "pl");
+  check("a teammate's message does not name the customer's language", after[agentOnly].locale === null);
+  check("a deleted message does not name the language", after[deletedOnly].locale === null);
+  check("a ticket without messages gets no language", after[noMessages].locale === null);
+  check("re-detected tickets carry the current detector version", ids.every((id) => after[id].locale_version === LOCALE_DETECTOR_VERSION));
+
+  await withTenant(A, (c) => c.query("UPDATE tickets SET locale = 'de' WHERE id = $1", [czechAsPt]));
+  await redetectTicketLocales();
+  check("a ticket at the current version is not detected again", (await state())[czechAsPt].locale === "de");
+
+  await withTenant(A, async (c) => {
+    await c.query("DELETE FROM messages WHERE ticket_id = ANY($1)", [ids]);
+    await c.query("DELETE FROM tickets WHERE id = ANY($1)", [ids]);
+  });
   await superClean();
 
   await appPool.end();

@@ -4,6 +4,7 @@ import {
   ArrowRight,
   Bot,
   ClipboardCheck,
+  FileSearch,
   FlaskConical,
   MessageCircle,
   ScrollText,
@@ -12,6 +13,7 @@ import {
 } from "lucide-react";
 import { SettingsPage } from "@/components/settings-page";
 import { type AiOverview, fetchAiOverview } from "@/lib/ai";
+import { type DocsSearchResponse, fetchDocsSearchSettings } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 
 // The AI governance hub (Wave 5 item 22) — one read-only surface that packages the
@@ -76,12 +78,15 @@ function Line({ label, value, tone }: { label: string; value: string; tone?: "wa
 
 export function SettingsAiPage() {
   const [data, setData] = useState<AiOverview | null>(null);
+  const [docsSearch, setDocsSearch] = useState<DocsSearchResponse | null>(null);
   const [loadError, setLoadError] = useState(false);
 
   const load = useRef(async () => {
     setLoadError(false);
     try {
-      setData(await fetchAiOverview());
+      const [overview, search] = await Promise.all([fetchAiOverview(), fetchDocsSearchSettings().catch(() => null)]);
+      setData(overview);
+      setDocsSearch(search);
     } catch {
       setLoadError(true);
     }
@@ -141,6 +146,20 @@ export function SettingsAiPage() {
                   <GovernCard icon={MessageCircle} title="Voice" to="/settings/persona">
                     <Line label="Persona" value={data.persona.configured ? "Configured" : "Default"} />
                     <Line label="Tone" value={data.persona.tone} />
+                  </GovernCard>
+
+                  <GovernCard icon={FileSearch} title="Docs search" to="/settings/docs-search">
+                    {docsSearch ? (
+                      <>
+                        <Line label="Rewrite questions" value={docsSearch.settings.rewrite ? "On" : "Off"} />
+                        <Line label="About your product" value={docsSearch.settings.product ? "Described" : "Not set"} />
+                        <Line label="Prompt" value={docsSearch.settings.prompt == null ? "Default" : "Custom"} />
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        How the AI turns a customer's message into a search of your docs.
+                      </p>
+                    )}
                   </GovernCard>
 
                   <GovernCard icon={Bot} title="Autoreply & routing" to="/settings/autoreply">

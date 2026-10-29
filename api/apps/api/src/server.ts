@@ -12,6 +12,7 @@ import { routeFloor, roleAtLeast } from "./rbac.js";
 import { ensureTicketsCollection, reindexAllTickets, ensureKbCollection, reindexAllArticles, ensureChunksCollection, reindexAllChunks } from "./search.js";
 import { ensureThreadsCollection, reindexAllThreads } from "./threads.js";
 import { ensureVectorCollections, reindexAllVectors } from "./vector.js";
+import { redetectTicketLocales } from "./locale.js";
 import { startDiscord } from "./discord-gateway.js";
 import { drainDiscordRelay } from "./discord-relay-outbox.js";
 import { drainScheduledReplies } from "./scheduled-replies.js";
@@ -462,6 +463,7 @@ void ensureThreadsCollection()
 void ensureVectorCollections()
   .then(() => reindexAllVectors(app.log))
   .catch((err) => app.log.warn({ err }, "qdrant ensure/backfill failed"));
+void redetectTicketLocales(app.log).catch((err) => app.log.warn({ err }, "ticket language re-detection failed"));
 setInterval(() => void drainOutbox(), 500);
 // Discord ops-mirror relay outbox (0113): deliver mirror messages/notes + promote ✅ reacts durably,
 // surviving degraded Discord connections and process restarts. Single-flight internally; 1s cadence.

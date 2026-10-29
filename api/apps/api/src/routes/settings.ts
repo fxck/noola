@@ -4,7 +4,7 @@ import { authPool, withTenant } from "@repo/db";
 import { putBuffer } from "../storage.js";
 import {
   ModelConfigInput, AutoreplyPolicyInput, DiscordLinkInput, DiscordBotInput, EmailLinkInput, SlackConnectionInput,
-  TranslationSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
+  TranslationSettingsInput, DocsSearchSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { getModelConfig, listAvailableModels, putModelConfig, testModelConfig } from "../modelconfig.js";
@@ -13,6 +13,7 @@ import {
   getPolicy, putPolicy, listDecisionsForTicket, listQueue, sendQueued, dismissQueued,
   enqueueBacklog, drainJobs, listJobs,
 } from "../autoreply.js";
+import { getDocsSearchSettings, putDocsSearchSettings, DEFAULT_SEARCH_PROMPT, SEARCH_REPLY_FORMAT } from "../docs-search.js";
 import { patchTraceOutcome, getTrace, listTicketTraces, listTraces, parseTraceListQuery, type TraceListQuery } from "../trace.js";
 import {
   linkGuild, listDiscordChannelBindings, replaceDiscordChannelBindings,
@@ -87,14 +88,26 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
   app.get("/settings/model/available", tenanted(async (tenantId) => ({ models: await listAvailableModels(tenantId) })));
 
   // ---- Settings: translation (Wave 4) --------------------------------------
-  // The workspace language + the auto-translate master switch. Detection + the language analytics
-  // run regardless; this only governs whether foreign messages/replies get bridged through the model.
+  // The workspace language and translation of conversations for the team. Language detection and the language analytics run regardless.
   app.get("/settings/translation", tenanted(async (tenantId) => getTranslationSettings(tenantId)));
 
   app.put("/settings/translation", tenanted(async (tenantId, req, reply) => {
     const parsed = TranslationSettingsInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     return putTranslationSettings(tenantId, parsed.data);
+  }));
+
+  // ---- Settings: docs search -------------------------------------------------
+  app.get("/settings/docs-search", tenanted(async (tenantId) => ({
+    settings: await getDocsSearchSettings(tenantId),
+    defaultPrompt: DEFAULT_SEARCH_PROMPT,
+    replyFormat: SEARCH_REPLY_FORMAT,
+  })));
+
+  app.put("/settings/docs-search", tenanted(async (tenantId, req, reply) => {
+    const parsed = DocsSearchSettingsInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return { settings: await putDocsSearchSettings(tenantId, parsed.data), defaultPrompt: DEFAULT_SEARCH_PROMPT, replyFormat: SEARCH_REPLY_FORMAT };
   }));
 
   // ---- Settings: auto-tagging rules (STUDIO-SEEDED-FLOWS.md #1) -------------

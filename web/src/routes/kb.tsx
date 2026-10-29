@@ -17,7 +17,10 @@ import {
   ArrowUpRight,
   MoreHorizontal,
   List as ListIcon,
+  Languages,
+  X,
 } from "lucide-react";
+import type { LexicalEditor } from "lexical";
 import {
   type KbArticle,
   type KbCollection,
@@ -28,7 +31,12 @@ import {
   updateArticle,
   deleteCollection,
   fetchCollections,
+  detectArticleLanguage,
+  translateArticle,
+  type ArticleLanguage,
 } from "@/lib/kb";
+import { localeName } from "@/lib/settings";
+import type { ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -36,7 +44,7 @@ import { RowsSkeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { Badge } from "@/components/ui/badge";
-import { RichTextEditor } from "@/components/editor/rich-text-editor";
+import { RichTextEditor, setEditorMarkdown } from "@/components/editor/rich-text-editor";
 import { ArticleBody } from "@/components/editor/article-body";
 import { Combobox, type ComboOption } from "@/components/ui/combobox";
 import { Popover } from "@/components/ui/popover";
@@ -1291,6 +1299,79 @@ export function ArticleEditor({
     setEditorSeed((s) => s + 1);
   }
 
+  // Answers search the knowledge base in the workspace language, so an article in another language is offered a translation.
+  const editorRef = useRef<LexicalEditor | null>(null);
+  const [language, setLanguage] = useState<ArticleLanguage | null>(null);
+  const [translating, setTranslating] = useState(false);
+  const [beforeTranslation, setBeforeTranslation] = useState<{ title: string; body: string; serialized: string | null } | null>(null);
+
+  // Detection waits for a pause in typing and for enough text to tell the language.
+  useEffect(() => {
+    const text = `${title}\n\n${body}`.trim();
+    if (text.length < 40) {
+      setLanguage(null);
+      return;
+    }
+    let live = true;
+    const timer = setTimeout(() => {
+      // The server reads only the start of the prose, so a long article sends just its beginning.
+      detectArticleLanguage(text.slice(0, 8000))
+        .then((l) => live && setLanguage(l))
+        .catch(() => {});
+    }, 800);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [title, body]);
+
+  function replaceBody(md: string): string | null {
+    if (editorRef.current) return setEditorMarkdown(editorRef.current, md);
+    seedTemplate(md);
+    return null;
+  }
+
+  // Ctrl+Z back to the untranslated body also restores the title.
+  useEffect(() => {
+    if (beforeTranslation?.serialized != null && body === beforeTranslation.serialized) {
+      setTitle(beforeTranslation.title);
+      setBeforeTranslation(null);
+    }
+  }, [body, beforeTranslation]);
+
+  async function translate() {
+    if (translating) return;
+    setTranslating(true);
+    setError(null);
+    // Typing during the translation would be overwritten by it.
+    editorRef.current?.setEditable(false);
+    try {
+      const out = await translateArticle(title, body);
+      const serialized = replaceBody(out.body);
+      setBeforeTranslation({ title, body, serialized });
+      setTitle(out.title);
+    } catch (e) {
+      const msg = (e as ApiError).detail ?? "Couldn't translate the article. Please try again.";
+      setError(msg);
+      onError?.(msg);
+    } finally {
+      editorRef.current?.setEditable(true);
+      setTranslating(false);
+      setMetaOpen(false);
+    }
+  }
+
+  function undoTranslation() {
+    if (!beforeTranslation) return;
+    setTitle(beforeTranslation.title);
+    replaceBody(beforeTranslation.body);
+    setBeforeTranslation(null);
+  }
+
+  const workspaceLanguage = localeName(language?.workspaceLocale ?? "en");
+  const offerTranslation =
+    !beforeTranslation && !!language?.canTranslate && !!language.locale && language.locale !== language.workspaceLocale;
+
   // First-run: land the cursor in the title so writing starts immediately.
   useEffect(() => {
     if (!initial) titleRef.current?.focus();
@@ -1447,6 +1528,18 @@ export function ArticleEditor({
               options={[{ value: "internal", label: "Internal" }, { value: "public", label: "Public" }]}
             />
             <p className="text-xs text-muted-foreground">{metaHint}</p>
+            {language?.canTranslate && body.trim() && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 w-full text-xs"
+                onClick={() => void translate()}
+                disabled={translating}
+              >
+                <Languages className="size-3.5" />
+                {translating ? "Translating…" : `Translate to ${workspaceLanguage}`}
+              </Button>
+            )}
           </div>
         </Popover>
         <Button size="sm" className="h-8 text-xs" onClick={() => void save()} disabled={saving || !hasTitle} title={shortcut("S")}>
@@ -1461,6 +1554,7 @@ export function ArticleEditor({
           <Input
             ref={titleRef}
             value={title}
+            readOnly={translating}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="Untitled article"
             className="h-auto border-0 bg-transparent px-0 py-1 text-3xl font-semibold tracking-tight shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0 md:text-4xl"
@@ -1483,9 +1577,42 @@ export function ArticleEditor({
             </div>
           )}
         </div>
+        {(offerTranslation || beforeTranslation) && (
+          <div className="mx-auto w-full max-w-[72ch] px-6">
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+              <Languages className="size-3.5 shrink-0" />
+              {beforeTranslation ? (
+                <>
+                  <span className="text-foreground">Translated to {workspaceLanguage}. Check it before saving.</span>
+                  <button type="button" onClick={undoTranslation} className="font-medium text-foreground underline-offset-2 hover:underline">
+                    Undo translation
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBeforeTranslation(null)}
+                    className="ml-auto rounded p-0.5 hover:bg-muted hover:text-foreground"
+                    aria-label="Dismiss"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span>
+                    This looks like {localeName(language?.locale)}. AI answers search your articles in {workspaceLanguage}.
+                  </span>
+                  <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => void translate()} disabled={translating}>
+                    {translating ? "Translating…" : `Translate to ${workspaceLanguage}`}
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
         <RichTextEditor
           key={`${initial?.id ?? "new"}-${editorSeed}`}
           initialMarkdown={editorInitial.current}
+          editorRef={editorRef}
           onChange={setBody}
           placeholder="Write — Markdown works: ## heading, - list, > quote. Select text to format."
           ariaLabel="Article body"

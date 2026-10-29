@@ -175,6 +175,7 @@ async function main() {
     const cited = (await getTrace(A, answered.traceId!))?.sources.find((s) => s.id === article);
     check("the keyword search's rank is on the source", cited?.keywordRank === 1, cited);
     check("the source keeps the start of its text", cited?.excerpt === "Feed the TRACETEST zebrafish twice a day with flakes.", cited);
+    check("without a search query no source says what found it", cited?.foundBy === undefined, cited);
   } finally {
     if (article) await deleteArticle(A, article);
     await putPolicies(A, { traceRetentionDays: policiesBefore.traceRetentionDays });

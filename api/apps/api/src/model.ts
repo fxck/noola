@@ -10,7 +10,7 @@
 // an agent's "let me look into it" keeps the ball on our side.
 
 import { requireEnv } from "./env.js";
-import { DRAFT_OUTCOMES_SYSTEM } from "./ai-outcome.js";
+import { DRAFT_OUTCOMES_SYSTEM, NO_SOURCES_SYSTEM } from "./ai-outcome.js";
 
 export type WhoseTurn = "us" | "customer";
 
@@ -108,7 +108,12 @@ export interface ModelServingDriver {
    * has no generative reasoning, so callers MUST feature-detect (`if (driver.complete)`)
    * and fall back to a deterministic path when it's absent.
    */
-  complete?(system: string, user: string): Promise<string>;
+  complete?(system: string, user: string, opts?: CompleteOptions): Promise<string>;
+}
+
+export interface CompleteOptions {
+  /** Throw when the model stops at its output limit, for callers that must never use a cut-off answer. */
+  rejectTruncated?: boolean;
 }
 
 // Business-risk classification for the autoreply gate — a deterministic backstop
@@ -311,7 +316,8 @@ function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.
   const persona = input.persona?.trim();
-  const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${DRAFT_OUTCOMES_SYSTEM}` : DRAFT_SYSTEM;
+  const outcomes = sources ? DRAFT_OUTCOMES_SYSTEM : `${DRAFT_OUTCOMES_SYSTEM}\n\n${NO_SOURCES_SYSTEM}`;
+  const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${outcomes}` : DRAFT_SYSTEM;
   const base = persona ? `${persona}\n\n${rules}` : rules;
   const system = sources ? `${base}\n\nSources:\n${sources}` : base;
   const latest = input.customerMessage || "(the customer has not written anything yet)";
@@ -417,7 +423,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
 
   /** Raw completion for the agent-node tool loop — same wire shapes as draftReply,
    *  no source-grounding system prompt (the caller owns the whole prompt). */
-  async complete(system: string, user: string): Promise<string> {
+  async complete(system: string, user: string, opts: CompleteOptions = {}): Promise<string> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 25_000);
     try {
@@ -425,6 +431,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         this.opts.provider === "anthropic"
           ? await this.anthropic(system, user, undefined, ctrl.signal)
           : await this.openaiCompatible(system, user, undefined, ctrl.signal);
+      if (opts.rejectTruncated && r.truncated) throw new Error("completion stopped at the output limit");
       return r.text.trim();
     } finally {
       clearTimeout(timer);
@@ -464,7 +471,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
     user: string,
     images: DraftImage[] | undefined,
     signal: AbortSignal,
-  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number }> {
+  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number; truncated: boolean }> {
     const res = await fetch(`${this.base()}/chat/completions`, {
       method: "POST",
       signal,
@@ -481,13 +488,14 @@ export class HttpChatModelDriver implements ModelServingDriver {
     });
     if (!res.ok) throw new Error(`chat ${res.status}: ${clip(await res.text(), 200)}`);
     const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     return {
       text: data.choices?.[0]?.message?.content ?? "",
       tokensIn: data.usage?.prompt_tokens,
       tokensOut: data.usage?.completion_tokens,
+      truncated: data.choices?.[0]?.finish_reason === "length",
     };
   }
 
@@ -496,7 +504,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
     user: string,
     images: DraftImage[] | undefined,
     signal: AbortSignal,
-  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number }> {
+  ): Promise<{ text: string; tokensIn?: number; tokensOut?: number; truncated: boolean }> {
     const res = await fetch(`${this.base()}/messages`, {
       method: "POST",
       signal,
@@ -515,12 +523,14 @@ export class HttpChatModelDriver implements ModelServingDriver {
     if (!res.ok) throw new Error(`anthropic ${res.status}: ${clip(await res.text(), 200)}`);
     const data = (await res.json()) as {
       content?: Array<{ text?: string }>;
+      stop_reason?: string;
       usage?: { input_tokens?: number; output_tokens?: number };
     };
     return {
       text: data.content?.map((b) => b.text ?? "").join("") ?? "",
       tokensIn: data.usage?.input_tokens,
       tokensOut: data.usage?.output_tokens,
+      truncated: data.stop_reason === "max_tokens",
     };
   }
 

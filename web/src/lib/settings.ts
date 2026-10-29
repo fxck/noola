@@ -126,6 +126,10 @@ export const WORKSPACE_LANGUAGES: { value: string; label: string }[] = [
   { value: "pt", label: "Portuguese" },
   { value: "it", label: "Italian" },
   { value: "nl", label: "Dutch" },
+  { value: "cs", label: "Czech" },
+  { value: "sk", label: "Slovak" },
+  { value: "pl", label: "Polish" },
+  { value: "hu", label: "Hungarian" },
   { value: "ru", label: "Russian" },
   { value: "uk", label: "Ukrainian" },
   { value: "zh", label: "Chinese" },
@@ -154,6 +158,33 @@ export async function fetchTranslationSettings(): Promise<TranslationSettings> {
 
 export async function saveTranslationSettings(input: TranslationSettingsInput): Promise<TranslationSettings> {
   return api<TranslationSettings>("/settings/translation", { method: "PUT", body: JSON.stringify(input) });
+}
+
+// ── Docs search ──────────────────────────────────────────────────────────────
+
+export const DOCS_SEARCH_PRODUCT_MAX = 500;
+export const DOCS_SEARCH_PROMPT_MAX = 4000;
+
+export interface DocsSearchSettings {
+  rewrite: boolean;
+  product: string;
+  /** Null uses the default prompt. */
+  prompt: string | null;
+}
+
+export interface DocsSearchResponse {
+  settings: DocsSearchSettings;
+  defaultPrompt: string;
+  /** Always added after the prompt, so the reply can be read. */
+  replyFormat: string;
+}
+
+export async function fetchDocsSearchSettings(): Promise<DocsSearchResponse> {
+  return api<DocsSearchResponse>("/settings/docs-search");
+}
+
+export async function saveDocsSearchSettings(input: DocsSearchSettings): Promise<DocsSearchResponse> {
+  return api<DocsSearchResponse>("/settings/docs-search", { method: "PUT", body: JSON.stringify(input) });
 }
 
 // ── Replies ──────────────────────────────────────────────────────────────────

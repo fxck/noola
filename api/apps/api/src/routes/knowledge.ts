@@ -8,6 +8,9 @@ import {
 import { ingestDocument, listDocuments, countDocuments, getDocument, getDocumentContent, deleteDocument, searchDocuments } from "../documents.js";
 import { listSources, getSource, createSource, updateSource, deleteSource, syncSource, maskSource } from "../sources.js";
 import { presignUpload, storageSmoke } from "../storage.js";
+import { getTranslationSettings, translateArticle } from "../translate.js";
+import { detectLanguage } from "../locale.js";
+import { resolveModelDriver } from "../modelconfig.js";
 
 // The knowledge & content surfaces: KB articles + collections, uploaded documents (the RAG
 // ingest/retrieval half), live sources (connectors), attachment presign, and a storage smoke.
@@ -53,6 +56,29 @@ export default async function knowledgeRoutes(app: FastifyInstance): Promise<voi
       status: parsed.data.status, visibility: parsed.data.visibility,
     });
     return reply.code(201).send({ article: a });
+  }));
+
+  // The article editor asks this to offer a translation into the workspace language.
+  app.post("/kb/language", tenanted(async (tenantId, req, reply) => {
+    const text = (req.body as { text?: unknown } | undefined)?.text;
+    if (typeof text !== "string") return reply.code(400).send({ error: "text is required" });
+    const [{ workspaceLocale }, driver] = await Promise.all([getTranslationSettings(tenantId), resolveModelDriver(tenantId)]);
+    // Code is mostly English keywords, and a long text dilutes the stopword score.
+    // So detection reads only the start of the prose.
+    const prose = text.replace(/```[\s\S]*?```/g, " ").slice(0, 2000);
+    return { locale: detectLanguage(prose), workspaceLocale, canTranslate: typeof driver.complete === "function" };
+  }));
+
+  app.post("/kb/translate", tenanted(async (tenantId, req, reply) => {
+    const body = req.body as { title?: unknown; body?: unknown } | undefined;
+    if (typeof body?.title !== "string" || typeof body.body !== "string") {
+      return reply.code(400).send({ error: "title and body are required" });
+    }
+    if (body.title.length + body.body.length > 30_000) return reply.code(413).send({ error: "This article is too long to translate at once." });
+    const { workspaceLocale } = await getTranslationSettings(tenantId);
+    const out = await translateArticle(tenantId, { title: body.title, body: body.body }, workspaceLocale);
+    if (!out) return reply.code(502).send({ error: "The translation failed. Check the workspace's AI model and try again." });
+    return { ...out, locale: workspaceLocale };
   }));
 
   app.get("/kb/:id", tenanted(async (tenantId, req, reply) => {

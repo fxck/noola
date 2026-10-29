@@ -1509,13 +1509,21 @@ export type AutomationAuthorInput = z.infer<typeof AutomationAuthorInput>;
 
 // ── Wave 4: conversational reach (multilingual + channel registry) ───────────
 
-/** PUT /settings/translation — the workspace's own language + whether to auto-translate agent
- *  replies into the customer's detected language on send. workspaceLocale is an ISO-639-1 code. */
+/** PUT /settings/translation: the workspace language (ISO-639-1) and translation of conversations for the team. */
 export const TranslationSettingsInput = z.object({
   workspaceLocale: z.string().trim().min(2).max(8),
   autoTranslate: z.boolean(),
 });
 export type TranslationSettingsInput = z.infer<typeof TranslationSettingsInput>;
+
+/** PUT /settings/docs-search: whether a model writes the docs-search query, the product description, and an
+ *  optional replacement prompt (null or empty uses the default). */
+export const DocsSearchSettingsInput = z.object({
+  rewrite: z.boolean(),
+  product: z.string().max(500),
+  prompt: z.string().max(4000).nullable(),
+});
+export type DocsSearchSettingsInput = z.infer<typeof DocsSearchSettingsInput>;
 
 // ── Wave 5: custom data events ───────────────────────────────────────────────
 

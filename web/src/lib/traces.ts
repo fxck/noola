@@ -40,9 +40,12 @@ export interface TraceSource {
   /** For a document source: its document, and its page when the document came from a URL. */
   documentId?: string;
   url?: string;
-  /** Where the keyword and meaning searches ranked the source, from 1. A search that didn't find it leaves its rank out. */
+  /** Where the keyword and meaning searches ranked the source, from 1, in the search text that scored it higher.
+   *  A search that didn't find it leaves its rank out. */
   keywordRank?: number;
   meaningRank?: number;
+  /** With a search query, whether the query, the customer's message or both found the source. */
+  foundBy?: "query" | "message" | "both";
   /** For a document source: which of the document's passages it is, from 0, and how many it has. */
   passage?: number;
   passages?: number;
@@ -59,6 +62,8 @@ export interface TraceDecision {
 }
 
 export interface TraceDetail extends TraceSummary {
+  /** The query the search model wrote, when retrieval also searched that. */
+  searchQuery: string | null;
   /** The full raw model output, answer tags included. */
   draft: string;
   parsed: ParsedDraft;

@@ -103,6 +103,93 @@ export async function translateText(
   }
 }
 
+// Each part is translated in its own call, so the translation fits the model's output limit.
+// Czech or German output takes two to three times the tokens of English, and the smallest limit is 1500 tokens.
+const ARTICLE_PART_CHARS = 1500;
+
+/** Split Markdown at blank lines outside code fences, packed into parts of at most `max` characters where a block allows. */
+export function splitMarkdown(md: string, max = ARTICLE_PART_CHARS): string[] {
+  const blocks: string[] = [];
+  let current: string[] = [];
+  let inFence = false;
+  for (const line of md.split("\n")) {
+    if (line.trimStart().startsWith("```")) inFence = !inFence;
+    if (!inFence && line.trim() === "") {
+      if (current.length) blocks.push(current.join("\n"));
+      current = [];
+    } else {
+      current.push(line);
+    }
+  }
+  if (current.length) blocks.push(current.join("\n"));
+
+  const parts: string[] = [];
+  let part = "";
+  for (const block of blocks) {
+    if (part && part.length + block.length + 2 > max) {
+      parts.push(part);
+      part = "";
+    }
+    part = part ? `${part}\n\n${block}` : block;
+  }
+  if (part) parts.push(part);
+  return parts;
+}
+
+/** Drop a code fence the model wrapped its whole answer in, unless the source started with one. */
+function unwrapFence(out: string, source: string): string {
+  const m = out.match(/^```[\w-]*\n([\s\S]*)\n```$/);
+  return m && !source.trimStart().startsWith("```") ? m[1] : out;
+}
+
+/**
+ * An article's title and Markdown body translated into `to` through the workspace's hosted model.
+ * Null when there is no hosted model, or when any part fails, so the editor never receives a half-translated article.
+ */
+export async function translateArticle(
+  tenantId: string,
+  input: { title: string; body: string },
+  to: string,
+): Promise<{ title: string; body: string } | null> {
+  const driver = await resolveModelDriver(tenantId);
+  if (!driver.complete) return null;
+  const complete = driver.complete.bind(driver);
+  const language = localeName(to);
+  const system =
+    `You are a professional translation engine for a help center. Translate the user's text into ${language}. ` +
+    `Keep the Markdown formatting, links, URLs, code, product names and placeholders exactly as they are. ` +
+    `Leave any part that is already in ${language} unchanged. Output ONLY the translation, with no notes, quotes or preamble.`;
+  let failed = false;
+  const translate = async (text: string): Promise<string> => {
+    if (!text.trim()) return text;
+    try {
+      const out = (await complete(system, text, { rejectTruncated: true })).trim();
+      if (!out) throw new Error("empty translation");
+      return unwrapFence(out, text);
+    } catch (e) {
+      failed = true;
+      throw e;
+    }
+  };
+  try {
+    const parts = splitMarkdown(input.body);
+    const translated: string[] = new Array(parts.length);
+    // Three body parts at a time keep a long article quick without bursting the workspace's rate limit.
+    let next = 0;
+    const worker = async () => {
+      while (next < parts.length && !failed) {
+        const i = next++;
+        translated[i] = await translate(parts[i]);
+      }
+    };
+    const workers = Array.from({ length: Math.min(3, parts.length) }, worker);
+    const [title] = await Promise.all([translate(input.title), Promise.all(workers)]);
+    return { title, body: translated.join("\n\n") };
+  } catch {
+    return null;
+  }
+}
+
 /** Merge a translation onto a message's meta (JSONB), leaving any existing keys intact. */
 async function stampMessageTranslation(
   tenantId: string,

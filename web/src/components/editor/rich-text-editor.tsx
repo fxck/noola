@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type MutableRefObject } from "react";
 import { LexicalComposer } from "@lexical/react/LexicalComposer";
 import { RichTextPlugin } from "@lexical/react/LexicalRichTextPlugin";
 import { ContentEditable } from "@lexical/react/LexicalContentEditable";
@@ -9,8 +9,10 @@ import { LinkPlugin } from "@lexical/react/LexicalLinkPlugin";
 import { MarkdownShortcutPlugin } from "@lexical/react/LexicalMarkdownShortcutPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { AutoFocusPlugin } from "@lexical/react/LexicalAutoFocusPlugin";
+import { EditorRefPlugin } from "@lexical/react/LexicalEditorRefPlugin";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import {
+  $getRoot,
   $getSelection,
   $isRangeSelection,
   $createParagraphNode,
@@ -177,6 +179,15 @@ function Toolbar() {
   );
 }
 
+/** Replace the editor's content as one step that Ctrl+Z undoes, and return the Markdown that the undo restores. */
+export function setEditorMarkdown(editor: LexicalEditor, markdown: string): string {
+  // History records only states it has seen, and an editor nobody touched has shown it none.
+  editor.update(() => $getRoot().markDirty(), { tag: "history-merge", discrete: true });
+  const before = editor.getEditorState().read(() => $convertToMarkdownString(MD_TRANSFORMERS));
+  editor.update(() => $convertFromMarkdownString(markdown, MD_TRANSFORMERS), { discrete: true });
+  return before;
+}
+
 // ── editor ───────────────────────────────────────────────────────────────────
 /**
  * A Dropbox-Paper/Medium-grade rich-text editor on installed Lexical. Type
@@ -194,6 +205,7 @@ export function RichTextEditor({
   toolbar = true,
   minHeight = 240,
   className,
+  editorRef,
 }: {
   initialMarkdown?: string;
   onChange?: (markdown: string) => void;
@@ -207,6 +219,8 @@ export function RichTextEditor({
   toolbar?: boolean;
   minHeight?: number;
   className?: string;
+  /** Lets the owner replace the content as one step that Ctrl+Z undoes. */
+  editorRef?: MutableRefObject<LexicalEditor | null>;
 }) {
   const initialConfig = {
     namespace: "noola-rich",
@@ -262,6 +276,7 @@ export function RichTextEditor({
           <SelectionToolbar />
           <LinkEditorPlugin />
           {autoFocus && <AutoFocusPlugin />}
+          {editorRef && <EditorRefPlugin editorRef={editorRef} />}
         </div>
       </div>
     </LexicalComposer>

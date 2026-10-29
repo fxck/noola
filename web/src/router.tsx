@@ -37,6 +37,7 @@ import { SettingsModelPage } from "@/routes/settings-model";
 import { SettingsAiPage } from "@/routes/settings-ai";
 import { SettingsAutoreplyPage } from "@/routes/settings-autoreply";
 import { SettingsTranslationPage } from "@/routes/settings-translation";
+import { SettingsDocsSearchPage } from "@/routes/settings-docs-search";
 import { SettingsTagRulesPage } from "@/routes/settings-tag-rules";
 import { SettingsClassificationPage } from "@/routes/settings-classification";
 import { SettingsDiscordMirrorPage } from "@/routes/settings-discord-mirror";
@@ -530,6 +531,15 @@ const settingsTranslationRoute = createRoute({
   component: SettingsTranslationPage,
 });
 
+const settingsDocsSearchRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/docs-search",
+  beforeLoad: ({ context }) => {
+    if (!context.auth.isAuthed) throw redirect({ to: "/login" });
+  },
+  component: SettingsDocsSearchPage,
+});
+
 const settingsTagRulesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/tag-rules",
@@ -795,6 +805,7 @@ const routeTree = rootRoute.addChildren([
   settingsAiRoute,
   settingsAutoreplyRoute,
   settingsTranslationRoute,
+  settingsDocsSearchRoute,
   settingsTagRulesRoute,
   settingsClassificationRoute,
   settingsDiscordMirrorRoute,

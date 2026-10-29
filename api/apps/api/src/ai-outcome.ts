@@ -69,3 +69,11 @@ export const DRAFT_OUTCOMES_SYSTEM = [
     "for example that you are not replying. To send the customer nothing, use form 4 or 5.",
   "Use each tag at most once, never use them in any other way, and never mention them to the customer.",
 ].join("\n");
+
+/** Added when retrieval found nothing, so the model can still skip a thank-you or ask what the customer needs. */
+export const NO_SOURCES_SYSTEM = [
+  "You have no sources for this message, so state nothing about the product, its features, prices or policies.",
+  "If the message needs no answer, such as a thank-you or a goodbye, use form 4.",
+  "If you can't tell what the customer needs, ask one short question to find out.",
+  "Otherwise say plainly that you don't have that information, in the customer's language, and hand off with form 3.",
+].join("\n");

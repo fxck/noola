@@ -4,6 +4,7 @@ import { SettingsPage } from "@/components/settings-page";
 import {
   type TranslationSettings,
   WORKSPACE_LANGUAGES,
+  localeName,
   fetchTranslationSettings,
   saveTranslationSettings,
 } from "@/lib/settings";
@@ -16,9 +17,8 @@ import { toast } from "@/components/ui/toaster";
 const SELECT_TRIGGER =
   "my-0 h-9 w-full justify-between rounded-md border border-input bg-background px-3 py-1 text-sm font-normal shadow-sm hover:bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed";
 
-// Translation settings — the workspace's own language + the auto-translate master switch. Language
-// DETECTION and the analytics breakdown run regardless of this switch; it only governs whether the
-// model bridges foreign messages (customer → agent) and replies (agent → customer).
+// Translation settings: the workspace language and translation of conversations for the team.
+// Language detection and the analytics breakdown run regardless of the switch.
 export function SettingsTranslationPage() {
   const [settings, setSettings] = useState<TranslationSettings | null>(null);
   const [loadError, setLoadError] = useState(false);
@@ -61,7 +61,7 @@ export function SettingsTranslationPage() {
     <SettingsPage
       active="translation"
       title="Translation"
-      description="Detect each customer's language and, optionally, bridge the conversation both ways."
+      description="Detect each customer's language and translate conversations for your team."
       status={status}
       onRetry={() => void load()}
       errorTitle="Couldn't load translation settings"
@@ -93,10 +93,11 @@ export function SettingsTranslationPage() {
             {/* Auto-translate toggle */}
             <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
               <div className="min-w-0">
-                <p className="text-sm font-medium text-foreground">Auto-translate conversations</p>
+                <p className="text-sm font-medium text-foreground">Translate conversations for your team</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  Translate foreign customer messages for agents, and translate agent replies back
-                  into the customer's language on send.
+                  Show customer messages in {localeName(settings.workspaceLocale)} in your inbox, and send your
+                  team's replies in the customer's language. The AI doesn't need this, as it reads and replies in
+                  the customer's language either way.
                 </p>
               </div>
               <Switch

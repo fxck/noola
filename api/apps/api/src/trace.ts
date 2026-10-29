@@ -18,9 +18,12 @@ export interface TraceSource {
   /** For a document source: its document, and its page when the document came from a URL. */
   documentId?: string;
   url?: string;
-  /** Where the keyword and meaning searches ranked the source, from 1. A search that didn't find it leaves its rank out. */
+  /** Where the keyword and meaning searches ranked the source, from 1, in the search text that scored it higher.
+   *  A search that didn't find it leaves its rank out. */
   keywordRank?: number;
   meaningRank?: number;
+  /** With a search query, whether the query, the customer's message or both found the source. */
+  foundBy?: "query" | "message" | "both";
   /** For a document source: which of the document's passages it is, from 0, and how many it has. */
   passage?: number;
   passages?: number;
@@ -33,6 +36,8 @@ export interface DraftTraceInput {
   ticketId: string | null;
   messageId: string | null;
   query: string;
+  /** The query the search model wrote, when retrieval also searched that. */
+  searchQuery?: string | null;
   sources: TraceSource[];
   retrieval: { topScore: number; agreement: number };
   draft: string;
@@ -54,13 +59,14 @@ export async function recordDraftTrace(input: DraftTraceInput): Promise<string |
       const r = await c.query(
         `INSERT INTO draft_traces
            (tenant_id, ticket_id, message_id, query, sources, top_score, agreement,
-            draft, model, embed_model, confidence, tokens_in, tokens_out, latency_ms, source)
-         VALUES (current_tenant(), $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            draft, model, embed_model, confidence, tokens_in, tokens_out, latency_ms, source, search_query)
+         VALUES (current_tenant(), $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING id`,
         [
           input.ticketId, input.messageId, input.query, JSON.stringify(input.sources),
           input.retrieval.topScore, input.retrieval.agreement, input.draft, input.model,
           input.embedModel, input.confidence, input.tokensIn, input.tokensOut, input.latencyMs, input.source,
+          input.searchQuery ?? null,
         ],
       );
       return r.rows[0].id as string;
@@ -206,6 +212,7 @@ export interface TraceSummary {
 }
 
 export interface TraceDetail extends TraceSummary {
+  searchQuery: string | null;
   draft: string;
   /** What Noola made of the draft's answer tags. A draft without tags is a plain reply. */
   parsed: DraftOutcome;
@@ -343,8 +350,9 @@ export async function getTrace(tenantId: string, traceId: string): Promise<Trace
     const r = await c.query<SummaryRow & {
       draft: string; sources: TraceSource[]; top_score: number | null; agreement: number | null;
       confidence: number | null; embed_model: string | null; risk_tags: string[]; outcome: string | null; full_query: string;
+      search_query: string | null;
     }>(
-      `SELECT ${SUMMARY_COLS}, t.query AS full_query, t.draft, t.sources, t.top_score, t.agreement, t.confidence, t.embed_model, t.risk_tags, t.outcome
+      `SELECT ${SUMMARY_COLS}, t.query AS full_query, t.search_query, t.draft, t.sources, t.top_score, t.agreement, t.confidence, t.embed_model, t.risk_tags, t.outcome
          FROM draft_traces t WHERE t.id = $1`,
       [traceId],
     );
@@ -357,6 +365,7 @@ export async function getTrace(tenantId: string, traceId: string): Promise<Trace
     return {
       ...toSummary(t),
       query: t.full_query,
+      searchQuery: t.search_query,
       draft: t.draft,
       parsed: hasOutcomeTag(t.draft) ? parseDraftOutcome(t.draft) : { kind: "ok", reply: t.draft.trim(), note: null, noReply: false, handoff: false },
       sources: t.sources ?? [],
