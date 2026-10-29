@@ -111,6 +111,8 @@ export interface ModelServingDriver {
    * and fall back to a deterministic path when it's absent.
    */
   complete?(system: string, user: string, opts?: CompleteOptions): Promise<string>;
+  /** The thinking level a hosted model runs at, when the workspace chose one. */
+  readonly effort?: string | null;
 }
 
 export interface CompleteOptions {
@@ -288,6 +290,8 @@ export interface ChatModelOptions {
   endpoint?: string | null; // base URL; defaults per provider
   model: string;
   apiKey: string;
+  /** The thinking level the provider runs the model at. Null leaves the model's own default. */
+  effort?: string | null;
 }
 
 const DRAFT_SYSTEM =
@@ -308,6 +312,8 @@ const DRAFT_MAX_TOKENS = 1500;
 // Current Claude models think before they answer, and the thinking counts against max_tokens.
 // The ceiling itself costs nothing, only the tokens the model produces, thinking included.
 const ANTHROPIC_DRAFT_MAX_TOKENS = 8000;
+// An OpenAI reasoning model's thinking counts against its limit too.
+const REASONING_MAX_TOKENS = 8000;
 // An OpenAI account also lists embedding, audio and image models, which can't draft a reply.
 const NOT_A_CHAT_MODEL = /embedding|whisper|tts|audio|realtime|transcribe|dall-e|image|moderation|davinci|babbage/i;
 
@@ -366,10 +372,26 @@ function openaiUserContent(user: string, images?: DraftImage[]): unknown {
 
 export class HttpChatModelDriver implements ModelServingDriver {
   readonly name: string;
+  readonly effort: string | null;
   private readonly rule = new RuleModelDriver();
 
   constructor(private readonly opts: ChatModelOptions) {
     this.name = `${opts.provider}:${opts.model}`;
+    this.effort = opts.effort ?? null;
+  }
+
+  // Claude 4.6 to 4.8 models think only when asked, and the level alone would just trim the answer.
+  private anthropicEffort(): Record<string, unknown> {
+    return this.effort ? { thinking: { type: "adaptive" }, output_config: { effort: this.effort } } : {};
+  }
+
+  // OpenAI's reasoning models, the only ones that take a thinking level, reject max_tokens and a set temperature.
+  // A custom OpenAI-compatible endpoint never gets a level, as its support for one is unknown.
+  private openaiLimits(): Record<string, unknown> {
+    if (this.effort && this.opts.provider === "openai") {
+      return { max_completion_tokens: REASONING_MAX_TOKENS, reasoning_effort: this.effort };
+    }
+    return { max_tokens: DRAFT_MAX_TOKENS, temperature: 0.3 };
   }
 
   classifyWhoseTurn(input: WhoseTurnInput): Promise<WhoseTurn> {
@@ -484,8 +506,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
-        temperature: 0.3,
+        ...this.openaiLimits(),
         messages: [
           { role: "system", content: system },
           { role: "user", content: openaiUserContent(user, images) },
@@ -522,6 +543,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       body: JSON.stringify({
         model: this.opts.model,
         max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
+        ...this.anthropicEffort(),
         system,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],
       }),
@@ -577,6 +599,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       body: JSON.stringify({
         model: this.opts.model,
         max_tokens: ANTHROPIC_DRAFT_MAX_TOKENS,
+        ...this.anthropicEffort(),
         system,
         stream: true,
         messages: [{ role: "user", content: anthropicUserContent(user, images) }],
@@ -617,8 +640,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        max_tokens: DRAFT_MAX_TOKENS,
-        temperature: 0.3,
+        ...this.openaiLimits(),
         stream: true,
         stream_options: { include_usage: true },
         messages: [

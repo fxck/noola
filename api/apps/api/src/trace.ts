@@ -42,6 +42,8 @@ export interface DraftTraceInput {
   retrieval: { topScore: number; agreement: number };
   draft: string;
   model: string;
+  /** The thinking level the model ran at, when the workspace chose one. */
+  effort?: string | null;
   embedModel: string;
   confidence: number | null;
   tokensIn: number | null;
@@ -59,14 +61,14 @@ export async function recordDraftTrace(input: DraftTraceInput): Promise<string |
       const r = await c.query(
         `INSERT INTO draft_traces
            (tenant_id, ticket_id, message_id, query, sources, top_score, agreement,
-            draft, model, embed_model, confidence, tokens_in, tokens_out, latency_ms, source, search_query)
-         VALUES (current_tenant(), $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            draft, model, embed_model, confidence, tokens_in, tokens_out, latency_ms, source, search_query, effort)
+         VALUES (current_tenant(), $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          RETURNING id`,
         [
           input.ticketId, input.messageId, input.query, JSON.stringify(input.sources),
           input.retrieval.topScore, input.retrieval.agreement, input.draft, input.model,
           input.embedModel, input.confidence, input.tokensIn, input.tokensOut, input.latencyMs, input.source,
-          input.searchQuery ?? null,
+          input.searchQuery ?? null, input.effort ?? null,
         ],
       );
       return r.rows[0].id as string;
@@ -200,6 +202,7 @@ export interface TraceSummary {
   ticketId: string | null;
   messageId: string | null;
   model: string;
+  effort: string | null;
   query: string;
   draftPreview: string;
   gateOutcome: string | null;
@@ -226,18 +229,18 @@ export interface TraceDetail extends TraceSummary {
   decisions: { outcome: string; reason: string; source: string; sentMessageId: string | null; createdAt: string }[];
 }
 
-const SUMMARY_COLS = `t.id, t.created_at, t.ticket_id, t.message_id, t.model, left(t.query, 200) AS query, left(t.draft, 200) AS draft_preview,
+const SUMMARY_COLS = `t.id, t.created_at, t.ticket_id, t.message_id, t.model, t.effort, left(t.query, 200) AS query, left(t.draft, 200) AS draft_preview,
   t.gate_outcome, t.gate_reason, jsonb_array_length(t.sources) AS source_count, t.tokens_in, t.tokens_out, t.latency_ms`;
 
 type SummaryRow = {
-  id: string; created_at: Date; ticket_id: string | null; message_id: string | null; model: string; query: string; draft_preview: string;
+  id: string; created_at: Date; ticket_id: string | null; message_id: string | null; model: string; effort: string | null; query: string; draft_preview: string;
   gate_outcome: string | null; gate_reason: string | null; source_count: number;
   tokens_in: number | null; tokens_out: number | null; latency_ms: number | null;
 };
 
 function toSummary(r: SummaryRow): TraceSummary {
   return {
-    id: r.id, createdAt: r.created_at.toISOString(), ticketId: r.ticket_id, messageId: r.message_id, model: r.model, query: r.query,
+    id: r.id, createdAt: r.created_at.toISOString(), ticketId: r.ticket_id, messageId: r.message_id, model: r.model, effort: r.effort, query: r.query,
     draftPreview: r.draft_preview, gateOutcome: r.gate_outcome, gateReason: r.gate_reason, sourceCount: r.source_count,
     tokensIn: r.tokens_in, tokensOut: r.tokens_out, latencyMs: r.latency_ms,
   };

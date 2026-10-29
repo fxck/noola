@@ -97,7 +97,7 @@ export async function searchQueryFor(tenantId: string, message: string, history:
   if (!text) return null;
   const settings = await getDocsSearchSettings(tenantId);
   if (!settings.rewrite) return null;
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "search" });
   if (!driver.complete) return null;
   const { workspaceLocale } = await getTranslationSettings(tenantId);
   const prompt = renderSearchPrompt(settings.prompt ?? DEFAULT_SEARCH_PROMPT, {

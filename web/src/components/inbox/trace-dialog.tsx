@@ -291,7 +291,7 @@ function TraceBody({ t }: { t: TraceDetail }) {
           <span title={new Date(t.createdAt).toLocaleString()}>{relativeTime(t.createdAt)}</span>
         </Fact>
         <Fact label="Model">
-          <span title={t.model}>{shortModel(t.model)}</span>
+          <span title={t.model}>{shortModel(t.model)}{t.effort && ` · ${t.effort}`}</span>
         </Fact>
         <Fact label="Tokens">
           {t.tokensIn == null && t.tokensOut == null ? "—" : `${compactNum(t.tokensIn ?? 0)} in · ${compactNum(t.tokensOut ?? 0)} out`}

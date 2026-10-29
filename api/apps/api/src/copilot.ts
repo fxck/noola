@@ -583,7 +583,7 @@ async function prepareDraft(
     }));
     const traceId = await recordDraftTrace({
       tenantId, ticketId, messageId, query, searchQuery, sources: traceSources, retrieval,
-      draft: result.text, model, embedModel: embeddingDriver.name,
+      draft: result.text, model, effort: model === driver.name ? (driver.effort ?? null) : null, embedModel: embeddingDriver.name,
       confidence: result.confidence ?? null, tokensIn: result.tokensIn ?? null,
       tokensOut: result.tokensOut ?? null, latencyMs: Date.now() - started, source,
     });

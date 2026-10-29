@@ -11,6 +11,8 @@ export interface TraceSummary {
   /** The customer message the draft answered. */
   messageId: string | null;
   model: string;
+  /** The thinking level the model ran at. Null is the model's default. */
+  effort: string | null;
   /** The customer text the draft answered. */
   query: string;
   /** The first 200 characters of the raw model output. */

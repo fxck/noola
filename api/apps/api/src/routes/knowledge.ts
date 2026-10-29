@@ -62,7 +62,7 @@ export default async function knowledgeRoutes(app: FastifyInstance): Promise<voi
   app.post("/kb/language", tenanted(async (tenantId, req, reply) => {
     const text = (req.body as { text?: unknown } | undefined)?.text;
     if (typeof text !== "string") return reply.code(400).send({ error: "text is required" });
-    const [{ workspaceLocale }, driver] = await Promise.all([getTranslationSettings(tenantId), resolveModelDriver(tenantId)]);
+    const [{ workspaceLocale }, driver] = await Promise.all([getTranslationSettings(tenantId), resolveModelDriver(tenantId, { job: "search" })]);
     // Code is mostly English keywords, and a long text dilutes the stopword score.
     // So detection reads only the start of the prose.
     const prose = text.replace(/```[\s\S]*?```/g, " ").slice(0, 2000);

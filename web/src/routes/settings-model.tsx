@@ -10,13 +10,17 @@ import {
 } from "lucide-react";
 import { SettingsRail } from "@/components/settings-rail";
 import {
+  type ModelJob,
   type ModelProvider,
   type ModelSettings,
   type ModelSettingsInput,
   type ModelTestResult,
   PROVIDER_OPTIONS,
+  PROVIDER_EFFORTS,
+  MODEL_JOB_LABELS,
   MODEL_PLACEHOLDER,
   MODEL_SUGGESTIONS,
+  effortLabel,
   fetchModelSettings,
   fetchAvailableModels,
   saveModelSettings,
@@ -123,12 +127,18 @@ function ModelCombobox({
 }
 
 // Form mirror of the saved settings, plus the two write-only-key affordances.
+// An empty job field means "not set": the model's default level, or the answers settings for search and general.
 type Form = {
   provider: ModelProvider;
   endpoint: string;
   model: string;
   apiKey: string;
   replacingKey: boolean; // reveal an empty key input over the "Key saved" state
+  effort: string;
+  searchModel: string;
+  searchEffort: string;
+  generalModel: string;
+  generalEffort: string;
 };
 
 function formFrom(s: ModelSettings): Form {
@@ -138,7 +148,92 @@ function formFrom(s: ModelSettings): Form {
     model: s.model ?? "",
     apiKey: "",
     replacingKey: false,
+    effort: s.effort ?? "",
+    searchModel: s.searchModel ?? "",
+    searchEffort: s.searchEffort ?? "",
+    generalModel: s.generalModel ?? "",
+    generalEffort: s.generalEffort ?? "",
   };
+}
+
+const JOB_KEYS = {
+  answers: { model: "model", effort: "effort" },
+  search: { model: "searchModel", effort: "searchEffort" },
+  general: { model: "generalModel", effort: "generalEffort" },
+} as const satisfies Record<ModelJob, { model: keyof Form; effort: keyof Form }>;
+
+const JOB_BLURBS: Record<ModelJob, string> = {
+  answers:
+    "The replies the AI writes on the widget, by e-mail and on Discord, and Draft with AI. The jobs below use these settings unless you set their own.",
+  search: "The docs-search query, Translate in the article editor, and translating conversations for your team.",
+  general: "Auto-tags, topics, thread summaries, conversation QA, the article draft from a ticket, and automations.",
+};
+
+/**
+ * One job's model and thinking level. The level menu's empty option names what the server does without one:
+ * the answers level when the job has no model of its own, else the model's own default.
+ */
+function JobFields({
+  job,
+  model,
+  effort,
+  onModel,
+  onEffort,
+  suggestions,
+  levels,
+  placeholder,
+}: {
+  job: ModelJob;
+  model: string;
+  effort: string;
+  onModel: (v: string) => void;
+  onEffort: (v: string) => void;
+  suggestions: string[];
+  levels: readonly string[];
+  placeholder: string;
+}) {
+  const inherits = job !== "answers" && !model.trim();
+  const id = `${job}-model`;
+  return (
+    <div role="group" aria-labelledby={`${job}-title`} className="space-y-3 rounded-lg border p-4">
+      <div>
+        <p id={`${job}-title`} className="text-sm font-medium text-foreground">
+          {MODEL_JOB_LABELS[job]}
+          {job === "answers" && <span className="text-muted-foreground"> (default)</span>}
+        </p>
+        <p className="mt-0.5 text-xs text-muted-foreground">{JOB_BLURBS[job]}</p>
+      </div>
+      <div className={cn("grid gap-3", levels.length > 0 && "sm:grid-cols-[minmax(0,1fr)_11rem]")}>
+        <div className="space-y-1.5">
+          <Label htmlFor={id}>Model</Label>
+          <ModelCombobox id={id} value={model} onChange={onModel} suggestions={suggestions} placeholder={placeholder} />
+        </div>
+        {levels.length > 0 && (
+          <Label className="flex flex-col gap-1.5">
+            <span>Thinking level</span>
+            <PopoverSelect
+              value={levels.includes(effort) ? effort : null}
+              align="start"
+              options={[
+                { value: null, label: inherits ? "Same as answers" : "Model default" },
+                ...levels.map((l) => ({ value: l, label: effortLabel(l) })),
+              ]}
+              onChange={(v) => onEffort(v ?? "")}
+              buttonClassName={SELECT_TRIGGER}
+            />
+          </Label>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// A failed job carries its own error in the list, so the summary repeats none of them.
+function testSummary(r: ModelTestResult): string {
+  if (r.jobs.length === 0) {
+    return r.ok ? "Connection succeeded. The saved provider is reachable." : r.error || "Connection failed. Check the model, key, and endpoint.";
+  }
+  return r.ok ? "Connection succeeded. Every job's model responded." : "Connection failed. Check the jobs marked below.";
 }
 
 export function SettingsModelPage() {
@@ -184,9 +279,31 @@ export function SettingsModelPage() {
     setTestResult(null);
   }
 
+  // Another provider's model ids don't run here, so a switch clears the job models and a switch back restores the saved ones.
+  // Levels stay in the form and are filtered by the provider when shown and saved, so a round trip keeps them.
+  function switchProvider(provider: ModelProvider) {
+    const back = provider === settings?.provider;
+    setForm((f) =>
+      f && f.provider !== provider
+        ? {
+            ...f,
+            provider,
+            searchModel: back ? (settings?.searchModel ?? "") : "",
+            generalModel: back ? (settings?.generalModel ?? "") : "",
+          }
+        : f,
+    );
+    setTestResult(null);
+  }
+
+  // A level the selected provider doesn't take counts as unset.
+  const levelFor = (provider: ModelProvider, v: string) => (PROVIDER_EFFORTS[provider].includes(v) ? v : "");
+  const level = (v: string) => (form ? levelFor(form.provider, v) : "");
+
   const needsModel = form?.provider === "openai" || form?.provider === "anthropic" || form?.provider === "custom";
   const needsEndpoint = form?.provider === "custom";
   const needsKey = needsModel; // every non-managed provider takes a key
+  const levels = form ? PROVIDER_EFFORTS[form.provider] : [];
 
   // Whether the key input is shown (no key on file, or the user chose to replace).
   const keyInputShown = !!form && (!settings?.hasKey || form.provider !== settings.provider || form.replacingKey);
@@ -197,14 +314,28 @@ export function SettingsModelPage() {
     !!settings &&
     (form.provider !== settings.provider ||
       (needsEndpoint && form.endpoint.trim() !== (settings.endpoint ?? "")) ||
-      (needsModel && form.model.trim() !== (settings.model ?? "")) ||
+      (needsModel &&
+        (form.model.trim() !== (settings.model ?? "") ||
+          level(form.effort) !== (settings.effort ?? "") ||
+          form.searchModel.trim() !== (settings.searchModel ?? "") ||
+          level(form.searchEffort) !== (settings.searchEffort ?? "") ||
+          form.generalModel.trim() !== (settings.generalModel ?? "") ||
+          level(form.generalEffort) !== (settings.generalEffort ?? ""))) ||
       form.apiKey.trim().length > 0);
 
   function buildInput(f: Form): ModelSettingsInput {
     if (f.provider === "managed") return { provider: "managed" };
-    const input: ModelSettingsInput = { provider: f.provider };
+    const orNull = (v: string) => v.trim() || null;
+    const input: ModelSettingsInput = {
+      provider: f.provider,
+      model: f.model.trim(),
+      effort: orNull(levelFor(f.provider, f.effort)),
+      searchModel: orNull(f.searchModel),
+      searchEffort: orNull(levelFor(f.provider, f.searchEffort)),
+      generalModel: orNull(f.generalModel),
+      generalEffort: orNull(levelFor(f.provider, f.generalEffort)),
+    };
     if (needsEndpoint) input.endpoint = f.endpoint.trim();
-    input.model = f.model.trim();
     if (f.apiKey.trim()) input.apiKey = f.apiKey; // non-empty only — empty keeps existing
     return input;
   }
@@ -231,7 +362,7 @@ export function SettingsModelPage() {
     try {
       setTestResult(await testModelSettings());
     } catch {
-      setTestResult({ ok: false, error: "The test request failed to reach the server." });
+      setTestResult({ ok: false, error: "The test request failed to reach the server.", jobs: [] });
     } finally {
       setTesting(false);
     }
@@ -271,8 +402,8 @@ export function SettingsModelPage() {
                 </Button>
               </header>
               <p className="px-6 text-small text-muted-foreground">
-                Choose which model writes reply drafts — your own provider key, or the built-in
-                assistant.
+                Choose which model runs the AI, and how much it thinks for each job: your own provider key, or
+                the built-in assistant.
               </p>
 
               <div className="max-w-2xl px-6 pb-10 pt-4">
@@ -285,7 +416,7 @@ export function SettingsModelPage() {
                     align="start"
                     options={PROVIDER_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
                     onChange={(v) => {
-                      if (v !== null) patch({ provider: v as ModelProvider });
+                      if (v !== null) switchProvider(v as ModelProvider);
                     }}
                     buttonClassName={SELECT_TRIGGER}
                   />
@@ -314,25 +445,6 @@ export function SettingsModelPage() {
                         />
                         <p className="text-xs text-muted-foreground">
                           OpenAI-compatible base URL. We'll call its chat-completions endpoint.
-                        </p>
-                      </div>
-                    )}
-
-                    {needsModel && (
-                      <div className="space-y-1.5">
-                        <Label htmlFor="model">Model</Label>
-                        <ModelCombobox
-                          id="model"
-                          value={form.model}
-                          onChange={(v) => patch({ model: v })}
-                          suggestions={
-                            available.length && form.provider === settings?.provider ? available : MODEL_SUGGESTIONS[form.provider]
-                          }
-                          placeholder={MODEL_PLACEHOLDER[form.provider]}
-                        />
-                        <p className="text-xs text-muted-foreground">
-                          Pick a known model or type any id your provider serves. A typo here
-                          silently breaks every AI draft, so double-check custom entries.
                         </p>
                       </div>
                     )}
@@ -381,6 +493,35 @@ export function SettingsModelPage() {
                 )}
               </div>
 
+              {needsModel && (
+                <div className="mt-5 space-y-4 rounded-xl border bg-card p-6 shadow-sm">
+                  <div>
+                    <h2 className="text-sm font-semibold">Model per job</h2>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Pick a known model or type any id your provider serves. A typo silently breaks the job,
+                      so double-check custom entries.
+                      {levels.length > 0 &&
+                        " Only some models accept a thinking level (OpenAI reasoning models, Claude 4.6 and newer). Test connection checks it."}
+                    </p>
+                  </div>
+                  {(["answers", "search", "general"] as const).map((job) => (
+                    <JobFields
+                      key={job}
+                      job={job}
+                      model={form[JOB_KEYS[job].model]}
+                      effort={form[JOB_KEYS[job].effort]}
+                      onModel={(v) => patch({ [JOB_KEYS[job].model]: v })}
+                      onEffort={(v) => patch({ [JOB_KEYS[job].effort]: v })}
+                      suggestions={
+                        available.length && form.provider === settings?.provider ? available : MODEL_SUGGESTIONS[form.provider]
+                      }
+                      levels={levels}
+                      placeholder={job === "answers" ? MODEL_PLACEHOLDER[form.provider] : "Same as answers"}
+                    />
+                  ))}
+                </div>
+              )}
+
               {/* Actions */}
               <div className="mt-5 flex flex-wrap items-center gap-2">
                 <Button
@@ -425,11 +566,31 @@ export function SettingsModelPage() {
                   ) : (
                     <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
                   )}
-                  <p>
-                    {testResult.ok
-                      ? "Connection succeeded — the saved provider is reachable."
-                      : testResult.error || "Connection failed. Check the model, key, and endpoint."}
-                  </p>
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <p>{testSummary(testResult)}</p>
+                    {testResult.jobs.length > 0 && (
+                      <ul className="space-y-1 text-xs">
+                        {testResult.jobs.map((j) => (
+                          <li key={j.job} className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                            {j.ok ? (
+                              <Check className="size-3.5 shrink-0 text-primary" />
+                            ) : (
+                              <AlertTriangle className="size-3.5 shrink-0 text-destructive" />
+                            )}
+                            <span className="font-medium">{MODEL_JOB_LABELS[j.job]}</span>
+                            <span className="font-mono text-muted-foreground">
+                              {j.model}
+                              {j.effort && ` · ${j.effort}`}
+                            </span>
+                            {j.error && <span className="basis-full text-destructive sm:basis-auto">{j.error}</span>}
+                          </li>
+                        ))}
+                        {testResult.jobs.length < 3 && (
+                          <li className="text-muted-foreground">Jobs not listed run the answers model at the answers level.</li>
+                        )}
+                      </ul>
+                    )}
+                  </div>
                 </div>
               )}
               </div>

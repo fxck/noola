@@ -6,30 +6,81 @@ import { api } from "@/lib/api";
 
 export type ModelProvider = "managed" | "openai" | "anthropic" | "custom";
 
+/** What the model is used for. Answers is the default for the other two jobs. */
+export type ModelJob = "answers" | "search" | "general";
+
+export const MODEL_JOB_LABELS: Record<ModelJob, string> = {
+  answers: "Answers",
+  search: "Search & translation",
+  general: "General",
+};
+
 export interface ModelSettings {
   provider: ModelProvider;
   /** OpenAI-compatible base URL — only meaningful for the "custom" provider. */
   endpoint: string | null;
-  /** Model id, e.g. "gpt-4o-mini" / "claude-3-5-sonnet-latest" / a custom id. */
+  /** The answers model, e.g. "gpt-4o-mini" / "claude-sonnet-5-5" / a custom id. */
   model: string | null;
   /** Whether an encrypted key is stored. The key itself is never returned. */
   hasKey: boolean;
+  /** The answers job's thinking level. Null runs the model at its own default. */
+  effort: string | null;
+  /** A job with neither a model nor a level of its own uses the answers model and level.
+   *  With only a level it runs the answers model at that level, with only a model it runs that model at its default. */
+  searchModel: string | null;
+  searchEffort: string | null;
+  generalModel: string | null;
+  generalEffort: string | null;
 }
 
 /**
  * PUT body. `apiKey` is write-only: omit or send "" to keep the existing key,
  * send a non-empty value to replace it. `provider: "managed"` clears the config.
+ * For the job fields, omitted keeps the saved value and null clears it.
  */
 export interface ModelSettingsInput {
   provider: ModelProvider;
   endpoint?: string;
   model?: string;
   apiKey?: string;
+  effort?: string | null;
+  searchModel?: string | null;
+  searchEffort?: string | null;
+  generalModel?: string | null;
+  generalEffort?: string | null;
+}
+
+export interface ModelJobTest {
+  job: ModelJob;
+  model: string;
+  effort: string | null;
+  ok: boolean;
+  error?: string;
 }
 
 export interface ModelTestResult {
   ok: boolean;
   error?: string;
+  /** The answers job, plus each job whose model or level differs from the answers job. Empty for the built-in model. */
+  jobs: ModelJobTest[];
+}
+
+/** The thinking levels each provider accepts. Mirrors the server's PROVIDER_EFFORTS. */
+export const PROVIDER_EFFORTS: Record<ModelProvider, readonly string[]> = {
+  managed: [],
+  openai: ["low", "medium", "high"],
+  anthropic: ["low", "medium", "high"],
+  custom: [],
+};
+
+const EFFORT_LABELS: Record<string, string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
+
+export function effortLabel(effort: string): string {
+  return EFFORT_LABELS[effort] ?? effort;
 }
 
 export const PROVIDER_OPTIONS: { value: ModelProvider; label: string }[] = [
@@ -76,6 +127,11 @@ export const DEFAULT_SETTINGS: ModelSettings = {
   endpoint: null,
   model: null,
   hasKey: false,
+  effort: null,
+  searchModel: null,
+  searchEffort: null,
+  generalModel: null,
+  generalEffort: null,
 };
 
 export async function fetchModelSettings(): Promise<ModelSettings> {

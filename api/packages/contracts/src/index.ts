@@ -442,6 +442,12 @@ export const ModelConfigInput = z.object({
   endpoint: z.string().url().max(500).nullish(),
   model: z.string().min(1).max(200).nullish(),
   apiKey: z.string().max(1000).optional(),
+  /** Thinking levels and the search and general jobs' models. Omitted keeps the saved value, null clears it. */
+  effort: z.string().max(20).nullish(),
+  searchModel: z.string().max(200).nullish(),
+  searchEffort: z.string().max(20).nullish(),
+  generalModel: z.string().max(200).nullish(),
+  generalEffort: z.string().max(20).nullish(),
 });
 export type ModelConfigInput = z.infer<typeof ModelConfigInput>;
 

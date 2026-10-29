@@ -1067,7 +1067,7 @@ async function distillThread(
       .map((m) => `${m.author?.username ?? "user"}: ${(m.content ?? "").trim()}`)
       .join("\n")}`.slice(0, 12000);
     try {
-      const driver = await resolveModelDriver(tenantId);
+      const driver = await resolveModelDriver(tenantId, { job: "general" });
       if (typeof driver.complete === "function") {
         const out = (await driver.complete(DISTILL_PROMPT, transcript)).trim();
         if (out) return out;

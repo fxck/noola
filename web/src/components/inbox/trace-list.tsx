@@ -70,7 +70,7 @@ export function TraceList({
                 {t.sourceCount === 0 && t.model !== "grounding-guard" && <span className="text-muted-foreground"> · no sources</span>}
               </td>
               <td className={cn(WIDE, "max-w-40 truncate px-3 py-2 align-top font-mono text-xs text-muted-foreground")} title={t.model}>
-                {shortModel(t.model)}
+                {shortModel(t.model)}{t.effort && ` · ${t.effort}`}
               </td>
               <td className={cn(WIDE, "whitespace-nowrap px-3 py-2 text-right align-top font-mono text-xs tabular-nums text-muted-foreground")}>
                 {t.tokensIn == null && t.tokensOut == null ? "—" : `${compactNum(t.tokensIn ?? 0)} / ${compactNum(t.tokensOut ?? 0)}`}

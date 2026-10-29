@@ -89,7 +89,7 @@ export async function translateText(
 ): Promise<string | null> {
   const body = (text ?? "").trim();
   if (!body || from === to) return null;
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "search" });
   if (!driver.complete) return null; // extractive baseline / air-gapped → no translation
   const system =
     `You are a professional translation engine for a customer-support tool. Translate the user's ` +
@@ -151,7 +151,7 @@ export async function translateArticle(
   input: { title: string; body: string },
   to: string,
 ): Promise<{ title: string; body: string } | null> {
-  const driver = await resolveModelDriver(tenantId);
+  const driver = await resolveModelDriver(tenantId, { job: "search" });
   if (!driver.complete) return null;
   const complete = driver.complete.bind(driver);
   const language = localeName(to);
