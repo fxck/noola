@@ -3,7 +3,7 @@ import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, t
 import { resolveModelDriver } from "./modelconfig.js";
 import { DEFAULT_PERSONA, getPersona, handoffRulesFor, personaPrompt } from "./persona.js";
 import { searchArticles, hydrateArticles } from "./kb.js";
-import { searchDocuments, listDocuments, hydrateChunks } from "./documents.js";
+import { searchDocuments, documentNames, hydrateChunks } from "./documents.js";
 import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
 import { searchResolvedThreads, hydrateThreads } from "./threads.js";
 import { vectorSearch, type VectorCollection } from "./vector.js";
@@ -496,12 +496,9 @@ async function prepareDraft(
   const threadTop = thrR.items.slice(0, MAX_THREADS);
   const chunkTop = chkR.items.slice(0, MAX_CHUNKS);
 
-  // Resolve chunk → document filename for citation (one list, mapped).
-  const docNames = new Map<string, string>();
-  if (chunkTop.length > 0) {
-    const docs = await listDocuments(tenantId).catch(() => []);
-    for (const d of docs) docNames.set(d.id, d.filename);
-  }
+  const docNames = chunkTop.length > 0
+    ? await documentNames(tenantId, [...new Set(chunkTop.map((ch) => ch.document_id))]).catch(() => new Map<string, string>())
+    : new Map<string, string>();
   // Chunk → absolute source URL, straight off the hit's source_key (url-connector docs only — a
   // page URL with domain). Guarded to http(s) so a manual upload (null) or a github repo path
   // never becomes a bogus link.

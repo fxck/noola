@@ -139,6 +139,13 @@ function docWhere(opts: ListDocumentsOpts, params: unknown[]): string {
   return where.length ? `WHERE ${where.join(" AND ")}` : "";
 }
 
+/** The filenames of the given documents, by id. */
+export async function documentNames(tenantId: string, ids: string[]): Promise<Map<string, string>> {
+  if (ids.length === 0) return new Map();
+  const r = await withTenant(tenantId, (c) => c.query("SELECT id, filename FROM documents WHERE id = ANY($1)", [ids]));
+  return new Map(r.rows.map((row) => [row.id as string, row.filename as string]));
+}
+
 export async function listDocuments(tenantId: string, opts: ListDocumentsOpts = {}): Promise<DocumentRow[]> {
   const params: unknown[] = [];
   const whereSql = docWhere(opts, params);
