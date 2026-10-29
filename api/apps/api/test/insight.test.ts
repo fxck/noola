@@ -3,6 +3,7 @@ import { ingestInbound } from "../src/ingest.js";
 import { ruleTopic, assignTicketTopic, listTopics } from "../src/topics.js";
 import { ruleScore, scoreTicket, listScores, qaSummary } from "../src/qa.js";
 import { getPersona, putPersona, personaPrompt, DEFAULT_PERSONA } from "../src/persona.js";
+import { DEFAULT_HANDOFF_RULES } from "../src/ai-outcome.js";
 import { createSegment, deleteSegment } from "../src/segments.js";
 import { createBroadcast, getBroadcast } from "../src/broadcasts.js";
 import { createContact } from "../src/contacts.js";
@@ -44,7 +45,7 @@ async function main() {
 
   // ---- pure: persona render ----
   check("personaPrompt empty for default", personaPrompt(DEFAULT_PERSONA) === "");
-  const rendered = personaPrompt({ tone: "formal", signature: "— Acme", guardrails: "promise refunds", instructions: "Be brief." });
+  const rendered = personaPrompt({ tone: "formal", signature: "— Acme", guardrails: "promise refunds", instructions: "Be brief.", handoffRules: null });
   check("personaPrompt includes tone/instructions/guardrails/signature",
     rendered.includes("formal") && rendered.includes("Be brief.") && rendered.includes("promise refunds") && rendered.includes("— Acme"));
 
@@ -77,7 +78,12 @@ async function main() {
   check("putPersona partial keeps other fields", saved.guardrails === before.guardrails);
   check("getPersona reads it back", (await getPersona(A)).tone === "playful");
   check("persona is tenant-isolated (B unaffected)", (await getPersona(B)).signature !== `${MARK}-sig`);
-  await putPersona(A, { tone: DEFAULT_PERSONA.tone, signature: "" }); // reset
+  check("the handoff rules default to null", (await getPersona(A)).handoffRules === before.handoffRules && saved.handoffRules === before.handoffRules);
+  const custom = await putPersona(A, { handoffRules: "  Hand off billing questions.  " });
+  check("custom handoff rules are saved trimmed", custom.handoffRules === "Hand off billing questions.", custom.handoffRules);
+  check("the default text is saved as null", (await putPersona(A, { handoffRules: DEFAULT_HANDOFF_RULES })).handoffRules === null);
+  check("empty handoff rules are saved as null", (await putPersona(A, { handoffRules: " " })).handoffRules === null);
+  await putPersona(A, { tone: DEFAULT_PERSONA.tone, signature: "", handoffRules: before.handoffRules }); // reset
 
   // ---- DB: broadcast from a saved segment ----
   const co = `${MARK}Co${RUN}`;

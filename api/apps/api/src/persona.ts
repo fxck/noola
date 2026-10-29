@@ -1,4 +1,5 @@
 import { withTenant } from "@repo/db";
+import { DEFAULT_HANDOFF_RULES } from "./ai-outcome.js";
 
 // Agent persona — the tenant's assistant voice. One row per tenant sets the tone, an optional
 // signature, hard guardrails, and free-form extra instructions. personaPrompt() renders it into a
@@ -15,6 +16,8 @@ export interface Persona {
   signature: string;
   guardrails: string;
   instructions: string;
+  /** When the AI helps and when it hands off. Null uses DEFAULT_HANDOFF_RULES. */
+  handoffRules: string | null;
 }
 
 export interface PersonaPatch {
@@ -22,6 +25,7 @@ export interface PersonaPatch {
   signature?: string;
   guardrails?: string;
   instructions?: string;
+  handoffRules?: string | null;
 }
 
 export const DEFAULT_PERSONA: Persona = {
@@ -29,12 +33,27 @@ export const DEFAULT_PERSONA: Persona = {
   signature: "",
   guardrails: "",
   instructions: "",
+  handoffRules: null,
 };
+
+export const HANDOFF_RULES_MAX = 4000;
+
+const PERSONA_COLS = `tone, signature, guardrails, instructions, handoff_rules AS "handoffRules"`;
+
+export function handoffRulesFor(p: Persona): string {
+  return p.handoffRules ?? DEFAULT_HANDOFF_RULES;
+}
+
+/** Empty rules, or the default text, are stored as null so a workspace follows later changes to the default. */
+function normalizeHandoffRules(rules: string | null): string | null {
+  const t = rules?.trim() ?? "";
+  return !t || t === DEFAULT_HANDOFF_RULES ? null : t.slice(0, HANDOFF_RULES_MAX);
+}
 
 export async function getPersona(tenantId: string): Promise<Persona> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      "SELECT tone, signature, guardrails, instructions FROM agent_persona WHERE tenant_id = current_tenant()",
+      `SELECT ${PERSONA_COLS} FROM agent_persona WHERE tenant_id = current_tenant()`,
     );
     return r.rowCount ? (r.rows[0] as Persona) : DEFAULT_PERSONA;
   });
@@ -48,16 +67,17 @@ export async function putPersona(tenantId: string, patch: PersonaPatch): Promise
     signature: (patch.signature ?? cur.signature).slice(0, 500),
     guardrails: (patch.guardrails ?? cur.guardrails).slice(0, 2000),
     instructions: (patch.instructions ?? cur.instructions).slice(0, 2000),
+    handoffRules: patch.handoffRules === undefined ? cur.handoffRules : normalizeHandoffRules(patch.handoffRules),
   };
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
-      `INSERT INTO agent_persona (tenant_id, tone, signature, guardrails, instructions, updated_at)
-       VALUES (current_tenant(), $1, $2, $3, $4, now())
+      `INSERT INTO agent_persona (tenant_id, tone, signature, guardrails, instructions, handoff_rules, updated_at)
+       VALUES (current_tenant(), $1, $2, $3, $4, $5, now())
        ON CONFLICT (tenant_id) DO UPDATE SET
          tone = EXCLUDED.tone, signature = EXCLUDED.signature, guardrails = EXCLUDED.guardrails,
-         instructions = EXCLUDED.instructions, updated_at = now()
-       RETURNING tone, signature, guardrails, instructions`,
-      [next.tone, next.signature, next.guardrails, next.instructions],
+         instructions = EXCLUDED.instructions, handoff_rules = EXCLUDED.handoff_rules, updated_at = now()
+       RETURNING ${PERSONA_COLS}`,
+      [next.tone, next.signature, next.guardrails, next.instructions, next.handoffRules],
     );
     return r.rows[0] as Persona;
   });
@@ -77,10 +97,4 @@ export function personaPrompt(p: Persona): string {
   if (p.guardrails.trim()) lines.push(`Never do the following: ${p.guardrails.trim()}`);
   if (p.signature.trim()) lines.push(`Sign off exactly as:\n${p.signature.trim()}`);
   return lines.join("\n");
-}
-
-/** Convenience: fetch + render in one call for the draft path. Empty string when unconfigured. */
-export async function personaFragment(tenantId: string): Promise<string> {
-  const p = await getPersona(tenantId);
-  return personaPrompt(p);
 }

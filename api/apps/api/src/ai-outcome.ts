@@ -70,6 +70,17 @@ export const DRAFT_OUTCOMES_SYSTEM = [
   "Use each tag at most once, never use them in any other way, and never mention them to the customer.",
 ].join("\n");
 
+/** When the AI helps and when it hands off. A workspace can replace it, and it goes before the fixed rules. */
+export const DEFAULT_HANDOFF_RULES = [
+  "When the customer reports a problem with their own project, service or account, answer from the sources when they cover it. " +
+    "If you need a detail to help, such as the service name or the exact error, ask for it in one short question.",
+  "If it looks like an outage or a fault on our side rather than in their setup, don't troubleshoot. " +
+    "Signs are several services or sites down at once, something stuck or still broken after a restart or redeploy, " +
+    "or the dashboard or API failing. Tell the customer briefly that a teammate will look into it, without guessing the cause, " +
+    "leave a note for the team and hand off.",
+  "Also hand off when the customer asks for a person, or when the fix needs someone who can see or change their account.",
+].join("\n");
+
 /** Added when retrieval found nothing, so the model can still skip a thank-you or ask what the customer needs. */
 export const NO_SOURCES_SYSTEM = [
   "You have no sources for this message, so state nothing about the product, its features, prices or policies.",

@@ -63,7 +63,8 @@ export async function getAiOverview(tenantId: string): Promise<AiOverview> {
     persona: {
       configured:
         persona.tone !== DEFAULT_PERSONA.tone ||
-        !!persona.instructions?.trim() || !!persona.signature?.trim() || !!persona.guardrails?.trim(),
+        !!persona.instructions?.trim() || !!persona.signature?.trim() || !!persona.guardrails?.trim() ||
+        persona.handoffRules != null,
       tone: persona.tone,
     },
     policy: {

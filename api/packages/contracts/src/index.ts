@@ -807,6 +807,8 @@ export const PersonaInput = z.object({
   signature: z.string().max(500).optional(),
   guardrails: z.string().max(2000).optional(),
   instructions: z.string().max(2000).optional(),
+  /** Null resets to the default rules. */
+  handoffRules: z.string().max(4000).nullable().optional(),
 });
 export type PersonaInput = z.infer<typeof PersonaInput>;
 

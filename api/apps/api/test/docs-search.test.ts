@@ -2,6 +2,8 @@ import pg from "pg";
 import { getModelConfig, putModelConfig } from "../src/modelconfig.js";
 import { createArticle, deleteArticle } from "../src/kb.js";
 import { ensureKbCollection } from "../src/search.js";
+import { DEFAULT_HANDOFF_RULES } from "../src/ai-outcome.js";
+import { getPersona, putPersona } from "../src/persona.js";
 import { mergeQueryRuns, safeWithoutSources, suggestForQuery, suggestForQueryStream } from "../src/copilot.js";
 import {
   DEFAULT_SEARCH_PROMPT, SEARCH_REPLY_FORMAT, getDocsSearchSettings, parseSearchQuery, putDocsSearchSettings, renderSearchPrompt, searchQueryFor,
@@ -88,6 +90,7 @@ async function main() {
   }) as typeof fetch;
 
   const before = await getDocsSearchSettings(A);
+  const personaBefore = await getPersona(A);
   const articles: string[] = [];
   const queries: string[] = [];
   const ask = (q: string) => {
@@ -152,6 +155,7 @@ async function main() {
     reply = "<none/>";
     const plain = await ask("DSRCHMSG gadget troubleshooting help");
     check("without a query the message is searched alone", plain.citations[0]?.id === viaMessage, plain.citations);
+    check("a draft that can't hand off gets no handoff rules", !lastDraftSystem.includes(DEFAULT_HANDOFF_RULES.slice(0, 60)), lastDraftSystem.slice(0, 400));
 
     // ---- No sources found: an empty scope finds nothing every time ----
     const sourceless = (q: string, outcomes: boolean) => {
@@ -170,6 +174,12 @@ async function main() {
     const thanks = await sourceless("ok děkuji DSRCH", true);
     check("without sources the model still answers when it can tag its answer", thanks.model !== "grounding-guard" && thanks.draft === "<no_reply/>", [thanks.model, thanks.draft]);
     check("and it is told it has no sources", lastDraftSystem.includes("You have no sources for this message"), lastDraftSystem.slice(-400));
+    const rulesAt = lastDraftSystem.indexOf(DEFAULT_HANDOFF_RULES);
+    check("the default handoff rules come before the fixed rules", rulesAt >= 0 && rulesAt < lastDraftSystem.indexOf("You are a customer-support agent"), lastDraftSystem.slice(0, 400));
+    await putPersona(A, { handoffRules: "DSRCH hand off everything about billing." });
+    await sourceless("ok díky DSRCH", true);
+    check("a workspace's own handoff rules replace the default", lastDraftSystem.includes("DSRCH hand off everything about billing.") && !lastDraftSystem.includes(DEFAULT_HANDOFF_RULES), lastDraftSystem.slice(0, 400));
+    await putPersona(A, { handoffRules: null });
     check("a thank-you the model leaves unanswered is not a knowledge gap", (await gaps("ok děkuji DSRCH")) === 0);
     draftReply = "I don't have that information, a teammate will help. <handoff/>";
     await sourceless("what is the DSRCH quota", true);
@@ -202,6 +212,7 @@ async function main() {
     globalThis.fetch = realFetch;
     await putModelConfig(A, { provider: "managed" });
     await putDocsSearchSettings(A, before);
+    await putPersona(A, { handoffRules: personaBefore.handoffRules });
     for (const id of articles) await deleteArticle(A, id);
     await superPool.query("DELETE FROM draft_traces WHERE tenant_id = $1 AND query = ANY($2)", [A, queries]);
     await superPool.query("DELETE FROM knowledge_gaps WHERE tenant_id = $1 AND question = ANY($2)", [A, queries]);

@@ -62,6 +62,8 @@ export interface DraftReplyInput {
   persona?: string;
   /** Lets the draft carry a note for the team or say that no reply is needed (ai-outcome.ts). The rule baseline ignores it. */
   outcomes?: boolean;
+  /** When the model helps and when it hands off. Used only with outcomes. */
+  handoffRules?: string;
 }
 
 /** A drafted reply plus the signals the autoreply gate + trace store need: how
@@ -309,16 +311,20 @@ const ANTHROPIC_DRAFT_MAX_TOKENS = 8000;
 // An OpenAI account also lists embedding, audio and image models, which can't draft a reply.
 const NOT_A_CHAT_MODEL = /embedding|whisper|tts|audio|realtime|transcribe|dall-e|image|moderation|davinci|babbage/i;
 
+/** The fixed parts of the draft prompt, for the settings page that shows the whole prompt. */
+export const DRAFT_PROMPT_PARTS = { always: DRAFT_SYSTEM, answerForms: DRAFT_OUTCOMES_SYSTEM, noSources: NO_SOURCES_SYSTEM };
+
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const sources = input.sources
     .map((s, i) => `[${i + 1}] ${s.title}${s.url ? ` — ${s.url}` : ""}\n${s.text}`)
     .join("\n\n");
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.
-  const persona = input.persona?.trim();
   const outcomes = sources ? DRAFT_OUTCOMES_SYSTEM : `${DRAFT_OUTCOMES_SYSTEM}\n\n${NO_SOURCES_SYSTEM}`;
   const rules = input.outcomes ? `${DRAFT_SYSTEM}\n\n${outcomes}` : DRAFT_SYSTEM;
-  const base = persona ? `${persona}\n\n${rules}` : rules;
+  // The handoff rules only apply when the model can hand off, and they go before the fixed rules.
+  const lead = [input.persona?.trim(), input.outcomes ? input.handoffRules?.trim() : ""].filter(Boolean).join("\n\n");
+  const base = lead ? `${lead}\n\n${rules}` : rules;
   const system = sources ? `${base}\n\nSources:\n${sources}` : base;
   const latest = input.customerMessage || "(the customer has not written anything yet)";
   // Render prior turns as a labeled transcript so the model can see the conversation — without it a

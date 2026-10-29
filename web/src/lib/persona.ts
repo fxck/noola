@@ -9,12 +9,31 @@ export interface Persona {
   signature: string;
   guardrails: string;
   instructions: string;
+  /** When the AI helps and when it hands off. Null uses the default rules. */
+  handoffRules: string | null;
 }
+
+/** The fixed parts of the prompt the AI answers with, for showing the whole prompt. */
+export interface DraftPrompt {
+  /** The saved persona as the model reads it. */
+  persona: string;
+  always: string;
+  answerForms: string;
+  noSources: string;
+}
+
+export interface PersonaSettings {
+  persona: Persona;
+  defaultHandoffRules: string;
+  prompt: DraftPrompt;
+}
+
+export const HANDOFF_RULES_MAX = 4000;
 
 export const TONES = ["friendly", "professional", "concise", "empathetic", "playful", "formal"] as const;
 
-export async function fetchPersona(): Promise<Persona> {
-  return (await api<{ persona: Persona }>("/persona")).persona;
+export async function fetchPersona(): Promise<PersonaSettings> {
+  return api<PersonaSettings>("/persona");
 }
 
 export async function savePersona(patch: Partial<Persona>): Promise<Persona> {

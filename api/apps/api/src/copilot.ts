@@ -1,7 +1,7 @@
 import { withTenant } from "@repo/db";
 import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
-import { personaFragment } from "./persona.js";
+import { DEFAULT_PERSONA, getPersona, handoffRulesFor, personaPrompt } from "./persona.js";
 import { searchArticles, hydrateArticles } from "./kb.js";
 import { searchDocuments, listDocuments, hydrateChunks } from "./documents.js";
 import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
@@ -432,7 +432,7 @@ async function prepareDraft(
   started: number,
 ): Promise<{
   driver: ModelServingDriver;
-  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[]; outcomes?: boolean };
+  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[]; outcomes?: boolean; handoffRules?: string };
   citations: Citation[];
   retrieval: RetrievalSummary;
   /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model has nothing to ground on,
@@ -564,10 +564,14 @@ async function prepareDraft(
   const driver = await resolveModelDriver(tenantId);
   // The tenant's configured voice (persona.ts) steers the hosted draft; empty/unconfigured is a
   // no-op. Best-effort — a persona lookup failure must never block a draft.
-  const persona = await personaFragment(tenantId).catch(() => "");
+  const personaRow = await getPersona(tenantId).catch(() => DEFAULT_PERSONA);
+  const persona = personaPrompt(personaRow);
   // Current-turn images (widget screenshots) ride along to a vision model as image content-blocks —
   // extra context on TOP of the text-driven retrieval, never a substitute for grounding.
-  const draftInput = { customerMessage: query, sources: grounding, persona, history, images: opts.images, outcomes: opts.outcomes };
+  const draftInput = {
+    customerMessage: query, sources: grounding, persona, history, images: opts.images, outcomes: opts.outcomes,
+    handoffRules: handoffRulesFor(personaRow),
+  };
 
   // Trace + content-gap + Suggestion assembly, invoked once a DraftResult exists (one-shot
   // or streamed). `latencyMs` is the draft-generation time the caller measured.
