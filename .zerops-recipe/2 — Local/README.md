@@ -1,3 +1,6 @@
+<!-- PUBLIC RECIPE: deploys your own copy of Noola from GitHub. The Noola application's Mates, Stage
+     and Production in Zerops Mate come from HQ's `group` recipe instead — see ../README.md. -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 Just the backing stores — PostgreSQL, Valkey, NATS, Typesense, Qdrant and object
 storage — plus Mailpit, and no app containers. Bring up the Zerops VPN

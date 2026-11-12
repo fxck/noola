@@ -1,5 +1,10 @@
 #zeropsPreprocessor=on
 
+# PUBLIC RECIPE: the "Deploy on Zerops" button's tier, deploying your own copy of Noola from
+# GitHub. The Noola application's Mates, Stage and Production in Zerops Mate come from the recipe
+# in HQ's `group` repository instead, changed only through zerops_workflow action="group-recipe" —
+# see ../README.md.
+
 # Stage — a single non-HA running instance built with the *prod setups: one container
 # per service over single-node stores, with a shared embedder, runner and Mailpit. For
 # pre-production validation before Small / HA Production. The demo workspace is seeded

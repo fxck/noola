@@ -1,5 +1,10 @@
 #zeropsPreprocessor=on
 
+# PUBLIC RECIPE: the "Deploy on Zerops" button's tier, deploying your own copy of Noola from
+# GitHub. The Noola application's Mates, Stage and Production in Zerops Mate come from the recipe
+# in HQ's `group` repository instead, changed only through zerops_workflow action="group-recipe" —
+# see ../README.md.
+
 # AI Agent — full dev + stage pairs for agent-driven development (the topology Noola itself
 # was built on). EVERY service we own is paired, so every one of them can be changed:
 #

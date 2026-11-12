@@ -1,5 +1,10 @@
 #zeropsPreprocessor=on
 
+# PUBLIC RECIPE: the "Deploy on Zerops" button's tier, deploying your own copy of Noola from
+# GitHub. The Noola application's Mates, Stage and Production in Zerops Mate come from the recipe
+# in HQ's `group` repository instead, changed only through zerops_workflow action="group-recipe" —
+# see ../README.md.
+
 # Small Production — single-node managed stores, app runtimes on shared CPU autoscaling
 # 1→2, a shared embedder and runner. No demo seed: set BOOTSTRAP_ADMIN_EMAIL +
 # BOOTSTRAP_ADMIN_PASSWORD and that account owns the first workspace. Outbound email is

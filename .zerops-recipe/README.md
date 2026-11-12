@@ -1,5 +1,18 @@
 # Noola — Zerops recipe
 
+> **Two recipes, two audiences.** This folder is the **public recipe**, behind the "Deploy on
+> Zerops" button in the [root README](../README.md): anyone deploys their own copy of Noola on
+> Zerops from GitHub — a dev service per part (`apidev`, `webdev`, … on the `*dev` setups) beside
+> its stage, every service building from github.com/fxck/noola. It is current: keep it in step
+> when a part or a managed service is added.
+>
+> The **Noola application's own** Mates, Stage and Production in Zerops Mate are built from a
+> different recipe, kept in HQ's `group` repository and changed only through
+> `zerops_workflow action="group-recipe"`: a dev pool per part (`apipool`, … on the `*pool`
+> setups) leased per branch, every service building from HQ. A Mate's stand-up reads that one,
+> never this folder. The two differ by design — pools vs dev services, HQ vs GitHub — so neither
+> shows the other is out of date.
+
 See the [root README](../README.md).
 
 ## Recipe metadata

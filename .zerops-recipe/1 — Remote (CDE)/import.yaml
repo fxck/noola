@@ -1,5 +1,10 @@
 #zeropsPreprocessor=on
 
+# PUBLIC RECIPE: the "Deploy on Zerops" button's tier, deploying your own copy of Noola from
+# GitHub. The Noola application's Mates, Stage and Production in Zerops Mate come from the recipe
+# in HQ's `group` repository instead, changed only through zerops_workflow action="group-recipe" —
+# see ../README.md.
+
 # Remote CDE — one dev container carrying the whole monorepo (the `app` service uses
 # the apidev setup: deploys [.] and idles via `zsc noop`), plus the backing stores, a
 # shared embedder and Mailpit. Connect your IDE / SSH into `app` and run the api and web

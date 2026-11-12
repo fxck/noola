@@ -1,3 +1,6 @@
+<!-- PUBLIC RECIPE: deploys your own copy of Noola from GitHub. The Noola application's Mates, Stage
+     and Production in Zerops Mate come from HQ's `group` recipe instead — see ../README.md. -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 A single cloud dev container with the whole Noola monorepo checked out and idling, plus
 PostgreSQL, Valkey, NATS, Typesense, Qdrant, object storage, a shared embedder and

@@ -1,3 +1,6 @@
+<!-- PUBLIC RECIPE: deploys your own copy of Noola from GitHub. The Noola application's Mates, Stage
+     and Production in Zerops Mate come from HQ's `group` recipe instead — see ../README.md. -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 The development topology Noola was built on: dev + stage pairs of api, edge and web
 over single-node stores, sharing one embedder and one runner. The dev containers

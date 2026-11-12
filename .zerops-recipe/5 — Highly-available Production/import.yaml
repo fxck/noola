@@ -1,5 +1,10 @@
 #zeropsPreprocessor=on
 
+# PUBLIC RECIPE: the "Deploy on Zerops" button's tier, deploying your own copy of Noola from
+# GitHub. The Noola application's Mates, Stage and Production in Zerops Mate come from the recipe
+# in HQ's `group` repository instead, changed only through zerops_workflow action="group-recipe" —
+# see ../README.md.
+
 # HA Production — highly-available managed clusters (PostgreSQL, Valkey, NATS, Typesense
 # and Qdrant all :ha), with the api, edge and web runtimes on dedicated CPU autoscaling
 # 2→4 and a redundant runner pool. No demo seed: set BOOTSTRAP_ADMIN_EMAIL +

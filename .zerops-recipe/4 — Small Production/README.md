@@ -1,3 +1,6 @@
+<!-- PUBLIC RECIPE: deploys your own copy of Noola from GitHub. The Noola application's Mates, Stage
+     and Production in Zerops Mate come from HQ's `group` recipe instead — see ../README.md. -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 Run Noola on a budget: single-node PostgreSQL, Valkey, NATS, Typesense and Qdrant,
 with the api, edge and web runtimes on shared CPU autoscaling 1→2, plus a shared
