@@ -1,6 +1,6 @@
 # Root manifest for the Noola monorepo — one repo, one zerops.yaml, every service.
 #
-# EXACTLY TWO setups per service we own — *dev and *prod — and no third for stage. A stage
+# Per service we own: a dev setup (*dev, or *pool for a Mate) and *prod — no third for stage. A stage
 # service is built with the *prod setup ON PURPOSE: stage exists to validate the artifact and
 # config that production will run, so giving it its own setup would test something that never
 # ships. There is no `*stage` setup anywhere in this file and there must never be one.
@@ -12,18 +12,23 @@
 #           stage half of a dev/stage project AND the service of a production project, so it MUST
 #           NOT name any sibling: the api is `apistage` in one and `api` in the other. Every
 #           cross-service URL it needs comes from project env, set per environment by the
-#           project's recipe (see below) — the only layer that knows the project's shape.
+#           recipe that made the project (see below) — the only layer that knows its shape.
+#   *pool — the dev environment of the Noola application's Mates in Zerops Mate, in place of
+#           *dev: a dev pool leased per branch (see the pool section at the bottom). The public
+#           recipe never uses it; the Mates' recipe uses it instead of *dev.
 #
 # Managed stores (db, cache, broker, search, qdrant, storage) are shared singles with identical
 # names in both shapes, so referencing them directly (DB_HOST: db, ${broker_port}) is always safe.
 #
 # Cross-service URLs that vary by topology — EMBED_URL, API_INTERNAL_URL, and the
 # SMTP / Mailpit endpoint — plus every signing/DB secret are PROJECT-LEVEL env, set
-# per environment by the project's recipe: each tier's import.yaml in HQ's `group`
-# repository (AI Agent for a Mate, Stage, Small Production), which changes only
-# through zerops_workflow action="group-recipe". .zerops-recipe/ in this repo is NOT
-# that recipe: it is the old public one-click recipe for deploying your own copy
-# from GitHub, in the old one-dev-service-per-part setup. Project vars + secrets are
+# per environment by the recipe that made the project. Two recipes, two audiences:
+#   - .zerops-recipe/<tier>/import.yaml — the public recipe: anyone's own copy, deployed
+#     on Zerops from GitHub (*dev + *prod). Keep it current.
+#   - the tiers in HQ's `group` repository — the Noola application's own Mates, Stage
+#     and Production in Zerops Mate (*pool + *prod), built from HQ; they change only
+#     through zerops_workflow action="group-recipe".
+# They differ by design; neither shows the other is out of date. Project vars + secrets are
 # auto-inherited by every service, so they are NOT wired here (re-referencing an
 # inherited var as ${VAR} would resolve to a literal string). One zerops.yaml serves
 # every rung, from a single agent-driven pair up to an HA cluster. Only genuine
@@ -398,8 +403,9 @@ zerops:
         # the second. The old defaults assembled `api-${zeropsSubdomainHost}` / `edge-...`, which
         # is only ever right in a production-shaped project and silently produces a URL for a
         # non-existent host anywhere else. VITE_API_URL / VITE_EDGE_URL come from project env,
-        # set per environment by the project's recipe in HQ's `group` repository (see the top
-        # of this file), which is the only layer that knows which shape it is. Project vars
+        # set per environment by the recipe that made the project — the public one or the
+        # Mates' one in HQ (see the top of this file) — the only layer that knows which shape
+        # it is. Project vars
         # are inherited into the build shell by name.
       buildCommands:
         # Clean install every build — do NOT cache web/node_modules. A cached node_modules
@@ -517,8 +523,8 @@ zerops:
       start: runner/runnerd
 
   # ═══ site — React 19 / Vite / TanStack Router · site/ (Noola marketing site) ══
-  # The project's recipe in HQ's `group` repository carries it (sitepool + sitestage for a
-  # Mate, site in Stage and Small Production). The old public one-click recipe in
+  # The Noola application's recipe in HQ's `group` repository carries it (sitepool +
+  # sitestage for a Mate, site in Stage and Small Production). The public recipe in
   # .zerops-recipe/ DELIBERATELY leaves it out: a fork wants the app, not our landing page.
   # It also ships in the separate noola.cc project, which builds from this same repo — so
   # these setups stay here and MUST NOT be deleted as dead code.

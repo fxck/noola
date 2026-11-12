@@ -1,5 +1,5 @@
-<!-- OLD PUBLIC RECIPE, not this project's recipe — see ../README.md. This project's recipe lives in
-     HQ's `group` repository and changes only through zerops_workflow action="group-recipe". -->
+<!-- PUBLIC RECIPE: deploys your own copy of Noola from GitHub. The Noola application's Mates, Stage
+     and Production in Zerops Mate come from HQ's `group` recipe instead — see ../README.md. -->
 
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 The development topology Noola was built on: dev + stage pairs of api, edge and web

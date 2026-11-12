@@ -19,7 +19,7 @@ lives in [README.md](README.md).
 
 ## Zerops topology — how a service maps to a container
 
-**This project's recipe** — the services, env and scale each new Mate, Stage and Production of the Noola application get — lives in HQ's `group` repository and changes only through `zerops_workflow action="group-recipe"`; `.zerops-recipe/` here is the old public one-click recipe, not this project's.
+**Two recipes, two audiences.** `.zerops-recipe/` is the public recipe: anyone's own copy, deployed on Zerops from GitHub, with a `*dev` service per part beside its stage — keep it current. The Noola application's own Mates, Stage and Production in Zerops Mate come from the recipe in HQ's `group` repository instead (a `*pool` dev pool per part, built from HQ), which changes only through `zerops_workflow action="group-recipe"`. They differ by design; neither shows the other is out of date. The topology and loops below describe a copy made from the public recipe; a Mate works in leases of its dev pools, as zcp's develop workflow lays out.
 
 Each service has a **dev half** (`*dev`) and a **stage/prod half**:
 

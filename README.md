@@ -54,9 +54,7 @@ generated) and seed a demo workspace — sign in with `ales@acme.test` / `demo12
 
 ▶ **[Deploy on Zerops](https://app.zerops.io/recipes/detail?github=https://github.com/fxck/noola)**
 
-The one-click recipe's manifest lives in [`.zerops-recipe/`](./.zerops-recipe/). It is the old
-public recipe for deploying your own copy, not the recipe of the Noola application's own Mates,
-Stage and Production, which lives in HQ.
+The recipe manifest lives in [`.zerops-recipe/`](./.zerops-recipe/).
 
 ## Local development
 
@@ -96,7 +94,7 @@ runner/          Go — automation-run worker (one Zerops Box sandbox per run)
 web/             Vite + React 19 SPA — the console
 site/            Vite + React 19 — the public marketing site (static nginx)
 zerops.yaml      build/run setups for every service (*dev + *prod)
-.zerops-recipe/  the old public one-click recipe (not this project's recipe, which lives in HQ)
+.zerops-recipe/  Zerops recipe variants (AI Agent · Remote CDE · Local · Stage · Small/HA Production)
 ```
 
 ## License
