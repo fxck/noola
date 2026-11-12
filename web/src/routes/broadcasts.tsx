@@ -27,6 +27,8 @@ import {
   Target,
   Copy,
   Trash2,
+  LayoutTemplate,
+  type LucideIcon,
 } from "lucide-react";
 import {
   useReactTable,
@@ -118,7 +120,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { PopoverSelect } from "@/components/ui/menu";
-import { TAB_BASE, TAB_OFF, TAB_ON } from "@/components/ui/segmented";
 import { Textarea } from "@/components/ui/textarea";
 import { Spinner } from "@/components/ui/spinner";
 import { RowsSkeleton } from "@/components/ui/skeleton";
@@ -278,6 +279,11 @@ const CHANNEL_LABEL: Record<BroadcastChannel, string> = {
   whatsapp: "WhatsApp",
 };
 const BROADCAST_CHANNELS = Object.keys(CHANNEL_LABEL) as BroadcastChannel[];
+
+// The composer's PopoverSelect triggers, boxed like its other form fields
+// (PopoverSelect alone is the quiet inline picker of rails and chrome).
+const BOXED_SELECT =
+  "my-0 h-8 min-w-56 justify-between rounded-md border border-input bg-background px-2.5 text-xs shadow-sm hover:bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
 // Why a channel is disabled — mirrors the server's channel registry gating.
 const CHANNEL_CRED_HINT: Record<BroadcastChannel, string> = {
@@ -1018,6 +1024,9 @@ function ComposeBroadcast({
   const [windowTz, setWindowTz] = useState(
     draft?.window_tz_offset_min ?? -new Date().getTimezoneOffset(),
   );
+  // "Send immediately" ignores the window, so the composer shows it — and
+  // ships it — only for a scheduled or continuous delivery.
+  const windowActive = windowOn && timing !== "now";
   function toggleWindowDay(n: number) {
     setWindowDays((ds) => (ds.includes(n) ? ds.filter((d) => d !== n) : [...ds, n].sort((a, b) => a - b)));
     setError(null);
@@ -1347,7 +1356,7 @@ function ComposeBroadcast({
     }
     // The send window validates client-side too — the server would 400 an
     // empty day set (it reads as "no window") or inverted bounds.
-    if (windowOn) {
+    if (windowActive) {
       if (windowDays.length === 0) {
         setError("Pick at least one day for the send window.");
         return;
@@ -1388,10 +1397,10 @@ function ComposeBroadcast({
           stopAt: stopAt ?? "",
           goalEvent: isEmail ? goalEvent.trim() : "",
           ...(isEmail && goalEvent.trim() ? { goalDays: clampGoalDays(goalDays) } : {}),
-          windowDays: windowOn ? windowDays : null,
-          windowStartMin: windowOn ? winStartMin : null,
-          windowEndMin: windowOn ? winEndMin : null,
-          windowTzOffsetMin: windowOn ? windowTz : null,
+          windowDays: windowActive ? windowDays : null,
+          windowStartMin: windowActive ? winStartMin : null,
+          windowEndMin: windowActive ? winEndMin : null,
+          windowTzOffsetMin: windowActive ? windowTz : null,
         });
         onSaved(saved, true);
         return;
@@ -1422,7 +1431,7 @@ function ComposeBroadcast({
           ? { goalEvent: goalEvent.trim(), goalDays: clampGoalDays(goalDays) }
           : {}),
         // The send window ships only while the disclosure is on.
-        ...(windowOn
+        ...(windowActive
           ? {
               windowDays,
               windowStartMin: winStartMin,
@@ -1538,19 +1547,25 @@ function ComposeBroadcast({
           </div>
         )}
 
+        {/* the sending settings — each group under the same ComposerSection
+            header (icon, title, "Optional" where it is), divided from the
+            message above. */}
+        <div className="space-y-6 border-t pt-6">
         {/* email template — the stationery the message renders in. Email-only;
             other channels deliver plain text, so the picker hides with them. */}
         {channel === "email" && (
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <Label className="mb-0">Template</Label>
+          <ComposerSection
+            icon={LayoutTemplate}
+            title="Template"
+            action={
               <Link
                 to="/settings/email-templates"
                 className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
               >
                 Manage templates
               </Link>
-            </div>
+            }
+          >
             {templates.length > 0 ? (
               <div>
                 <PopoverSelect
@@ -1561,6 +1576,7 @@ function ComposeBroadcast({
                   }))}
                   onChange={(v) => setTemplateId(v ?? "branded")}
                   align="start"
+                  buttonClassName={BOXED_SELECT}
                 />
               </div>
             ) : (
@@ -1568,62 +1584,60 @@ function ComposeBroadcast({
                 The built-in Branded template will be used.
               </p>
             )}
-          </div>
+          </ComposerSection>
         )}
 
-        {/* channel picker — segmented, each option carries its reachable count from
-            the live preview; uncredentialed channels disable (server-gated too) */}
-        <div className="space-y-1.5">
-          <Label>Channel</Label>
+        {/* channel picker — one radio card per channel, the same selected idiom
+            as Delivery's; each carries its reachable count from the live
+            preview. Uncredentialed channels disable (server-gated too) and say
+            so instead of showing a count. */}
+        <ComposerSection icon={Send} title="Channel">
           <div
             role="radiogroup"
             aria-label="Delivery channel"
-            // w-fit flex (not inline-flex) — the inline Label above would otherwise
-            // share its line and jam against the control.
-            className="flex w-fit flex-wrap items-center gap-0.5 rounded-lg border bg-muted/60 p-0.5"
+            className="grid grid-cols-[repeat(auto-fill,minmax(7rem,1fr))] gap-1.5"
           >
             {BROADCAST_CHANNELS.map((id) => {
               const enabled = isCredentialed(id);
+              const on = channel === id;
               const reach = preview?.reachable[id];
               return (
                 <button
                   key={id}
                   type="button"
                   role="radio"
-                  aria-checked={channel === id}
+                  aria-checked={on}
                   disabled={!enabled}
                   title={enabled ? undefined : CHANNEL_CRED_HINT[id]}
                   onClick={() => pickChannel(id)}
                   className={cn(
-                    TAB_BASE,
-                    channel === id ? TAB_ON : TAB_OFF,
-                    !enabled && "cursor-not-allowed opacity-45 hover:text-muted-foreground",
+                    "flex min-w-0 flex-col gap-0.5 rounded-lg border px-2.5 py-2 text-left transition-colors motion-reduce:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    on ? "border-primary bg-primary/5" : "border-input hover:bg-muted/40",
+                    !enabled && "cursor-not-allowed border-dashed opacity-60 hover:bg-transparent",
                   )}
                 >
-                  {CHANNEL_LABEL[id]}
-                  {reach != null && (
-                    <span
-                      className={cn(
-                        "tabular-nums",
-                        channel === id ? "text-muted-foreground" : "text-muted-foreground/70",
-                      )}
-                    >
-                      · {reach.toLocaleString()}
-                    </span>
-                  )}
+                  <span className="flex items-center gap-1.5 text-xs font-medium">
+                    <ChannelIcon channel={id} className={on ? "text-primary" : undefined} />
+                    {CHANNEL_LABEL[id]}
+                  </span>
+                  <span className="truncate text-micro tabular-nums text-muted-foreground">
+                    {!enabled
+                      ? "Not set up"
+                      : id === "discord"
+                        ? "Posts to a channel"
+                        : reach != null
+                          ? `${reach.toLocaleString()} reachable`
+                          : " "}
+                  </span>
                 </button>
               );
             })}
           </div>
-        </div>
+        </ComposerSection>
 
         {/* Discord channel-post (0078): no contact segment — ONE post to a channel. */}
         {isDiscord && (
-          <div className="space-y-2">
-            <div className="flex items-center gap-1.5">
-              <SlidersHorizontal className="size-3.5 text-muted-foreground" />
-              <Label className="mb-0">Where to post</Label>
-            </div>
+          <ComposerSection icon={SlidersHorizontal} title="Where to post">
             <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
               <p className="text-xs text-muted-foreground">
                 A Discord broadcast posts <span className="font-medium text-foreground">one message</span> to a
@@ -1671,164 +1685,124 @@ function ComposeBroadcast({
                 <Switch checked={asEmbed} onCheckedChange={setAsEmbed} />
               </label>
             </div>
-          </div>
+          </ComposerSection>
         )}
 
-        {/* segment builder — the same filters as the contacts directory */}
+        {/* segment builder — the same filters as the contacts directory. The
+            live reach is the card's footer: the result of the filters above it. */}
         {!isDiscord && (
-        <div className="space-y-2">
-          <div className="flex items-center gap-1.5">
-            <SlidersHorizontal className="size-3.5 text-muted-foreground" />
-            <Label className="mb-0">Audience</Label>
-          </div>
-          <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
-            {savedSegments.length > 0 && (
-              <div className="space-y-1">
-                <Label className="text-xs">Saved segment</Label>
-                <div>
-                  <PopoverSelect
-                    value={segmentId}
-                    options={[
-                      { value: null, label: "Custom filter…" },
-                      ...savedSegments.map((s) => ({ value: s.id, label: s.name })),
-                    ]}
-                    onChange={(v) => (v ? applySavedSegment(v) : setSegmentId(null))}
-                    align="start"
+          <ComposerSection
+            icon={Users}
+            title="Audience"
+            action={
+              hasFilters && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="-my-1 h-6 gap-1 px-1.5 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setQ("");
+                    setGroups([[]]);
+                    setSegmentId(null);
+                  }}
+                >
+                  <X className="size-3.5" /> Clear audience
+                </Button>
+              )
+            }
+          >
+            <div className="overflow-hidden rounded-lg border">
+              <div className="space-y-3 bg-muted/20 p-3">
+                {savedSegments.length > 0 && (
+                  <div className="space-y-1">
+                    <Label className="text-xs">Saved segment</Label>
+                    <div>
+                      <PopoverSelect
+                        value={segmentId}
+                        options={[
+                          { value: null, label: "Custom filter…" },
+                          ...savedSegments.map((s) => ({ value: s.id, label: s.name })),
+                        ]}
+                        onChange={(v) => (v ? applySavedSegment(v) : setSegmentId(null))}
+                        align="start"
+                        buttonClassName={BOXED_SELECT}
+                      />
+                    </div>
+                  </div>
+                )}
+                <div className="space-y-1">
+                  <Label htmlFor="b-q" className="text-xs">
+                    Keyword search
+                  </Label>
+                  <Input
+                    id="b-q"
+                    value={q}
+                    onChange={(e) => editQ(e.target.value)}
+                    placeholder="Matches name, e-mail, or company…"
+                    className="h-8 text-xs"
+                    autoComplete="off"
                   />
                 </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Filters</Label>
+                  {/* the contacts directory's condition builder, verbatim — a segment
+                      composed here is the same grammar a saved Customers view stores.
+                      "+ Or" adds an OR-ed row (each row's conditions AND together). */}
+                  <FilterBuilder fields={filterFields} groups={groups} onChange={editGroups} />
+                </div>
               </div>
-            )}
-            <div className="space-y-1">
-              <Label htmlFor="b-q" className="text-xs">
-                Keyword search
-              </Label>
-              <Input
-                id="b-q"
-                value={q}
-                onChange={(e) => editQ(e.target.value)}
-                placeholder="Matches name, e-mail, or company…"
-                className="h-8 text-xs"
-                autoComplete="off"
-              />
-            </div>
-            <div className="space-y-1">
-              <Label className="text-xs">Filters</Label>
-              {/* the contacts directory's condition builder, verbatim — a segment
-                  composed here is the same grammar a saved Customers view stores.
-                  "+ Or" adds an OR-ed row (each row's conditions AND together). */}
-              <FilterBuilder fields={filterFields} groups={groups} onChange={editGroups} />
-            </div>
-            {hasFilters && (
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs"
-                onClick={() => {
-                  setQ("");
-                  setGroups([[]]);
-                  setSegmentId(null);
-                }}
-              >
-                <X className="size-3.5" /> Clear audience
-              </Button>
-            )}
-          </div>
 
-          {/* subscription topic (0110) — scopes the recipient's unsubscribe to this list, so opting
-              out of one topic leaves the others intact. Omit for a global-footer send. */}
-          {!isDiscord && (
-            <div className="space-y-1">
-              <Label className="text-xs">Subscription topic <span className="font-normal text-muted-foreground">(optional)</span></Label>
-              <div className="flex items-center gap-2">
-                <select
-                  value={topicId}
-                  onChange={(e) => setTopicId(e.target.value)}
-                  className="h-8 flex-1 rounded-md border bg-background px-2 text-xs"
-                >
-                  <option value="">No topic — unsubscribe opts out of everything</option>
-                  {topics.map((t) => (
-                    <option key={t.id} value={t.id}>{t.name}</option>
-                  ))}
-                </select>
-                {!addingTopic && (
-                  <Button type="button" size="sm" variant="outline" className="h-8 shrink-0 gap-1 px-2 text-xs" onClick={() => setAddingTopic(true)}>
-                    <Plus className="size-3.5" /> New
+              {/* live reach preview */}
+              <div className="flex min-h-11 items-center gap-2 border-t bg-muted/40 px-3 py-2 text-sm">
+                {previewing ? (
+                  <span className="flex items-center gap-1.5 text-muted-foreground">
+                    <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" /> Counting the
+                    audience…
+                  </span>
+                ) : previewFailed ? (
+                  <span className="text-muted-foreground">
+                    Couldn't preview the audience — you can still create the draft.
+                  </span>
+                ) : preview ? (
+                  (() => {
+                    // Reach is per channel — the line always speaks for the CHOSEN one.
+                    const reach = preview.reachable[channel] ?? 0;
+                    const unreachable = Math.max(0, preview.total - reach);
+                    return (
+                      <span className="flex-1">
+                        Will send to <span className="font-semibold tabular-nums">{reach.toLocaleString()}</span>{" "}
+                        {reach === 1 ? "contact" : "contacts"} via {CHANNEL_LABEL[channel]}
+                        <span className="text-muted-foreground">
+                          {" "}
+                          ({preview.total.toLocaleString()} match
+                          {unreachable > 0
+                            ? `, ${unreachable.toLocaleString()} not reachable on ${CHANNEL_LABEL[channel]}`
+                            : ""}
+                          )
+                        </span>
+                      </span>
+                    );
+                  })()
+                ) : (
+                  <span className="text-muted-foreground">Refine the audience to preview reach.</span>
+                )}
+                {/* view-recipients drill-in — the fix for "just a number": list exactly who receives */}
+                {preview && (preview.reachable[channel] ?? 0) > 0 && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto h-7 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+                    onClick={() => setShowRecipients(true)}
+                  >
+                    <Eye className="size-3.5" />
+                    View recipients
                   </Button>
                 )}
               </div>
-              {addingTopic && (
-                <div className="flex items-center gap-2">
-                  <Input
-                    value={newTopicName}
-                    onChange={(e) => setNewTopicName(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void addTopicInline(); } }}
-                    placeholder="e.g. Product updates"
-                    className="h-8 flex-1 text-xs"
-                    autoFocus
-                  />
-                  <Button type="button" size="sm" className="h-8 px-2 text-xs" onClick={() => void addTopicInline()} disabled={!newTopicName.trim()}>Add</Button>
-                  <Button type="button" size="sm" variant="ghost" className="h-8 px-2 text-xs" onClick={() => { setAddingTopic(false); setNewTopicName(""); }}>Cancel</Button>
-                </div>
-              )}
-              <p className="text-micro text-muted-foreground">
-                {topicId
-                  ? "Recipients can opt out of just this topic; other topics still reach them."
-                  : "The footer unsubscribe opts recipients out of all marketing."}
-              </p>
             </div>
-          )}
-
-          {/* live reach preview */}
-          <div className="flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-sm">
-            <Users className="size-4 shrink-0 text-muted-foreground" />
-            {previewing ? (
-              <span className="flex items-center gap-1.5 text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" /> Counting the
-                audience…
-              </span>
-            ) : previewFailed ? (
-              <span className="text-muted-foreground">
-                Couldn't preview the audience — you can still create the draft.
-              </span>
-            ) : preview ? (
-              (() => {
-                // Reach is per channel — the line always speaks for the CHOSEN one.
-                const reach = preview.reachable[channel] ?? 0;
-                const unreachable = Math.max(0, preview.total - reach);
-                return (
-                  <span className="flex-1">
-                    Will send to <span className="font-semibold tabular-nums">{reach.toLocaleString()}</span>{" "}
-                    {reach === 1 ? "contact" : "contacts"} via {CHANNEL_LABEL[channel]}
-                    <span className="text-muted-foreground">
-                      {" "}
-                      ({preview.total.toLocaleString()} match
-                      {unreachable > 0
-                        ? `, ${unreachable.toLocaleString()} not reachable on ${CHANNEL_LABEL[channel]}`
-                        : ""}
-                      )
-                    </span>
-                  </span>
-                );
-              })()
-            ) : (
-              <span className="text-muted-foreground">Refine the audience to preview reach.</span>
-            )}
-            {/* view-recipients drill-in — the fix for "just a number": list exactly who receives */}
-            {preview && (preview.reachable[channel] ?? 0) > 0 && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="ml-auto h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
-                onClick={() => setShowRecipients(true)}
-              >
-                <Users className="size-3.5" />
-                View recipients
-              </Button>
-            )}
-          </div>
-        </div>
+          </ComposerSection>
         )}
         <RecipientPreviewDialog
           open={showRecipients}
@@ -1838,235 +1812,283 @@ function ComposeBroadcast({
           topicId={topicId || null}
         />
 
-        {/* delivery timing — WHEN the broadcast goes out once its draft is
-            sent. Radio cards: the header row is the radio; a card's extra
-            controls render inside it only while selected. A channel-post posts
-            immediately on send (no schedule/continuous/window), so it's hidden. */}
+        {/* subscription topic (0110) — scopes the recipient's unsubscribe to this list, so opting
+            out of one topic leaves the others intact. Omit for a global-footer send. */}
         {!isDiscord && (
-        <div className="space-y-1.5">
-          <div className="flex items-center gap-1.5">
-            <Clock className="size-3.5 text-muted-foreground" />
-            <Label className="mb-0">Delivery</Label>
-          </div>
-          <div role="radiogroup" aria-label="Delivery timing" className="space-y-1.5">
-            <TimingOption
-              checked={timing === "now"}
-              onSelect={() => {
-                setTiming("now");
-                setError(null);
-              }}
-              title="Send immediately"
-              description="Delivery starts as soon as you send the draft."
-            />
-            <TimingOption
-              checked={timing === "schedule"}
-              onSelect={() => {
-                setTiming("schedule");
-                setError(null);
-              }}
-              title="Schedule for later"
-              description="Sending the draft arms it; delivery starts by itself at the time you pick."
-            >
-              <Input
-                type="datetime-local"
-                value={sendAtLocal}
-                min={localMinuteNow()}
-                onChange={(e) => {
-                  setSendAtLocal(e.target.value);
-                  setError(null);
-                }}
-                className="h-8 w-fit text-xs"
-                aria-label="Scheduled send time"
-              />
-              {wordsFromLocal(sendAtLocal) && (
-                <p className="text-xs text-muted-foreground">Sends {wordsFromLocal(sendAtLocal)}.</p>
+          <ComposerSection icon={MailX} title="Subscription topic" htmlFor="b-topic" optional>
+            <div className="flex items-center gap-2">
+              <select
+                id="b-topic"
+                value={topicId}
+                onChange={(e) => setTopicId(e.target.value)}
+                className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="">No topic — unsubscribe opts out of everything</option>
+                {topics.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+              {!addingTopic && (
+                <Button type="button" size="sm" variant="outline" className="h-8 shrink-0 gap-1 px-2.5 text-xs" onClick={() => setAddingTopic(true)}>
+                  <Plus className="size-3.5" /> New topic
+                </Button>
               )}
-            </TimingOption>
-            <TimingOption
-              checked={timing === "continuous"}
-              onSelect={() => {
-                setTiming("continuous");
-                setError(null);
-              }}
-              title="Send continuously"
-              description="Sends once to each person the first time they match the audience. People already in the audience receive it on the first pass."
-            >
-              <div className="space-y-1">
-                <Label htmlFor="b-stop" className="text-xs">
-                  Stop date (optional)
-                </Label>
+            </div>
+            {addingTopic && (
+              <div className="flex items-center gap-2">
                 <Input
-                  id="b-stop"
-                  type="datetime-local"
-                  value={stopAtLocal}
-                  min={localMinuteNow()}
-                  onChange={(e) => {
-                    setStopAtLocal(e.target.value);
-                    setError(null);
-                  }}
-                  className="h-8 w-fit text-xs"
+                  value={newTopicName}
+                  onChange={(e) => setNewTopicName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void addTopicInline(); } }}
+                  placeholder="e.g. Product updates"
+                  className="h-8 flex-1 text-xs"
+                  autoFocus
                 />
-              </div>
-              {wordsFromLocal(stopAtLocal) && (
-                <p className="text-xs text-muted-foreground">Stops {wordsFromLocal(stopAtLocal)}.</p>
-              )}
-            </TimingOption>
-          </div>
-
-          {/* send window — an optional disclosure: scheduler-driven deliveries
-              (a scheduled fire, continuous matching) only run inside it. The
-              fields ship only while it's on. */}
-          <div className="rounded-lg border border-input">
-            <label className="flex w-full cursor-pointer items-start justify-between gap-3 p-3">
-              <span className="min-w-0">
-                <span className="block text-sm font-medium">Send window</span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  Scheduled and continuous deliveries only go out on these days and hours.
-                  "Send immediately" ignores the window.
-                </span>
-              </span>
-              <Switch
-                checked={windowOn}
-                onCheckedChange={(v) => {
-                  setWindowOn(v);
-                  setError(null);
-                }}
-              />
-            </label>
-            {windowOn && (
-              <div className="space-y-3 border-t border-border/60 p-3">
-                <div>
-                  <Label className="mb-1.5 block text-xs">Days</Label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {ISO_WEEKDAYS.map((label, i) => {
-                      const n = i + 1; // ISO: Mon=1…Sun=7
-                      const on = windowDays.includes(n);
-                      return (
-                        <button
-                          key={n}
-                          type="button"
-                          aria-pressed={on}
-                          onClick={() => toggleWindowDay(n)}
-                          className={cn(
-                            "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                            on
-                              ? "border-primary bg-primary/10 text-primary"
-                              : "border-border text-muted-foreground hover:text-foreground",
-                          )}
-                        >
-                          {label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-end gap-3">
-                  <div className="space-y-1">
-                    <Label htmlFor="b-win-from" className="text-xs">
-                      From
-                    </Label>
-                    <Input
-                      id="b-win-from"
-                      type="time"
-                      value={minToTime(winStartMin)}
-                      onChange={(e) => {
-                        setWinStartMin(timeToMin(e.target.value));
-                        setError(null);
-                      }}
-                      className="h-8 w-fit text-xs"
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label htmlFor="b-win-to" className="text-xs">
-                      Until
-                    </Label>
-                    <Input
-                      id="b-win-to"
-                      type="time"
-                      value={minToTime(winEndMin)}
-                      onChange={(e) => {
-                        setWinEndMin(timeToMin(e.target.value));
-                        setError(null);
-                      }}
-                      className="h-8 w-fit text-xs"
-                    />
-                  </div>
-                  {/* the SLA business-hours offset idiom — hours, fixed (no DST) */}
-                  <div className="space-y-1">
-                    <Label htmlFor="b-win-tz" className="text-xs">
-                      UTC offset (hours)
-                    </Label>
-                    <Input
-                      id="b-win-tz"
-                      type="number"
-                      min={-14}
-                      max={14}
-                      step="any"
-                      value={windowTz / 60}
-                      onChange={(e) =>
-                        setWindowTz(
-                          Math.min(840, Math.max(-840, Math.round((Number(e.target.value) || 0) * 60))),
-                        )
-                      }
-                      className="h-8 w-20 text-xs tabular-nums"
-                    />
-                  </div>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Fixed weekly schedule (no daylight-saving shifts), in the wall clock set by the
-                  UTC offset — currently {tzOffsetWords(windowTz)}.
-                </p>
+                <Button type="button" size="sm" className="h-8 px-2 text-xs" onClick={() => void addTopicInline()} disabled={!newTopicName.trim()}>Add</Button>
+                <Button type="button" size="sm" variant="ghost" className="h-8 px-2 text-xs" onClick={() => { setAddingTopic(false); setNewTopicName(""); }}>Cancel</Button>
               </div>
             )}
-          </div>
-        </div>
+            <p className="text-xs text-muted-foreground">
+              {topicId
+                ? "Recipients can opt out of just this topic; other topics still reach them."
+                : "The footer unsubscribe opts recipients out of all marketing."}
+            </p>
+          </ComposerSection>
+        )}
+
+        {/* delivery timing — WHEN the broadcast goes out once its draft is
+            sent. Three radio cards side by side; the chosen one's pickers and
+            the send window (which only scheduler-driven deliveries obey) open
+            in one panel below them. A channel-post posts immediately on send
+            (no schedule/continuous/window), so it's hidden. */}
+        {!isDiscord && (
+          <ComposerSection icon={Clock} title="Delivery">
+            <div role="radiogroup" aria-label="Delivery timing" className="grid gap-1.5 sm:grid-cols-3">
+              <TimingOption
+                checked={timing === "now"}
+                onSelect={() => {
+                  setTiming("now");
+                  setError(null);
+                }}
+                title="Send immediately"
+                description="As soon as you send the draft."
+              />
+              <TimingOption
+                checked={timing === "schedule"}
+                onSelect={() => {
+                  setTiming("schedule");
+                  setError(null);
+                }}
+                title="Schedule for later"
+                description="Starts by itself at the time you pick."
+              />
+              <TimingOption
+                checked={timing === "continuous"}
+                onSelect={() => {
+                  setTiming("continuous");
+                  setError(null);
+                }}
+                title="Send continuously"
+                description="Once to each person as they match."
+              />
+            </div>
+
+            {timing !== "now" && (
+              <div className="divide-y divide-border/60 rounded-lg border bg-muted/20">
+                <div className="space-y-1.5 p-3">
+                  {timing === "schedule" ? (
+                    <>
+                      <Label htmlFor="b-send-at" className="text-xs">
+                        Send at
+                      </Label>
+                      <Input
+                        id="b-send-at"
+                        type="datetime-local"
+                        value={sendAtLocal}
+                        min={localMinuteNow()}
+                        onChange={(e) => {
+                          setSendAtLocal(e.target.value);
+                          setError(null);
+                        }}
+                        className="h-8 w-fit text-xs"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {wordsFromLocal(sendAtLocal)
+                          ? `Sends ${wordsFromLocal(sendAtLocal)}.`
+                          : "Sending the draft arms it; delivery starts by itself at this time."}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <Label htmlFor="b-stop" className="text-xs">
+                        Stop date <span className="font-normal text-muted-foreground">Optional</span>
+                      </Label>
+                      <Input
+                        id="b-stop"
+                        type="datetime-local"
+                        value={stopAtLocal}
+                        min={localMinuteNow()}
+                        onChange={(e) => {
+                          setStopAtLocal(e.target.value);
+                          setError(null);
+                        }}
+                        className="h-8 w-fit text-xs"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        People already in the audience receive it on the first pass; anyone who
+                        matches later receives it then.
+                        {wordsFromLocal(stopAtLocal) && ` Stops ${wordsFromLocal(stopAtLocal)}.`}
+                      </p>
+                    </>
+                  )}
+                </div>
+
+                {/* send window — an optional disclosure: scheduler-driven deliveries
+                    (a scheduled fire, continuous matching) only run inside it. The
+                    fields ship only while it's on. */}
+                <div>
+                  <label className="flex w-full cursor-pointer items-center justify-between gap-3 p-3">
+                    <span className="min-w-0">
+                      <span className="block text-xs font-medium">Only send during set hours</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        Deliveries go out only on the days and hours you pick.
+                      </span>
+                    </span>
+                    <Switch
+                      checked={windowOn}
+                      onCheckedChange={(v) => {
+                        setWindowOn(v);
+                        setError(null);
+                      }}
+                    />
+                  </label>
+                  {windowOn && (
+                    <div className="space-y-3 px-3 pb-3">
+                      <div>
+                        <Label className="mb-1.5 block text-xs">Days</Label>
+                        <div className="flex flex-wrap gap-1.5">
+                          {ISO_WEEKDAYS.map((label, i) => {
+                            const n = i + 1; // ISO: Mon=1…Sun=7
+                            const on = windowDays.includes(n);
+                            return (
+                              <button
+                                key={n}
+                                type="button"
+                                aria-pressed={on}
+                                onClick={() => toggleWindowDay(n)}
+                                className={cn(
+                                  "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                                  on
+                                    ? "border-primary bg-primary/10 text-primary"
+                                    : "border-border text-muted-foreground hover:text-foreground",
+                                )}
+                              >
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-end gap-3">
+                        <div className="space-y-1">
+                          <Label htmlFor="b-win-from" className="text-xs">
+                            From
+                          </Label>
+                          <Input
+                            id="b-win-from"
+                            type="time"
+                            value={minToTime(winStartMin)}
+                            onChange={(e) => {
+                              setWinStartMin(timeToMin(e.target.value));
+                              setError(null);
+                            }}
+                            className="h-8 w-fit text-xs"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="b-win-to" className="text-xs">
+                            Until
+                          </Label>
+                          <Input
+                            id="b-win-to"
+                            type="time"
+                            value={minToTime(winEndMin)}
+                            onChange={(e) => {
+                              setWinEndMin(timeToMin(e.target.value));
+                              setError(null);
+                            }}
+                            className="h-8 w-fit text-xs"
+                          />
+                        </div>
+                        {/* the SLA business-hours offset idiom — hours, fixed (no DST) */}
+                        <div className="space-y-1">
+                          <Label htmlFor="b-win-tz" className="text-xs">
+                            UTC offset (hours)
+                          </Label>
+                          <Input
+                            id="b-win-tz"
+                            type="number"
+                            min={-14}
+                            max={14}
+                            step="any"
+                            value={windowTz / 60}
+                            onChange={(e) =>
+                              setWindowTz(
+                                Math.min(840, Math.max(-840, Math.round((Number(e.target.value) || 0) * 60))),
+                              )
+                            }
+                            className="h-8 w-20 text-xs tabular-nums"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Fixed weekly schedule (no daylight-saving shifts), in the wall clock set by the
+                        UTC offset — currently {tzOffsetWords(windowTz)}.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </ComposerSection>
         )}
 
         {/* conversion goal (email only) — which contact event counts as success,
             and how long after delivery it still counts. Optional; the draft
             ships without one when the event name stays empty. */}
         {isEmail && (
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-1.5">
-              <Target className="size-3.5 text-muted-foreground" />
-              <Label htmlFor="b-goal" className="mb-0">
-                Goal
-              </Label>
-              <span className="text-xs text-muted-foreground">optional</span>
+          <ComposerSection icon={Target} title="Goal" htmlFor="b-goal" optional>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                id="b-goal"
+                value={goalEvent}
+                onChange={(e) => setGoalEvent(e.target.value)}
+                placeholder="signed_up"
+                className="h-8 w-44 font-mono text-xs"
+                autoComplete="off"
+                aria-label="Goal event name"
+              />
+              <span className="text-xs text-muted-foreground">within</span>
+              <Input
+                type="number"
+                min={1}
+                max={90}
+                step={1}
+                value={goalDays}
+                onChange={(e) => setGoalDays(e.target.value)}
+                onBlur={() => setGoalDays(String(clampGoalDays(goalDays)))}
+                className="h-8 w-16 text-xs tabular-nums"
+                aria-label="Goal window in days"
+              />
+              <span className="text-xs text-muted-foreground">days of delivery</span>
             </div>
-            <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <Input
-                  id="b-goal"
-                  value={goalEvent}
-                  onChange={(e) => setGoalEvent(e.target.value)}
-                  placeholder="signed_up"
-                  className="h-8 w-44 font-mono text-xs"
-                  autoComplete="off"
-                  aria-label="Goal event name"
-                />
-                <span className="text-xs text-muted-foreground">within</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={90}
-                  step={1}
-                  value={goalDays}
-                  onChange={(e) => setGoalDays(e.target.value)}
-                  onBlur={() => setGoalDays(String(clampGoalDays(goalDays)))}
-                  className="h-8 w-16 text-xs tabular-nums"
-                  aria-label="Goal window in days"
-                />
-                <span className="text-xs text-muted-foreground">days</span>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Counts recipients who do this event within the window after delivery. Links are
-                tracked automatically and tagged with UTM parameters.
-              </p>
-            </div>
-          </div>
+            <p className="text-xs text-muted-foreground">
+              Counts recipients who do this event within the window after delivery. Links are
+              tracked automatically and tagged with UTM parameters.
+            </p>
+          </ComposerSection>
         )}
-
+        </div>
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
 
@@ -2154,54 +2176,79 @@ function localMinuteNow(): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** One delivery-timing choice — a full-width radio card (the checkbox/filter
- *  selected idiom: border-primary + a quiet tint). The header row is the
- *  radio button; `children` (the pickers) render inside the card only while
- *  it's selected, so no input ever nests inside the button. */
+/** One delivery-timing choice — a compact radio card (the checkbox/filter
+ *  selected idiom: border-primary + a quiet tint), three to a row. The chosen
+ *  option's pickers open in the panel below the row, never inside the card. */
 function TimingOption({
   checked,
   onSelect,
   title,
   description,
-  children,
 }: {
   checked: boolean;
   onSelect: () => void;
   title: string;
   description: string;
-  children?: ReactNode;
 }) {
   return (
-    <div
+    <button
+      type="button"
+      role="radio"
+      aria-checked={checked}
+      onClick={onSelect}
       className={cn(
-        "rounded-lg border transition-colors",
-        checked ? "border-primary bg-primary/5" : "border-input",
+        "flex items-start gap-2.5 rounded-lg border p-3 text-left transition-colors motion-reduce:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        checked ? "border-primary bg-primary/5" : "border-input hover:bg-muted/40",
       )}
     >
-      <button
-        type="button"
-        role="radio"
-        aria-checked={checked}
-        onClick={onSelect}
-        className="flex w-full items-start gap-2.5 p-3 text-left"
+      <span
+        aria-hidden
+        className={cn(
+          "mt-0.5 grid size-4 shrink-0 place-items-center rounded-full border",
+          checked ? "border-primary" : "border-input",
+        )}
       >
-        <span
-          aria-hidden
-          className={cn(
-            "mt-0.5 grid size-4 shrink-0 place-items-center rounded-full border",
-            checked ? "border-primary" : "border-input",
-          )}
-        >
-          {checked && <span className="size-2 rounded-full bg-primary" />}
-        </span>
-        <span className="min-w-0">
-          <span className="block text-sm font-medium">{title}</span>
-          <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span>
-        </span>
-      </button>
-      {/* indented to the title's left edge: p-3 (12px) + disc (16px) + gap (10px) */}
-      {checked && children != null && <div className="space-y-1.5 pb-3 pl-[38px] pr-3">{children}</div>}
-    </div>
+        {checked && <span className="size-2 rounded-full bg-primary" />}
+      </span>
+      <span className="min-w-0">
+        <span className="block text-sm font-medium">{title}</span>
+        <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span>
+      </span>
+    </button>
+  );
+}
+
+/** One group of the composer's sending settings — the same header row for
+ *  every group: icon, title, a quiet "Optional" where it is, and an action on
+ *  the right (a settings link, a clear button). */
+function ComposerSection({
+  icon: Icon,
+  title,
+  htmlFor,
+  optional,
+  action,
+  children,
+}: {
+  icon: LucideIcon;
+  title: string;
+  /** The control the title labels, when the group is one field. */
+  htmlFor?: string;
+  optional?: boolean;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="space-y-2">
+      <div className="flex min-h-5 items-center gap-1.5">
+        <Icon className="size-3.5 text-muted-foreground" />
+        <Label htmlFor={htmlFor} className="mb-0">
+          {title}
+        </Label>
+        {optional && <span className="text-xs text-muted-foreground">Optional</span>}
+        {action && <div className="ml-auto">{action}</div>}
+      </div>
+      {children}
+    </section>
   );
 }
 
