@@ -1,3 +1,6 @@
+<!-- OLD PUBLIC RECIPE, not this project's recipe — see ../README.md. This project's recipe lives in
+     HQ's `group` repository and changes only through zerops_workflow action="group-recipe". -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 A single, non-HA running instance built with the production setups — one container
 per service over single-node stores, with a shared embedder, runner and Mailpit. Use

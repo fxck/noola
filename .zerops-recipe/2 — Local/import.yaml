@@ -1,5 +1,10 @@
 #zeropsPreprocessor=on
 
+# OLD PUBLIC RECIPE, not this project's recipe — see ../README.md. It is the one-click "Deploy on
+# Zerops" recipe for your own copy from GitHub, in the old one-dev-service-per-part setup. This
+# project's recipe lives in HQ's `group` repository and changes only through
+# zerops_workflow action="group-recipe".
+
 # Local — backing stores + Mailpit only, no app containers. Bring up the Zerops VPN
 # (`zcli vpn up`) and run api, edge, embedder and web on your own machine, pointing the
 # DB / cache / broker / search / qdrant / storage env at the internal hostnames below.

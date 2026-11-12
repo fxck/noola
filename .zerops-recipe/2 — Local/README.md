@@ -1,3 +1,6 @@
+<!-- OLD PUBLIC RECIPE, not this project's recipe — see ../README.md. This project's recipe lives in
+     HQ's `group` repository and changes only through zerops_workflow action="group-recipe". -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 Just the backing stores — PostgreSQL, Valkey, NATS, Typesense, Qdrant and object
 storage — plus Mailpit, and no app containers. Bring up the Zerops VPN

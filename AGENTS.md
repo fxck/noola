@@ -19,6 +19,8 @@ lives in [README.md](README.md).
 
 ## Zerops topology — how a service maps to a container
 
+**This project's recipe** — the services, env and scale each new Mate, Stage and Production of the Noola application get — lives in HQ's `group` repository and changes only through `zerops_workflow action="group-recipe"`; `.zerops-recipe/` here is the old public one-click recipe, not this project's.
+
 Each service has a **dev half** (`*dev`) and a **stage/prod half**:
 
 - **`*dev`** (`apidev`, `webdev`, …) self-deploys the *whole monorepo* (`deployFiles: [.]`) and idles on

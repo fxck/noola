@@ -1,5 +1,14 @@
 # Noola — Zerops recipe
 
+> **Not this project's recipe.** This folder is the old public recipe behind the
+> "Deploy on Zerops" button in the [root README](../README.md): one click deploys your own copy
+> of Noola from GitHub, outside Zerops Mate. It still describes the old setup — one dev service
+> per part (`apidev`, `webdev`, …), every service building from GitHub — and nothing here says
+> what the Noola application's Mates, Stage or Production run. That recipe lives in HQ's `group`
+> repository and changes only through `zerops_workflow action="group-recipe"`; a Mate's stand-up
+> reads it, not this folder. Don't compare the two or conclude from this folder that the group
+> recipe is out of date.
+
 See the [root README](../README.md).
 
 ## Recipe metadata

@@ -1,3 +1,6 @@
+<!-- OLD PUBLIC RECIPE, not this project's recipe — see ../README.md. This project's recipe lives in
+     HQ's `group` repository and changes only through zerops_workflow action="group-recipe". -->
+
 <!-- #ZEROPS_EXTRACT_START:intro# -->
 The development topology Noola was built on: dev + stage pairs of api, edge and web
 over single-node stores, sharing one embedder and one runner. The dev containers
