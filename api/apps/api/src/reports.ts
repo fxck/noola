@@ -93,6 +93,7 @@ interface TicketRowLite {
   first_response_at: string | null;
   status: string;
   support_mode?: string;
+  spam_at?: string | null;
 }
 
 async function runRange(
@@ -125,7 +126,7 @@ async function runRange(
     let closedRows: TicketRowLite[] = [];
     if (wantsTicketMetrics) {
       const cr = await c.query(
-        `SELECT t.created_at, t.closed_at, t.status, t.support_mode,
+        `SELECT t.created_at, t.closed_at, t.status, t.support_mode, t.spam_at,
                 (SELECT min(m.created_at) FROM messages m
                    WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id AND m.author_type = 'agent') AS first_response_at
            FROM tickets t

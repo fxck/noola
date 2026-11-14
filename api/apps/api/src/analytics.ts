@@ -290,7 +290,7 @@ export async function getSlaReport(tenantId: string, weeks = 8): Promise<SlaRepo
                    AND m.author_type = 'agent') AS first_response_at
          FROM tickets t
         WHERE t.created_at > now() - make_interval(weeks => $1)
-          AND t.merged_into IS NULL
+          AND t.merged_into IS NULL AND t.spam_at IS NULL
         ORDER BY t.created_at`,
       [windowWeeks],
     );
@@ -430,7 +430,7 @@ export async function getOpsDashboard(tenantId: string): Promise<OpsDashboard> {
                      AND m.author_type = 'agent') AS first_response_at
            FROM tickets t
            LEFT JOIN contacts co ON co.tenant_id = t.tenant_id AND co.id = t.contact_id
-          WHERE t.status = 'open' AND (t.snoozed_until IS NULL OR t.snoozed_until <= now())`,
+          WHERE t.status = 'open' AND t.spam_at IS NULL AND (t.snoozed_until IS NULL OR t.snoozed_until <= now())`,
       );
       const now = Date.now();
       const rows: (OpsTicketRef & { dueMs: number })[] = [];
