@@ -5,6 +5,8 @@ import { ensureKbCollection } from "../src/search.js";
 import { DEFAULT_HANDOFF_RULES } from "../src/ai-outcome.js";
 import { getPersona, putPersona } from "../src/persona.js";
 import { mergeQueryRuns, safeWithoutSources, suggestForQuery, suggestForQueryStream } from "../src/copilot.js";
+import { createAutomation, deleteAutomation, executeAutomation } from "../src/automations.js";
+import { ingestInbound } from "../src/ingest.js";
 import {
   DEFAULT_SEARCH_PROMPT, SEARCH_REPLY_FORMAT, getDocsSearchSettings, parseSearchQuery, putDocsSearchSettings, renderSearchPrompt, searchQueryFor,
 } from "../src/docs-search.js";
@@ -156,6 +158,36 @@ async function main() {
     const plain = await ask("DSRCHMSG gadget troubleshooting help");
     check("without a query the message is searched alone", plain.citations[0]?.id === viaMessage, plain.citations);
     check("a draft that can't hand off gets no handoff rules", !lastDraftSystem.includes(DEFAULT_HANDOFF_RULES.slice(0, 60)), lastDraftSystem.slice(0, 400));
+
+    // ---- Customers only see articles that the help center shows ----
+    const internal = (await createArticle(A, "DSRCHVIS quota internals", "The DSRCHVIS quota is raised by hand for big accounts.", null, { visibility: "internal" })).id;
+    const draft = (await createArticle(A, "DSRCHVIS quota draft", "The DSRCHVIS quota draft text.", null, { visibility: "public", status: "draft" })).id;
+    articles.push(internal, draft);
+    const forCustomer = await ask("DSRCHVIS quota");
+    check("a customer-facing answer skips internal and draft articles", !forCustomer.citations.some((c) => c.id === internal || c.id === draft), forCustomer.citations);
+    queries.push("DSRCHVIS quota for an agent");
+    const forAgent = await suggestForQuery(A, "DSRCHVIS quota for an agent", { audience: "agent", forceScope: ["kb"], source: "eval" });
+    check("an agent's draft still finds internal articles", forAgent.citations.some((c) => c.id === internal), forAgent.citations);
+    queries.push("DSRCHVIS quota sent unreviewed");
+    const unreviewed = await suggestForQuery(A, "DSRCHVIS quota sent unreviewed", { audience: "agent", forceScope: ["kb"], source: "eval", customerFacing: true });
+    check("an answer sent without review skips internal and draft articles", !unreviewed.citations.some((c) => c.id === internal || c.id === draft), unreviewed.citations);
+    // An automation's draft can reach the customer through a later reply action, so it is customer-facing too.
+    const asked = await ingestInbound({ tenantId: A, authorType: "customer", subject: "DSRCHVIS automation", body: "DSRCHVIS quota" });
+    queries.push("DSRCHVIS quota");
+    const rule = await createAutomation(A, {
+      name: "DSRCHVIS draft", trigger: "message.received", enabled: false,
+      conditions: { match: "all", conditions: [] }, actions: [{ type: "rag" }],
+    });
+    try {
+      await executeAutomation(A, rule.id, { ticketId: asked.ticketId });
+      const ragSources = (await superPool.query(
+        "SELECT e->>'id' AS id FROM draft_traces t, jsonb_array_elements(t.sources) e WHERE t.ticket_id = $1 AND e->>'kind' = 'kb'", [asked.ticketId],
+      )).rows.map((r) => r.id as string);
+      check("an automation's draft skips internal and draft articles", !ragSources.includes(internal) && !ragSources.includes(draft), ragSources);
+    } finally {
+      await deleteAutomation(A, rule.id);
+      await superPool.query("DELETE FROM tickets WHERE id = $1", [asked.ticketId]);
+    }
 
     // ---- No sources found: an empty scope finds nothing every time ----
     const sourceless = (q: string, outcomes: boolean) => {

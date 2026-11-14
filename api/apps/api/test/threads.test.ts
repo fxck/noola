@@ -8,7 +8,7 @@ import {
   searchResolvedThreads,
   reindexAllThreads,
 } from "../src/threads.js";
-import { suggestReply } from "../src/copilot.js";
+import { suggestForQuery, suggestReply } from "../src/copilot.js";
 import { computeUserHash, resolveVerifiedIdentity, trustedIdentity, type WidgetKey } from "../src/widget.js";
 import { ingestInbound } from "../src/ingest.js";
 import { setTicketStatus } from "../src/tickets.js";
@@ -38,8 +38,8 @@ async function searchUntil(tenantId: string, q: string, want: (h: { ticket_id: s
 }
 
 /** Create a ticket with a customer question + an agent answer, then close it. */
-async function resolvedTicket(tenantId: string, subject: string, question: string, answer: string) {
-  const q = await ingestInbound({ tenantId, authorType: "customer", subject, body: question });
+async function resolvedTicket(tenantId: string, subject: string, question: string, answer: string, email?: string) {
+  const q = await ingestInbound({ tenantId, authorType: "customer", subject, body: question, identity: email ? { email } : undefined });
   await ingestInbound({ tenantId, authorType: "agent", ticketId: q.ticketId, body: answer });
   await setTicketStatus(tenantId, q.ticketId, "closed");
   await indexResolvedThread(tenantId, q.ticketId);
@@ -105,6 +105,38 @@ async function main() {
     check("thread citation is labelled Resolved: <subject>", s.citations.some((c) => c.kind === "thread" && c.title.startsWith("Resolved:")));
     check("draft is grounded in the past answer (mentions the marker)", s.draft.includes(MARK));
     check("suggest never cites the other tenant's thread", !s.citations.some((c) => c.id === b1));
+  }
+
+  // ---- a customer-facing answer uses only the verified customer's own past conversations ----
+  {
+    const OWN = "threadownzebra";
+    const own = await resolvedTicket(
+      A, "THREADTEST own invoice", `Why is my ${OWN} invoice higher?`, `Your ${OWN} invoice includes the extra seats you added in May.`, "threadtest-owner@x.example",
+    );
+    created.push(own);
+    await searchUntil(A, OWN, (h) => h.some((x) => x.ticket_id === own));
+    const ask = async (email: string) => {
+      const q = await ingestInbound({ tenantId: A, authorType: "customer", subject: "THREADTEST own question", body: `About my ${OWN} invoice again?`, identity: { email } });
+      created.push(q.ticketId);
+      return q.ticketId;
+    };
+    const owner = await ask("threadtest-owner@x.example");
+    const stranger = await ask("threadtest-stranger@x.example");
+    type Proven = { userId: string | null; email: string | null };
+    const threads = async (ticketId: string, opts: { customerFacing?: boolean; verifiedCustomer?: Proven }) =>
+      (await suggestForQuery(A, `About my ${OWN} invoice again?`, { ticketId, source: "eval", forceScope: ["thread"], ...opts }))
+        .citations.filter((c) => c.kind === "thread").map((c) => c.id);
+    check("an agent's draft may use any customer's conversation", (await threads(stranger, {})).includes(own));
+    check("an unverified customer-facing answer uses no past conversations", (await threads(owner, { customerFacing: true })).length === 0);
+    const ownerProof: Proven = { userId: null, email: "threadtest-owner@x.example" };
+    const verified = await threads(owner, { customerFacing: true, verifiedCustomer: ownerProof });
+    check("a verified customer's answer uses their own past conversation", verified.includes(own));
+    check("and nobody else's", verified.every((id) => id === own));
+    check("a verified stranger's answer never uses another customer's conversation",
+      !(await threads(stranger, { customerFacing: true, verifiedCustomer: { userId: null, email: "threadtest-stranger@x.example" } })).includes(own));
+    check("a proof of another identity unlocks nothing on the owner's ticket",
+      (await threads(owner, { customerFacing: true, verifiedCustomer: { userId: "threadtest-attacker", email: null } })).length === 0);
+
   }
 
   // ---- widget identity: a proof covers one handle, and the other never comes from the browser unchecked ----

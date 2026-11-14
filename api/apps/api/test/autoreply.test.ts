@@ -88,8 +88,10 @@ async function main() {
 
   // ---- seed A's knowledge so retrieval corroborates (KB + document = agreement 2).
   // Topic is guardrail-neutral (dashboard widgets) so the strong body doesn't trip a risk rule. ----
-  await createArticle(A, "AUTOREPLY Widgets guide", `The ${MARK} dashboard widget shows recent activity; drag its corner to resize and the layout saves per user.`);
+  await createArticle(A, "AUTOREPLY Widgets guide", `The ${MARK} dashboard widget shows recent activity; drag its corner to resize and the layout saves per user.`, null, { visibility: "public" });
   await ingestDocument(A, "AUTOREPLY-guide.md", "text/markdown", `# Guide\n\nThe ${MARK} dashboard widget layout is stored per account and syncs across your devices.`);
+  // An internal article on the same topic: drafts that a person reviews may use it, replies sent unreviewed may not.
+  const internalArticle = (await createArticle(A, "AUTOREPLY Widgets internals", `The ${MARK} dashboard widget layout sync is handled by the team by hand.`)).id;
   // Globex holds the same distinctive word — the cross-tenant leak trap.
   await ingestDocument(B, "AUTOREPLY-globex.md", "text/markdown", `# Globex\n\nGlobex ${MARK} secret internal runbook — must never reach Acme.`);
 
@@ -160,6 +162,13 @@ async function main() {
   await arm(tAuto.ticketId);
   const auto = await evaluateAutoreply(A, tAuto.ticketId, tAuto.messageId);
   check("auto + strong retrieval → outcome auto_sent", auto?.outcome === "auto_sent");
+  {
+    const kbSources = async (ticketId: string) => (await superPool.query(
+      `SELECT e->>'id' AS id FROM autoreply_decisions d JOIN draft_traces t ON t.id = d.trace_id, jsonb_array_elements(t.sources) e
+        WHERE d.ticket_id = $1 AND e->>'kind' = 'kb'`, [ticketId])).rows.map((r) => r.id as string);
+    check("a reply sent unreviewed never grounds on an internal article", !(await kbSources(tAuto.ticketId)).includes(internalArticle));
+    check("a draft held for review may use the internal article", (await kbSources(tSug.ticketId)).includes(internalArticle));
+  }
   check("auto_sent → an agent reply was inserted", (await agentMsgCount(tAuto.ticketId)) === 1);
   {
     const t = await superPool.query("SELECT whose_turn FROM tickets WHERE id = $1", [tAuto.ticketId]);
@@ -263,7 +272,7 @@ async function main() {
   // 9. Backlog job queue — the sweep-existing-tickets feature. Hermetic: clean + reseed
   //    the tenant's knowledge and a fresh backlog so job counts are exact.
   await clean();
-  await createArticle(A, "AUTOREPLY Widgets guide", `The ${MARK} dashboard widget shows recent activity; drag its corner to resize and the layout saves per user.`);
+  await createArticle(A, "AUTOREPLY Widgets guide", `The ${MARK} dashboard widget shows recent activity; drag its corner to resize and the layout saves per user.`, null, { visibility: "public" });
   await ingestDocument(A, "AUTOREPLY-guide.md", "text/markdown", `# Guide\n\nThe ${MARK} dashboard widget layout is stored per account and syncs across your devices.`);
 
   // seed a backlog of 3 tickets awaiting a reply (open + whose_turn='us') + 1 closed

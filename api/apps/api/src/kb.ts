@@ -192,6 +192,11 @@ export async function updateArticle(
 // here hard-filters `status = 'published' AND visibility = 'public'` so a draft or internal article
 // can never leak. Tenant is resolved from a widget key BEFORE these run (pre-context), then passed in.
 
+/** Whether customers may see an article, as the help center and public AI answers require. */
+export function isPublicArticle(a: KbArticle): boolean {
+  return a.status === "published" && a.visibility === "public";
+}
+
 /** Published, public articles for the help center, newest-published first, with collection name. */
 export async function listPublicArticles(tenantId: string, collectionId?: string): Promise<PublicArticle[]> {
   return withTenant(tenantId, async (c) => {

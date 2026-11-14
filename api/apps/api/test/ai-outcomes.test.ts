@@ -137,7 +137,7 @@ async function main() {
     // A reply that hands off is sent, then the AI is paused. The reply has to pass the corroboration gate to be sent.
     await ensureChunksCollection();
     await ensureKbCollection();
-    await createArticle(A, "AIOUT restart guide", "AIOUT after you restarted the service, it reconnects on its own within a minute.");
+    await createArticle(A, "AIOUT restart guide", "AIOUT after you restarted the service, it reconnects on its own within a minute.", null, { visibility: "public" });
     await putPolicy(A, { mode: "auto", channel_modes: { synthetic: "auto" }, min_agreement: 0, min_top_score: 0 }, { sweep: false });
     const handedOver = await turn("A teammate will take this from here.\n<handoff/>");
     const pausedAfter = (await superPool.query("SELECT assistant_enabled, whose_turn FROM tickets WHERE id = $1", [handedOver.m.ticketId])).rows[0];

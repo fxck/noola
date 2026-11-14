@@ -75,13 +75,13 @@ export async function unindexThread(ticketId: string): Promise<void> {
 }
 
 /** Hydrate resolved-thread ids through RLS (still-closed only) into full ThreadHits,
- *  preserving the given id order (double tenant guard for either ranker). */
-export async function hydrateThreads(tenantId: string, ids: string[]): Promise<ThreadHit[]> {
+ *  preserving the given id order (double tenant guard for either ranker). `contactId` keeps only that contact's threads. */
+export async function hydrateThreads(tenantId: string, ids: string[], contactId?: string): Promise<ThreadHit[]> {
   if (ids.length === 0) return [];
   return withTenant(tenantId, async (c) => {
     const t = await c.query(
-      "SELECT id, subject FROM tickets WHERE id = ANY($1::uuid[]) AND status = 'closed'",
-      [ids],
+      "SELECT id, subject FROM tickets WHERE id = ANY($1::uuid[]) AND status = 'closed' AND ($2::uuid IS NULL OR contact_id = $2)",
+      [ids, contactId ?? null],
     );
     const subjects = new Map<string, string>(t.rows.map((r) => [r.id as string, r.subject as string]));
     const hits: ThreadHit[] = [];
@@ -104,8 +104,8 @@ export async function hydrateThreads(tenantId: string, ids: string[]): Promise<T
  * rows hydrate through RLS re-reading only still-closed tickets (double tenant guard,
  * and drops any thread reopened since it was indexed).
  */
-export async function searchResolvedThreads(tenantId: string, q: string): Promise<ThreadHit[]> {
-  return hydrateThreads(tenantId, await searchThreadIds(tenantId, q));
+export async function searchResolvedThreads(tenantId: string, q: string, contactId?: string): Promise<ThreadHit[]> {
+  return hydrateThreads(tenantId, await searchThreadIds(tenantId, q), contactId);
 }
 
 /** Backfill: index every already-closed ticket. System-level read via the BYPASSRLS

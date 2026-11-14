@@ -328,6 +328,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     try {
       const s = await suggestForQuery(wk.tenantId, question, {
         audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files), outcomes: true,
+        verifiedCustomer: rid.verified ? { userId: rid.userId, email: rid.email } : undefined,
       });
       const answer = await settleWidgetAnswer(wk.tenantId, inbound.ticketId, inbound.messageId, s);
       if (answer.kind !== "reply") {
@@ -470,6 +471,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     try {
       const stream = suggestForQueryStream(wk.tenantId, question, {
         audience: "public", ticketId: inbound.ticketId, messageId: inbound.messageId, images: imagesForModel(files), outcomes: true,
+        verifiedCustomer: rid.verified ? { userId: rid.userId, email: rid.email } : undefined,
       });
       // Manual iteration so we capture the generator's RETURN value (the final Suggestion).
       let suggestion: Awaited<ReturnType<typeof suggestForQuery>>;
