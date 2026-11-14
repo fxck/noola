@@ -175,7 +175,7 @@ const TICKET_SORT_FIELDS = new Set(["updated_at", "created_at", "priority"]);
 // closed, so those sink to the end (NULLS LAST). This mirrors computeSla's calendar branch; when
 // business hours are on the exact badge still comes from computeSla (JS), but the ORDER stays
 // faithful because addBusinessMinutes is monotonic in created_at — same-target tickets keep order.
-const SLA_DUE_EXPR = `CASE WHEN sp.enabled AND t.status = 'open' THEN
+const SLA_DUE_EXPR = `CASE WHEN sp.enabled AND t.status = 'open' AND t.spam_at IS NULL THEN
     t.created_at + (CASE WHEN (SELECT min(m.created_at) FROM messages m
                                WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id
                                  AND m.author_type = 'agent') IS NULL

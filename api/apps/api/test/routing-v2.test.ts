@@ -4,7 +4,7 @@ import { createTeam, deleteTeam } from "../src/teams.js";
 import { setTicketTeam } from "../src/tickets.js";
 import { createRoutingRule, deleteRoutingRule } from "../src/routing.js";
 import { getSlaReport, getWorkload } from "../src/analytics.js";
-import { getSlaPolicy, upsertSlaPolicy } from "../src/sla.js";
+import { computeSla, getSlaPolicy, upsertSlaPolicy } from "../src/sla.js";
 
 // Routing v2 (item 12): skills gate, OOO exclusion + one-shot hand-back, load caps — all at
 // pool-pick time. SLA adherence (item 13): decided-only rates, week/priority/team buckets via
@@ -158,6 +158,11 @@ async function main() {
   const noTeamRow = report.byTeam.find((t) => t.teamId === null);
   check("byTeam has a No-team bucket", noTeamRow !== undefined && noTeamRow.teamName === "No team");
   check("byWeek rows exist + trends numeric", report.byWeek.length >= 1 && report.byWeek.some((w) => w.avgFrHours !== null));
+
+  const livePolicy = await getSlaPolicy(A);
+  const opened = new Date(Date.now() - 3_600_000).toISOString();
+  check("an open ticket has an SLA", computeSla(livePolicy, { created_at: opened }) !== null);
+  check("a spam ticket has no SLA", computeSla(livePolicy, { created_at: opened, spam_at: new Date().toISOString() }) === null);
 
   const disabled = await upsertSlaPolicy(A, { ...((await getSlaPolicy(A))), enabled: false });
   const offReport = await getSlaReport(A, 8);

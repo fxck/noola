@@ -175,6 +175,9 @@ async function main() {
     const SLATK = "dddddddd-0000-4000-8000-0000000000c1";
     await superPool.query(
       `INSERT INTO tickets (tenant_id, id, subject, channel_type, created_at) VALUES ($1,$2,'SLA breach','synthetic', now() - interval '2 hours')`, [T, SLATK]);
+    const SPAMTK = "dddddddd-0000-4000-8000-0000000000c2";
+    await superPool.query(
+      `INSERT INTO tickets (tenant_id, id, subject, channel_type, created_at, spam_at) VALUES ($1,$2,'SLA spam','synthetic', now() - interval '2 hours', now())`, [T, SPAMTK]);
     await createAutomation(T, {
       name: "Escalate SLA breaches", trigger: "sla.breached",
       conditions: { match: "all", conditions: [] }, actions: [{ type: "add_tags", tags: ["sla-breach"] }],
@@ -191,6 +194,8 @@ async function main() {
     await detectSlaBreaches(); // second scan must not re-reserve / re-fire
     const key2 = await superPool.query(`SELECT count(*)::int AS n FROM flow_dedupe WHERE tenant_id=$1 AND dedupe_key=$2`, [T, `sla.breached:first_response:${SLATK}`]);
     check("SLA breach fires once per ticket/target (deduped across scans)", key2.rows[0].n === 1);
+    const spamKey = await superPool.query(`SELECT count(*)::int AS n FROM flow_dedupe WHERE tenant_id=$1 AND dedupe_key LIKE $2`, [T, `sla.%:${SPAMTK}`]);
+    check("an overdue spam ticket fires no SLA event", spamKey.rows[0].n === 0);
   }
 
   // ── E3: RBAC-by-effect (pure-function policy) ──────────────────────────────

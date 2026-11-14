@@ -158,6 +158,8 @@ export interface SlaTicketInput {
   created_at: string;
   closed_at?: string | null;
   first_response_at?: string | null;
+  /** A spam ticket has no SLA. */
+  spam_at?: string | null;
 }
 
 function target(
@@ -187,7 +189,7 @@ export function computeSla(
   t: SlaTicketInput,
   nowMs: number = Date.now(),
 ): TicketSla | null {
-  if (!policy.enabled) return null;
+  if (!policy.enabled || t.spam_at) return null;
   const bh = policy.businessHoursEnabled ? policy.businessHours : null;
   return {
     firstResponse: target(t.created_at, policy.firstResponseMins, t.first_response_at ?? null, nowMs, bh),
@@ -223,7 +225,7 @@ export async function detectSlaBreaches(log?: SlaLog): Promise<void> {
             `SELECT t.id, t.created_at, t.closed_at,
                     (SELECT min(m.created_at) FROM messages m
                        WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id AND m.author_type = 'agent') AS first_response_at
-               FROM tickets t WHERE t.status = 'open'`,
+               FROM tickets t WHERE t.status = 'open' AND t.spam_at IS NULL`,
           );
           return r.rows as Array<{ id: string; created_at: string; closed_at: string | null; first_response_at: string | null }>;
         });
