@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getRouteApi, Link } from "@tanstack/react-router";
-import { Search, Inbox as InboxIcon, ArrowDownWideNarrow, MessageCircle } from "lucide-react";
+import { Search, Inbox as InboxIcon, ArrowDownWideNarrow, MessageCircle, CheckCheck } from "lucide-react";
 import { useAuth } from "@/auth/auth";
 import {
   type Ticket,
@@ -17,8 +17,10 @@ import {
   fetchUnreadTicketIds,
   fetchTicket,
   markTicketRead,
+  markAllTicketsRead,
   bulkTickets,
 } from "@/lib/tickets";
+import { toast } from "@/components/ui/toaster";
 import { type Team, fetchTeams } from "@/lib/teams";
 import { useRealtime } from "@/lib/realtime-context";
 import { useQueue } from "@/lib/queue-context";
@@ -368,6 +370,27 @@ export function InboxPage() {
   }, [selectedId, loading, open, closed, spam, outbound, linkedTicket, viewParam, teamParam]);
   const activeView = VIEWS.find((v) => v.key === view)!;
 
+  const [markingRead, setMarkingRead] = useState(false);
+  const listHasUnread = list.some((t) => unreadIds.has(t.id));
+  async function markAllRead() {
+    if (markingRead) return;
+    setMarkingRead(true);
+    const shown = new Set(list.map((t) => t.id));
+    setUnreadIds((prev) => new Set([...prev].filter((id) => !shown.has(id))));
+    try {
+      await markAllTicketsRead(
+        activeTeam ? { scope: "view", view: "all", teamId: activeTeam.id } : { scope: "view", view },
+      );
+    } catch {
+      toast.error("Couldn't mark the conversations as read.");
+    } finally {
+      setMarkingRead(false);
+      void fetchUnreadTicketIds()
+        .then((ids) => setUnreadIds(new Set(ids)))
+        .catch(() => {});
+    }
+  }
+
   // Auto-select the top row on desktop after the first load so the reading pane is
   // productive on arrival — but WITHOUT marking it read (that waits for a real open).
   const autoSelectedRef = useRef(false);
@@ -525,6 +548,18 @@ export function InboxPage() {
               )}
             </span>
             <span className="ml-auto flex items-center gap-1">
+              {!searchMode && (
+                <button
+                  type="button"
+                  onClick={() => void markAllRead()}
+                  disabled={markingRead || !listHasUnread}
+                  title="Mark all as read"
+                  aria-label="Mark all as read"
+                  className="flex h-7 items-center rounded-md px-1.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                >
+                  <CheckCheck className="size-3.5" />
+                </button>
+              )}
               {!searchMode && (
                 <Menu
                   align="end"

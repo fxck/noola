@@ -19,6 +19,7 @@ import {
   Bookmark,
   BookmarkPlus,
   Check,
+  CheckCheck,
   CheckCircle2,
   RotateCcw,
   Plus,
@@ -56,10 +57,12 @@ import {
   type TicketPriority,
   type AgentUser,
   type BulkAction,
+  type TicketQuery,
   TICKET_PRIORITIES,
   queryTickets,
   bulkTickets,
   fetchUsers,
+  markAllTicketsRead,
 } from "@/lib/tickets";
 import { type Team, fetchTeams } from "@/lib/teams";
 
@@ -75,10 +78,12 @@ function ago(iso: string): string {
   return `${Math.floor(h / 24)}d`;
 }
 
-const STATUS_TABS: { value: "open" | "closed" | "all"; label: string }[] = [
+type StatusFilter = NonNullable<TicketQuery["status"]>;
+const STATUS_TABS: { value: StatusFilter; label: string }[] = [
   { value: "open", label: "Open" },
   { value: "closed", label: "Closed" },
   { value: "all", label: "All" },
+  { value: "spam", label: "Spam" },
 ];
 
 // Same triage vocabulary as the inbox rows (§4): priority earns a glyph only
@@ -172,7 +177,7 @@ function buildColumns(showStatus: boolean): ColumnDef<Ticket>[] {
     },
   ];
   if (showStatus) {
-    // Only the All view mixes statuses — there, closed rows say so once, quietly.
+    // Only the All and Spam views mix statuses, so there the closed rows say so once, quietly.
     cols.push({
       accessorKey: "status",
       header: "Status",
@@ -314,17 +319,21 @@ export function TicketsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rawQ]);
 
+  const filters: TicketQuery = {
+    status,
+    priority: priorities.length ? priorities : undefined,
+    teamId: teamFilter || undefined,
+    assigneeId: assigneeFilter || undefined,
+    q: search.q || undefined,
+  };
+
   // Fetch a page whenever the URL-driven query changes.
   useEffect(() => {
     let live = true;
     setLoading(true);
     setError(false);
     queryTickets({
-      status,
-      priority: priorities.length ? priorities : undefined,
-      teamId: teamFilter || undefined,
-      assigneeId: assigneeFilter || undefined,
-      q: search.q || undefined,
+      ...filters,
       sort: sortBy,
       sortDir,
       limit: PAGE_SIZE,
@@ -338,7 +347,7 @@ export function TicketsPage() {
   }, [status, search.priority, teamFilter, assigneeFilter, search.q, sortBy, sortDir, page, reloadKey]);
 
   const sorting: SortingState = useMemo(() => [{ id: sortBy, desc: sortDir === "desc" }], [sortBy, sortDir]);
-  const columns = useMemo(() => buildColumns(status === "all"), [status]);
+  const columns = useMemo(() => buildColumns(status === "all" || status === "spam"), [status]);
 
   // §2b — a signal column whose every cell would render nothing is dropped for
   // this page instead of shipping a dead header over empty space.
@@ -394,9 +403,23 @@ export function TicketsPage() {
     }
   }
 
+  const [markingRead, setMarkingRead] = useState(false);
+  async function markAllRead() {
+    if (markingRead) return;
+    setMarkingRead(true);
+    try {
+      const n = await markAllTicketsRead({ scope: "table", query: filters });
+      toast.success(`Marked ${n} ticket${n === 1 ? "" : "s"} as read.`);
+    } catch {
+      toast.error("Couldn't mark the tickets as read.");
+    } finally {
+      setMarkingRead(false);
+    }
+  }
+
   const total = page_?.total ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const setStatus = (v: "open" | "closed" | "all") => void navigate({ search: (s) => ({ ...s, status: v, page: 0 }) });
+  const setStatus = (v: StatusFilter) => void navigate({ search: (s) => ({ ...s, status: v, page: 0 }) });
   const togglePriority = (p: TicketPriority) => {
     const next = priorities.includes(p) ? priorities.filter((x) => x !== p) : [...priorities, p];
     void navigate({ search: (s) => ({ ...s, priority: next.length ? next.join(",") : undefined, page: 0 }) });
@@ -511,6 +534,17 @@ export function TicketsPage() {
                   switching views must not teleport the control across the screen */}
               <InboxViewSwitch current="table" />
               <div className="ml-auto flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void markAllRead()}
+                  disabled={markingRead || total === 0}
+                  title="Mark all as read"
+                  aria-label="Mark all as read"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+                >
+                  <CheckCheck className="size-3.5" />
+                  <span className="hidden xl:inline">Mark all as read</span>
+                </button>
                 {/* saved views + save-current, one quiet menu */}
                 {showSave ? (
                   <span className="inline-flex items-center gap-1">

@@ -1,4 +1,8 @@
 import { withTenant } from "@repo/db";
+import type { TicketFilter } from "./tickets.js";
+
+/** The most tickets one mark-all-as-read touches, newest activity first. */
+export const MARK_ALL_READ_LIMIT = 1000;
 
 // Per-agent read state. A ticket is "unread" for an agent when it holds a customer message newer than
 // that agent's last_read_at (or they've never opened it). Marking read on open upserts the timestamp;
@@ -16,6 +20,35 @@ export async function markTicketRead(tenantId: string, ticketId: string, userId:
       [ticketId, userId],
     ),
   );
+}
+
+/** Upsert the agent's read marker to now() on every ticket that `filter` matches and that is unread for them.
+ *  Returns how many it marked, so repeated calls reach unread tickets past the limit. */
+export async function markTicketsRead(
+  tenantId: string,
+  userId: string,
+  filter: TicketFilter,
+  limit = MARK_ALL_READ_LIMIT,
+): Promise<number> {
+  const params = [...filter.params, userId];
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `INSERT INTO ticket_reads (tenant_id, ticket_id, user_id, last_read_at)
+       SELECT current_tenant(), t.id, $${params.length}::uuid, now()
+         FROM tickets t
+         ${filter.where}
+          AND EXISTS (SELECT 1 FROM messages m
+                        LEFT JOIN ticket_reads r ON r.tenant_id = t.tenant_id AND r.ticket_id = t.id AND r.user_id = $${params.length}::uuid
+                       WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id AND m.author_type = 'customer'
+                         AND m.created_at > COALESCE(r.last_read_at, '-infinity'))
+        ORDER BY t.updated_at DESC
+        LIMIT ${Math.max(1, Math.floor(limit))}
+       ON CONFLICT (tenant_id, ticket_id, user_id)
+         DO UPDATE SET last_read_at = now()`,
+      params,
+    );
+    return r.rowCount ?? 0;
+  });
 }
 
 /**

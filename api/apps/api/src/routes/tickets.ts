@@ -1,17 +1,17 @@
 import type { FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
 import { withTenant } from "@repo/db";
-import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput, OutboundConversationInput, SpamTicketInput, ParticipantInput } from "@repo/contracts";
+import { MergeTicketInput, SnoozeTicketInput, LinkTicketInput, AssignInput, TicketTeamInput, ReplyInput, OutboundConversationInput, SpamTicketInput, ParticipantInput, MarkAllReadInput } from "@repo/contracts";
 import { markConversationSpam, unmarkConversationSpam } from "../spam.js";
 import { listParticipants, addParticipant, removeParticipant } from "../participants.js";
 import { tenanted } from "../http/tenant.js";
 import { getSlaPolicy, computeSla, type TicketSla } from "../sla.js";
 import {
   listTickets, queryTickets, getTicketDetail, getReplyChannels, patchTicket, listUsers, assignTicket, setTicketTeam, setTicketStatus,
-  snoozeTicket, mergeTicket, TICKET_PRIORITIES,
-  type View, type TicketQuery, type TicketPriority, type TicketRow,
+  snoozeTicket, mergeTicket, TICKET_PRIORITIES, viewFilter, tableFilter,
+  type View, type TicketQuery, type TicketPriority, type TicketRow, type TicketFilter,
 } from "../tickets.js";
-import { markTicketRead, unreadTicketIds } from "../reads.js";
+import { markTicketRead, markTicketsRead, unreadTicketIds } from "../reads.js";
 import { listLinks, linkTickets, unlinkTickets } from "../links.js";
 import { summarizeTicket } from "../summarize.js";
 import { draftArticleFromTicket } from "../article.js";
@@ -34,6 +34,19 @@ async function withSla<T extends TicketRow>(tenantId: string, rows: T[]): Promis
   return rows.map((r) => ({ ...r, sla: computeSla(policy, r) }));
 }
 
+// The table's status filter. "spam" lists only spam-hidden tickets, whatever their status.
+function tableStatus(status: string | undefined): Pick<TicketQuery, "status" | "spam"> {
+  if (status === "spam") return { status: "all", spam: true };
+  return { status: status === "open" || status === "closed" ? status : "all" };
+}
+
+/** The tickets that an inbox lane lists. The inbox's Needs reply lane also lists community threads, which the server's View leaves out. */
+function inboxLaneFilter(view: View, userId: string, teamId?: string): TicketFilter | null {
+  if (view !== "needs_reply") return viewFilter(view, userId, teamId);
+  const all = viewFilter("all", userId, teamId);
+  return all && { ...all, where: `${all.where} AND t.whose_turn = 'us'` };
+}
+
 // The core inbox/ticket surfaces: the list (Views + deep-table), per-agent unread, snooze, merge,
 // related links, thread summarize / draft-article, detail, patch (priority/tags/type), the agent
 // picker, assign, close/reopen (with survey + knowledge-index side effects), and the message thread.
@@ -49,7 +62,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     }
     const num = (v: string | undefined) => (v !== undefined && v !== "" && !Number.isNaN(Number(v)) ? Number(v) : undefined);
     const query: TicketQuery = {
-      status: q.status === "open" || q.status === "closed" ? q.status : "all",
+      ...tableStatus(q.status),
       priority: q.priority ? q.priority.split(",").filter(Boolean) : undefined,
       tags: q.tag ? q.tag.split(",").filter(Boolean) : undefined,
       assigneeId: q.assigneeId || undefined,
@@ -77,6 +90,27 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     if (!userId) return reply.code(400).send({ error: "missing tenant" });
     await markTicketRead(tenantId, (req.params as { id: string }).id, userId);
     return { ok: true };
+  }));
+
+  // Mark every ticket of one inbox lane or table filter read for the current agent.
+  app.post("/tickets/read-all", tenanted(async (tenantId, req, reply) => {
+    const userId = req.session?.userId;
+    if (!userId) return reply.code(400).send({ error: "missing tenant" });
+    const parsed = MarkAllReadInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const input = parsed.data;
+    const filter = input.scope === "view"
+      ? inboxLaneFilter(input.view, userId, input.teamId)
+      : tableFilter({
+          ...tableStatus(input.status),
+          priority: input.priority?.length ? input.priority : undefined,
+          tags: input.tags?.length ? input.tags : undefined,
+          assigneeId: input.assigneeId || undefined,
+          teamId: input.teamId || undefined,
+          channelType: input.channel || undefined,
+          q: input.q || undefined,
+        });
+    return { marked: filter ? await markTicketsRead(tenantId, userId, filter) : 0 };
   }));
 
   // Snooze until a time (ISO), or unsnooze with null. Snoozed tickets leave the open queues.

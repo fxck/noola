@@ -1,7 +1,13 @@
 import { withTenant, relayPool } from "@repo/db";
 import type { PoolClient } from "pg";
 
-export type View = "my" | "unassigned" | "needs_reply" | "closed" | "all" | "spam" | "outbound";
+export type View = "my" | "unassigned" | "needs_reply" | "approval" | "closed" | "all" | "spam" | "outbound";
+
+/** A WHERE clause over `tickets t` and its positional params. */
+export interface TicketFilter {
+  where: string;
+  params: unknown[];
+}
 
 export interface TicketRow {
   id: string;
@@ -99,17 +105,13 @@ const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_chann
 export const TICKET_PRIORITIES = ["low", "normal", "high", "urgent"] as const;
 export type TicketPriority = (typeof TICKET_PRIORITIES)[number];
 
-/** Inbox listing filtered by View. Tenant-scoped by RLS; the View is a WHERE over
- *  (status, assignee_id, whose_turn). 'my' with no assignee returns nothing. */
-export async function listTickets(
-  tenantId: string,
-  view: View,
-  assigneeId?: string,
-): Promise<TicketRow[]> {
+/** The WHERE for an inbox View over (status, assignee_id, whose_turn), optionally narrowed to a team lane.
+ *  null when the View matches nothing: 'my' with no assignee. */
+export function viewFilter(view: View, assigneeId?: string, teamId?: string): TicketFilter | null {
   let where = "WHERE t.status = 'open'";
   const params: unknown[] = [];
   if (view === "my") {
-    if (!assigneeId) return [];
+    if (!assigneeId) return null;
     params.push(assigneeId);
     where = `WHERE t.status = 'open' AND t.assignee_id = $${params.length}`;
   } else if (view === "unassigned") {
@@ -118,6 +120,9 @@ export async function listTickets(
     // Community-mode threads (support_mode='community') keep whose_turn='us' (an unanswered
     // question → deflect-eligible) but are NOT agent work — exclude them from needs-reply (§5.1).
     where = "WHERE t.status = 'open' AND t.whose_turn = 'us' AND t.support_mode = 'staffed'";
+  } else if (view === "approval") {
+    where = `WHERE t.status = 'open' AND EXISTS (SELECT 1 FROM autoreply_queue q
+               WHERE q.tenant_id = t.tenant_id AND q.ticket_id = t.id AND q.status = 'pending')`;
   } else if (view === "closed") {
     where = "WHERE t.status = 'closed'";
   } else if (view === "spam") {
@@ -137,15 +142,30 @@ export async function listTickets(
   // shows them). The wake sweep clears the flag, but the predicate also resurfaces them the instant
   // the time passes even before the sweep runs.
   if (view !== "closed" && view !== "spam") where += " AND (t.snoozed_until IS NULL OR t.snoozed_until <= now())";
+  if (teamId) {
+    params.push(teamId);
+    where += ` AND t.team_id = $${params.length}`;
+  }
+  return { where, params };
+}
+
+/** Inbox listing filtered by View. Tenant-scoped by RLS. */
+export async function listTickets(
+  tenantId: string,
+  view: View,
+  assigneeId?: string,
+): Promise<TicketRow[]> {
+  const filter = viewFilter(view, assigneeId);
+  if (!filter) return [];
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT ${TICKET_COLS}
          FROM tickets t
          LEFT JOIN users u ON u.tenant_id = t.tenant_id AND u.id = t.assignee_id
          LEFT JOIN contacts co ON co.tenant_id = t.tenant_id AND co.id = t.contact_id
-         ${where}
+         ${filter.where}
         ORDER BY t.updated_at DESC LIMIT 100`,
-      params,
+      filter.params,
     );
     return r.rows as TicketRow[];
   });
@@ -189,25 +209,7 @@ export async function queryTickets(
   tenantId: string,
   query: TicketQuery,
 ): Promise<{ rows: TicketRow[]; total: number }> {
-  const clauses: string[] = [];
-  const params: unknown[] = [];
-  const add = (sql: string, val: unknown) => { params.push(val); clauses.push(sql.replace("$?", `$${params.length}`)); };
-
-  if (query.status && query.status !== "all") add("t.status = $?", query.status);
-  // Hide currently-snoozed tickets from the open filter (they resurface at their wake time).
-  if (query.status === "open") clauses.push("(t.snoozed_until IS NULL OR t.snoozed_until <= now())");
-  if (query.priority?.length) add("t.priority = ANY($?::text[])", query.priority);
-  if (query.tags?.length) add("t.tags @> $?::text[]", query.tags);
-  if (query.assigneeId === "none") clauses.push("t.assignee_id IS NULL");
-  else if (query.assigneeId) add("t.assignee_id = $?", query.assigneeId);
-  if (query.teamId === "none") clauses.push("t.team_id IS NULL");
-  else if (query.teamId) add("t.team_id = $?", query.teamId);
-  if (query.channelType) add("t.channel_type = $?", query.channelType);
-  if (query.q?.trim()) add("t.subject ILIKE $?", `%${query.q.trim()}%`);
-  // Spam-hidden tickets are excluded everywhere by default; `spam: true` shows only them.
-  clauses.push(query.spam ? "t.spam_at IS NOT NULL" : "t.spam_at IS NULL");
-
-  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const { where, params } = tableFilter(query);
   const isSla = query.sortBy === "sla";
   const sortBy = !isSla && query.sortBy && TICKET_SORT_FIELDS.has(query.sortBy) ? query.sortBy : "updated_at";
   const dir = query.sortDir === "asc" ? "ASC" : "DESC";
@@ -239,6 +241,29 @@ export async function queryTickets(
     );
     return { rows: rowsR.rows as TicketRow[], total };
   });
+}
+
+/** The WHERE for the tickets table's filters, without its sort and paging. */
+export function tableFilter(query: TicketQuery): TicketFilter {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const add = (sql: string, val: unknown) => { params.push(val); clauses.push(sql.replace("$?", `$${params.length}`)); };
+
+  if (query.status && query.status !== "all") add("t.status = $?", query.status);
+  // Hide currently-snoozed tickets from the open filter (they resurface at their wake time).
+  if (query.status === "open") clauses.push("(t.snoozed_until IS NULL OR t.snoozed_until <= now())");
+  if (query.priority?.length) add("t.priority = ANY($?::text[])", query.priority);
+  if (query.tags?.length) add("t.tags @> $?::text[]", query.tags);
+  if (query.assigneeId === "none") clauses.push("t.assignee_id IS NULL");
+  else if (query.assigneeId) add("t.assignee_id = $?", query.assigneeId);
+  if (query.teamId === "none") clauses.push("t.team_id IS NULL");
+  else if (query.teamId) add("t.team_id = $?", query.teamId);
+  if (query.channelType) add("t.channel_type = $?", query.channelType);
+  if (query.q?.trim()) add("t.subject ILIKE $?", `%${query.q.trim()}%`);
+  // Spam-hidden tickets are excluded everywhere by default; `spam: true` shows only them.
+  clauses.push(query.spam ? "t.spam_at IS NOT NULL" : "t.spam_at IS NULL");
+
+  return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", params };
 }
 
 // Read a single ticket's full row on an EXISTING tenant-scoped connection (so a read-after-write
