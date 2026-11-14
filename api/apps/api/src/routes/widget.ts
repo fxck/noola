@@ -20,7 +20,7 @@ import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
 import { settleWidgetAnswer, suggestionMeta, traceWidgetReply } from "../autoreply.js";
 import { withoutOutcomeTags } from "../ai-outcome.js";
 import { wantsHuman, type DraftImage } from "../model.js";
-import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, resolveVerifiedIdentity } from "../widget.js";
+import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, trustedIdentity } from "../widget.js";
 import { upsertContact, bumpContactSeen, absorbAnonymousByHandles } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
 import { deriveContactContext } from "../enrich.js";
@@ -246,7 +246,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     // (identity from its claims) or a user_hash HMAC. When verification is ENABLED, an unproven
     // identified claim is DOWNGRADED to anonymous — dropped so the message can't be threaded into
     // someone else's contact/conversation.
-    const rid = resolveVerifiedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    const rid = await trustedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
     let email = rid.email ?? undefined;
     let identName = name ?? null;
     if (wk.config.verifyIdentity && !rid.verified) {
@@ -398,7 +398,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
     // Same identity-verification gate as /public/ask — drop an unverified identity claim.
-    const rid = resolveVerifiedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    const rid = await trustedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
     let email = rid.email ?? undefined;
     let identName = name ?? null;
     if (wk.config.verifyIdentity && !rid.verified) {
@@ -650,7 +650,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     const companyName = typeof company === "string" ? company : company?.name;
     const companyExternalId = typeof company === "object" && company ? company.company_id : undefined;
     // Identity is either proven by a signed JWT (identity from its claims) or a user_hash HMAC.
-    const rid = resolveVerifiedIdentity(wk, { userId: parsed.data.userId, email: parsed.data.email, userHash, userJwt });
+    const rid = await trustedIdentity(wk, { userId: parsed.data.userId, email: parsed.data.email, userHash, userJwt });
     if (!rid.email && !rid.userId) return { ok: true, identified: false };
     // When verification is enabled, refuse to attach an identity that isn't proven — the visitor
     // stays anonymous rather than claiming someone else's profile. Off by default (opt-in, like Intercom).
@@ -718,7 +718,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
-    const rid = resolveVerifiedIdentity(wk, {
+    const rid = await trustedIdentity(wk, {
       userId: parsed.data.userId, email: parsed.data.email, userHash: parsed.data.userHash, userJwt: parsed.data.userJwt,
     });
     // Don't attribute an event to an unverified identity claim when verification is enabled.
@@ -833,7 +833,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     if (!originAllowed(wk.allowedDomains, origin)) {
       return reply.code(403).send({ error: "origin not allowed for this widget key" });
     }
-    const rid = resolveVerifiedIdentity(wk, {
+    const rid = await trustedIdentity(wk, {
       userId: (body.userId ?? "").trim() || undefined,
       email: (body.email ?? "").trim() || undefined,
       userHash: body.userHash,
