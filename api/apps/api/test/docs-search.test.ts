@@ -4,7 +4,9 @@ import { createArticle, deleteArticle } from "../src/kb.js";
 import { ensureKbCollection } from "../src/search.js";
 import { DEFAULT_HANDOFF_RULES } from "../src/ai-outcome.js";
 import { getPersona, putPersona } from "../src/persona.js";
-import { mergeQueryRuns, safeWithoutSources, suggestForQuery, suggestForQueryStream } from "../src/copilot.js";
+import {
+  type Candidate, candidateKey, mergeQueryRuns, passageOverlap, pickSources, rankedHigh, requiredWords, safeWithoutSources, suggestForQuery, suggestForQueryStream,
+} from "../src/copilot.js";
 import { createAutomation, deleteAutomation, executeAutomation } from "../src/automations.js";
 import { ingestInbound } from "../src/ingest.js";
 import {
@@ -59,6 +61,37 @@ async function main() {
   check("the reported scores stay unhalved for the gate", merged.scores.get("m") === 0.03 && merged.scores.get("q") === 0.02, [...merged.scores]);
   check("a source both runs found has the ranks of the run that gave its score", merged.ranks.get("q")?.foundBy === "both" && merged.ranks.get("q")?.keyword === 1, [...merged.ranks]);
   check("a source only the message found says so", merged.ranks.get("m")?.foundBy === "message", [...merged.ranks]);
+
+  // ---- Which sources are cited, no search ----
+  check("a query of one or two words must match all of them", requiredWords(1) === 1 && requiredWords(2) === 2);
+  check("a longer query needs half its words, at most 4", requiredWords(3) === 2 && requiredWords(5) === 3 && requiredWords(40) === 4);
+  const howTo = "Trigger a pipeline from your nodejs repository with zcli push and a personal access token that you store as a CI secret";
+  const sibling = howTo.replace("nodejs", "golang");
+  const other = "Shared storage is mounted into every container of the services that you connect it to";
+  check("pages that differ only in a technology name overlap", passageOverlap(howTo, sibling) >= 0.6, passageOverlap(howTo, sibling));
+  check("unrelated passages do not overlap", passageOverlap(howTo, other) < 0.1, passageOverlap(howTo, other));
+
+  const doc = (id: string, page: string, text: string) => ({ kind: "document", id, item: { id, document_id: page, chunk_index: 0, text, chunk_count: 1 } }) as Candidate;
+  const kb = (id: string) => ({ kind: "kb", id, item: { id, title: id, body: id } }) as unknown as Candidate;
+  const ranked = (cs: Candidate[], rankOf: (i: number) => number = (i) => i + 1) => ({
+    items: cs, scores: new Map<string, number>(), ranks: new Map(cs.map((c, i) => [candidateKey(c), { meaning: rankOf(i) }])),
+  });
+  const ids = (cs: Candidate[]) => cs.map((c) => c.id).join(",");
+  const pick = (r: ReturnType<typeof ranked>) => pickSources(r.items, rankedHigh(r));
+  const samePage = pick(ranked([doc("a", "p1", howTo), doc("b", "p1", other), doc("c", "p2", "Scale a service by adding containers in the GUI")]));
+  check("a second passage from a cited page is left out", ids(samePage) === "a,c", ids(samePage));
+  const nearCopy = pick(ranked([doc("a", "p1", howTo), doc("b", "p2", sibling), doc("c", "p3", other)]));
+  check("a near-copy of a cited passage is left out", ids(nearCopy) === "a,c", ids(nearCopy));
+  const capped = pick(ranked([kb("k1"), kb("k2"), kb("k3"), doc("a", "p1", howTo), doc("b", "p2", other), doc("c", "p3", "Scale a service"), doc("d", "p4", "Set up a cron job")]));
+  check("each kind has its number of places", ids(capped) === "k1,k2,a,b,c", ids(capped));
+  const weak = pick(ranked([doc("a", "p1", howTo), kb("k1")], (i) => (i === 0 ? 1 : 11)));
+  check("a source that no search ranked in the top 10 is left out, even with a free place", ids(weak) === "a", ids(weak));
+  // The message run gives this source the better score but ranks it 11th, and the query run ranks it first.
+  const x = doc("x", "p9", other);
+  const queryRun = { items: [x], scores: new Map([[candidateKey(x), 1 / 61]]), ranks: new Map([[candidateKey(x), { keyword: 1 }]]) };
+  const messageRun = { items: [x], scores: new Map([[candidateKey(x), 2 / 71]]), ranks: new Map([[candidateKey(x), { keyword: 11, meaning: 11 }]]) };
+  const bothRuns = mergeQueryRuns(queryRun, messageRun, candidateKey);
+  check("a source that either run ranked in the top 10 is cited", ids(pickSources(bothRuns.items, rankedHigh(queryRun, messageRun))) === "x", [...bothRuns.ranks]);
 
   const superPool = new pg.Pool({
     host: process.env.DB_HOST, port: Number(process.env.DB_PORT ?? 5432),
@@ -145,7 +178,7 @@ async function main() {
     const viaQuery = (await createArticle(A, "DSRCHQRY widget setup", "Set up the DSRCHQRY widget from the dashboard.", null, { visibility: "public" })).id;
     articles.push(viaMessage, viaQuery);
     reply = "<query>DSRCHQRY widget setup</query>";
-    const both = await ask("I get DSRCHMSG on my thing and want to set it up, please help");
+    const both = await ask("I get the DSRCHMSG gadget error and want to set it up, please help");
     const ids = both.citations.map((c) => c.id);
     check("the query's article comes first", ids[0] === viaQuery, both.citations);
     check("the message's own match is still kept", ids.includes(viaMessage), both.citations);
@@ -157,6 +190,10 @@ async function main() {
     reply = "<none/>";
     const plain = await ask("DSRCHMSG gadget troubleshooting help");
     check("without a query the message is searched alone", plain.citations[0]?.id === viaMessage, plain.citations);
+    // The article shares one word with this message, which is not a keyword match.
+    const oneWord = await ask("DSRCHMSG question about invoices billing refunds");
+    const oneWordTrace = (await superPool.query("SELECT sources FROM draft_traces WHERE id = $1", [oneWord.traceId])).rows[0]?.sources as { id: string; keywordRank?: number }[];
+    check("one shared word does not make a keyword match", oneWordTrace !== undefined && !oneWordTrace.some((s) => s.id === viaMessage && s.keywordRank), oneWordTrace);
     check("a draft that can't hand off gets no handoff rules", !lastDraftSystem.includes(DEFAULT_HANDOFF_RULES.slice(0, 60)), lastDraftSystem.slice(0, 400));
 
     // ---- Customers only see articles that the help center shows ----

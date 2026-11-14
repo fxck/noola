@@ -2,11 +2,12 @@ import { withTenant } from "@repo/db";
 import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { DEFAULT_PERSONA, getPersona, handoffRulesFor, personaPrompt } from "./persona.js";
-import { searchArticles, hydrateArticles, isPublicArticle, type KbArticle } from "./kb.js";
-import { searchDocuments, documentNames, hydrateChunks } from "./documents.js";
+import { hydrateArticles, isPublicArticle, type KbArticle } from "./kb.js";
+import { documentNames, hydrateChunks, type ChunkHit } from "./documents.js";
 import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
-import { searchResolvedThreads, hydrateThreads } from "./threads.js";
-import { vectorSearch, type VectorCollection } from "./vector.js";
+import { hydrateThreads, type ThreadHit } from "./threads.js";
+import { vectorHits, type VectorCollection } from "./vector.js";
+import { keywordHits, type RetrievalCollection } from "./search.js";
 import { recordDraftTrace } from "./trace.js";
 import { isContentGap, recordKnowledgeGap } from "./gaps.js";
 import { searchQueryFor } from "./docs-search.js";
@@ -27,11 +28,8 @@ const MAX_CHUNKS = 3;
 // neighbours so retrieval `agreement` means something for the autoreply gate.
 const VEC_FLOOR = 0.3;
 
-// Filler/greeting/question words carry no retrieval signal. Keyword search ANDs
-// its tokens, so a raw sentence ("Hi, I have a question about your refund policy")
-// forces the corpus to contain every filler word and finds nothing. We reduce the
-// message to its content words before retrieving. (The vector arm handles semantics;
-// this keeps the keyword arm from zeroing out on natural-language phrasing.)
+// Filler, greeting and question words carry no retrieval signal.
+// A keyword hit must match most of the words (requiredWords), so they would push real matches out.
 const STOP = new Set(
   ("a an and or but so the this that these those is are was were be been being have has had do does did " +
    "i we you your yours my me our us they them it its of on in to for from with about as at by " +
@@ -47,27 +45,109 @@ export function keywords(text: string): string[] {
   return [...new Set(kept)].sort((a, b) => b.length - a.length);
 }
 
+// requiredWords never asks a long message for more matched words than this.
+const MAX_REQUIRED_WORDS = 4;
+
+/** How many of a keyword query's words a hit must match: all of one or two, else half, at most MAX_REQUIRED_WORDS. */
+export function requiredWords(n: number): number {
+  return n <= 2 ? n : Math.min(Math.ceil(n / 2), MAX_REQUIRED_WORDS);
+}
+
+// Pages that differ only in a technology name overlap by over 0.9, unrelated passages by under 0.1.
+const DUPLICATE_OVERLAP = 0.6;
+
+function wordTrigrams(text: string): Set<string> {
+  const w = text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+  const out = new Set<string>();
+  for (let i = 0; i + 2 < w.length; i++) out.add(`${w[i]} ${w[i + 1]} ${w[i + 2]}`);
+  if (out.size === 0 && w.length > 0) out.add(w.join(" "));
+  return out;
+}
+
+/** Jaccard overlap of two passages' word trigrams, from 0 to 1. */
+export function passageOverlap(a: string, b: string): number {
+  const x = wordTrigrams(a);
+  const y = wordTrigrams(b);
+  let shared = 0;
+  for (const t of x) if (y.has(t)) shared++;
+  return shared / Math.max(1, x.size + y.size - shared);
+}
+
+type SourceKind = "kb" | "thread" | "document";
+
+/** A retrieved source of any kind. `id` is the article, ticket or chunk id. */
+export type Candidate =
+  | { kind: "kb"; id: string; item: KbArticle }
+  | { kind: "thread"; id: string; item: ThreadHit }
+  | { kind: "document"; id: string; item: ChunkHit };
+
+export const candidateKey = (c: Candidate) => `${c.kind}:${c.id}`;
+
+interface Surface {
+  collection: RetrievalCollection & VectorCollection;
+  /** Rows for the ids that the requester may use, in id order. */
+  hydrate: (ids: string[]) => Promise<Candidate[]>;
+}
+
 /**
- * Keyword retrieval that tolerates natural-language questions. Try the precise
- * conjunction of all content words first; if it finds nothing (the corpus rarely
- * contains every word), relax to the most distinctive single terms in turn. Extra
- * calls happen only on a miss. `search` is the tenant-scoped ranker (KB or chunks).
+ * Rank the sources of every surface in one list.
+ * Keyword hits are ordered by words matched, meaning hits by cosine, and the two lists are RRF-fused.
+ * Rows hydrate before ranking, so a source that the requester may not use takes no rank.
+ * A null query vector (embedder down) leaves the keyword ranking alone.
  */
-async function retrieve<T>(
-  search: (q: string) => Promise<T[]>,
-  message: string,
-  textOf: (item: T) => string,
-): Promise<T[]> {
-  const kw = keywords(message);
-  if (kw.length === 0) return search(message).catch(() => []);
-  const precise = await search(kw.join(" ")).catch(() => []);
-  if (precise.length) return precise;
-  for (const term of kw) {
-    const hits = await search(term).catch(() => []);
-    const solid = hits.filter((h) => textOf(h).toLowerCase().includes(term));
-    if (solid.length) return solid;
+async function rankSources(tenantId: string, text: string, surfaces: Surface[], queryVector: number[] | null): Promise<Ranked<Candidate>> {
+  const words = keywords(text);
+  const need = requiredWords(words.length);
+  const found = await Promise.all(surfaces.map(async (s) => {
+    const [kw, vec] = await Promise.all([
+      words.length > 0
+        ? keywordHits(s.collection, tenantId, words.join(" ")).then((hs) => hs.filter((h) => h.words >= need)).catch(() => [])
+        : Promise.resolve([]),
+      queryVector ? vectorHits(s.collection, tenantId, queryVector, 20, VEC_FLOOR).catch(() => []) : Promise.resolve([]),
+    ]);
+    const rows = await s.hydrate([...new Set([...kw, ...vec].map((h) => h.id))]).catch(() => []);
+    const byId = new Map(rows.map((c) => [c.id, c]));
+    return {
+      kw: kw.flatMap((h) => (byId.has(h.id) ? [{ c: byId.get(h.id)!, words: h.words, score: h.score }] : [])),
+      vec: vec.flatMap((h) => (byId.has(h.id) ? [{ c: byId.get(h.id)!, score: h.score }] : [])),
+    };
+  }));
+  const kwList = found.flatMap((f) => f.kw).sort((a, b) => b.words - a.words || b.score - a.score).map((x) => x.c);
+  const vecList = found.flatMap((f) => f.vec).sort((a, b) => b.score - a.score).map((x) => x.c);
+  const ranks = new Map<string, SearchRanks>();
+  vecList.forEach((c, i) => ranks.set(candidateKey(c), { meaning: i + 1 }));
+  kwList.forEach((c, i) => ranks.set(candidateKey(c), { keyword: i + 1, ...ranks.get(candidateKey(c)) }));
+  return { ...rrfMerge([vecList, kwList], candidateKey), ranks };
+}
+
+const MAX_OF_KIND: Record<SourceKind, number> = { kb: MAX_ARTICLES, thread: MAX_THREADS, document: MAX_CHUNKS };
+// A source that no search ranked this high is too weak to cite, even when its kind has a free place.
+const MAX_SOURCE_RANK = 10;
+
+/** The keys of the sources that some search of these runs ranked within MAX_SOURCE_RANK. */
+export function rankedHigh(...runs: Array<Ranked<Candidate> | null>): Set<string> {
+  const keys = new Set<string>();
+  for (const run of runs) {
+    for (const [key, r] of run?.ranks ?? []) if (Math.min(r.keyword ?? Infinity, r.meaning ?? Infinity) <= MAX_SOURCE_RANK) keys.add(key);
   }
-  return [];
+  return keys;
+}
+
+/**
+ * The sources to cite in rank order, taking only those in `strong` and at most MAX_OF_KIND of each kind.
+ * A passage from a page already cited, or one that repeats a cited passage, is skipped.
+ */
+export function pickSources(ranked: Candidate[], strong: Set<string>): Candidate[] {
+  const picked: Candidate[] = [];
+  const count: Record<SourceKind, number> = { kb: 0, thread: 0, document: 0 };
+  for (const c of ranked) {
+    if (!strong.has(candidateKey(c))) continue;
+    if (count[c.kind] >= MAX_OF_KIND[c.kind]) continue;
+    if (c.kind === "document" && picked.some((p) => p.kind === "document" && (p.item.document_id === c.item.document_id || passageOverlap(p.item.text, c.item.text) >= DUPLICATE_OVERLAP))) continue;
+    picked.push(c);
+    count[c.kind]++;
+  }
+  return picked;
 }
 
 /**
@@ -108,31 +188,6 @@ interface Ranked<T> {
   items: T[];
   scores: Map<string, number>;
   ranks: Map<string, SearchRanks>;
-}
-
-/**
- * Hybrid retrieval for one knowledge surface: run the keyword ranker (Typesense)
- * and the vector ranker (Qdrant) in parallel, then RRF-fuse. A null query vector
- * (embedder down) degrades to keyword-only. Returns fused items + fused scores, and each search's rank for the trace.
- */
-async function hybrid<T>(
-  keyword: () => Promise<T[]>,
-  collection: VectorCollection,
-  tenantId: string,
-  queryVector: number[] | null,
-  hydrate: (ids: string[]) => Promise<T[]>,
-  idOf: (t: T) => string,
-): Promise<Ranked<T>> {
-  const [kw, vec] = await Promise.all([
-    keyword(),
-    queryVector
-      ? vectorSearch(collection, tenantId, queryVector, 20, VEC_FLOOR).then(hydrate).catch(() => [])
-      : Promise.resolve<T[]>([]),
-  ]);
-  const ranks = new Map<string, SearchRanks>();
-  vec.forEach((item, i) => ranks.set(idOf(item), { meaning: i + 1 }));
-  kw.forEach((item, i) => ranks.set(idOf(item), { keyword: i + 1, ...ranks.get(idOf(item)) }));
-  return { ...rrfMerge([vec, kw], idOf), ranks };
 }
 
 /**
@@ -452,41 +507,35 @@ async function prepareDraft(
   const ticketId = opts.ticketId ?? null;
   const messageId = opts.messageId ?? null;
 
-  // Embed the query once (all three surfaces share the vector), then retrieve each
-  // IN-SCOPE surface with hybrid keyword+vector fusion. Tenant-scoped throughout. The
-  // audience scope (item 18) drops whole surfaces: public answers default to KB only.
+  // The audience scope drops whole surfaces, and rankSources ranks the rest together.
   const scope = opts.forceScope
     ? new Set(opts.forceScope)
     : await audienceScope(tenantId, opts.audience ?? "agent");
-  const NONE = { items: [] as never[], scores: new Map<string, number>(), ranks: new Map<string, SearchRanks>() };
   // A customer-facing answer may only use articles that the help center shows.
   const customerFacing = (opts.audience ?? "agent") === "public" || opts.customerFacing === true;
   const visible = (articles: KbArticle[]) => (customerFacing ? articles.filter(isPublicArticle) : articles);
   // It never uses another customer's conversations, and its own customer's only when their identity is proven.
   const threadOwner = customerFacing ? (opts.verifiedCustomer && ticketId ? await provenContact(tenantId, ticketId, opts.verifiedCustomer) : null) : undefined;
-  const retrieveAll = async (text: string) => {
-    const queryVector = (await embeddingDriver.embed([text]))?.[0] ?? null;
-    return Promise.all([
-      scope.has("kb")
-        ? hybrid(
-            () => retrieve((q) => searchArticles(tenantId, q).then(visible), text, (a) => `${a.title} ${a.body}`),
-            "kb", tenantId, queryVector, (ids) => hydrateArticles(tenantId, ids).then(visible), (a) => a.id,
-          )
-        : Promise.resolve(NONE),
-      scope.has("thread") && threadOwner !== null
-        ? hybrid(
-            () => retrieve((q) => searchResolvedThreads(tenantId, q, threadOwner), text, (t) => `${t.subject} ${t.text}`),
-            "threads", tenantId, queryVector, (ids) => hydrateThreads(tenantId, ids, threadOwner), (t) => t.ticket_id,
-          )
-        : Promise.resolve(NONE),
-      scope.has("document")
-        ? hybrid(
-            () => retrieve((q) => searchDocuments(tenantId, q), text, (ch) => ch.text),
-            "chunks", tenantId, queryVector, (ids) => hydrateChunks(tenantId, ids), (ch) => ch.id,
-          )
-        : Promise.resolve(NONE),
-    ]);
-  };
+  const surfaces: Surface[] = [];
+  if (scope.has("kb")) {
+    surfaces.push({
+      collection: "kb",
+      hydrate: async (ids) => visible(await hydrateArticles(tenantId, ids)).map((a) => ({ kind: "kb", id: a.id, item: a })),
+    });
+  }
+  if (scope.has("thread") && threadOwner !== null) {
+    surfaces.push({
+      collection: "threads",
+      hydrate: async (ids) => (await hydrateThreads(tenantId, ids, threadOwner)).map((t) => ({ kind: "thread", id: t.ticket_id, item: t })),
+    });
+  }
+  if (scope.has("document")) {
+    surfaces.push({
+      collection: "chunks",
+      hydrate: async (ids) => (await hydrateChunks(tenantId, ids)).map((ch) => ({ kind: "document", id: ch.id, item: ch })),
+    });
+  }
+  const retrieveAll = async (text: string) => rankSources(tenantId, text, surfaces, (await embeddingDriver.embed([text]))?.[0] ?? null);
   // Conversation history (best-effort) so the draft is context-aware — a follow-up must see the
   // prior turns, not answer blind. Ticket-scoped; a bare query (raw /suggest, eval) → no history.
   const history = ticketId ? await loadHistory(tenantId, ticketId, messageId).catch(() => []) : [];
@@ -495,57 +544,56 @@ async function prepareDraft(
     retrieveAll(query),
     opts.searchQuery !== undefined ? opts.searchQuery : searchQueryFor(tenantId, query, history).catch(() => null),
   ]);
-  let [artR, thrR, chkR] = original;
-  if (searchQuery) {
-    const [art2, thr2, chk2] = await retrieveAll(searchQuery);
-    artR = mergeQueryRuns(art2, artR, (a) => a.id);
-    thrR = mergeQueryRuns(thr2, thrR, (t) => t.ticket_id);
-    chkR = mergeQueryRuns(chk2, chkR, (ch) => ch.id);
-  }
+  const queryRun = searchQuery ? await retrieveAll(searchQuery) : null;
+  const ranked = queryRun ? mergeQueryRuns(queryRun, original, candidateKey) : original;
+  // The merge keeps the ranks of the run with the better score, so the rank cut-off checks both runs.
+  const picked = pickSources(ranked.items, rankedHigh(queryRun, original));
+  const chunks = picked.flatMap((c) => (c.kind === "document" ? [c.item] : []));
 
-  const kbTop = artR.items.slice(0, MAX_ARTICLES);
-  const threadTop = thrR.items.slice(0, MAX_THREADS);
-  const chunkTop = chkR.items.slice(0, MAX_CHUNKS);
-
-  const docNames = chunkTop.length > 0
-    ? await documentNames(tenantId, [...new Set(chunkTop.map((ch) => ch.document_id))]).catch(() => new Map<string, string>())
+  const docNames = chunks.length > 0
+    ? await documentNames(tenantId, [...new Set(chunks.map((ch) => ch.document_id))]).catch(() => new Map<string, string>())
     : new Map<string, string>();
   // Chunk → absolute source URL, straight off the hit's source_key (url-connector docs only — a
   // page URL with domain). Guarded to http(s) so a manual upload (null) or a github repo path
   // never becomes a bogus link.
   const docUrls = new Map<string, string>();
-  for (const ch of chunkTop) {
+  for (const ch of chunks) {
     if (ch.source_key && /^https?:\/\//i.test(ch.source_key)) docUrls.set(ch.document_id, ch.source_key);
   }
 
-  const kbSources: Citation[] = kbTop.map((a) => ({
-    kind: "kb", id: a.id, title: a.title, snippet: clip(a.body, 180),
-  }));
-  const threadSources: Citation[] = threadTop.map((t) => ({
-    kind: "thread", id: t.ticket_id, title: `Resolved: ${t.subject}`, snippet: clip(t.text, 180),
-  }));
-  const docSources: Citation[] = chunkTop.map((ch) => ({
-    kind: "document", id: ch.document_id, title: docNames.get(ch.document_id) ?? "Document", snippet: clip(ch.text, 180),
-    url: docUrls.get(ch.document_id),
-  }));
-  // Rank order: authored KB answers, then how we actually answered before (resolved
-  // threads), then raw document passages.
-  const citations = [...kbSources, ...threadSources, ...docSources];
-
-  // Per-citation fused scores → the retrieval summary the gate reads.
-  const perCitation: RetrievalSummary["perCitation"] = [
-    ...kbTop.map((a) => ({ kind: "kb" as const, id: a.id, score: artR.scores.get(a.id) ?? 0 })),
-    ...threadTop.map((t) => ({ kind: "thread" as const, id: t.ticket_id, score: thrR.scores.get(t.ticket_id) ?? 0 })),
-    ...chunkTop.map((ch) => ({ kind: "document" as const, id: ch.id, score: chkR.scores.get(ch.id) ?? 0 })),
-  ];
+  // Citations, gate scores, trace details and grounding all follow the one rank order.
+  const described = picked.map((c) => {
+    const score = ranked.scores.get(candidateKey(c)) ?? 0;
+    const ranks = rankFields(ranked.ranks.get(candidateKey(c)));
+    if (c.kind === "kb") {
+      const a = c.item;
+      return {
+        citation: { kind: "kb", id: a.id, title: a.title, snippet: clip(a.body, 180) } as Citation,
+        score, detail: { ...ranks, excerpt: clip(a.body, EXCERPT_CHARS) },
+        grounding: { title: a.title, text: a.body } as { title: string; text: string; url?: string },
+      };
+    }
+    if (c.kind === "thread") {
+      const t = c.item;
+      return {
+        citation: { kind: "thread", id: t.ticket_id, title: `Resolved: ${t.subject}`, snippet: clip(t.text, 180) } as Citation,
+        score, detail: { ...ranks, excerpt: clip(t.text, EXCERPT_CHARS) },
+        grounding: { title: `Resolved: ${t.subject}`, text: t.text },
+      };
+    }
+    const ch = c.item;
+    const title = docNames.get(ch.document_id) ?? "Document";
+    return {
+      citation: { kind: "document", id: ch.document_id, title, snippet: clip(ch.text, 180), url: docUrls.get(ch.document_id) } as Citation,
+      score, detail: { ...ranks, excerpt: clip(ch.text, EXCERPT_CHARS), passage: ch.chunk_index, passages: ch.chunk_count },
+      grounding: { title, text: ch.text, url: docUrls.get(ch.document_id) },
+    };
+  });
+  const citations = described.map((d) => d.citation);
+  // The autoreply gate reads these fused scores. A document is scored per passage.
+  const perCitation: RetrievalSummary["perCitation"] = picked.map((c, i) => ({ kind: c.kind, id: c.id, score: described[i].score }));
   // What the trace viewer shows per source, in the order of perCitation.
-  const traceDetails = [
-    ...kbTop.map((a) => ({ ...rankFields(artR.ranks.get(a.id)), excerpt: clip(a.body, EXCERPT_CHARS) })),
-    ...threadTop.map((t) => ({ ...rankFields(thrR.ranks.get(t.ticket_id)), excerpt: clip(t.text, EXCERPT_CHARS) })),
-    ...chunkTop.map((ch) => ({
-      ...rankFields(chkR.ranks.get(ch.id)), excerpt: clip(ch.text, EXCERPT_CHARS), passage: ch.chunk_index, passages: ch.chunk_count,
-    })),
-  ];
+  const traceDetails = described.map((d) => d.detail);
   const citedKinds = [...new Set(perCitation.map((p) => p.kind))];
   const retrieval: RetrievalSummary = {
     topScore: perCitation.reduce((m, p) => Math.max(m, p.score), 0),
@@ -554,18 +602,7 @@ async function prepareDraft(
     perCitation,
   };
 
-  // Grounding text: fuller passages than the display snippets. Round-robin the three
-  // sources so the draft draws from a DIVERSE set — the model only uses the top
-  // couple, and we don't want two loose KB hits to crowd out a strong thread answer.
-  const bySource: Array<Array<{ title: string; text: string; url?: string }>> = [
-    kbTop.map((a) => ({ title: a.title, text: a.body })),
-    threadTop.map((t) => ({ title: `Resolved: ${t.subject}`, text: t.text })),
-    chunkTop.map((ch) => ({ title: docNames.get(ch.document_id) ?? "Document", text: ch.text, url: docUrls.get(ch.document_id) })),
-  ];
-  const grounding: Array<{ title: string; text: string; url?: string }> = [];
-  for (let i = 0; i < Math.max(0, ...bySource.map((s) => s.length)); i++) {
-    for (const src of bySource) if (src[i]) grounding.push(src[i]);
-  }
+  const grounding = described.map((d) => d.grounding);
 
   // Draft through the tenant's configured model (BYO hosted LLM, or the extractive
   // rule baseline). Degrade to the baseline on hosted-model failure rather than 502.

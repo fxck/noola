@@ -75,6 +75,17 @@ export async function vectorSearch(
   limit = 20,
   scoreThreshold?: number,
 ): Promise<string[]> {
+  return (await vectorHits(collection, tenantId, vector, limit, scoreThreshold)).map((h) => h.id);
+}
+
+/** vectorSearch with each hit's cosine similarity. */
+export async function vectorHits(
+  collection: VectorCollection,
+  tenantId: string,
+  vector: number[],
+  limit = 20,
+  scoreThreshold?: number,
+): Promise<Array<{ id: string; score: number }>> {
   if (!vectorEnabled()) return [];
   const res = await qdrant(`/collections/${collection}/points/search`, "POST", {
     vector,
@@ -87,8 +98,8 @@ export async function vectorSearch(
     ...(scoreThreshold !== undefined ? { score_threshold: scoreThreshold } : {}),
   });
   if (!res.ok) throw new Error(`qdrant search ${collection} failed: ${res.status}`);
-  const raw = (await res.json()) as { result?: Array<{ id: string | number }> };
-  return (raw.result ?? []).map((h) => String(h.id));
+  const raw = (await res.json()) as { result?: Array<{ id: string | number; score?: number }> };
+  return (raw.result ?? []).map((h) => ({ id: String(h.id), score: h.score ?? 0 }));
 }
 
 /** Delete points by id (row deletion). */
