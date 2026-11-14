@@ -5,6 +5,7 @@
 
 import { relayPool } from "@repo/db";
 import { embeddingDriver } from "./model.js";
+import { withChunkIndexLock } from "./search.js";
 
 const BASE = process.env.QDRANT_URL ?? "http://qdrant:6333";
 const HEADERS: Record<string, string> = {
@@ -102,10 +103,10 @@ export async function vectorHits(
   return (raw.result ?? []).map((h) => ({ id: String(h.id), score: h.score ?? 0 }));
 }
 
-/** Delete points by id (row deletion). */
-export async function deleteVectors(collection: VectorCollection, ids: string[]): Promise<void> {
-  if (!vectorEnabled() || ids.length === 0) return;
-  await qdrant(`/collections/${collection}/points/delete?wait=true`, "POST", { points: ids });
+/** Delete points by id (row deletion). Returns whether Qdrant accepted the delete. */
+export async function deleteVectors(collection: VectorCollection, ids: string[]): Promise<boolean> {
+  if (!vectorEnabled() || ids.length === 0) return true;
+  return (await qdrant(`/collections/${collection}/points/delete?wait=true`, "POST", { points: ids })).ok;
 }
 
 /** Delete every point matching a payload key (e.g. all chunks of a document). */
@@ -159,11 +160,12 @@ export async function reindexAllVectors(
   log?: { info?: (m: string) => void; warn?: (o: unknown, m?: string) => void },
 ): Promise<void> {
   if (!vectorEnabled()) return;
-  if ((await pointCount("chunks")) === 0) {
+  await withChunkIndexLock(async () => {
+    if ((await pointCount("chunks")) > 0) return;
     const r = await relayPool.query("SELECT tenant_id, id, document_id, text FROM document_chunks");
     const n = await backfill("chunks", r.rows as BackfillRow[], (b) => ({ tenant_id: b.tenant_id, document_id: b.document_id ?? "" }), log);
     log?.info?.(`vectors: backfilled ${n} chunks`);
-  }
+  });
   if ((await pointCount("kb")) === 0) {
     const r = await relayPool.query("SELECT tenant_id, id, (title || ' ' || body) AS text FROM kb_articles");
     const n = await backfill("kb", r.rows as BackfillRow[], (b) => ({ tenant_id: b.tenant_id }), log);
