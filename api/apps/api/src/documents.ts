@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { withTenant } from "@repo/db";
 import { putText, getText } from "./storage.js";
-import { extractText, isSupported, chunkText } from "./extract.js";
+import { extractText, isSupported, chunkDocument } from "./extract.js";
 import { indexChunk, deleteDocChunks, searchChunkIds } from "./search.js";
 import { embeddingDriver } from "./model.js";
 import { upsertVectors, deleteVectorsByPayload } from "./vector.js";
@@ -69,7 +69,7 @@ export async function ingestDocument(
 
   // 2. extract → 3. chunk
   const text = extractText(contentType, content);
-  const chunks = chunkText(text);
+  const chunks = chunkDocument(text, contentType);
 
   // 4. persist the document + its chunks in one tenant-scoped transaction
   const doc = await withTenant(tenantId, async (c) => {
