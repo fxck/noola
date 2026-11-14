@@ -315,19 +315,28 @@ export async function removeSyncMemberships(c: PoolClient, contactId: string, co
   await repinPrimary(c, contactId);
 }
 
-/** Ensure the contact has exactly one primary membership when it has any (keeping the current one
- *  if it survived, else the oldest), and mirror it onto contacts.company_id / contacts.company. */
+/**
+ * Keep exactly one primary membership while the contact has any, and mirror it onto contacts.company_id / contacts.company.
+ * A primary that a person chose stays. Otherwise the earliest joined_at wins, owners first on a tie.
+ * Without any joined_at, the current primary stays, else an owner's membership, else the first one recorded.
+ */
 export async function repinPrimary(c: PoolClient, contactId: string): Promise<void> {
-  const cur = await c.query(`SELECT company_id FROM contact_companies WHERE contact_id = $1 AND is_primary`, [contactId]);
-  let primary = cur.rows[0]?.company_id as string | undefined;
-  if (!primary) {
-    primary = (await c.query(
-      `SELECT company_id FROM contact_companies WHERE contact_id = $1 ORDER BY created_at, company_id LIMIT 1`, [contactId],
-    )).rows[0]?.company_id as string | undefined;
-    if (primary) {
-      await c.query(`UPDATE contact_companies SET is_primary = true WHERE contact_id = $1 AND company_id = $2`, [contactId, primary]);
-    }
+  const rows = (await c.query(
+    `SELECT cc.company_id, cc.is_primary, cc.joined_at, ct.primary_company_chosen AS chosen
+       FROM contact_companies cc JOIN contacts ct ON ct.id = cc.contact_id
+      WHERE cc.contact_id = $1
+      ORDER BY cc.joined_at NULLS LAST, COALESCE(lower(cc.role) = 'owner', false) DESC, cc.created_at, cc.company_id`,
+    [contactId],
+  )).rows as { company_id: string; is_primary: boolean; joined_at: Date | null; chosen: boolean }[];
+  const current = rows.find((r) => r.is_primary)?.company_id;
+  const chosen = Boolean(rows[0]?.chosen && current);
+  const primary = chosen ? current : rows.some((r) => r.joined_at) ? rows[0].company_id : (current ?? rows[0]?.company_id);
+  if (primary !== current) {
+    await c.query(`UPDATE contact_companies SET is_primary = false WHERE contact_id = $1 AND is_primary`, [contactId]);
+    await c.query(`UPDATE contact_companies SET is_primary = true WHERE contact_id = $1 AND company_id = $2`, [contactId, primary]);
   }
+  // If the chosen membership is gone, the next pick is automatic again.
+  if (!chosen) await c.query(`UPDATE contacts SET primary_company_chosen = false WHERE id = $1 AND primary_company_chosen`, [contactId]);
   await c.query(
     `UPDATE contacts SET company_id = $2,
             company = COALESCE((SELECT name FROM companies WHERE id = $2), '')

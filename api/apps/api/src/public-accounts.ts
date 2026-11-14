@@ -124,8 +124,8 @@ async function syncCompany(c: PoolClient, input: PublicCompanyInput, aliases: Ma
 
   let unknown: string[] = [];
   if (input.members) {
-    const byExt = new Map<string, string>(); // external_id → role (last one wins)
-    for (const m of input.members) byExt.set(m.external_id, m.role ?? "");
+    const byExt = new Map<string, { role: string; joinedAt: string | null }>(); // external_id → membership (last one wins)
+    for (const m of input.members) byExt.set(m.external_id, { role: m.role ?? "", joinedAt: m.joined_at ?? null });
     const ids = [...byExt.keys()];
     const found = ids.length
       ? ((await c.query(`SELECT id, external_id FROM contacts WHERE external_id = ANY($1::text[])`, [ids])).rows as { id: string; external_id: string }[])
@@ -135,11 +135,13 @@ async function syncCompany(c: PoolClient, input: PublicCompanyInput, aliases: Ma
 
     const touched = new Set<string>();
     for (const r of found) {
+      const member = byExt.get(r.external_id);
       await c.query(
-        `INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary, role, source)
-         VALUES (current_tenant(), $1, $2, false, $3, 'sync')
-         ON CONFLICT (tenant_id, contact_id, company_id) DO UPDATE SET role = EXCLUDED.role, source = 'sync'`,
-        [r.id, id, byExt.get(r.external_id)],
+        `INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary, role, source, joined_at)
+         VALUES (current_tenant(), $1, $2, false, $3, 'sync', $4)
+         ON CONFLICT (tenant_id, contact_id, company_id) DO UPDATE
+           SET role = EXCLUDED.role, source = 'sync', joined_at = COALESCE(EXCLUDED.joined_at, contact_companies.joined_at)`,
+        [r.id, id, member?.role ?? "", member?.joinedAt ?? null],
       );
       touched.add(r.id);
     }

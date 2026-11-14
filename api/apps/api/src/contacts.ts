@@ -650,6 +650,7 @@ async function setContactCompanies(
     : [];
   const nameById = new Map(found.map((r) => [r.id, r.name]));
   const validIds = ids.filter((id) => nameById.has(id)); // preserve order, drop unknown/cross-tenant
+  const before = (await c.query(`SELECT company_id FROM contact_companies WHERE contact_id = $1 AND is_primary`, [contactId])).rows[0]?.company_id as string | undefined;
 
   // Drop memberships no longer present.
   if (validIds.length) {
@@ -669,6 +670,12 @@ async function setContactCompanies(
   const primaryId = validIds[0] ?? null;
   if (primaryId) {
     await c.query(`UPDATE contact_companies SET is_primary = true WHERE contact_id = $1 AND company_id = $2`, [contactId, primaryId]);
+  }
+  // A list that puts a different company first is a person's choice, which syncs keep.
+  if (primaryId && primaryId !== before) {
+    await c.query(`UPDATE contacts SET primary_company_chosen = true WHERE id = $1`, [contactId]);
+  } else if (!primaryId) {
+    await c.query(`UPDATE contacts SET primary_company_chosen = false WHERE id = $1 AND primary_company_chosen`, [contactId]);
   }
   return { primaryId, primaryName: primaryId ? (nameById.get(primaryId) ?? "") : "" };
 }
@@ -758,8 +765,14 @@ export async function updateContact(
       await c.query(`UPDATE contacts SET company_id = $2, company = $3, updated_at = now() WHERE id = $1`, [id, primaryId, primaryName]);
     } else if (input.company_id !== undefined) {
       // Legacy single-company change → keep the junction primary in step with the column.
-      if (input.company_id) await ensurePrimaryCompany(c, id, input.company_id);
-      else await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [id]);
+      if (input.company_id) {
+        const before = (await c.query(`SELECT company_id FROM contact_companies WHERE contact_id = $1 AND is_primary`, [id])).rows[0]?.company_id;
+        await ensurePrimaryCompany(c, id, input.company_id);
+        // Setting a different company is a choice, which syncs keep.
+        if (before !== input.company_id) await c.query(`UPDATE contacts SET primary_company_chosen = true WHERE id = $1`, [id]);
+      } else {
+        await c.query(`DELETE FROM contact_companies WHERE contact_id = $1 AND is_primary`, [id]);
+      }
     }
 
     const sel = await c.query(`SELECT ${DERIVED_COLS} FROM contacts WHERE id = $1`, [id]);

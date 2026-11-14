@@ -240,6 +240,35 @@ async function main() {
     check("re-upsert revives the person (user)", again.status === "updated" && again.contact.account_status === "user");
   }
 
+  // ---- primary company: the oldest membership by join date, owners first, unless a person chose one ----
+  {
+    await publicUpsertContact(A, { external_id: "pa-j1", email: "pa-j1@x.example", name: "pa-j1" });
+    const primary = async () => (await superPool.query(
+      "SELECT co.external_id FROM contacts ct JOIN companies co ON co.id = ct.company_id WHERE ct.external_id = 'pa-j1'")).rows[0]?.external_id as string | undefined;
+    const join = (company: string, role: string, joined_at: string) => publicSyncCompany(A, { external_id: company, name: company, members: [{ external_id: "pa-j1", role, joined_at }] });
+    await join("pa-jnew", "owner", "2025-06-01T00:00:00Z");
+    check("the first membership becomes the primary", (await primary()) === "pa-jnew");
+    await join("pa-jold", "admin", "2023-01-01T00:00:00Z");
+    check("an older membership takes over the primary on a later sync", (await primary()) === "pa-jold");
+    await join("pa-jtie", "owner", "2023-01-01T00:00:00Z");
+    check("on the same join date the owner's company wins", (await primary()) === "pa-jtie");
+    await publicSyncCompany(A, { external_id: "pa-jold", members: [{ external_id: "pa-j1", role: "admin" }] });
+    check("a sync without a join date keeps the stored one", (await primary()) === "pa-jtie");
+
+    const ids = (await superPool.query("SELECT id, external_id FROM companies WHERE external_id LIKE 'pa-j%'")).rows as { id: string; external_id: string }[];
+    const idOf = (ext: string) => ids.find((r) => r.external_id === ext)!.id;
+    const contactId = (await superPool.query("SELECT id FROM contacts WHERE external_id = 'pa-j1'")).rows[0].id as string;
+    await updateContact(A, contactId, { company_ids: [idOf("pa-jnew"), idOf("pa-jtie"), idOf("pa-jold")] });
+    check("a person can choose another primary", (await primary()) === "pa-jnew");
+    await join("pa-jold", "admin", "2022-01-01T00:00:00Z");
+    check("a sync keeps the primary that a person chose", (await primary()) === "pa-jnew");
+    await publicSyncCompany(A, { external_id: "pa-jnew", members: [] });
+    check("removing the chosen membership hands the primary back to the oldest", (await primary()) === "pa-jold");
+    await updateContact(A, contactId, { company_id: idOf("pa-jtie") });
+    await join("pa-jold", "admin", "2021-01-01T00:00:00Z");
+    check("a company set through the API is a choice that syncs keep", (await primary()) === "pa-jtie");
+  }
+
   // ---- topic opt-out ----
   {
     const t = await createTopic(A, { name: "PA topic EOL" });

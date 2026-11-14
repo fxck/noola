@@ -33,6 +33,8 @@ type Member struct {
 	ExternalID string `json:"external_id"`
 	// Role, e.g. "owner", "admin", "developer" — filterable in Noola audiences.
 	Role string `json:"role,omitempty"`
+	// JoinedAt is when the person joined the client. The person's oldest membership becomes their primary company.
+	JoinedAt *time.Time `json:"joined_at,omitempty"`
 }
 
 // Project is one of the client's projects with its FULL service list.

@@ -1650,6 +1650,8 @@ export const PublicCompanyMemberInput = z.object({
   /** The person's external_id — the contact must already be synced (contacts/upsert first). */
   external_id: z.string().trim().min(1).max(200),
   role: z.string().trim().max(60).optional(),
+  /** When the person joined the company. The oldest membership becomes the person's primary company. */
+  joined_at: z.string().datetime({ offset: true }).optional(),
 });
 
 export const PublicCompanyInput = z.object({
