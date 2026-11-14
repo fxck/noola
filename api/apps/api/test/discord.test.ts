@@ -417,7 +417,7 @@ async function main() {
       "INSERT INTO discord_channel_bindings (guild_id, channel_id, tenant_id, mode) VALUES ($1,$2,$3,'community'),($1,$4,$3,'staffed') ON CONFLICT DO NOTHING",
       [GUILD_B, PARENT_B_COMM, B, PARENT_B_STAFF],
     );
-    await createArticle(B, "DISCTEST Widgets guide", `The ${MARK} dashboard widget shows recent activity; drag its corner to resize and the layout saves per user.`);
+    await createArticle(B, "DISCTEST Widgets guide", `The ${MARK} dashboard widget shows recent activity; drag its corner to resize and the layout saves per user.`, null, { visibility: "public" });
     // auto mode, discord channel auto, configured thread cap 3 → only the community clamp limits to 1.
     await putPolicy(B, {
       mode: "auto", channel_modes: { discord: "auto", synthetic: "auto" },
