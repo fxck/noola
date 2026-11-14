@@ -206,7 +206,10 @@ async function recordDecision(tenantId: string, d: DecisionInput): Promise<strin
        RETURNING id`,
       [d.messageId, d.ticketId, d.outcome, d.reason, d.agreement, d.topScore, d.confidence, d.riskTags, d.sentMessageId, d.traceId, d.source ?? "ambient", d.invokedByExternalId ?? null],
     );
-    return r.rowCount ? (r.rows[0].id as string) : null;
+    if (!r.rowCount) return null;
+    // The open conversation shows each decision as it is made.
+    await emitTicketUpdated(c, tenantId, d.ticketId, { change: "autoreply_decision" });
+    return r.rows[0].id as string;
   });
 }
 

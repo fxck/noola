@@ -268,6 +268,13 @@ async function main() {
     const seen = await import("../src/autoreply.js").then((m) => m.listDecisionsForTicket(B, tAuto.ticketId));
     check("isolation → Globex cannot read Acme's decisions", seen.length === 0);
   }
+  {
+    const event = await superPool.query(
+      "SELECT count(*)::int AS n FROM outbox WHERE event_type = 'ticket.updated' AND payload->>'ticketId' = $1 AND payload->'data'->>'change' = 'autoreply_decision'",
+      [tAuto.ticketId],
+    );
+    check("a recorded decision announces itself, so the open conversation shows it", event.rows[0].n >= 1, event.rows[0]);
+  }
 
   // 9. Backlog job queue — the sweep-existing-tickets feature. Hermetic: clean + reseed
   //    the tenant's knowledge and a fresh backlog so job counts are exact.
