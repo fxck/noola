@@ -373,7 +373,8 @@ async function runAction(
         // Dynamic import mirrors the reply/ingest cycle-break; suggestReply runs the same grounded
         // RAG draft the copilot /suggest endpoint uses (extractive under FORCE_RULE_MODEL).
         const { suggestReply } = await import("./copilot.js");
-        const s = await suggestReply(tenantId, ctx.ticketId);
+        // A later reply action may send the answer as it is, so nobody reviews it.
+        const s = await suggestReply(tenantId, ctx.ticketId, { customerFacing: true });
         const answer = s.draft ?? "";
         const confidence = s.confidence;
         ctx.rag = { answer, confidence };

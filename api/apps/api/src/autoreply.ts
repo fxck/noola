@@ -497,7 +497,9 @@ async function evaluateForMessage(
   }
 
   // Draft + retrieve (records a draft_trace). Needed for both suggest_only and auto.
-  const suggestion = await suggestForQuery(tenantId, ctx.body, { ticketId, messageId, source: "live", outcomes: true });
+  const suggestion = await suggestForQuery(tenantId, ctx.body, {
+    ticketId, messageId, source: "live", outcomes: true, customerFacing: channelMode === "auto",
+  });
   const agreement = suggestion.retrieval.agreement;
   const topScore = suggestion.retrieval.topScore;
   const confidence = suggestion.confidence;

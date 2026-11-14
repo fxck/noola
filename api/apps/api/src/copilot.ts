@@ -2,7 +2,7 @@ import { withTenant } from "@repo/db";
 import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { DEFAULT_PERSONA, getPersona, handoffRulesFor, personaPrompt } from "./persona.js";
-import { searchArticles, hydrateArticles } from "./kb.js";
+import { searchArticles, hydrateArticles, isPublicArticle, type KbArticle } from "./kb.js";
 import { searchDocuments, documentNames, hydrateChunks } from "./documents.js";
 import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
 import { searchResolvedThreads, hydrateThreads } from "./threads.js";
@@ -261,6 +261,10 @@ export interface SuggestOpts {
   images?: DraftImage[];
   /** The ambient autoreply and the widget let a hosted model add a note for the team or decide that no reply is needed. */
   outcomes?: boolean;
+  /** The answer reaches the customer unreviewed. It uses only public articles, and past conversations only as `verifiedCustomer` allows. */
+  customerFacing?: boolean;
+  /** The identity that the requester proved in a private channel. It unlocks the past conversations of a ticket contact who has it. */
+  verifiedCustomer?: { userId: string | null; email: string | null };
 }
 
 const EXCERPT_CHARS = 240;
@@ -453,19 +457,24 @@ async function prepareDraft(
     ? new Set(opts.forceScope)
     : await audienceScope(tenantId, opts.audience ?? "agent");
   const NONE = { items: [] as never[], scores: new Map<string, number>(), ranks: new Map<string, SearchRanks>() };
+  // A customer-facing answer may only use articles that the help center shows.
+  const customerFacing = (opts.audience ?? "agent") === "public" || opts.customerFacing === true;
+  const visible = (articles: KbArticle[]) => (customerFacing ? articles.filter(isPublicArticle) : articles);
+  // It never uses another customer's conversations, and its own customer's only when their identity is proven.
+  const threadOwner = customerFacing ? (opts.verifiedCustomer && ticketId ? await provenContact(tenantId, ticketId, opts.verifiedCustomer) : null) : undefined;
   const retrieveAll = async (text: string) => {
     const queryVector = (await embeddingDriver.embed([text]))?.[0] ?? null;
     return Promise.all([
       scope.has("kb")
         ? hybrid(
-            () => retrieve((q) => searchArticles(tenantId, q), text, (a) => `${a.title} ${a.body}`),
-            "kb", tenantId, queryVector, (ids) => hydrateArticles(tenantId, ids), (a) => a.id,
+            () => retrieve((q) => searchArticles(tenantId, q).then(visible), text, (a) => `${a.title} ${a.body}`),
+            "kb", tenantId, queryVector, (ids) => hydrateArticles(tenantId, ids).then(visible), (a) => a.id,
           )
         : Promise.resolve(NONE),
-      scope.has("thread")
+      scope.has("thread") && threadOwner !== null
         ? hybrid(
-            () => retrieve((q) => searchResolvedThreads(tenantId, q), text, (t) => `${t.subject} ${t.text}`),
-            "threads", tenantId, queryVector, (ids) => hydrateThreads(tenantId, ids), (t) => t.ticket_id,
+            () => retrieve((q) => searchResolvedThreads(tenantId, q, threadOwner), text, (t) => `${t.subject} ${t.text}`),
+            "threads", tenantId, queryVector, (ids) => hydrateThreads(tenantId, ids, threadOwner), (t) => t.ticket_id,
           )
         : Promise.resolve(NONE),
       scope.has("document")
@@ -631,7 +640,18 @@ const PUBLIC_NO_GROUNDING_DEFLECTION =
 
 /** The ticket-scoped entry point for the /suggest endpoint: find the latest customer
  *  message, then run the shared core. */
-export async function suggestReply(tenantId: string, ticketId: string): Promise<Suggestion> {
+export async function suggestReply(tenantId: string, ticketId: string, opts: { customerFacing?: boolean } = {}): Promise<Suggestion> {
   const query = await latestCustomerMessage(tenantId, ticketId);
-  return suggestForQuery(tenantId, query ?? "", { ticketId });
+  return suggestForQuery(tenantId, query ?? "", { ticketId, customerFacing: opts.customerFacing });
+}
+
+/** The ticket's contact, when it has the e-mail or user id that the requester proved. */
+async function provenContact(tenantId: string, ticketId: string, proven: { userId: string | null; email: string | null }): Promise<string | null> {
+  if (!proven.userId && !proven.email) return null;
+  const r = await withTenant(tenantId, (c) => c.query(
+    `SELECT ct.id FROM tickets t JOIN contacts ct ON ct.id = t.contact_id
+      WHERE t.id = $1 AND (lower(ct.email) = lower($2) OR ct.external_id = $3)`,
+    [ticketId, proven.email, proven.userId],
+  ));
+  return (r.rows[0]?.id as string | undefined) ?? null;
 }
