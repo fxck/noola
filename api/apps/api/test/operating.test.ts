@@ -1,7 +1,10 @@
+import Fastify from "fastify";
 import pg from "pg";
 import { appPool, relayPool } from "@repo/db";
 import { ingestInbound } from "../src/ingest.js";
-import { listTickets, assignTicket, setTicketStatus, listUsers, type View } from "../src/tickets.js";
+import { listTickets, assignTicket, setTicketStatus, setTicketSpam, listUsers, type View } from "../src/tickets.js";
+import { unreadTicketIds } from "../src/reads.js";
+import ticketRoutes from "../src/routes/tickets.js";
 
 // Slice-03 seam gate: whose-turn automation, cross-tenant assignment block,
 // View filters, close/reopen — through the same functions the routes call. Exit 1 on any fail.
@@ -9,6 +12,7 @@ import { listTickets, assignTicket, setTicketStatus, listUsers, type View } from
 const A = "33333333-3333-3333-3333-333333333333"; // TestCo (dedicated test tenant)
 const B = "22222222-2222-2222-2222-222222222222"; // Globex
 const TESTCO_U1 = "c0000000-0000-0000-0000-000000000001"; // Tess
+const TESTCO_U2 = "c0000000-0000-0000-0000-000000000002"; // Tom
 const GLOBEX_U = "b0000000-0000-0000-0000-000000000001"; // Mia
 
 let failures = 0;
@@ -97,6 +101,62 @@ async function main() {
   // 6 — cross-tenant ticket isolation still holds through the View path
   const globexSees = (await listTickets(B, "all")).filter((t) => t.subject.startsWith("OPTEST"));
   check("Globex sees none of TestCo's OPTEST tickets", globexSees.length === 0);
+
+  // 7 — the tickets table lists spam only when asked, whatever the spam ticket's status
+  const app = Fastify();
+  let asUser = TESTCO_U1;
+  app.addHook("onRequest", async (req) => {
+    (req as unknown as { session: unknown }).session = { userId: asUser, tenantId: A, role: "agent", email: "t@example.invalid", name: "T" };
+  });
+  await app.register(ticketRoutes);
+  const tableSubjects = async (status: string) => {
+    const res = await app.inject({ method: "GET", url: `/tickets?table=1&status=${status}&q=OPTEST&limit=100` });
+    return (res.json().tickets as { subject: string }[]).map((t) => t.subject).sort();
+  };
+  const v5 = await mk("OPTEST-V5");
+  await setTicketSpam(A, v5, true);
+  await setTicketStatus(A, v5, "closed");
+  check("table status=spam lists only the spam ticket (V5, closed)", eq(await tableSubjects("spam"), ["OPTEST-V5"]));
+  check("table status=all hides spam", !(await tableSubjects("all")).includes("OPTEST-V5"));
+  check("table status=closed hides spam", !(await tableSubjects("closed")).includes("OPTEST-V5"));
+
+  // 8 — mark all as read covers exactly the view's tickets, for the calling agent only
+  const subjectOf: Record<string, string> = { [v1]: "OPTEST-V1", [v2]: "OPTEST-V2", [v3]: "OPTEST-V3", [v4]: "OPTEST-V4", [v5]: "OPTEST-V5" };
+  const readBy = async (userId: string) =>
+    (await superPool.query("SELECT ticket_id FROM ticket_reads WHERE user_id = $1 AND ticket_id = ANY($2::uuid[])", [userId, Object.keys(subjectOf)]))
+      .rows.map((r) => subjectOf[r.ticket_id as string]).sort();
+  const readAll = (body: unknown) => app.inject({ method: "POST", url: "/tickets/read-all", payload: body as object });
+
+  const myRes = await readAll({ scope: "view", view: "my" });
+  check("read-all view=my succeeds", myRes.statusCode === 200 && typeof myRes.json().marked === "number");
+  check("read-all view=my marks only Tess's ticket (V2)", eq(await readBy(TESTCO_U1), ["OPTEST-V2"]));
+  check("read-all as Tess leaves Tom's read state untouched", eq(await readBy(TESTCO_U2), []));
+  check("V2 drops out of Tess's unread set", !(await unreadTicketIds(A, TESTCO_U1)).includes(v2));
+  const again = await readAll({ scope: "view", view: "my" });
+  check("a second read-all marks nothing, because only unread tickets count", again.json().marked === 0, again.json());
+
+  asUser = TESTCO_U2;
+  await readAll({ scope: "table", status: "open", q: "OPTEST" });
+  check("read-all table status=open marks the open non-spam tickets for Tom (V2,V3,V4)", eq(await readBy(TESTCO_U2), ["OPTEST-V2", "OPTEST-V3", "OPTEST-V4"]));
+  check("Tom's read-all leaves Tess's read state as it was", eq(await readBy(TESTCO_U1), ["OPTEST-V2"]));
+
+  asUser = TESTCO_U1;
+  await readAll({ scope: "table", status: "spam", q: "OPTEST" });
+  check("read-all table status=spam marks only the spam ticket (V5)", eq(await readBy(TESTCO_U1), ["OPTEST-V2", "OPTEST-V5"]));
+  const approvalRes = await readAll({ scope: "view", view: "approval" });
+  check("read-all view=approval runs (no pending drafts on OPTEST tickets)", approvalRes.statusCode === 200 && eq(await readBy(TESTCO_U1), ["OPTEST-V2", "OPTEST-V5"]));
+  const laneRes = await readAll({ scope: "view", view: "all", teamId: "00000000-0000-4000-8000-000000000000" });
+  check("read-all in an empty team lane marks nothing", laneRes.statusCode === 200 && laneRes.json().marked === 0);
+  const bad = await readAll({ scope: "view", view: "bogus" });
+  check("read-all rejects an unknown view with 400", bad.statusCode === 400);
+  // The inbox's Needs reply lane lists community threads too, so its read-all marks them.
+  const v6 = await mk("OPTEST-V6");
+  subjectOf[v6] = "OPTEST-V6";
+  await superPool.query("UPDATE tickets SET support_mode = 'community', whose_turn = 'us' WHERE id = $1", [v6]);
+  asUser = TESTCO_U2;
+  await readAll({ scope: "view", view: "needs_reply" });
+  check("read-all in Needs reply marks a community thread that the lane shows", (await readBy(TESTCO_U2)).includes("OPTEST-V6"));
+  await app.close();
 
   await clean();
   await superPool.end();

@@ -94,6 +94,29 @@ export async function markTicketRead(id: string): Promise<void> {
   await api(`/tickets/${id}/read`, { method: "POST" });
 }
 
+/** What "Mark all as read" covers: an inbox lane (a team lane is `teamId`) or the table's filters. */
+export type MarkAllReadTarget =
+  | { scope: "view"; view: ViewKey; teamId?: string }
+  | { scope: "table"; query: TicketQuery };
+
+/** Mark every ticket of a lane or table filter read for the current agent. The server resolves the tickets. */
+export async function markAllTicketsRead(target: MarkAllReadTarget): Promise<number> {
+  const body =
+    target.scope === "view"
+      ? target
+      : {
+          scope: "table",
+          status: target.query.status ?? "all",
+          priority: target.query.priority,
+          tags: target.query.tag ? target.query.tag.split(",").filter(Boolean) : undefined,
+          assigneeId: target.query.assigneeId,
+          teamId: target.query.teamId,
+          channel: target.query.channel,
+          q: target.query.q,
+        };
+  return (await api<{ marked: number }>("/tickets/read-all", { method: "POST", body: JSON.stringify(body) })).marked;
+}
+
 export type BulkAction = "close" | "reopen" | "assign" | "priority" | "tag" | "team";
 
 /** Apply one action to many tickets. Returns the number updated. */
@@ -517,7 +540,8 @@ export async function removeParticipant(ticketId: string, userId: string): Promi
 
 // ---- Deep ticketing: the filterable/sortable/paginated ticket table ----------
 export interface TicketQuery {
-  status?: "open" | "closed" | "all";
+  /** "spam" lists only spam-hidden tickets, whatever their status. */
+  status?: "open" | "closed" | "all" | "spam";
   priority?: TicketPriority[];
   tag?: string;
   assigneeId?: string; // "none" = unassigned

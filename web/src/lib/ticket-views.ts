@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 // saved-segments use), so no new table is needed. The definition mirrors the /tickets query.
 
 export interface TicketViewDefinition {
-  status?: "open" | "closed" | "all";
+  status?: "open" | "closed" | "all" | "spam";
   priority?: string; // csv of priorities
   team?: string; // team id, or "none" = no team
   assignee?: string; // user id, or "none" = unassigned

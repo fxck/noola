@@ -405,6 +405,27 @@ export const SpamTicketInput = z.object({
 });
 export type SpamTicketInput = z.infer<typeof SpamTicketInput>;
 
+/** POST /tickets/read-all marks one list read for the current agent, as the server resolves it.
+ *  `view` is an inbox lane, with `teamId` for a team lane, and `table` is the tickets table's filters. */
+export const MarkAllReadInput = z.discriminatedUnion("scope", [
+  z.object({
+    scope: z.literal("view"),
+    view: z.enum(["all", "needs_reply", "approval", "unassigned", "my", "closed", "spam", "outbound"]).default("all"),
+    teamId: z.guid().optional(),
+  }),
+  z.object({
+    scope: z.literal("table"),
+    status: z.enum(["open", "closed", "all", "spam"]).default("all"),
+    priority: z.array(z.string()).optional(),
+    tags: z.array(z.string()).optional(),
+    assigneeId: z.string().optional(), // user id, or "none" = unassigned
+    teamId: z.string().optional(), // team id, or "none" = no team
+    channel: z.string().optional(),
+    q: z.string().optional(),
+  }),
+]);
+export type MarkAllReadInput = z.infer<typeof MarkAllReadInput>;
+
 /** Add a teammate as a participant on a ticket (an "attendee" pulled into the issue). */
 export const ParticipantInput = z.object({
   userId: z.guid(),

@@ -164,7 +164,7 @@ const inboxRoute = createRoute({
 });
 
 interface TicketsSearch {
-  status?: "open" | "closed" | "all";
+  status?: "open" | "closed" | "all" | "spam";
   priority?: string; // csv of priorities
   team?: string; // team id, or "none" = no team
   assignee?: string; // user id, or "none" = unassigned
@@ -179,7 +179,7 @@ const ticketsRoute = createRoute({
   path: "/tickets",
   // Deep-linkable, shareable filtered views — the table mirrors its state into the URL.
   validateSearch: (search: Record<string, unknown>): TicketsSearch => ({
-    status: search.status === "closed" || search.status === "all" ? search.status : search.status === "open" ? "open" : undefined,
+    status: search.status === "closed" || search.status === "all" || search.status === "spam" ? search.status : search.status === "open" ? "open" : undefined,
     priority: typeof search.priority === "string" ? search.priority : undefined,
     team: typeof search.team === "string" ? search.team : undefined,
     assignee: typeof search.assignee === "string" ? search.assignee : undefined,
