@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import pg from "pg";
 import { appPool, relayPool } from "@repo/db";
 import {
@@ -8,6 +9,7 @@ import {
   reindexAllThreads,
 } from "../src/threads.js";
 import { suggestReply } from "../src/copilot.js";
+import { computeUserHash, resolveVerifiedIdentity, trustedIdentity, type WidgetKey } from "../src/widget.js";
 import { ingestInbound } from "../src/ingest.js";
 import { setTicketStatus } from "../src/tickets.js";
 import { ensureKbCollection, ensureChunksCollection } from "../src/search.js";
@@ -57,6 +59,7 @@ async function main() {
   const clean = async () => {
     for (const id of created) await unindexThread(id).catch(() => {});
     await superPool.query("DELETE FROM tickets WHERE subject LIKE 'THREADTEST%'");
+    await superPool.query("DELETE FROM contacts WHERE email LIKE 'threadtest-%' OR name = 'THREADTEST id'");
   };
   await clean();
   created.length = 0;
@@ -102,6 +105,53 @@ async function main() {
     check("thread citation is labelled Resolved: <subject>", s.citations.some((c) => c.kind === "thread" && c.title.startsWith("Resolved:")));
     check("draft is grounded in the past answer (mentions the marker)", s.draft.includes(MARK));
     check("suggest never cites the other tenant's thread", !s.citations.some((c) => c.id === b1));
+  }
+
+  // ---- widget identity: a proof covers one handle, and the other never comes from the browser unchecked ----
+  {
+    for (const [ext, email] of [["threadtest-uid", "threadtest-synced@x.example"], [null, "threadtest-victim@x.example"], ["threadtest-noemail", null]]) {
+      await superPool.query("INSERT INTO contacts (tenant_id, external_id, email, name) VALUES ($1, $2, $3, 'THREADTEST id')", [A, ext, email]);
+    }
+    const wk = { tenantId: A, identitySecret: "threadtest-secret" } as WidgetKey;
+    const hash = (v: string) => computeUserHash("threadtest-secret", v);
+    const trust = (userId: string | null, email: string | null, proof: string | null) =>
+      trustedIdentity(wk, { userId, email, userHash: proof ? hash(proof) : null });
+
+    const forged = resolveVerifiedIdentity(wk, { userId: "threadtest-attacker", email: "threadtest-victim@x.example", userHash: hash("threadtest-attacker") });
+    check("a hash for the user id proves the user id and not the e-mail", forged.verified && forged.proven.userId === "threadtest-attacker" && forged.proven.email === null);
+    check("a hash for the e-mail proves the e-mail", resolveVerifiedIdentity(wk, { email: "threadtest-victim@x.example", userHash: hash("threadtest-victim@x.example") }).proven.email === "threadtest-victim@x.example");
+
+    const synced = await trust("threadtest-uid", "threadtest-victim@x.example", "threadtest-uid");
+    check("a proven user id takes the stored contact's e-mail, not the browser's", synced.email === "threadtest-synced@x.example", synced);
+    const taken = await trust("threadtest-newuid", "threadtest-victim@x.example", "threadtest-newuid");
+    check("an e-mail that another contact holds is dropped", taken.userId === "threadtest-newuid" && taken.email === null, taken);
+    const mixedCase = await trust("threadtest-newuid", "ThreadTest-Victim@X.example", "threadtest-newuid");
+    check("the holder check ignores case", mixedCase.email === null, mixedCase);
+    const fresh = await trust("threadtest-newuid", "threadtest-fresh@x.example", "threadtest-newuid");
+    check("a new person's e-mail is kept while nobody holds it", fresh.email === "threadtest-fresh@x.example", fresh);
+    const noEmail = await trust("threadtest-noemail", "threadtest-victim@x.example", "threadtest-noemail");
+    check("a stored contact without an e-mail still can't take a held one", noEmail.email === null, noEmail);
+    const fromEmail = await trust(null, "threadtest-synced@x.example", "threadtest-synced@x.example");
+    check("a proven e-mail takes the stored contact's user id", fromEmail.userId === "threadtest-uid", fromEmail);
+    const otherId = await trust("threadtest-uid", "threadtest-victim@x.example", "threadtest-victim@x.example");
+    check("a user id that another contact holds is dropped", otherId.email === "threadtest-victim@x.example" && otherId.userId === null, otherId);
+    // Whatever the database locale lowercases İ to, a kept e-mail must not be one that another contact holds.
+    const dotted = await trust("threadtest-newuid", "threadtest-vİctim@x.example", "threadtest-newuid");
+    const dottedHolders = dotted.email
+      ? (await superPool.query("SELECT count(*)::int AS n FROM contacts WHERE tenant_id = $1 AND lower(email) = lower($2)", [A, dotted.email])).rows[0].n
+      : 0;
+    check("an e-mail that only Unicode case folding tells apart is still checked against holders", dottedHolders === 0, dotted);
+    const jwt = (claims: Record<string, string>) => {
+      const part = (v: object) => Buffer.from(JSON.stringify(v)).toString("base64url");
+      const body = `${part({ alg: "HS256", typ: "JWT" })}.${part(claims)}`;
+      return `${body}.${crypto.createHmac("sha256", "threadtest-secret").update(body).digest("base64url")}`;
+    };
+    const jwtId = await trustedIdentity(wk, { email: "threadtest-victim@x.example", userJwt: jwt({ user_id: "threadtest-uid" }) });
+    check("a JWT with only a user id takes the stored contact's e-mail", jwtId.email === "threadtest-synced@x.example", jwtId);
+    const jwtEmail = await trustedIdentity(wk, { userId: "threadtest-uid", userJwt: jwt({ email: "threadtest-victim@x.example" }) });
+    check("a JWT with only an e-mail never takes another contact's user id", jwtEmail.userId === null, jwtEmail);
+    const unverified = await trust("threadtest-uid", "threadtest-victim@x.example", null);
+    check("an unverified request keeps its claims for the route to judge", !unverified.verified && unverified.email === "threadtest-victim@x.example", unverified);
   }
 
   // ---- reopening removes the thread from the source ----

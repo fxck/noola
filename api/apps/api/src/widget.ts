@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { relayPool } from "@repo/db";
+import { relayPool, withTenant } from "@repo/db";
 import {
   type WidgetConfig,
   type WidgetConfigInput,
@@ -92,6 +92,12 @@ export function verifyIdentity(
     .some((id) => verifyUserHash(secret, id, provided));
 }
 
+/** The handles that a signature proves. A user_hash proves one handle, so the other one that the visitor sent stays unproven. */
+export interface ProvenIdentity {
+  userId: string | null;
+  email: string | null;
+}
+
 /** Verify an Intercom-style identity JWT (`intercom_user_jwt`). Intercom's CURRENT scheme signs a
  *  JWT with `jwt.sign(payload, MessengerApiSecret)` — HS256, i.e. HMAC-SHA256 with the secret as
  *  the key — carrying user_id/email in the claims. We verify the signature with the SAME secret and
@@ -139,14 +145,45 @@ export function verifyIdentityJwt(
 export function resolveVerifiedIdentity(
   wk: WidgetKey,
   input: { userId?: string | null; email?: string | null; userHash?: string | null; userJwt?: string | null },
-): { userId: string | null; email: string | null; verified: boolean } {
+): { userId: string | null; email: string | null; verified: boolean; proven: ProvenIdentity } {
   if (input.userJwt) {
     const claims = verifyIdentityJwt(wk.identitySecret, input.userJwt);
-    if (claims) return { userId: claims.userId, email: claims.email, verified: true };
-    return { userId: input.userId ?? null, email: input.email ?? null, verified: false };
+    if (claims) return { userId: claims.userId, email: claims.email, verified: true, proven: { userId: claims.userId, email: claims.email } };
+    return { userId: input.userId ?? null, email: input.email ?? null, verified: false, proven: { userId: null, email: null } };
   }
   const verified = verifyIdentity(wk.identitySecret, { userId: input.userId, email: input.email }, input.userHash);
-  return { userId: input.userId ?? null, email: input.email ?? null, verified };
+  const proves = (id: string | null | undefined) => (id?.trim() && verifyUserHash(wk.identitySecret, id.trim(), input.userHash) ? id.trim() : null);
+  return { userId: input.userId ?? null, email: input.email ?? null, verified, proven: { userId: proves(input.userId), email: proves(input.email) } };
+}
+
+/**
+ * The identity to trust from a widget request. A verified request keeps the handle that its proof covers.
+ * The other handle comes from the contact that is stored under the proven one.
+ * Without such a contact, the browser's other handle counts only while no other contact holds it.
+ * An unverified request returns its claims as they are, for the caller to accept or drop.
+ */
+export async function trustedIdentity(
+  wk: WidgetKey,
+  input: { userId?: string | null; email?: string | null; userHash?: string | null; userJwt?: string | null },
+): Promise<ReturnType<typeof resolveVerifiedIdentity>> {
+  const rid = resolveVerifiedIdentity(wk, input);
+  if (!rid.verified || (rid.proven.userId && rid.proven.email)) return rid;
+  // Postgres does the lowercasing, as the routes that read contacts by e-mail do.
+  const r = await withTenant(wk.tenantId, (c) => c.query(
+    `SELECT (SELECT row_to_json(o) FROM (SELECT id, external_id, email FROM contacts
+              WHERE external_id = $1 OR lower(email) = lower($2) LIMIT 1) o) AS own,
+            (SELECT id FROM contacts WHERE lower(email) = lower($3) LIMIT 1) AS email_holder,
+            (SELECT id FROM contacts WHERE external_id = $4 LIMIT 1) AS id_holder`,
+    [rid.proven.userId, rid.proven.email, rid.email, rid.userId],
+  ));
+  const row = r.rows[0] as { own: { id: string; external_id: string | null; email: string | null } | null; email_holder: string | null; id_holder: string | null };
+  const own = row.own;
+  if (rid.proven.userId) {
+    const email = own?.email || (rid.email && (!row.email_holder || row.email_holder === own?.id) ? rid.email : null);
+    return { ...rid, userId: rid.proven.userId, email };
+  }
+  const userId = own?.external_id || (rid.userId && (!row.id_holder || row.id_holder === own?.id) ? rid.userId : null);
+  return { ...rid, userId, email: rid.proven.email };
 }
 
 /** Is `origin` allowed for this key? Empty allowlist = any origin (dev). Matches on host
