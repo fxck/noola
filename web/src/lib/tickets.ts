@@ -693,19 +693,28 @@ export function relativeTime(iso: string): string {
   return `${Math.floor(d / 365)}y ago`;
 }
 
+// The channel that a teammate's note came from, as the api appends it to their name.
+const SOURCE_LABEL = /\s*\((?:Discord|Slack|Telegram|WhatsApp|Teams|E-?mail|Widget)\)$/i;
+
+/** A display name without its trailing source label: "Jan Saidl (Discord)" is the same person as "Jan Saidl". */
+export function personName(name: string | null | undefined): string {
+  const full = (name ?? "").trim();
+  return full.replace(SOURCE_LABEL, "").trim() || full;
+}
+
 export function initials(name: string | null | undefined): string {
-  const words = (name || "?").trim().split(/\s+/).filter(Boolean);
+  const person = personName(name);
+  const words = person.split(/\s+/).filter((w) => /^[\p{L}\p{N}]/u.test(w)).map((w) => Array.from(w));
   // Multi-word → first letter of the first two words ("Bell Labs" → "BL").
-  // Single word → its first two chars ("Beta" → "BE") so distinct names never
-  // collapse to the same monogram (the old first-letters-only made "Beta" → "B").
-  const chars = words.length >= 2 ? words[0][0] + words[1][0] : (words[0] ?? "?").slice(0, 2);
+  // Single word → its first two letters or digits ("Beta" → "BE"), so distinct names don't collapse to one letter.
+  const chars = words.length >= 2 ? words[0][0] + words[1][0] : words[0] ? words[0].slice(0, 2).join("") : (person.match(/[\p{L}\p{N}]/gu) ?? ["?"]).slice(0, 2).join("");
   return chars.toUpperCase();
 }
 
 /** Deterministic desaturated hue (0–359) from a name — the identity color for its
- *  avatar. Same name → same hue, every time, app-wide. */
+ *  avatar. Same person → same hue, every time, app-wide, whatever source label the name carries. */
 export function avatarHue(name: string | null | undefined): number {
-  const s = name || "?";
+  const s = personName(name) || "?";
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
   return h % 360;
