@@ -265,6 +265,8 @@ export interface SuggestOpts {
   customerFacing?: boolean;
   /** The identity that the requester proved in a private channel. It unlocks the past conversations of a ticket contact who has it. */
   verifiedCustomer?: { userId: string | null; email: string | null };
+  /** A search query made earlier for this message, or null for none. An eval passes one so that every run searches alike. */
+  searchQuery?: string | null;
 }
 
 const EXCERPT_CHARS = 240;
@@ -491,7 +493,7 @@ async function prepareDraft(
   // A model-written search query matches the docs better than a long or foreign message, so its results lead.
   const [original, searchQuery] = await Promise.all([
     retrieveAll(query),
-    searchQueryFor(tenantId, query, history).catch(() => null),
+    opts.searchQuery !== undefined ? opts.searchQuery : searchQueryFor(tenantId, query, history).catch(() => null),
   ]);
   let [artR, thrR, chkR] = original;
   if (searchQuery) {
