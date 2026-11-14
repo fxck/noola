@@ -1,8 +1,9 @@
 import pg from "pg";
 import { appPool, relayPool } from "@repo/db";
-import { ingestDocument, getDocument, getDocumentContent, deleteDocument, searchDocuments } from "../src/documents.js";
+import { ingestDocument, getDocument, getDocumentContent, deleteDocument, searchDocuments, passageContext } from "../src/documents.js";
 import { ensureChunksCollection } from "../src/search.js";
 import { extractText, chunkText, chunkDocument } from "../src/extract.js";
+import { RuleModelDriver } from "../src/model.js";
 
 // Ingestion pipeline seam + isolation gate: a document is stored, extracted,
 // chunked into MANY pieces, and every chunk is retrievable by content; the tenant
@@ -97,6 +98,8 @@ async function main() {
   check("text without headings is split by paragraphs", JSON.stringify(chunkDocument(makeDoc("acme"), MD)) === JSON.stringify(chunkText(makeDoc("acme"))));
   const plain = "# not a heading in plain text\n\nSome notes.";
   check("plain text is split by paragraphs", JSON.stringify(chunkDocument(plain, "text/plain")) === JSON.stringify(chunkText(plain)));
+  const rule = await new RuleModelDriver().draftReply({ customerMessage: "limit?", sources: [{ title: "Guide", text: "The limit is 42.", context: "Intro of the guide. The limit is 42." }] });
+  check("the extractive draft quotes the passage, not the page", rule.text.includes("The limit is 42.") && !rule.text.includes("Intro of the guide"), rule.text);
 
   // ---- ingest A + B (shared word in both, tenant-unique doc) ----
   const da = await ingestDocument(A, "DOCTEST-acme.md", "text/markdown", makeDoc("acme"));
@@ -108,6 +111,18 @@ async function main() {
   {
     const hits = await searchUntil(A, LATE);
     check("retrieval finds a chunk from a LATE paragraph (full-doc indexing)", hits.some((h) => h.text.includes(LATE) && h.document_id === da.id));
+  }
+
+  // ---- the page around a passage, for a draft ----
+  {
+    const texts = (await superPool.query("SELECT text FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index", [da.id])).rows.map((r) => r.text as string);
+    const whole = await passageContext(A, da.id, 1, 1_000_000);
+    check("a page that fits is read whole", whole === texts.join("\n\n"));
+    const room = texts[1].length + texts[2].length + texts[3].length + 4;
+    const around = await passageContext(A, da.id, 2, room);
+    check("a page that doesn't fit gives the passages around the match", around === texts.slice(1, 4).join("\n\n"));
+    check("the matched passage is kept even past the limit", (await passageContext(A, da.id, 2, 10)) === texts[2]);
+    check("another tenant gets nothing", (await passageContext(B, da.id, 2, 1_000_000)) === "");
   }
 
   // ---- isolation on a shared word ----

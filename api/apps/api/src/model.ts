@@ -29,6 +29,8 @@ export interface DraftSource {
    *  model links to the source with its real domain instead of emitting a bare path. Omitted for
    *  sources with no canonical URL (manual uploads, KB, threads). */
   url?: string;
+  /** The page around `text` that a hosted model reads instead. The extractive baseline quotes `text`. */
+  context?: string;
 }
 /** One prior turn of the conversation (oldest→newest), so the hosted model has context —
  *  who said what — and can CONTINUE its own previous reply instead of denying it exists. */
@@ -324,7 +326,7 @@ export const DRAFT_PROMPT_PARTS = { always: DRAFT_SYSTEM, answerForms: DRAFT_OUT
 
 function draftPrompt(input: DraftReplyInput): { system: string; user: string } {
   const sources = input.sources
-    .map((s, i) => `[${i + 1}] ${s.title}${s.url ? ` — ${s.url}` : ""}\n${s.text}`)
+    .map((s, i) => `[${i + 1}] ${s.title}${s.url ? ` — ${s.url}` : ""}\n${s.context || s.text}`)
     .join("\n\n");
   // Persona steers voice ON TOP of the grounding rules — it comes first as the framing, then the
   // non-negotiable grounding instruction, then the sources. Absent persona changes nothing.

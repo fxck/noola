@@ -1,9 +1,9 @@
 import { withTenant } from "@repo/db";
-import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
+import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftSource, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { DEFAULT_PERSONA, getPersona, handoffRulesFor, personaPrompt } from "./persona.js";
 import { hydrateArticles, isPublicArticle, type KbArticle } from "./kb.js";
-import { documentNames, hydrateChunks, type ChunkHit } from "./documents.js";
+import { documentNames, hydrateChunks, passageContext, type ChunkHit } from "./documents.js";
 import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
 import { hydrateThreads, type ThreadHit } from "./threads.js";
 import { vectorHits, type VectorCollection } from "./vector.js";
@@ -23,6 +23,8 @@ import { searchQueryFor } from "./docs-search.js";
 const MAX_ARTICLES = 2;
 const MAX_THREADS = 2;
 const MAX_CHUNKS = 3;
+// The cited pages share this many characters of context for the draft.
+const PAGE_CONTEXT_CHARS = 30_000;
 // Cosine floor for the vector arm — below this a "match" is noise (all-MiniLM scores
 // unrelated pairs well under this). Keeps semantic matches, drops nearest-but-far
 // neighbours so retrieval `agreement` means something for the autoreply gate.
@@ -493,7 +495,7 @@ async function prepareDraft(
   started: number,
 ): Promise<{
   driver: ModelServingDriver;
-  draftInput: { customerMessage: string; sources: Array<{ title: string; text: string }>; persona: string; history: DraftTurn[]; images?: DraftImage[]; outcomes?: boolean; handoffRules?: string };
+  draftInput: { customerMessage: string; sources: DraftSource[]; persona: string; history: DraftTurn[]; images?: DraftImage[]; outcomes?: boolean; handoffRules?: string };
   citations: Citation[];
   retrieval: RetrievalSummary;
   /** Number of grounding passages retrieved in-scope. Zero on a public answer means the model has nothing to ground on,
@@ -561,6 +563,12 @@ async function prepareDraft(
     if (ch.source_key && /^https?:\/\//i.test(ch.source_key)) docUrls.set(ch.document_id, ch.source_key);
   }
 
+  // A passage alone often cuts an answer short, so the draft reads the page around it.
+  const share = chunks.length > 0 ? Math.floor(PAGE_CONTEXT_CHARS / chunks.length) : 0;
+  const contexts = new Map(await Promise.all(chunks.map(async (ch) => [
+    ch.id, await passageContext(tenantId, ch.document_id, ch.chunk_index, share).catch(() => ""),
+  ] as const)));
+
   // Citations, gate scores, trace details and grounding all follow the one rank order.
   const described = picked.map((c) => {
     const score = ranked.scores.get(candidateKey(c)) ?? 0;
@@ -570,7 +578,7 @@ async function prepareDraft(
       return {
         citation: { kind: "kb", id: a.id, title: a.title, snippet: clip(a.body, 180) } as Citation,
         score, detail: { ...ranks, excerpt: clip(a.body, EXCERPT_CHARS) },
-        grounding: { title: a.title, text: a.body } as { title: string; text: string; url?: string },
+        grounding: { title: a.title, text: a.body } as DraftSource,
       };
     }
     if (c.kind === "thread") {
@@ -586,7 +594,7 @@ async function prepareDraft(
     return {
       citation: { kind: "document", id: ch.document_id, title, snippet: clip(ch.text, 180), url: docUrls.get(ch.document_id) } as Citation,
       score, detail: { ...ranks, excerpt: clip(ch.text, EXCERPT_CHARS), passage: ch.chunk_index, passages: ch.chunk_count },
-      grounding: { title, text: ch.text, url: docUrls.get(ch.document_id) },
+      grounding: { title, text: ch.text, context: contexts.get(ch.id) || undefined, url: docUrls.get(ch.document_id) },
     };
   });
   const citations = described.map((d) => d.citation);
