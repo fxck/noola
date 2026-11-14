@@ -1,7 +1,8 @@
 import pg from "pg";
 import { getModelConfig, putModelConfig } from "../src/modelconfig.js";
 import { createArticle, deleteArticle } from "../src/kb.js";
-import { ensureKbCollection } from "../src/search.js";
+import { ensureChunksCollection, ensureKbCollection } from "../src/search.js";
+import { deleteDocument, ingestDocument } from "../src/documents.js";
 import { DEFAULT_HANDOFF_RULES } from "../src/ai-outcome.js";
 import { getPersona, putPersona } from "../src/persona.js";
 import {
@@ -127,6 +128,7 @@ async function main() {
   const before = await getDocsSearchSettings(A);
   const personaBefore = await getPersona(A);
   const articles: string[] = [];
+  const documents: string[] = [];
   const queries: string[] = [];
   const ask = (q: string) => {
     queries.push(q);
@@ -195,6 +197,21 @@ async function main() {
     const oneWordTrace = (await superPool.query("SELECT sources FROM draft_traces WHERE id = $1", [oneWord.traceId])).rows[0]?.sources as { id: string; keywordRank?: number }[];
     check("one shared word does not make a keyword match", oneWordTrace !== undefined && !oneWordTrace.some((s) => s.id === viaMessage && s.keywordRank), oneWordTrace);
     check("a draft that can't hand off gets no handoff rules", !lastDraftSystem.includes(DEFAULT_HANDOFF_RULES.slice(0, 60)), lastDraftSystem.slice(0, 400));
+
+    // ---- The draft reads the page around a cited passage ----
+    await ensureChunksCollection();
+    const filler = (n: number) => `Paragraph ${n} of the DSRCHPAGE guide covers one more setting in detail, so the page needs several passages. `.repeat(4).trim();
+    const page = ["# DSRCHPAGE guide", filler(1), "## Setup", filler(2), "## Limits", "The DSRCHPAGE zorblat limit is 42 per project.", filler(3)].join("\n\n");
+    const pageDoc = await ingestDocument(A, "DSRCHPAGE guide.md", "text/markdown", page);
+    documents.push(pageDoc.id);
+    queries.push("DSRCHPAGE zorblat limit");
+    let paged = await suggestForQuery(A, "DSRCHPAGE zorblat limit", { audience: "agent", forceScope: ["document"], source: "eval" });
+    for (let i = 0; i < 10 && !paged.citations.some((c) => c.id === pageDoc.id); i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      paged = await suggestForQuery(A, "DSRCHPAGE zorblat limit", { audience: "agent", forceScope: ["document"], source: "eval" });
+    }
+    check("the page's passage about the limit is cited", paged.citations.some((c) => c.id === pageDoc.id), paged.citations);
+    check("the draft reads the whole page around the cited passage", lastDraftSystem.includes("zorblat limit is 42") && lastDraftSystem.includes("Paragraph 1 of the DSRCHPAGE guide"), lastDraftSystem.slice(-1500));
 
     // ---- Customers only see articles that the help center shows ----
     const internal = (await createArticle(A, "DSRCHVIS quota internals", "The DSRCHVIS quota is raised by hand for big accounts.", null, { visibility: "internal" })).id;
@@ -283,6 +300,7 @@ async function main() {
     await putDocsSearchSettings(A, before);
     await putPersona(A, { handoffRules: personaBefore.handoffRules });
     for (const id of articles) await deleteArticle(A, id);
+    for (const id of documents) await deleteDocument(A, id);
     await superPool.query("DELETE FROM draft_traces WHERE tenant_id = $1 AND query = ANY($2)", [A, queries]);
     await superPool.query("DELETE FROM knowledge_gaps WHERE tenant_id = $1 AND question = ANY($2)", [A, queries]);
     await superPool.end();

@@ -146,6 +146,35 @@ export async function documentNames(tenantId: string, ids: string[]): Promise<Ma
   return new Map(r.rows.map((row) => [row.id as string, row.filename as string]));
 }
 
+/**
+ * The text around a passage for a draft to read. It is the whole document when that fits in `maxChars`.
+ * Otherwise it is the run of passages around `chunkIndex` that fits, taking one from each side in turn.
+ */
+export async function passageContext(tenantId: string, documentId: string, chunkIndex: number, maxChars: number): Promise<string> {
+  const r = await withTenant(tenantId, (c) => c.query(
+    "SELECT chunk_index, text FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index",
+    [documentId],
+  ));
+  const texts = (r.rows as Array<{ chunk_index: number; text: string }>).map((row) => row.text);
+  const at = (r.rows as Array<{ chunk_index: number }>).findIndex((row) => row.chunk_index === chunkIndex);
+  if (at < 0) return "";
+  let from = at;
+  let to = at;
+  let size = texts[at].length;
+  for (let grew = true; grew; ) {
+    grew = false;
+    if (to + 1 < texts.length && size + texts[to + 1].length + 2 <= maxChars) {
+      size += texts[++to].length + 2;
+      grew = true;
+    }
+    if (from > 0 && size + texts[from - 1].length + 2 <= maxChars) {
+      size += texts[--from].length + 2;
+      grew = true;
+    }
+  }
+  return texts.slice(from, to + 1).join("\n\n");
+}
+
 export async function listDocuments(tenantId: string, opts: ListDocumentsOpts = {}): Promise<DocumentRow[]> {
   const params: unknown[] = [];
   const whereSql = docWhere(opts, params);
