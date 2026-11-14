@@ -26,11 +26,11 @@ import { ThreadActions } from "@/components/inbox/thread-actions";
 import { AssigneePicker } from "@/components/inbox/assignee-picker";
 import { Composer, type ComposerHandle } from "@/components/inbox/composer";
 import { MessageBubble, NoteBubble, PendingReplyBubble } from "@/components/inbox/message-bubble";
-import { AutoreplyPanel } from "@/components/inbox/autoreply-panel";
+import { AiDecisionLine, useAutoreplyDecisions } from "@/components/inbox/ai-decision-line";
+import type { AutoreplyDecision } from "@/lib/autoreply";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useRealtime } from "@/lib/realtime-context";
-import { useNerdMode } from "@/lib/nerd-mode";
 import { TicketPresence } from "@/components/live/ticket-presence";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import { useLocalFlag } from "@/lib/use-local-flag";
@@ -102,7 +102,6 @@ export function ThreadPane({
 }) {
   const { setPresence } = useRealtime();
   const { user } = useAuth();
-  const { nerd } = useNerdMode();
   const { items: queueItems } = useQueue();
   const reduce = usePrefersReducedMotion();
   // A draft waiting for review on this ticket, if any (newest wins).
@@ -194,13 +193,31 @@ export function ThreadPane({
     };
   }, [ticket.id, refreshKey]);
 
-  // One time-ordered stream of the conversation: customer/agent messages interleaved
-  // with internal notes (agent-only, never dispatched). Notes carry `_note` so the
-  // renderer can pick the right bubble.
-  type TimelineItem = (Message & { _note?: false }) | (Note & { _note: true });
+  // A decision that sent a reply already shows as the AI's message, so only the others get a line.
+  // The kill switch and a skipped channel hold every message alike, so they get no line.
+  const decisions = useAutoreplyDecisions(ticket.id, refreshKey).filter(
+    (d) => !d.sent_message_id && d.reason !== "kill" && d.reason !== "channel_skipped",
+  );
+  const messageIds = new Set((messages ?? []).map((m) => m.id));
+  const decisionsByMessage = new Map<string, AutoreplyDecision[]>();
+  for (const d of decisions) {
+    if (d.message_id && messageIds.has(d.message_id)) {
+      decisionsByMessage.set(d.message_id, [...(decisionsByMessage.get(d.message_id) ?? []), d]);
+    }
+  }
+
+  // The conversation's messages and internal notes in time order, with `_note` picking the bubble.
+  // A decision whose message isn't in the thread joins the stream by its own time.
+  type TimelineItem =
+    | (Message & { _note?: false; _decision?: false })
+    | (Note & { _note: true; _decision?: false })
+    | { _note?: false; _decision: true; id: string; created_at: string; decision: AutoreplyDecision };
   const timeline: TimelineItem[] = [
     ...((messages ?? []) as TimelineItem[]),
     ...notes.map((n) => ({ ...n, _note: true as const })),
+    ...decisions
+      .filter((d) => d.created_at && !(d.message_id && messageIds.has(d.message_id)))
+      .map((d, i) => ({ _decision: true as const, id: d.id ?? `${d.message_id ?? ""}-${i}`, created_at: d.created_at!, decision: d })),
   ].sort((a, b) => a.created_at.localeCompare(b.created_at));
 
   // Omnichannel: only surface a per-message channel badge when the conversation
@@ -366,9 +383,6 @@ export function ThreadPane({
         </div>
       )}
 
-      {/* nerd: the autoreply decision trail for this ticket */}
-      {nerd && <AutoreplyPanel ticketId={ticket.id} refreshKey={refreshKey} />}
-
       {/* thread — auto-follows the newest message while you're pinned to the bottom,
           releases the lock the instant you scroll up, and offers a jump-back button.
           Keyed by ticket so switching conversations lands you at the latest turn. */}
@@ -407,11 +421,13 @@ export function ThreadPane({
                 // that opens a new day earns the marker like any message.
                 const prev = timeline[i - 1];
                 const newDay = prev != null && localDayKey(prev.created_at) !== localDayKey(item.created_at);
-                const key = item._note ? `note-${item.id}` : item.id;
+                const key = item._note ? `note-${item.id}` : item._decision ? `decision-${item.id}` : item.id;
                 return (
                   <Fragment key={key}>
                     {newDay && <DaySeparator label={dayLabel(item.created_at)} />}
-                    {item._note ? (
+                    {item._decision ? (
+                      <AiDecisionLine decision={item.decision} attached={false} />
+                    ) : item._note ? (
                       <NoteBubble
                         note={item}
                         authorAvatarUrl={users.find((u) => u.id === item.author_id)?.avatar_url}
@@ -430,9 +446,13 @@ export function ThreadPane({
                         contactAvatarUrl={ticket.contact_avatar_url}
                       />
                     )}
+                    {!item._note && !item._decision &&
+                      decisionsByMessage.get(item.id)?.map((d, j) => (
+                        <AiDecisionLine key={`decision-${d.id ?? j}`} decision={d} attached />
+                      ))}
                     {/* One chat-style read receipt, anchored under the newest agent message the
                         customer has seen. Right-aligned + muted to match the agent bubble's meta line. */}
-                    {!item._note && lastSeenAgentMsg && item.id === lastSeenAgentMsg.id && lastSeenAgentMsg.seen_at && (
+                    {!item._note && !item._decision && lastSeenAgentMsg && item.id === lastSeenAgentMsg.id && lastSeenAgentMsg.seen_at && (
                       <li className="-mt-2 flex justify-end px-1 text-micro text-muted-foreground/80">
                         Seen · {relativeTime(lastSeenAgentMsg.seen_at)}
                       </li>

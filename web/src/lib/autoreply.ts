@@ -106,9 +106,8 @@ export async function saveAutoreplyPolicy(
 
 // ── Per-ticket autoreply decisions ──────────────────────────────────────────
 // The trail of what the auto-sender decided for a ticket: whether it replied,
-// held for a human, and why. Surfaced in the thread's nerd panel. The server
-// shape is intentionally read loosely — fields are optional and we degrade
-// gracefully rather than crash when one is missing.
+// held for a human, and why. Shown inline in the thread, under the inbound message
+// each one is about. Every field is optional, so a missing one degrades the line instead of breaking it.
 
 /** What the auto-sender did about an inbound message. */
 export type AutoreplyOutcome = "sent" | "held" | "draft" | "skipped" | string;
@@ -121,7 +120,7 @@ export interface AutoreplyDecision {
   mode?: AutoreplyMode | string;
   /** What actually happened. */
   outcome?: AutoreplyOutcome;
-  /** Machine reason code, e.g. "guardrail:refund", "low_agreement". */
+  /** Machine reason code, e.g. "guardrail:refund", "weak_retrieval". */
   reason?: string | null;
   /** Distinct corroborating source kinds seen. */
   agreement?: number | null;
@@ -129,6 +128,10 @@ export interface AutoreplyDecision {
   min_agreement?: number | null;
   /** Top retrieval score at decision time, 0..1. */
   top_score?: number | null;
+  /** The AI message the decision sent, when it replied. */
+  sent_message_id?: string | null;
+  /** The draft trace behind the decision, readable by admins. */
+  trace_id?: string | null;
   created_at?: string;
   [k: string]: unknown;
 }
