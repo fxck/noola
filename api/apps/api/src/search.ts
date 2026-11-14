@@ -199,6 +199,16 @@ export async function indexChunk(doc: ChunkDoc): Promise<void> {
   if (!res.ok) throw new Error(`typesense chunk index failed: ${res.status}`);
 }
 
+/** Remove chunks from the keyword index by id. A missing chunk is no error. */
+export async function deleteChunkDocs(ids: string[]): Promise<void> {
+  for (let i = 0; i < ids.length; i += 20) {
+    await Promise.all(ids.slice(i, i + 20).map(async (id) => {
+      const res = await fetch(`${BASE}/collections/chunks/documents/${encodeURIComponent(id)}`, { method: "DELETE", headers: HEADERS });
+      if (!res.ok && res.status !== 404) throw new Error(`typesense chunk delete failed: ${res.status}`);
+    }));
+  }
+}
+
 /** Delete every indexed chunk of a document (document deletion). */
 export async function deleteDocChunks(documentId: string): Promise<void> {
   await fetch(`${BASE}/collections/chunks/documents?filter_by=document_id:=${documentId}`, {
@@ -223,10 +233,38 @@ export async function searchChunkIds(tenantId: string, q: string): Promise<strin
   return (raw.hits ?? []).map((h) => h.document.id);
 }
 
+// The advisory lock that the chunk backfills and the document re-split take, across all api processes.
+const CHUNK_INDEX_LOCK = 72_503_101;
+
+/**
+ * Run `fn` while no other api process backfills chunks or re-splits documents.
+ * A backfill reads every chunk row first, so it could re-index passages that a re-split just replaced.
+ * The lock is session-level, so it needs a direct connection, not a transaction pooler.
+ */
+export async function withChunkIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+  const c = await relayPool.connect();
+  let broken = false;
+  // A dropped connection releases the lock, and without a listener its error would crash the process.
+  const onError = () => { broken = true; };
+  c.on("error", onError);
+  try {
+    await c.query("SELECT pg_advisory_lock($1)", [CHUNK_INDEX_LOCK]);
+    return await fn();
+  } finally {
+    if (!broken) await c.query("SELECT pg_advisory_unlock($1)", [CHUNK_INDEX_LOCK]).catch(() => { broken = true; });
+    c.off("error", onError);
+    c.release(broken);
+  }
+}
+
 /** Backfill: index every existing chunk (via the BYPASSRLS relay). */
 export async function reindexAllChunks(
   log?: { info: (m: string) => void; warn: (o: unknown, m?: string) => void },
 ): Promise<number> {
+  return withChunkIndexLock(() => indexEveryChunk(log));
+}
+
+async function indexEveryChunk(log?: { info: (m: string) => void; warn: (o: unknown, m?: string) => void }): Promise<number> {
   const r = await relayPool.query(
     `SELECT tenant_id, id, document_id, chunk_index, text FROM document_chunks`,
   );

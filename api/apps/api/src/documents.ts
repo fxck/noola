@@ -1,15 +1,18 @@
 import crypto from "node:crypto";
-import { withTenant } from "@repo/db";
+import { relayPool, withTenant } from "@repo/db";
 import { putText, getText } from "./storage.js";
 import { extractText, isSupported, chunkDocument } from "./extract.js";
-import { indexChunk, deleteDocChunks, searchChunkIds } from "./search.js";
+import { indexChunk, deleteChunkDocs, deleteDocChunks, searchChunkIds, withChunkIndexLock } from "./search.js";
 import { embeddingDriver } from "./model.js";
-import { upsertVectors, deleteVectorsByPayload } from "./vector.js";
+import { upsertVectors, deleteVectors, deleteVectorsByPayload, vectorEnabled } from "./vector.js";
 
 // The document-ingestion pipeline: raw upload → object-storage → text extraction
 // → chunking → chunk rows (RLS) → keyword index. The embedding/vector step is
 // behind embeddingDriver (no-op default), so semantic retrieval slots in later
 // without touching this flow. All tenant-scoped; chunks never cross tenants.
+
+// The splitter that ingest uses. resplitDocuments re-splits the documents that an older one made.
+export const CHUNKING_VERSION = 2;
 
 export interface DocumentRow {
   id: string;
@@ -74,9 +77,9 @@ export async function ingestDocument(
   // 4. persist the document + its chunks in one tenant-scoped transaction
   const doc = await withTenant(tenantId, async (c) => {
     const d = await c.query(
-      `INSERT INTO documents (tenant_id, filename, content_type, storage_key, char_count, chunk_count, source_id, source_key, content_hash)
-       VALUES (current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8) RETURNING ${DOC_COLS}`,
-      [filename, contentType, storageKey, text.length, chunks.length, sourceId ?? null, meta?.sourceKey ?? null, meta?.contentHash ?? null],
+      `INSERT INTO documents (tenant_id, filename, content_type, storage_key, char_count, chunk_count, source_id, source_key, content_hash, chunking)
+       VALUES (current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING ${DOC_COLS}`,
+      [filename, contentType, storageKey, text.length, chunks.length, sourceId ?? null, meta?.sourceKey ?? null, meta?.contentHash ?? null, CHUNKING_VERSION],
     );
     const row = d.rows[0] as DocumentRow;
     for (let i = 0; i < chunks.length; i++) {
@@ -97,20 +100,118 @@ export async function ingestDocument(
     );
     return r.rows as Array<{ id: string; chunk_index: number; text: string }>;
   });
-  // Index each chunk for keyword (Typesense) + vector (Qdrant) retrieval. Embedding
-  // runs through the seam; a null result (embedder down) leaves keyword-only.
-  const vecs = await embeddingDriver.embed(rows.map((r) => r.text));
-  for (const r of rows) {
-    await indexChunk({ id: r.id, tenant_id: tenantId, document_id: doc.id, chunk_index: r.chunk_index, text: r.text });
-  }
-  if (vecs) {
-    await upsertVectors(
-      "chunks",
-      rows.map((r, i) => ({ id: r.id, vector: vecs[i], payload: { tenant_id: tenantId, document_id: doc.id } })),
-    );
-  }
+  await indexPassages(tenantId, doc.id, rows, false);
 
   return doc;
+}
+
+// Well under the embedder's limit of 256 texts per call, which also keeps each request small.
+const EMBED_BATCH = 64;
+
+/** Vectors can be made and stored. Without an embedder, documents are indexed for keywords only. */
+function embedderWired(): boolean {
+  return vectorEnabled() && embeddingDriver.name !== "noop" && process.env.EMBED_URL !== "";
+}
+
+type Log = { info: (m: string) => void; warn: (o: unknown, m?: string) => void };
+
+/**
+ * Index passages for keyword (Typesense) and vector (Qdrant) retrieval.
+ * Without `requireVectors`, passages that can't be embedded (embedder down) are indexed for keywords only.
+ */
+async function indexPassages(
+  tenantId: string,
+  documentId: string,
+  rows: Array<{ id: string; chunk_index: number; text: string }>,
+  requireVectors: boolean,
+): Promise<void> {
+  const vecs: number[][] = [];
+  for (let i = 0; i < rows.length && vecs.length === i; i += EMBED_BATCH) {
+    const got = await embeddingDriver.embed(rows.slice(i, i + EMBED_BATCH).map((r) => r.text));
+    if (got) vecs.push(...got);
+  }
+  const embedded = vecs.length === rows.length;
+  if (!embedded && requireVectors && embedderWired()) throw new Error("the passages could not be embedded");
+  for (const r of rows) {
+    await indexChunk({ id: r.id, tenant_id: tenantId, document_id: documentId, chunk_index: r.chunk_index, text: r.text });
+  }
+  if (embedded) {
+    await upsertVectors(
+      "chunks",
+      rows.map((r, i) => ({ id: r.id, vector: vecs[i], payload: { tenant_id: tenantId, document_id: documentId } })),
+    );
+  }
+}
+
+/** Remove passages from both indexes. A failure in one doesn't skip the other, and it is logged, not thrown. */
+async function removeFromIndexes(ids: string[], log?: Log): Promise<void> {
+  const results = await Promise.allSettled([deleteChunkDocs(ids), deleteVectors("chunks", ids)]);
+  for (const r of results) {
+    if (r.status === "rejected" || r.value === false) log?.warn({ err: r.status === "rejected" ? r.reason : "qdrant refused" }, "removing replaced passages from an index failed");
+  }
+}
+
+/**
+ * Re-split one document from its stored original, if an older splitter made it and no other process holds it.
+ * The new passages are indexed before the swap commits, and the old ones' index entries are removed after.
+ * If indexing fails, the new entries are removed and the document keeps its old passages.
+ */
+export async function resplitDocument(tenantId: string, documentId: string, log?: Log): Promise<boolean> {
+  const oldIds = await withTenant(tenantId, async (c) => {
+    const d = await c.query(
+      "SELECT content_type, storage_key FROM documents WHERE id = $1 AND chunking < $2 FOR UPDATE SKIP LOCKED",
+      [documentId, CHUNKING_VERSION],
+    );
+    if (!d.rowCount) return null;
+    const { content_type: contentType, storage_key: storageKey } = d.rows[0] as { content_type: string; storage_key: string };
+    const chunks = chunkDocument(extractText(contentType, await getText(storageKey)), contentType);
+    const old = await c.query("DELETE FROM document_chunks WHERE document_id = $1 RETURNING id", [documentId]);
+    // An empty read from storage must not wipe the passages, so the document waits for the next try.
+    if (chunks.length === 0 && (old.rowCount ?? 0) > 0) throw new Error("the stored original is empty");
+    const rows: Array<{ id: string; chunk_index: number; text: string }> = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const r = await c.query(
+        "INSERT INTO document_chunks (tenant_id, document_id, chunk_index, text) VALUES (current_tenant(), $1, $2, $3) RETURNING id",
+        [documentId, i, chunks[i]],
+      );
+      rows.push({ id: r.rows[0].id as string, chunk_index: i, text: chunks[i] });
+    }
+    await c.query("UPDATE documents SET chunking = $2, chunk_count = $3 WHERE id = $1", [documentId, CHUNKING_VERSION, chunks.length]);
+    try {
+      await indexPassages(tenantId, documentId, rows, true);
+    } catch (err) {
+      await removeFromIndexes(rows.map((r) => r.id), log);
+      throw err;
+    }
+    return old.rows.map((r) => r.id as string);
+  });
+  if (oldIds === null) return false;
+  await removeFromIndexes(oldIds, log);
+  return true;
+}
+
+/**
+ * Re-split every document that an older splitter made, one at a time.
+ * A document that fails is retried at the next boot, and the run stops early when the embedder is down.
+ */
+export async function resplitDocuments(log?: Log): Promise<number> {
+  return withChunkIndexLock(async () => {
+    const todo = (await relayPool.query(
+      "SELECT tenant_id, id FROM documents WHERE chunking < $1 ORDER BY created_at",
+      [CHUNKING_VERSION],
+    )).rows as Array<{ tenant_id: string; id: string }>;
+    let done = 0;
+    for (const d of todo) {
+      try {
+        if (await resplitDocument(d.tenant_id, d.id, log)) done++;
+      } catch (err) {
+        log?.warn({ err, id: d.id }, "re-splitting a document failed");
+        if (embedderWired() && !(await embeddingDriver.embed(["embedder check"]))) break;
+      }
+    }
+    if (todo.length > 0) log?.info(`documents: re-split ${done} of ${todo.length}`);
+    return done;
+  });
 }
 
 /** Hydrate chunk ids through RLS, preserving order (double tenant guard for either

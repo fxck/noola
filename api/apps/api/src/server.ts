@@ -12,6 +12,7 @@ import { routeFloor, roleAtLeast } from "./rbac.js";
 import { ensureTicketsCollection, reindexAllTickets, ensureKbCollection, reindexAllArticles, ensureChunksCollection, reindexAllChunks } from "./search.js";
 import { ensureThreadsCollection, reindexAllThreads } from "./threads.js";
 import { ensureVectorCollections, reindexAllVectors } from "./vector.js";
+import { resplitDocuments } from "./documents.js";
 import { redetectTicketLocales } from "./locale.js";
 import { startDiscord } from "./discord-gateway.js";
 import { drainDiscordRelay } from "./discord-relay-outbox.js";
@@ -453,16 +454,18 @@ void ensureTicketsCollection()
 void ensureKbCollection()
   .then(() => reindexAllArticles(app.log))
   .catch((err) => app.log.warn({ err }, "typesense kb ensure/backfill failed"));
-void ensureChunksCollection()
-  .then(() => reindexAllChunks(app.log))
-  .catch((err) => app.log.warn({ err }, "typesense chunks ensure/backfill failed"));
+const chunksIndexed = ensureChunksCollection().then(() => reindexAllChunks(app.log));
+void chunksIndexed.catch((err) => app.log.warn({ err }, "typesense chunks ensure/backfill failed"));
 void ensureThreadsCollection()
   .then(() => reindexAllThreads(app.log))
   .catch((err) => app.log.warn({ err }, "typesense threads ensure/backfill failed"));
 // Vector store (Qdrant) — ensure collections, then embed+backfill any empty ones.
-void ensureVectorCollections()
-  .then(() => reindexAllVectors(app.log))
-  .catch((err) => app.log.warn({ err }, "qdrant ensure/backfill failed"));
+const vectorsIndexed = ensureVectorCollections().then(() => reindexAllVectors(app.log));
+void vectorsIndexed.catch((err) => app.log.warn({ err }, "qdrant ensure/backfill failed"));
+// After both backfills, so the chunk backfill can't index passages that a re-split has replaced.
+void Promise.all([chunksIndexed, vectorsIndexed])
+  .then(() => resplitDocuments(app.log))
+  .catch((err) => app.log.warn({ err }, "document re-split failed"));
 void redetectTicketLocales(app.log).catch((err) => app.log.warn({ err }, "ticket language re-detection failed"));
 setInterval(() => void drainOutbox(), 500);
 // Discord ops-mirror relay outbox (0113): deliver mirror messages/notes + promote ✅ reacts durably,

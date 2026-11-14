@@ -1,9 +1,11 @@
 import pg from "pg";
 import { appPool, relayPool } from "@repo/db";
-import { ingestDocument, getDocument, getDocumentContent, deleteDocument, searchDocuments, passageContext } from "../src/documents.js";
-import { ensureChunksCollection } from "../src/search.js";
+import { CHUNKING_VERSION, ingestDocument, getDocument, getDocumentContent, deleteDocument, searchDocuments, passageContext, resplitDocument } from "../src/documents.js";
+import { deleteDocChunks, ensureChunksCollection, indexChunk, searchChunkIds, withChunkIndexLock } from "../src/search.js";
+import { vectorSearch } from "../src/vector.js";
+import { putText } from "../src/storage.js";
 import { extractText, chunkText, chunkDocument } from "../src/extract.js";
-import { RuleModelDriver } from "../src/model.js";
+import { RuleModelDriver, embeddingDriver } from "../src/model.js";
 
 // Ingestion pipeline seam + isolation gate: a document is stored, extracted,
 // chunked into MANY pieces, and every chunk is retrievable by content; the tenant
@@ -123,6 +125,92 @@ async function main() {
     check("a page that doesn't fit gives the passages around the match", around === texts.slice(1, 4).join("\n\n"));
     check("the matched passage is kept even past the limit", (await passageContext(A, da.id, 2, 10)) === texts[2]);
     check("another tenant gets nothing", (await passageContext(B, da.id, 2, 1_000_000)) === "");
+  }
+
+  // ---- a document that an older splitter made is re-split ----
+  {
+    // Earlier runs leave index entries behind, so the steps carry a word of this run's own.
+    const steps = `resplitsteps${Math.random().toString(36).slice(2, 8).replace(/[0-9]/g, "q")}`;
+    const md = `# DOCTEST resplit guide\n\n${para("the resplit guide")}\n\n## Steps\n\n${para(`the ${steps}`)}`;
+    const doc = await ingestDocument(A, "DOCTEST-resplit.md", "text/markdown", md);
+    const chunking = async () => (await superPool.query("SELECT chunking FROM documents WHERE id = $1", [doc.id])).rows[0]?.chunking as number;
+    check("ingest records the current splitter", (await chunking()) === CHUNKING_VERSION);
+    // Turn it into an older splitter's document, with indexed passages that carry a marker word.
+    await superPool.query("UPDATE documents SET chunking = 1 WHERE id = $1", [doc.id]);
+    await superPool.query("DELETE FROM document_chunks WHERE document_id = $1", [doc.id]);
+    await deleteDocChunks(doc.id);
+    const old = (await superPool.query(
+      "INSERT INTO document_chunks (tenant_id, document_id, chunk_index, text) VALUES ($1, $2, 0, 'doctestoldmarker passage') RETURNING id", [A, doc.id],
+    )).rows[0].id as string;
+    await indexChunk({ id: old, tenant_id: A, document_id: doc.id, chunk_index: 0, text: "doctestoldmarker passage" });
+    check("the old passage is findable before the re-split", (await searchUntil(A, "doctestoldmarker")).some((h) => h.id === old));
+
+    check("an older splitter's document is re-split", await resplitDocument(A, doc.id));
+    const rows = (await superPool.query("SELECT id, text FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index", [doc.id])).rows as { id: string; text: string }[];
+    check("its passages are the current splitter's", JSON.stringify(rows.map((r) => r.text)) === JSON.stringify(chunkDocument(md, MD)) && (await chunking()) === CHUNKING_VERSION);
+    check("the old passage is gone from the index", !(await searchChunkIds(A, "doctestoldmarker")).includes(old));
+    check("the new passages are indexed", (await searchUntil(A, steps)).some((h) => rows.some((r) => r.id === h.id)));
+    check("a current document is left alone", !(await resplitDocument(A, doc.id)));
+    check("another tenant can't re-split it", !(await resplitDocument(B, doc.id)));
+
+    // Vectors of the wrong size fail in Qdrant after the passages reached Typesense.
+    const keep = async () => {
+      await superPool.query("UPDATE documents SET chunking = 1 WHERE id = $1", [doc.id]);
+      return (await superPool.query("SELECT id FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index", [doc.id])).rows.map((r) => r.id as string);
+    };
+    const kept = await keep();
+    const embed = embeddingDriver.embed.bind(embeddingDriver);
+    embeddingDriver.embed = async (texts: string[]) => texts.map(() => [0.5]);
+    const failed = await resplitDocument(A, doc.id).then(() => "re-split", (e: Error) => e.message);
+    embeddingDriver.embed = embed;
+    const afterFail = (await superPool.query("SELECT id FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index", [doc.id])).rows.map((r) => r.id as string);
+    check("a re-split that fails while indexing keeps the old passages", failed !== "re-split" && JSON.stringify(afterFail) === JSON.stringify(kept) && (await chunking()) === 1, failed);
+    const indexed = await searchChunkIds(A, steps);
+    check("a failed re-split leaves no new passages in the index", indexed.length > 0 && indexed.every((id) => kept.includes(id)), indexed);
+
+    // An empty stored original must not wipe the passages.
+    const key = (await superPool.query("SELECT storage_key FROM documents WHERE id = $1", [doc.id])).rows[0].storage_key as string;
+    await putText(key, "", "text/markdown");
+    const emptied = await resplitDocument(A, doc.id).then(() => "re-split", (e: Error) => e.message);
+    const afterEmpty = (await superPool.query("SELECT id FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index", [doc.id])).rows.map((r) => r.id as string);
+    check("an empty stored original leaves the document as it was", emptied !== "re-split" && JSON.stringify(afterEmpty) === JSON.stringify(kept) && (await chunking()) === 1, emptied);
+  }
+
+  // ---- without an embedder, a re-split indexes for keywords only ----
+  {
+    const doc = await ingestDocument(A, "DOCTEST-noembed.md", "text/markdown", `# DOCTEST noembed\n\n${para("keyword-only indexing")}`);
+    await superPool.query("UPDATE documents SET chunking = 1 WHERE id = $1", [doc.id]);
+    const embed = embeddingDriver.embed.bind(embeddingDriver);
+    const url = process.env.EMBED_URL;
+    embeddingDriver.embed = async () => null;
+    process.env.EMBED_URL = "";
+    const ok = await resplitDocument(A, doc.id).catch((e: Error) => e.message);
+    embeddingDriver.embed = embed;
+    if (url === undefined) delete process.env.EMBED_URL;
+    else process.env.EMBED_URL = url;
+    check("without an embedder a document is still re-split", ok === true, ok);
+  }
+
+  // ---- a document with more passages than one embedder call takes ----
+  {
+    const run = Math.random().toString(36).slice(2, 8);
+    const sections = Array.from({ length: 300 }, (_, i) => `## Part ${i}\n\n${para(`doctestbatch ${run} part ${i}`)}`).join("\n\n");
+    const big = await ingestDocument(A, "DOCTEST-batch.md", "text/markdown", `# DOCTEST batch\n\n${sections}`);
+    const last = (await superPool.query("SELECT id, text FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index DESC LIMIT 1", [big.id])).rows[0] as { id: string; text: string };
+    const [vec] = (await embeddingDriver.embed([last.text])) ?? [[]];
+    check("a document with 300 passages has a vector for its last one", big.chunk_count >= 300 && (await vectorSearch("chunks", A, vec, 3)).includes(last.id), big.chunk_count);
+  }
+
+  // ---- chunk backfills and re-splits never run at once ----
+  {
+    const events: string[] = [];
+    const hold = (name: string) => withChunkIndexLock(async () => {
+      events.push(`${name} start`);
+      await new Promise((r) => setTimeout(r, 300));
+      events.push(`${name} end`);
+    });
+    await Promise.all([hold("a"), hold("b")]);
+    check("the chunk index lock runs one holder at a time", events[1] === `${events[0].split(" ")[0]} end`, events);
   }
 
   // ---- isolation on a shared word ----
