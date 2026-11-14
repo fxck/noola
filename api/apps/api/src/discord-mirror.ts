@@ -11,7 +11,7 @@ import { getMirrorTransport, setDiscordTransportForTests, rateLimitWaitMs, type 
 import { assignTicket, setTicketStatus, snoozeTicket } from "./tickets.js";
 import { addParticipant } from "./participants.js";
 import { canonicalEmojiName, getReactionMap } from "./classification.js";
-import { resolveTeammate, discordIdForSeat } from "./discord-classify.js";
+import { resolveTeammate, discordIdForSeat, unlinkedTeammateByName } from "./discord-classify.js";
 import { markConversationSpam } from "./spam.js";
 import { discordTokensToText, mdToDiscord, plainThreadName, splitForDiscord } from "./channels/format.js";
 import { emitTicketUpdated } from "./ticket-events.js";
@@ -1128,6 +1128,8 @@ export interface MirrorPostMessage {
   authorId: string;
   authorDisplayName: string | null;
   content: string;
+  /** The people that the message pings, by Discord id, with the name that the text shows for each. */
+  mentions?: { id: string; name: string | null }[];
   roleIds: string[];
   attachments?: { url: string; filename: string; contentType: string; size: number }[];
   isBotOrWebhook: boolean;
@@ -1172,10 +1174,19 @@ export async function handleMirrorPostMessage(m: MirrorPostMessage): Promise<{ h
   // their real Noola name — not just the Discord display handle (fixes "it's not aware it's me").
   const seatName = agentId ? await teammateName(mirror.tenant_id, agentId) : null;
   const name = seatName || m.authorDisplayName || "Discord teammate";
+  // A ping names a teammate by their linked Discord id. Without a link, only one unlinked member with that exact full name matches.
+  const mentionIds: string[] = [];
+  for (const p of m.mentions ?? []) {
+    const seat = (await resolveTeammate(mirror.tenant_id, p.id).catch(() => null))
+      ?? (p.name ? await unlinkedTeammateByName(mirror.tenant_id, p.name).catch(() => null) : null);
+    if (seat) mentionIds.push(seat);
+  }
   const note = await addNote(mirror.tenant_id, mirror.ticket_id, {
     authorId: agentId ?? null,
     authorName: `${name} (Discord)`,
     body: noteBody,
+    mentionIds,
+    parseMentions: false,
   }).catch(() => null);
   // Carry any Discord attachments onto the note (best-effort, post-insert) so a screenshot posted in
   // the mirror thread is visible on the ticket instead of being silently dropped.

@@ -54,16 +54,41 @@ export async function listNotes(tenantId: string, ticketId: string): Promise<Not
   }));
 }
 
-/** Resolve @tokens in the body to member ids (match on full name or first name, case-insensitive). */
+export interface MentionCandidate {
+  id: string;
+  name: string | null;
+}
+
+/**
+ * The members that the @mentions in a text name, case-insensitively. The longest full name after an @ wins.
+ * A first name alone counts only when exactly one member has it, and a name that two members share counts for neither.
+ */
+export function matchMentions(text: string, members: MentionCandidate[]): string[] {
+  const named = members
+    .map((m) => ({ id: m.id, name: (m.name ?? "").trim().toLowerCase().replace(/\s+/g, " ") }))
+    .filter((m) => m.name);
+  const found = new Set<string>();
+  // An @ inside a word, as in an e-mail address, is not a mention.
+  for (const at of text.matchAll(/(?<![\p{L}\p{N}._%+-])@(?=\p{L})/gu)) {
+    const rest = text.slice(at.index + 1).toLowerCase().replace(/\s+/g, " ");
+    const full = named.filter((m) => rest.startsWith(m.name) && !/[\p{L}\p{N}]/u.test(rest.charAt(m.name.length)));
+    const longest = Math.max(0, ...full.map((m) => m.name.length));
+    const best = full.filter((m) => m.name.length === longest);
+    if (best.length) {
+      if (best.length === 1) found.add(best[0].id);
+      continue;
+    }
+    const first = rest.match(/^\p{L}[\p{L}'-]*/u)?.[0];
+    const byFirst = first ? named.filter((m) => m.name.split(" ")[0] === first) : [];
+    if (byFirst.length === 1) found.add(byFirst[0].id);
+  }
+  return [...found];
+}
+
 async function resolveMentions(c: PoolClient, body: string): Promise<string[]> {
-  const tokens = [...body.matchAll(/@([\p{L}][\p{L}'-]*)/gu)].map((m) => m[1].toLowerCase());
-  if (tokens.length === 0) return [];
-  const r = await c.query(
-    `SELECT DISTINCT id FROM users
-      WHERE lower(name) = ANY($1::text[]) OR lower(split_part(name, ' ', 1)) = ANY($1::text[])`,
-    [Array.from(new Set(tokens))],
-  );
-  return r.rows.map((x) => x.id as string);
+  if (!body.includes("@")) return [];
+  const r = await c.query<MentionCandidate>("SELECT id, name FROM users");
+  return matchMentions(body, r.rows);
 }
 
 /** Keep only ids that are real members of this tenant (RLS scopes `users`, so a
@@ -87,6 +112,8 @@ export async function addNote(
     authorName?: string | null;
     body: string;
     mentionIds?: string[];
+    /** False when the source lists its mentions in `mentionIds` itself, so the body is not read for @names. */
+    parseMentions?: boolean;
   },
 ): Promise<NoteRow | null> {
   return withTenant(tenantId, async (c) => {
@@ -95,7 +122,7 @@ export async function addNote(
     const explicit = input.mentionIds?.length
       ? await validateMemberIds(c, input.mentionIds)
       : [];
-    const mentioned = explicit.length ? explicit : await resolveMentions(c, input.body);
+    const mentioned = input.parseMentions === false || explicit.length ? explicit : await resolveMentions(c, input.body);
     const ins = await c.query(
       `INSERT INTO ticket_notes (tenant_id, ticket_id, author_id, author_name, body, mentioned_ids)
        VALUES (current_tenant(), $1, $2, $3, $4, $5::uuid[])

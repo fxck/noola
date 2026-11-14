@@ -16,7 +16,7 @@ import { persistBufferAttachments } from "../src/attachments.js";
 import { splitForDiscord } from "../src/channels/format.js";
 import { handleMessageEmbeds } from "../src/discord.js";
 import { cancelScheduledReply, drainScheduledReplies, getSendDelay, sendScheduledReplyNow, setSendDelay } from "../src/scheduled-replies.js";
-import { addNote, listNotes } from "../src/notes.js";
+import { addNote, listNotes, matchMentions } from "../src/notes.js";
 import { editNote, removeNote, sendNoteToCustomer } from "../src/note-actions.js";
 import { createAttachment, claimNoteAttachments } from "../src/attachments.js";
 import { putBuffer } from "../src/storage.js";
@@ -321,6 +321,72 @@ async function main() {
     authorId: "u", authorDisplayName: null, content: "x", roleIds: [], isBotOrWebhook: false,
   });
   check("non-mirror thread falls through", nonMirror.handled === false);
+
+  // ── Mentions: a ping names a teammate by their linked Discord id, never by a shared first name ──
+  {
+    const TESS_ID = "c0000000-0000-0000-0000-000000000001";
+    const jans = [
+      { id: "j-abc", name: "Jan Abc" }, { id: "j-xyz", name: "Jan Xyz" }, { id: "j-gfh", name: "Jan Gfh" },
+      { id: "j-gfhova", name: "Jan Gfhova" }, { id: "eva", name: "Eva" }, { id: "petr-1", name: "Petr Novak" }, { id: "petr-2", name: "Petr Novak" },
+    ];
+    check("a full name picks that one person", matchMentions("ping @Jan Gfh please", jans).join() === "j-gfh", matchMentions("ping @Jan Gfh please", jans));
+    check("the longest full name wins", matchMentions("@Jan Gfhova, look", jans).join() === "j-gfhova", matchMentions("@Jan Gfhova, look", jans));
+    check("a first name that several people share names nobody", matchMentions("@Jan can you check", jans).length === 0, matchMentions("@Jan can you check", jans));
+    check("a unique first name still names its person", matchMentions("thanks @eva!", jans).join() === "eva", matchMentions("thanks @eva!", jans));
+    check("a full name that two people share names neither", matchMentions("@Petr Novak", jans).length === 0, matchMentions("@Petr Novak", jans));
+    check("an e-mail address is not a mention", matchMentions("write to jan@eva.cz", jans).length === 0, matchMentions("write to jan@eva.cz", jans));
+
+    const { upsertAgentChannelIdentity, removeAgentChannelIdentity } = await import("../src/discord-classify.js");
+    const seats = await withTenant(A, (c) => c.query("SELECT id, name FROM users ORDER BY name ASC LIMIT 2"));
+    const seatId = seats.rows[0].id as string;
+    const otherName = seats.rows[1].name as string;
+    const prevMark = await withTenant(A, (c) => c.query(
+      "SELECT external_id FROM agent_channel_identities WHERE user_id = $1 AND channel_type = 'discord'", [seatId]));
+    await upsertAgentChannelIdentity(A, seatId, "mirtest-ping-linked");
+    try {
+      const pinged = await handleMirrorPostMessage({
+        guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-ping",
+        authorId: "mirtest-user-bob", authorDisplayName: "Bob",
+        content: `MIRTEST @Someone Else, @Nobody Known and a typed @${otherName} have a look`,
+        mentions: [{ id: "mirtest-ping-linked", name: "Someone Else" }, { id: "mirtest-ping-unlinked", name: "Nobody Known" }],
+        roleIds: [ROLE], isBotOrWebhook: false,
+      });
+      const looped = await withTenant(A, (c) => c.query("SELECT mentioned_ids FROM ticket_notes WHERE id = $1", [pinged.noteId]));
+      check("a ping loops in the teammate linked to that Discord id, and nobody by the note's text",
+        (looped.rows[0]?.mentioned_ids as string[] | undefined)?.join() === seatId, looped.rows[0]);
+      const unlinked = await handleMirrorPostMessage({
+        guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-ping-2",
+        authorId: "mirtest-user-bob", authorDisplayName: "Bob",
+        content: `MIRTEST @Nobody Known and a typed @${otherName}`,
+        mentions: [{ id: "mirtest-ping-unlinked", name: "Nobody Known" }],
+        roleIds: [ROLE], isBotOrWebhook: false,
+      });
+      const none = await withTenant(A, (c) => c.query("SELECT mentioned_ids FROM ticket_notes WHERE id = $1", [unlinked.noteId]));
+      check("a typed @name in a Discord message loops nobody in", (none.rows[0]?.mentioned_ids as string[] | undefined)?.length === 0, none.rows[0]);
+      const sameName = await handleMirrorPostMessage({
+        guildId: GUILD, threadId: thread1, discordMessageId: "mirtest-dm-ping-3",
+        authorId: "mirtest-user-bob", authorDisplayName: "Bob",
+        content: `MIRTEST @${seats.rows[0].name as string}`,
+        mentions: [{ id: "mirtest-ping-unlinked", name: seats.rows[0].name as string }],
+        roleIds: [ROLE], isBotOrWebhook: false,
+      });
+      const notLinked = await withTenant(A, (c) => c.query("SELECT mentioned_ids FROM ticket_notes WHERE id = $1", [sameName.noteId]));
+      check("an unlinked ping never matches a teammate who is linked to another Discord id", (notLinked.rows[0]?.mentioned_ids as string[] | undefined)?.length === 0, notLinked.rows[0]);
+      const { unlinkedTeammateByName } = await import("../src/discord-classify.js");
+      const tessMark = await withTenant(A, (c) => c.query(
+        "SELECT external_id FROM agent_channel_identities WHERE user_id = $1 AND channel_type = 'discord'", [TESS_ID]));
+      await removeAgentChannelIdentity(A, TESS_ID, "discord");
+      try {
+        check("a name match ignores case and spacing", (await unlinkedTeammateByName(A, "  TESS ")) === TESS_ID);
+        check("a name match needs the exact letters", (await unlinkedTeammateByName(A, "Tesss")) === null);
+      } finally {
+        if (tessMark.rowCount) await upsertAgentChannelIdentity(A, TESS_ID, tessMark.rows[0].external_id as string);
+      }
+    } finally {
+      await removeAgentChannelIdentity(A, seatId, "discord");
+      if (prevMark.rowCount) await upsertAgentChannelIdentity(A, seatId, prevMark.rows[0].external_id as string);
+    }
+  }
 
   // ── D3: 📤 promotion — role gate + exactly-once ────────────────────────────
   // Unmapped emoji on the OP starter message (discordMessageId === thread id) reaches the triage map

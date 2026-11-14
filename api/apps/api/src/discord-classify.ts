@@ -77,6 +77,20 @@ export async function resolveTeammate(tenantId: string, discordUserId: string): 
   });
 }
 
+/** The member whose full name is exactly `name` and who has no linked Discord id. Null when none or several match. */
+export async function unlinkedTeammateByName(tenantId: string, name: string): Promise<string | null> {
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT u.id FROM users u
+        WHERE lower(regexp_replace(trim(u.name), '[[:space:]]+', ' ', 'g')) = lower(regexp_replace(trim($1), '[[:space:]]+', ' ', 'g'))
+          AND NOT EXISTS (SELECT 1 FROM agent_channel_identities i WHERE i.user_id = u.id AND i.channel_type = 'discord')
+        LIMIT 2`,
+      [name],
+    );
+    return r.rowCount === 1 ? (r.rows[0].id as string) : null;
+  });
+}
+
 /** The inverse of resolveTeammate: a Noola user seat → their registered Discord user id (for @pinging
  *  an assignee/participant in the ops mirror). null when they haven't mapped a Discord ID. */
 export async function discordIdForSeat(tenantId: string, userId: string): Promise<string | null> {

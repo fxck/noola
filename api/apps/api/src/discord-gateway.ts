@@ -456,10 +456,7 @@ function resolveMentions(msg: Message): string {
   if (!text.includes("<")) return text; // fast path — nothing to resolve
   return text
     .replace(/<@!?(\d+)>/g, (m, id: string) => {
-      const name =
-        msg.mentions.members?.get(id)?.displayName ??
-        msg.mentions.users.get(id)?.globalName ??
-        msg.mentions.users.get(id)?.username;
+      const name = mentionName(msg, id);
       return name ? `@${name}` : m;
     })
     .replace(/<#(\d+)>/g, (m, id: string) => {
@@ -470,6 +467,16 @@ function resolveMentions(msg: Message): string {
       const role = msg.mentions.roles.get(id);
       return role ? `@${role.name}` : m;
     });
+}
+
+function mentionName(msg: Message, id: string): string | null {
+  return msg.mentions.members?.get(id)?.displayName ?? msg.mentions.users.get(id)?.globalName ?? msg.mentions.users.get(id)?.username ?? null;
+}
+
+/** The people that the message pings in its text. The person that a reply pings is not one of them. */
+function userMentions(msg: Message): { id: string; name: string | null }[] {
+  const ids = new Set([...(msg.content ?? "").matchAll(/<@!?(\d+)>/g)].map((m) => m[1]));
+  return [...ids].map((id) => ({ id, name: mentionName(msg, id) }));
 }
 
 /** Thread taxonomy from a discord.js channel: a thread whose parent is a forum is a forum_post,
@@ -851,6 +858,7 @@ async function ingestGatewayMessage(
     authorId: msg.author.id,
     authorDisplayName: member?.displayName ?? msg.author.globalName ?? msg.author.username,
     content: resolvedContent,
+    mentions: userMentions(msg),
     roleIds: member ? [...member.roles.cache.keys()] : [],
     attachments,
     isBotOrWebhook: msg.author.bot || msg.webhookId != null,
