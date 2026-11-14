@@ -123,6 +123,42 @@ export async function searchArticleIds(tenantId: string, q: string): Promise<str
   return (raw.hits ?? []).map((h) => h.document.id);
 }
 
+// ---- Retrieval keyword search -------------------------------------------
+
+export type RetrievalCollection = "kb" | "chunks" | "threads";
+
+const RETRIEVAL_FIELDS: Record<RetrievalCollection, string> = { kb: "title,body", chunks: "text", threads: "subject,text" };
+
+/** A keyword hit, with how many query words it matched and Typesense's match score. */
+export interface KeywordHit {
+  id: string;
+  words: number;
+  score: number;
+}
+
+/**
+ * Tenant-scoped keyword hits for answer retrieval.
+ * Typesense drops query words from the end until it has `limit` hits, so a hit may match only the leading words.
+ * The caller decides how many must match.
+ */
+export async function keywordHits(collection: RetrievalCollection, tenantId: string, q: string, limit = 20): Promise<KeywordHit[]> {
+  if (!UUID_RE.test(tenantId)) throw new Error("invalid tenant");
+  const params = new URLSearchParams({
+    q,
+    query_by: RETRIEVAL_FIELDS[collection],
+    filter_by: `tenant_id:=${tenantId}`,
+    per_page: String(limit),
+    drop_tokens_threshold: String(limit),
+    include_fields: "id",
+  });
+  const res = await fetch(`${BASE}/collections/${collection}/documents/search?${params}`, { headers: HEADERS });
+  if (!res.ok) throw new Error(`typesense ${collection} search failed: ${res.status}`);
+  const raw = (await res.json()) as {
+    hits?: Array<{ document: { id: string }; text_match?: number; text_match_info?: { tokens_matched?: number } }>;
+  };
+  return (raw.hits ?? []).map((h) => ({ id: h.document.id, words: h.text_match_info?.tokens_matched ?? 0, score: Number(h.text_match ?? 0) }));
+}
+
 // ---- Document chunks collection (retrieval unit for ingested docs) -------
 
 export interface ChunkDoc {
