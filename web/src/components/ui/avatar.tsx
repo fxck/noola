@@ -2,6 +2,11 @@ import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { initials, avatarHue } from "@/lib/tickets";
 
+/** The identity colour of a name, the same one its initials avatar uses. */
+export function avatarColor(name: string | null | undefined): string {
+  return `hsl(${avatarHue(name)} 42% 45%)`;
+}
+
 /** Initials avatar. `unassigned` renders a dashed ghost ring instead of a filled disc.
  *  When `image` is set, the photo renders instead of initials — falling back to the
  *  initials render if the image fails to load. */
@@ -53,7 +58,6 @@ export function Avatar({
   // Identity color — a deterministic desaturated hue per name. A soft tinted disc
   // (not a saturated block): readable in both themes, and it turns an anonymous
   // roster into recognizable people/companies at a glance.
-  const hue = avatarHue(name);
   return (
     <span
       className={cn(
@@ -61,7 +65,7 @@ export function Avatar({
         className,
       )}
       style={{
-        backgroundColor: `hsl(${hue} 42% 45%)`,
+        backgroundColor: avatarColor(name),
         color: "#fff",
       }}
       aria-hidden

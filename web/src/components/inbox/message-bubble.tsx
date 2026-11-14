@@ -9,7 +9,6 @@ import {
   type Attachment,
   type ScheduledReply,
   relativeTime,
-  initials,
   downloadAttachment,
   fetchAttachmentBlob,
   formatBytes,
@@ -20,7 +19,7 @@ import { ArticleBody } from "@/components/editor/article-body";
 import { slackToMarkdown, splitLinks } from "@/lib/markdown";
 import { usePreferences } from "@/lib/preferences";
 import { NoolaMark } from "@/components/noola-mark";
-import { Avatar } from "@/components/ui/avatar";
+import { Avatar, avatarColor } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -104,10 +103,11 @@ function DeliveryBadge({
   );
 }
 
-/** Internal note in the thread — agent-only, visually distinct from customer/agent
- *  messages (never dispatched to a channel). Full-width, warning-tinted card. */
+/** Internal note in the thread, seen only by agents and never sent to a channel.
+ *  A warning-tinted card with the author's avatar and a left edge in the author's colour. */
 export function NoteBubble({
   note,
+  authorAvatarUrl,
   canEdit,
   canDelete,
   sendDelay,
@@ -116,6 +116,7 @@ export function NoteBubble({
   onDelete,
 }: {
   note: Note;
+  authorAvatarUrl?: string | null;
   canEdit: boolean;
   canDelete: boolean;
   /** The workspace's send delay in seconds. */
@@ -168,8 +169,12 @@ export function NoteBubble({
   }
 
   return (
-    <li>
-      <div className="rounded-xl border border-warning/30 bg-warning/5 px-3.5 py-2.5">
+    <li className="flex gap-3">
+      <Avatar name={note.author_name} image={avatarSrc(authorAvatarUrl)} className="mt-0.5 size-7 shrink-0 text-micro" />
+      <div
+        className="min-w-0 flex-1 rounded-xl border border-l-[3px] border-warning/30 bg-warning/5 px-3.5 py-2.5"
+        style={{ borderLeftColor: avatarColor(note.author_name) }}
+      >
         <div className="mb-1 flex flex-wrap items-center gap-1.5 text-micro font-medium uppercase tracking-wide text-warning">
           <StickyNote className="size-3.5" /> Internal note
           {note.author_name && (
@@ -397,19 +402,12 @@ export function MessageBubble({
           >
             <NoolaMark className="size-5" />
           </span>
-        ) : message.author_avatar_url ? (
+        ) : (
           <Avatar
             name={message.author_name || "Agent"}
             image={avatarSrc(message.author_avatar_url)}
             className="mt-0.5 size-7 shrink-0 text-micro"
           />
-        ) : (
-          <span
-            className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-primary/15 text-micro font-semibold text-primary"
-            aria-hidden
-          >
-            {initials(message.author_name || "Agent")}
-          </span>
         )
       ) : authorName || customerAvatarUrl ? (
         <Avatar name={authorName || "Customer"} image={avatarSrc(customerAvatarUrl)} className="mt-0.5 size-7 shrink-0 text-micro" />
@@ -548,20 +546,11 @@ export function PendingReplyBubble({
 
   return (
     <li className="flex flex-row-reverse gap-3">
-      {authorAvatarUrl ? (
-        <Avatar
-          name={reply.authorName || "Agent"}
-          image={avatarSrc(authorAvatarUrl)}
-          className="mt-0.5 size-7 shrink-0 text-micro opacity-60"
-        />
-      ) : (
-        <span
-          className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-full bg-primary/10 text-micro font-semibold text-primary/70"
-          aria-hidden
-        >
-          {initials(reply.authorName || "Agent")}
-        </span>
-      )}
+      <Avatar
+        name={reply.authorName || "Agent"}
+        image={avatarSrc(authorAvatarUrl)}
+        className="mt-0.5 size-7 shrink-0 text-micro opacity-60"
+      />
       <div className="flex min-w-0 max-w-[82%] flex-col items-end gap-1">
         <div className="break-words rounded-2xl rounded-tr-md border border-dashed border-border bg-accent/40 px-3.5 py-2.5 text-sm leading-relaxed text-muted-foreground">
           <ArticleBody markdown={reply.body} className={BUBBLE_MD} messageLinks />

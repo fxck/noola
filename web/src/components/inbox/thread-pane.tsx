@@ -414,6 +414,7 @@ export function ThreadPane({
                     {item._note ? (
                       <NoteBubble
                         note={item}
+                        authorAvatarUrl={users.find((u) => u.id === item.author_id)?.avatar_url}
                         canEdit={!!user && item.author_id === user.id && item.origin === "noola" && !item.sending}
                         canDelete={!!user && (item.author_id === user.id || isAdmin)}
                         sendDelay={sendDelay}
