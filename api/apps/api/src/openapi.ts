@@ -155,7 +155,10 @@ export function buildOpenApiSpec(serverUrl?: string) {
             currency: { type: "string", minLength: 3, maxLength: 3 },
             members: {
               type: "array", maxItems: 2000,
-              items: { type: "object", required: ["external_id"], properties: { external_id: { type: "string" }, role: { type: "string" } } },
+              items: {
+                type: "object", required: ["external_id"],
+                properties: { external_id: { type: "string" }, role: { type: "string" }, joined_at: { type: "string", format: "date-time" } },
+              },
             },
             projects: {
               type: "array", maxItems: 1000,
