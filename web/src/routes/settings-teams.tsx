@@ -106,7 +106,7 @@ export function SettingsTeamsPage() {
             </Button>
           </header>
           <p className="px-6 text-small text-muted-foreground">
-            Group agents into shared inbox lanes — assign tickets to a team, route to it, or round-robin across its members.
+            Group human agents into shared inbox lanes — assign tickets to a team, route to it, or round-robin across its members.
           </p>
           <div className="max-w-3xl px-6 pb-10 pt-4">
             {error ? (
@@ -117,7 +117,7 @@ export function SettingsTeamsPage() {
               <EmptyState
                 icon={Users}
                 title="No teams yet"
-                description="Teams give each group of agents its own inbox lane, a routing target for rules, and a round-robin pool for auto-assignment. Start with the shape of your org — Support, Billing, Success."
+                description="Teams give each group of human agents its own inbox lane, a routing target for rules, and a round-robin pool for auto-assignment. Start with the shape of your org — Support, Billing, Success."
                 action={
                   <Button size="sm" variant="brand" className="gap-1.5" onClick={() => setDraft({ ...EMPTY_DRAFT })}>
                     <Plus className="size-4" /> New team
@@ -258,7 +258,7 @@ function TeamEditor({
           </span>
         </Label>
         {users.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No agents in this workspace yet.</p>
+          <p className="text-xs text-muted-foreground">No human agents in this workspace yet.</p>
         ) : (
           <div className="max-h-56 overflow-y-auto rounded-md border">
             <ul className="divide-y divide-border/50">
@@ -289,7 +289,7 @@ function TeamEditor({
           </div>
         )}
         <p className="text-xs text-muted-foreground">
-          Membership is the full list you save here — routing pools and round-robin use exactly these agents.
+          Membership is the full list you save here — routing pools and round-robin use exactly these human agents.
         </p>
       </div>
     </div>

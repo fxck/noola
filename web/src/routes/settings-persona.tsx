@@ -61,7 +61,7 @@ export function SettingsPersonaPage() {
   return (
     <SettingsPage
       active="persona"
-      title="Agent persona"
+      title="AI agent persona"
       description="The voice your AI uses in drafts and autoreplies — it steers tone and sign-off, not grounding."
       status={status}
       onRetry={load}

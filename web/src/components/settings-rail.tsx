@@ -20,7 +20,7 @@ export const SETTINGS_GROUPS: { label: string; items: SettingsItem[] }[] = [
     items: [
       { key: "ai", to: "/settings/ai", label: "AI overview", Icon: Brain },
       { key: "model", to: "/settings/model", label: "AI & Model", Icon: Sparkles },
-      { key: "persona", to: "/settings/persona", label: "Agent persona", Icon: MessageCircle },
+      { key: "persona", to: "/settings/persona", label: "AI agent persona", Icon: MessageCircle },
       { key: "autoreply", to: "/settings/autoreply", label: "Autoreply", Icon: Bot },
       { key: "translation", to: "/settings/translation", label: "Translation", Icon: Languages },
       { key: "docs-search", to: "/settings/docs-search", label: "Docs search", Icon: FileSearch },

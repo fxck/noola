@@ -194,7 +194,7 @@ function SendDelayCard() {
         <div className="min-w-0 flex-1">
           <h2 className="text-sm font-semibold">Send delay</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            A reply from the inbox waits this long before it goes out, so the agent can still cancel it or send it at
+            A reply from the inbox waits this long before it goes out, so the human agent can still cancel it or send it at
             once. Each member picks what their Send button does under Settings → Profile.
           </p>
           <div className="mt-3 flex items-center gap-2">
@@ -331,7 +331,7 @@ function PoliciesCards() {
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-semibold">Console IP allowlist</h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              One IP or CIDR per line (e.g. 203.0.113.7 or 198.51.100.0/24). When set, the agent
+              One IP or CIDR per line (e.g. 203.0.113.7 or 198.51.100.0/24). When set, the
               console only answers from these addresses — public surfaces (widget, webhooks) are
               unaffected. Your current IP must be on the list; the save refuses a list that would
               lock you out.

@@ -243,12 +243,12 @@ function OverviewView() {
               {/* per-agent workload */}
               {data.byAgent && data.byAgent.length > 0 && (
                 <section className="rounded-xl border bg-card p-4">
-                  <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">By agent</h2>
+                  <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">By human agent</h2>
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="border-b text-left text-micro uppercase tracking-wide text-muted-foreground">
-                          <th className="pb-2 pr-4 font-medium">Agent</th>
+                          <th className="pb-2 pr-4 font-medium">Human agent</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">Assigned</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">Closed</th>
                           <th className="pb-2 text-right font-medium tabular-nums">Avg resolution</th>
@@ -467,7 +467,7 @@ function WorkloadView() {
     <div className="flex min-h-0 w-full min-w-0 flex-col">
       <header className="flex h-12 shrink-0 items-center gap-2 px-4">
         <h2 className="text-sm font-semibold tracking-tight">Workload</h2>
-        <span className="text-xs text-muted-foreground">live queue per agent and team · refreshes every 30s</span>
+        <span className="text-xs text-muted-foreground">live queue per human agent and team · refreshes every 30s</span>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-4 pb-4">
@@ -493,7 +493,7 @@ function WorkloadView() {
                 <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">By team</h2>
                 {data.byTeam.length === 0 ? (
                   <p className="py-4 text-center text-xs text-muted-foreground">
-                    No teams yet — group agents into teams in{" "}
+                    No teams yet — group human agents into teams in{" "}
                     <Link to="/settings/teams" className="font-medium text-primary underline-offset-4 hover:underline">
                       Settings → Teams
                     </Link>.
@@ -533,15 +533,15 @@ function WorkloadView() {
 
               {/* by agent — idle agents (0/0/0) are listed on purpose; imbalance is the point */}
               <section className="rounded-xl border bg-card p-4">
-                <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">By agent</h2>
+                <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">By human agent</h2>
                 {data.byAgent.length === 0 ? (
-                  <p className="py-4 text-center text-xs text-muted-foreground">No agents yet.</p>
+                  <p className="py-4 text-center text-xs text-muted-foreground">No human agents yet.</p>
                 ) : (
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="border-b text-left text-micro uppercase tracking-wide text-muted-foreground">
-                          <th className="pb-2 pr-4 font-medium">Agent</th>
+                          <th className="pb-2 pr-4 font-medium">Human agent</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">Open</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">Waiting</th>
                           <th className="pb-2 text-right font-medium tabular-nums">Closed today</th>

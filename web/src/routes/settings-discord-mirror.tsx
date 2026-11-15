@@ -478,7 +478,7 @@ export function SettingsDiscordMirrorPage() {
                               <p className="text-sm font-medium">Which conversations show up here</p>
                               <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
                                 Leave everything empty to show <strong>every</strong> non-Discord conversation. Add
-                                filters to narrow it — a conversation must match all of them. Agents can always push one
+                                filters to narrow it — a conversation must match all of them. Human agents can always push one
                                 in by hand.
                               </p>
                             </div>

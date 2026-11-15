@@ -135,7 +135,7 @@ export function SettingsAiPage() {
                   <StatChip label="drafts · 7d" value={data.activity7d.drafts} />
                   <StatChip label="auto-sent · 7d" value={data.activity7d.autoSent} />
                   <StatChip label="held for review · 7d" value={data.activity7d.held} />
-                  <StatChip label="agent runs · 7d" value={data.activity7d.agentRuns} />
+                  <StatChip label="AI agent runs · 7d" value={data.activity7d.agentRuns} />
                   <StatChip label="deflected · 7d" value={data.activity7d.deflected} />
                 </div>
 
@@ -238,7 +238,7 @@ export function SettingsAiPage() {
                       </>
                     ) : (
                       <p className="text-xs text-muted-foreground">
-                        No evals run yet — simulate the agent against past tickets before turning
+                        No evals run yet — simulate the AI agent against past tickets before turning
                         anything up.
                       </p>
                     )}

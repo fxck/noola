@@ -32,7 +32,7 @@ const DESCRIPTIONS: Record<SettingsSection, string> = {
   channels: "Connect channels and third-party tools.",
   workspace: "Workspace name and logo.",
   members: "Invite teammates and manage their roles.",
-  teams: "Group agents into shared inbox lanes and routing pools.",
+  teams: "Group human agents into shared inbox lanes and routing pools.",
   sso: "Single sign-on for your workspace.",
   "api-keys": "Programmatic access keys and their scopes.",
   audit: "A tamper-evident record of sensitive actions.",

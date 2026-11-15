@@ -106,7 +106,7 @@ export function AgentRunsSection({ ticketId }: { ticketId: string }) {
   const visible = showAll ? runs : runs.slice(0, SHOW_LIMIT);
 
   return (
-    <RailSection id="agent-runs" icon={Bot} title="Agent activity" count={runs.length}>
+    <RailSection id="agent-runs" icon={Bot} title="AI agent activity" count={runs.length}>
       <ul className="flex flex-col divide-y divide-border/40">
         {visible.map((r) => (
           <RunRow key={r.id} run={r} />

@@ -315,7 +315,7 @@ await noola.submitCsat({ ticketId, rating: 5 });`}
                         Drop this one tag on any site for an embeddable chat bubble — instant AI answers
                         with a “talk to a human” hand-off. Use a <span className="font-mono">widget</span> key
                         (public, domain-allowlisted), not a secret API key. The optional
-                        <span className="font-mono"> data-noola-edge</span> attribute streams agent replies
+                        <span className="font-mono"> data-noola-edge</span> attribute streams replies
                         in real time (falls back to polling when omitted).
                       </p>
                       <pre className="mt-3 overflow-x-auto rounded-md border border-input bg-background p-3 text-micro leading-relaxed">

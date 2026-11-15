@@ -358,7 +358,7 @@ function TraceBody({ t }: { t: TraceDetail }) {
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
         <RunFacts t={t} />
         {t.confidence != null && <Fact label="Confidence">{fmtScore(t.confidence)}</Fact>}
-        {t.humanOutcome && <Fact label="Agent verdict">{HUMAN_OUTCOMES[t.humanOutcome] ?? t.humanOutcome}</Fact>}
+        {t.humanOutcome && <Fact label="Human agent verdict">{HUMAN_OUTCOMES[t.humanOutcome] ?? t.humanOutcome}</Fact>}
         {t.riskTags.length > 0 && <Fact label="Risk tags">{t.riskTags.join(", ")}</Fact>}
       </dl>
 

@@ -387,7 +387,7 @@ export function ThreadPane({
         <div className="flex items-center gap-2 border-b border-border/60 bg-muted/40 px-4 py-2 text-micro text-muted-foreground">
           <Users className="size-3.5 shrink-0" aria-hidden />
           <span>
-            Community thread — a group conversation answered in-channel. No SLA or agent queue; the
+            Community thread — a group conversation answered in-channel. No SLA or human agent queue; the
             assistant deflects once, then observes for the record.
           </span>
         </div>

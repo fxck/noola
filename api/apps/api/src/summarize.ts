@@ -28,8 +28,8 @@ function extractiveSummary(msgs: Msg[]): string {
   const clip = (s: string, n = 220) => s.replace(/\s+/g, " ").trim().slice(0, n);
   const parts: string[] = [];
   if (firstCustomer) parts.push(`Issue: ${clip(firstCustomer.body)}`);
-  parts.push(`${customerMsgs} customer message${customerMsgs === 1 ? "" : "s"}, ${agentReplies} agent repl${agentReplies === 1 ? "y" : "ies"}.`);
-  if (last) parts.push(`Latest (${last.author_type === "customer" ? "customer" : "agent"}): ${clip(last.body)}`);
+  parts.push(`${customerMsgs} customer message${customerMsgs === 1 ? "" : "s"}, ${agentReplies} support repl${agentReplies === 1 ? "y" : "ies"}.`);
+  if (last) parts.push(`Latest (${last.author_type === "customer" ? "customer" : "support"}): ${clip(last.body)}`);
   return parts.join(" ");
 }
 

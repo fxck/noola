@@ -100,7 +100,7 @@ export function ReasonChip({ reason }: { reason: string }) {
           ? reason === "malformed_output"
             ? "The AI's note or no-reply markers were malformed, so the draft is held as written."
             : "Wanted to auto-send, but retrieval didn't corroborate the answer — held for a human."
-          : "Suggest-only mode: a grounded draft prepared for an agent to review."
+          : "Suggest-only mode: a grounded draft prepared for a human agent to review."
       }
     >
       {reason === "malformed_output" ? "Held · malformed" : weak ? "Held · low corroboration" : "Suggested"}

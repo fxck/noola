@@ -59,13 +59,13 @@ export const MODE_OPTIONS: {
   {
     value: "off",
     label: "Off",
-    blurb: "The AI won't reply on its own. Agents can still use Draft with AI manually.",
+    blurb: "The AI won't reply on its own. Human agents can still use Draft with AI manually.",
   },
   {
     value: "suggest_only",
     label: "Suggest only",
     blurb:
-      "Automatically prepares a grounded draft for every incoming message; an agent reviews and sends.",
+      "Automatically prepares a grounded draft for every incoming message; a human agent reviews and sends.",
   },
   {
     value: "auto",

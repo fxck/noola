@@ -232,7 +232,7 @@ export function SettingsRoutingPage() {
               <EmptyState
                 icon={RouteIcon}
                 title="No routing rules yet"
-                description="New tickets stay unassigned until an agent picks them up. Add a rule to auto-assign."
+                description="New tickets stay unassigned until a human agent picks them up. Add a rule to auto-assign."
                 action={
                   <Button size="sm" variant="brand" className="gap-1.5" onClick={() => setDraft({ ...EMPTY_DRAFT })}>
                     <Plus className="size-4" /> New rule
@@ -271,8 +271,8 @@ export function SettingsRoutingPage() {
                             : r.strategy === "specific"
                             ? nameById(r.assignee_ids[0] ?? "")
                             : r.assignee_ids.length === 0
-                            ? "any agent"
-                            : `${r.assignee_ids.length} agent${r.assignee_ids.length === 1 ? "" : "s"}`}
+                            ? "any human agent"
+                            : `${r.assignee_ids.length} human agent${r.assignee_ids.length === 1 ? "" : "s"}`}
                         </span>
                         {r.required_skills.length > 0 && <span>· requires {r.required_skills.join(", ")}</span>}
                         {r.set_priority && <span>· priority: {r.set_priority}</span>}
@@ -435,7 +435,7 @@ function RuleEditor({
                   disabled && "cursor-not-allowed opacity-50 hover:text-muted-foreground",
                 )}
               >
-                {t === "agents" ? "Agents" : "Team"}
+                {t === "agents" ? "Human agents" : "Team"}
               </button>
             );
           })}
@@ -484,14 +484,14 @@ function RuleEditor({
         </div>
         <p className="text-xs text-muted-foreground">
           {draft.strategy === "specific"
-            ? "Always assign to the one agent you pick."
+            ? "Always assign to the one human agent you pick."
             : draft.strategy === "round_robin"
             ? teamMode
               ? "Cycle through the team’s members in turn."
-              : "Cycle through the selected agents in turn (all agents if none selected)."
+              : "Cycle through the selected human agents in turn (all human agents if none selected)."
             : teamMode
             ? "Assign to the team member with the fewest open tickets."
-            : "Assign to whoever has the fewest open tickets (all agents if none selected)."}
+            : "Assign to whoever has the fewest open tickets (all human agents if none selected)."}
         </p>
       </div>
 
@@ -521,15 +521,15 @@ function RuleEditor({
             ))}
           </div>
         )}
-        <p className="text-xs text-muted-foreground">Only agents carrying every listed skill are eligible.</p>
+        <p className="text-xs text-muted-foreground">Only human agents carrying every listed skill are eligible.</p>
       </div>
 
       {/* Assignee pool */}
       {!teamMode && (
         <div className="space-y-1.5">
-          <Label>{draft.strategy === "specific" ? "Agent" : "Agent pool"}</Label>
+          <Label>{draft.strategy === "specific" ? "Human agent" : "Human agent pool"}</Label>
           <div className="flex flex-wrap gap-1.5">
-            {users.length === 0 && <span className="text-xs text-muted-foreground">No agents in this workspace yet.</span>}
+            {users.length === 0 && <span className="text-xs text-muted-foreground">No human agents in this workspace yet.</span>}
             {users.map((u) => {
               const on = draft.assigneeIds.includes(u.id);
               return (

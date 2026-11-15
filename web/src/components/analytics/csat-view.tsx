@@ -133,7 +133,7 @@ export function CsatView() {
     <div className="flex min-h-0 w-full min-w-0 flex-col">
       <header className="flex h-12 shrink-0 items-center gap-2 px-4">
         <h2 className="text-sm font-semibold tracking-tight">CSAT</h2>
-        <span className="hidden text-xs text-muted-foreground sm:inline">satisfaction trend & agent leaderboard · from post-close surveys</span>
+        <span className="hidden text-xs text-muted-foreground sm:inline">satisfaction trend & human agent leaderboard · from post-close surveys</span>
         <div className="ml-auto flex items-center gap-2">
           <SegmentedControl
             aria-label="Window"
@@ -214,15 +214,15 @@ export function CsatView() {
               {/* agent leaderboard — served sorted by closed DESC; zero-activity agents are
                   listed on purpose (the imbalance is the point, same as Workload). */}
               <section className="rounded-xl border bg-card p-4">
-                <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">Agent leaderboard</h2>
+                <h2 className="mb-3 text-micro font-semibold uppercase tracking-wide text-muted-foreground">Human agent leaderboard</h2>
                 {data.leaderboard.length === 0 ? (
-                  <p className="py-4 text-center text-xs text-muted-foreground">No agents yet.</p>
+                  <p className="py-4 text-center text-xs text-muted-foreground">No human agents yet.</p>
                 ) : (
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="border-b text-left text-micro uppercase tracking-wide text-muted-foreground">
-                          <th className="pb-2 pr-4 font-medium">Agent</th>
+                          <th className="pb-2 pr-4 font-medium">Human agent</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">Closed</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">CSAT</th>
                           <th className="pb-2 pr-4 text-right font-medium tabular-nums">Responses</th>

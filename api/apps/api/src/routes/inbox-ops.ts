@@ -171,7 +171,7 @@ export default async function inboxOpsRoutes(app: FastifyInstance): Promise<void
     const { instructions, tools, maxSteps, live, model } = parsed.data;
     const need = EFFECT_MIN_ROLE[agentToolsEffect(tools)];
     if (!roleAtLeast(req.session?.role, need)) {
-      return reply.code(403).send({ error: `Running an agent with these tools needs the ${need} role or higher.` });
+      return reply.code(403).send({ error: `Running an AI agent with these tools needs the ${need} role or higher.` });
     }
     const out = await runTicketAgent(tenantId, (req.params as { id: string }).id, { instructions, tools, maxSteps, model }, { dryRun: !live });
     if (!out) return reply.code(404).send({ error: "ticket not found" });

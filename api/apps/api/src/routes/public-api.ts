@@ -232,7 +232,7 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
     if (out.status === "blocked") {
       return reply.code(409).send({
         error: "resubscribe_blocked",
-        detail: "The contact opted out outside the API (their own unsubscribe, an agent, or an import). Send force: true only if they consented again in your system.",
+        detail: "The contact opted out outside the API (their own unsubscribe, a human agent, or an import). Send force: true only if they consented again in your system.",
         unsubscribed_at: out.unsubscribed_at,
         unsubscribed_source: out.unsubscribed_source,
       });

@@ -82,7 +82,7 @@ const discord: ChannelDriver = {
   label: "Discord",
   direction: "both",
   status: "live",
-  blurb: "Bot relays guild channel messages into tickets and posts agent replies back.",
+  blurb: "Bot relays guild channel messages into tickets and posts replies back.",
   credentialed: () => Boolean(process.env.DISCORD_BOT_TOKEN),
   connections: (tenantId) =>
     relayPool
