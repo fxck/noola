@@ -12,6 +12,7 @@ const { getModelConfig, putModelConfig } = await import("../src/modelconfig.js")
 const { ingestInbound } = await import("../src/ingest.js");
 const { listTraces } = await import("../src/trace.js");
 const { suggestForQuery } = await import("../src/copilot.js");
+const { draftForGap, draftPrompt, parseDraft } = await import("../src/gap-draft.js");
 
 const A = "33333333-3333-3333-3333-333333333333"; // TestCo (dedicated test tenant)
 const ENDPOINT = "https://llm.gaptest.invalid/v1";
@@ -67,6 +68,11 @@ async function main() {
           };
         }),
       });
+    } else if (system.includes("You write for the support team")) {
+      calls.push({ step: "draft", user });
+      text = user.includes("DRAFTFAIL")
+        ? "Sorry, I cannot."
+        : JSON.stringify({ title: "Billing for GAPTEST", body: "## Steps\n\n1. Open billing.", openQuestions: ["Confirm the refund window.", ""] });
     } else if (system.includes("You keep the list of knowledge gaps")) {
       calls.push({ step: "match", user });
       const asked = user.match(/<new question>\n(.+)\n/)?.[1] ?? "";
@@ -298,6 +304,30 @@ async function main() {
     const after = await ourGaps();
     check("an open gap that loses its last conversation is deleted", !after.some((g) => g.question === QUESTION("routing")));
     check("a re-review that finds the same question keeps its gap", after.find((g) => g.question === QUESTION("billing"))?.id === billing?.id, after.map((g) => g.question));
+
+    // ---- Drafts from a gap ----
+    const parsedDraft = parseDraft('```json\n{"title": "T", "body": "B", "openQuestions": ["Q", 3, " "]}\n```');
+    check("a draft is read from a fenced reply, keeping text open questions", parsedDraft?.title === "T" && parsedDraft.openQuestions.length === 1, parsedDraft);
+    check("a draft without a body is none", parseDraft('{"title": "T", "body": ""}') === null && parseDraft("no json") === null);
+    check("an article draft and a docs change get their own instructions",
+      draftPrompt({ ...setup, kind: "support_knowledge" }).includes("Write the article.") && draftPrompt({ ...setup, kind: "docs_missing" }).includes("Write the change for the documentation page."));
+    const draft = await draftForGap(A, billing!.id, {
+      notes: "There is no appeal.",
+      rounds: [{ notes: "Refunds take several days.", openQuestions: ["Can a declined customer appeal?", " "] }, { notes: " ", openQuestions: [] }],
+      previous: { title: "Old title", body: "Old body" },
+    });
+    const draftCall = calls.filter((c) => c.step === "draft").at(-1)?.user ?? "";
+    check("a draft comes back with its open questions", draft?.title === "Billing for GAPTEST" && draft.openQuestions.length === 1 && draft.model === "anthropic:gap-model", draft);
+    check("the draft reads the gap's conversations, the team's answer, the notes and the earlier draft",
+      draftCall.includes(`<gap>\n${QUESTION("billing")}`) && draftCall.includes("<conversation 1>") && draftCall.includes("Team's answer: The team explained billing.")
+      && draftCall.includes("<drafting so far>\nRound 1\nTeam's notes: Refunds take several days.\nYour open questions:\n- Can a declined customer appeal?\n\nRound 2\nTeam's notes: (none)\nYour open questions: (none)\n</drafting so far>")
+      && draftCall.includes("<earlier draft>\n# Old title") && draftCall.includes("<notes>\nThere is no appeal.\n</notes>"), draftCall.slice(-700));
+    check("the draft treats the notes as confirmed and the latest note as winning",
+      ["what they state is confirmed", "never ask an answered question again", "the later one wins"].every((t) => draftPrompt({ ...setup, kind: "support_knowledge" }).includes(t)));
+    check("a draft for a gap that does not exist is none",
+      (await draftForGap(A, "00000000-0000-4000-8000-000000000002")) === null && (await draftForGap(A, "not-a-gap")) === null);
+    const badDraft = await draftForGap(A, billing!.id, { notes: "DRAFTFAIL" }).then(() => null, (e: Error) => e.message);
+    check("a reply without a draft fails", badDraft === "no draft in the answer", badDraft);
 
     // ---- Triage, and deleting a conversation ----
     const article = "00000000-0000-4000-8000-000000000001";

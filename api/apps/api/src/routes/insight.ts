@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { PersonaInput, KnowledgeGapUpdateInput, ReportConfigInput } from "@repo/contracts";
+import { PersonaInput, KnowledgeGapUpdateInput, GapDraftInput, ReportConfigInput } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { getOverview, getWorkload, getSlaReport, getOpsDashboard, getCsatReport, getContainment, getSpamReport } from "../analytics.js";
 import { listTopics, ticketsForTopic, reclassifyGeneral } from "../topics.js";
@@ -10,6 +10,7 @@ import { DEFAULT_HANDOFF_RULES } from "../ai-outcome.js";
 import { DRAFT_PROMPT_PARTS } from "../model.js";
 import { listAudit, verifyAuditChain } from "../audit.js";
 import { listKnowledgeGaps, updateKnowledgeGap } from "../gaps.js";
+import { draftForGap } from "../gap-draft.js";
 
 // Reporting & insight surfaces: analytics overview, the Topics explorer, Conversation QA
 // (scores + coaching + CSAT correlation), the agent-simulation harness, agent persona,
@@ -176,4 +177,25 @@ export default async function insightRoutes(app: FastifyInstance): Promise<void>
     if (!gap) return reply.code(404).send({ error: "not_found" });
     return { gap };
   }));
+
+  // An AI draft of the article or docs change that closes a gap, from its conversations and the caller's notes.
+  app.post("/knowledge-gaps/:id/draft", tenanted(async (tenantId, req, reply) => {
+    const parsed = GapDraftInput.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    try {
+      const draft = await draftForGap(tenantId, (req.params as { id: string }).id, parsed.data);
+      if (!draft) return reply.code(404).send({ error: "not_found" });
+      return { draft };
+    } catch (e) {
+      req.log.warn({ err: e }, "gap draft failed");
+      return reply.code(502).send({ error: "draft_failed", message: draftFailure((e as Error).message ?? "") });
+    }
+  }));
+}
+
+/** A sentence for people about why a draft failed. Provider and network errors stay in the log. */
+function draftFailure(message: string): string {
+  if (message === "the workspace has no hosted model") return "Drafting needs the workspace's own model. Connect a model first.";
+  if (message === "no draft in the answer") return "The model's reply had no draft. Please try again.";
+  return "The model didn't answer. Please try again in a moment.";
 }
