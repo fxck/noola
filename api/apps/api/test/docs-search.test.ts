@@ -32,6 +32,8 @@ async function main() {
   check("the placeholders are filled", rendered === "Search English docs.\nAbout the product: Zerops is a cloud.\nOnly the query.", rendered);
   const bare = renderSearchPrompt("Search {language} docs.\n{product}\nOnly the query.", { language: "English", product: " " });
   check("an empty product line is dropped", bare === "Search English docs.\nOnly the query.", bare);
+  const odd = renderSearchPrompt("{product}", { language: "English", product: "costs $$5, see $& and {language}" });
+  check("the product text goes in as it is", odd === "About the product: costs $$5, see $& and {language}", odd);
   check("the default prompt uses both placeholders", DEFAULT_SEARCH_PROMPT.includes("{language}") && DEFAULT_SEARCH_PROMPT.includes("{product}"));
 
   check("the query is read from its tag", parseSearchQuery("<query>custom domain DNS setup</query>") === "custom domain DNS setup");
