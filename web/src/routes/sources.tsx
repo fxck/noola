@@ -1267,7 +1267,7 @@ function AiSourcesNote() {
       <span className="text-muted-foreground/70">— the only source for public/widget answers</span>
       <span className="text-muted-foreground/40">·</span>
       <span className="text-foreground/80">resolved tickets</span>
-      <span className="text-muted-foreground/70">— agent answers only, never public</span>
+      <span className="text-muted-foreground/70">— drafts for human agents only, never public</span>
     </div>
   );
 }

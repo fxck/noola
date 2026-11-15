@@ -51,7 +51,7 @@ export interface RoutingRuleInput {
 }
 
 export const STRATEGY_LABEL: Record<RoutingStrategy, string> = {
-  specific: "Specific agent",
+  specific: "Specific human agent",
   round_robin: "Round robin",
   least_loaded: "Least loaded",
 };

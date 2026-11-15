@@ -115,7 +115,7 @@ export const AGENT_TOOL_TYPES: { value: ActionType; label: string }[] = [
   { value: "set_priority", label: "Set priority" },
   { value: "escalate", label: "Escalate" },
   { value: "add_tags", label: "Add tags" },
-  { value: "assign", label: "Assign to agent" },
+  { value: "assign", label: "Assign to human agent" },
   { value: "survey", label: "Send a survey" },
   { value: "notify", label: "Notify a connector" },
   { value: "run", label: "Run code" },
@@ -249,12 +249,12 @@ export const CONDITION_OPS: { value: ConditionOp; label: string }[] = [
 ];
 
 export const ACTION_TYPES: { value: ActionType; label: string; desc: string }[] = [
-  { value: "assign", label: "Assign to agent", desc: "Route the ticket to a teammate (or a pool)" },
+  { value: "assign", label: "Assign to human agent", desc: "Route the ticket to a teammate (or a pool)" },
   { value: "set_status", label: "Set status", desc: "Open or close the ticket" },
   { value: "set_priority", label: "Set priority", desc: "Force the ticket's priority" },
   { value: "escalate", label: "Escalate", desc: "Bump priority + optionally reassign & notify" },
   { value: "add_tags", label: "Add tags", desc: "Append tags to the ticket" },
-  { value: "reply", label: "Post a reply", desc: "Send an agent message on the ticket" },
+  { value: "reply", label: "Post a reply", desc: "Send a message to the customer on the ticket" },
   { value: "survey", label: "Send survey", desc: "Deliver a CSAT/NPS prompt (once per ticket)" },
   { value: "notify", label: "Notify an integration", desc: "Send an alert through a connector" },
   { value: "stop", label: "Stop", desc: "Halt this flow (and later rules) — first match wins" },

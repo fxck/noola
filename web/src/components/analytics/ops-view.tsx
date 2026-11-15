@@ -181,7 +181,7 @@ export function OpsView() {
               {presence.length > 0 && (
                 <section className="rounded-xl border bg-card p-4">
                   <div className="mb-3 flex items-center gap-2">
-                    <h2 className="text-micro font-semibold uppercase tracking-wide text-muted-foreground">Agents online</h2>
+                    <h2 className="text-micro font-semibold uppercase tracking-wide text-muted-foreground">Human agents online</h2>
                     <span className="size-1.5 rounded-full bg-success" aria-hidden />
                     <span className="text-micro tabular-nums text-muted-foreground">{presence.length}</span>
                   </div>

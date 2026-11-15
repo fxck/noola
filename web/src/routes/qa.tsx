@@ -156,7 +156,7 @@ export function QualityView() {
             <div className="mb-5 grid gap-3 md:grid-cols-2">
               {agents.length > 0 && (
                 <section className="rounded-xl border bg-card p-4">
-                  <h3 className="mb-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Coaching — by agent</h3>
+                  <h3 className="mb-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Coaching — by human agent</h3>
                   <ul className="space-y-2">
                     {agents.map((a) => (
                       <li key={a.agentId} className="flex items-center gap-3">

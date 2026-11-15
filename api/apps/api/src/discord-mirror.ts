@@ -698,7 +698,7 @@ async function deliverMessageRelay(
   // Message deleted before we could relay it → nothing to deliver; terminal, not an error.
   if (!row) return { ok: true, retriable: false, error: "source message gone" };
   const isCustomer = row.author_type === "customer";
-  const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Agent");
+  const name = row.author_name || (isCustomer ? "Customer" : row.auto ? "AI assistant" : "Support");
   const label = isCustomer ? `💬 **${name}:**` : `↩️ **${name}** _(reply sent to customer)_:`;
   const loaded = await loadMirrorFiles(tenantId, messageId);
   const { quoted, files } = fitQuote(mdToDiscord(row.body), loaded.files);
@@ -735,7 +735,7 @@ async function noteForMirror(noteId: string): Promise<NoteForMirror | null> {
 
 /** The bot's post of a note: a labelled quote, with the note's files when it has any. */
 function noteMirrorPost(note: NoteForMirror, files: MirrorFile[], dropped: number): { content: string; files: MirrorFile[] } {
-  const name = note.author_name?.trim() || "Agent";
+  const name = note.author_name?.trim() || "Human agent";
   const label = `📝 **${name}** _(internal note${note.edited_at ? ", edited" : ""})_:`;
   const fitted = fitQuote(mdToDiscord(note.body), files);
   return { content: `${MIRROR_DIVIDER}\n${label}\n${fitted.quoted}${droppedNote(dropped)}`, files: fitted.files };

@@ -82,7 +82,7 @@ export function ActionFields({
           value={strategy}
           onChange={(v) => onChange({ strategy: v as AssignStrategy })}
           options={[
-            { value: "specific", label: "Specific agent" },
+            { value: "specific", label: "Specific human agent" },
             { value: "round_robin", label: "Round-robin (rotate)" },
             { value: "least_loaded", label: "Least loaded" },
           ]}
@@ -95,7 +95,7 @@ export function ActionFields({
           />
         ) : (
           <p className="text-micro text-muted-foreground">
-            Rotates across all agents. Configure a specific pool in{" "}
+            Rotates across all human agents. Configure a specific pool in{" "}
             <Link to="/settings/routing" className="font-medium text-primary underline-offset-4 hover:underline">
               Settings → Routing
             </Link>

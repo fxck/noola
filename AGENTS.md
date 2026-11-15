@@ -88,6 +88,12 @@ Production builds from `main`, so the deliverable is a **PR to `main`**.
 - A `commit-msg` / husky hook can blank or reject a valid message — commit with `--no-verify`
   (or `HUSKY=0`) if it aborts.
 
+## Wording
+
+Say **human agent** or **AI agent**, never a bare "agent", in UI copy, comments and docs. Both kinds answer customers, and "agent" alone reads as AI.
+When the text means both, use a word that covers both, such as "team" or "support".
+Identifiers keep their names (`audience: "agent"`, `authorType`, routes). Older comments and docs follow the rule when they are touched.
+
 ## Gotchas checklist
 
 - [ ] New service in a prod-shaped project? **Pin** its build to the `*prod` setup — a plain hostname

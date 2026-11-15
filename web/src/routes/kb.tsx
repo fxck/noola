@@ -113,14 +113,13 @@ function PublishBadges({ a }: { a: KbArticle }) {
   );
 }
 
-// The retrieval footprint — every article grounds agent answers; the chunk count is
-// its indexed size. No per-article "N answers served" metric exists, so we state the
-// truthful footprint rather than invent a usage number.
+// Every article grounds AI answers, and the chunk count is its indexed size.
+// No per-article "N answers served" metric exists, so the footprint stands in for usage.
 function UsageStat({ a, className }: { a: KbArticle; className?: string }) {
   return (
     <div className={cn("flex items-center gap-1.5 text-xs text-muted-foreground", className)}>
       <Lock className="size-3 shrink-0 opacity-70" />
-      <span>Powers agent answers</span>
+      <span>Grounds AI answers</span>
       {a.chunk_count != null && (
         <>
           <span className="text-muted-foreground/40">·</span>

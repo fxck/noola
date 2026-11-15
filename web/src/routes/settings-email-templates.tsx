@@ -823,7 +823,7 @@ function TemplateDesigner({
                 onChange={setReplies}
               />
               <p className="text-xs text-muted-foreground">
-                Agent replies to conversations are framed with this design — one template at a
+                Replies to conversations are framed with this design — one template at a
                 time. Replies are letters, not cards: the headline, heading sizes and social
                 links don't apply. Switched off, replies use the stock personal look.
               </p>

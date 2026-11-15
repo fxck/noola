@@ -56,8 +56,8 @@ export function AgentRunPanel({ ticketId, onLiveRun }: { ticketId: string; onLiv
 
       <p className="mt-1.5 text-xs text-muted-foreground">
         {live
-          ? "Live: the agent will take real actions on this ticket (reply, set status, assign…)."
-          : "Dry run: the agent plans and reports what it would do — nothing is changed."}
+          ? "Live: the AI agent will take real actions on this ticket (reply, set status, assign…)."
+          : "Dry run: the AI agent plans and reports what it would do — nothing is changed."}
       </p>
 
       <div className="mt-3">
@@ -71,15 +71,15 @@ export function AgentRunPanel({ ticketId, onLiveRun }: { ticketId: string; onLiv
       </div>
 
       <Button size="sm" className="mt-2" onClick={() => void run()} disabled={running}>
-        {running ? <><Loader2 className="animate-spin motion-reduce:animate-none" /> Working…</> : <><Play /> Run agent</>}
+        {running ? <><Loader2 className="animate-spin motion-reduce:animate-none" /> Working…</> : <><Play /> Run AI agent</>}
       </Button>
 
-      {error && <p className="mt-2 text-xs text-warning">Couldn't run the agent — please try again.</p>}
+      {error && <p className="mt-2 text-xs text-warning">Couldn't run the AI agent — please try again.</p>}
 
       {result && (
         <div className="mt-3 space-y-2">
           {result.steps.length === 0 && result.actions.length === 0 ? (
-            <p className="text-xs text-muted-foreground">The agent decided no action was needed.</p>
+            <p className="text-xs text-muted-foreground">The AI agent decided no action was needed.</p>
           ) : (
             <>
               {result.actions.length > 0 && (

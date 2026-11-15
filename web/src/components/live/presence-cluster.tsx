@@ -34,7 +34,7 @@ export function PresenceCluster({ max = 4 }: { max?: number }) {
   return (
     <span
       className="hidden items-center pl-1 sm:flex"
-      title={`${others.length} other ${others.length === 1 ? "agent" : "agents"} online: ${names}`}
+      title={`${others.length} other ${others.length === 1 ? "human agent" : "human agents"} online: ${names}`}
     >
       <span className="flex -space-x-2">
         {shown.map((u) => (

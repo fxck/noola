@@ -144,7 +144,7 @@ export function SettingsAutoreplyPage() {
     <SettingsPage
       active="autoreply"
       title="Autoreply"
-      description="Decide how much the AI does on its own — from nothing, to preparing drafts for your agents, to sending well-supported answers automatically."
+      description="Decide how much the AI does on its own — from nothing, to preparing drafts for your human agents, to sending well-supported answers automatically."
       status={status}
       onRetry={() => void load()}
       errorTitle="Couldn't load your Autoreply settings"
@@ -280,7 +280,7 @@ export function SettingsAutoreplyPage() {
                   },
                   {
                     audience: "agent" as const,
-                    title: "Agent assist",
+                    title: "Inbox answers",
                     blurb: "Copilot drafts and the autoreply gate.",
                   },
                 ]).map((row) => {
@@ -364,7 +364,7 @@ export function SettingsAutoreplyPage() {
                       <div className="space-y-0.5">
                         <p className="text-sm font-medium">Kill switch</p>
                         <p className="text-xs text-muted-foreground">
-                          Pause all auto-sending immediately. Drafts are still prepared for your
+                          Pause all auto-sending immediately. Drafts are still prepared for your human
                           agents.
                         </p>
                       </div>

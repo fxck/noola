@@ -244,7 +244,7 @@ async function runAction(
         // reply from re-triggering the engine (no cascade).
         const { ingestInbound } = await import("./ingest.js");
         await ingestInbound({ tenantId, body, authorType: "agent", ticketId: ctx.ticketId, origin: "automation" });
-        return { type: action.type, ok: true, detail: "posted agent reply" };
+        return { type: action.type, ok: true, detail: "posted reply" };
       }
       case "notify": {
         if (!action.integrationId) return { type: action.type, ok: false, detail: "no integration selected" };

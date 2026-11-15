@@ -38,7 +38,7 @@ function HelpShell({ children, keyParam }: { children: ReactNode; keyParam: stri
           <Link to="/help" search={keyParam === DEMO_KEY ? {} : { key: keyParam }} className="flex items-center gap-2 font-semibold tracking-tight">
             <LifeBuoy className="size-5 text-primary" /> Help Center
           </Link>
-          <Link to="/login" className="text-sm text-muted-foreground hover:text-foreground">Agent sign in</Link>
+          <Link to="/login" className="text-sm text-muted-foreground hover:text-foreground">Team sign in</Link>
         </div>
       </header>
       {children}
@@ -304,7 +304,7 @@ function ContactForm({ keyParam }: { keyParam: string }) {
       <main className="mx-auto max-w-3xl px-5 py-16 text-center">
         <div className="mx-auto grid size-12 place-items-center rounded-full bg-success/10 text-success"><Check className="size-6" /></div>
         <h1 className="mt-4 text-2xl font-semibold tracking-tight">We've got your message</h1>
-        <p className="mx-auto mt-2 max-w-sm text-sm text-muted-foreground">A support agent will follow up shortly. You can close this page.</p>
+        <p className="mx-auto mt-2 max-w-sm text-sm text-muted-foreground">A human agent will follow up shortly. You can close this page.</p>
         <Link to="/help" search={linkSearch}><Button variant="outline" size="sm" className="mt-6">Back to the Help Center</Button></Link>
       </main>
     );

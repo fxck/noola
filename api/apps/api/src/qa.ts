@@ -80,7 +80,7 @@ export function ruleScore(t: TicketFacts, msgs: Msg[]): Omit<QaScore, "ticket_id
   const overall = clamp(r * 0.45 + to * 0.25 + co * 0.3);
   const rationale = [
     closed ? "resolved" : "still open",
-    answered ? `${agent.length} agent repl${agent.length === 1 ? "y" : "ies"}` : "no agent reply",
+    answered ? `${agent.length} support repl${agent.length === 1 ? "y" : "ies"}` : "no support reply",
     t.sentiment ? `${t.sentiment} sentiment` : "neutral",
   ].join(" · ");
   return { overall, resolution: r, tone: to, completeness: co, band: bandOf(overall), rationale };

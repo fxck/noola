@@ -212,7 +212,7 @@ type NodeHelp = { body: string; example?: () => Record<string, unknown>; example
 
 const ACTION_HELP: Partial<Record<ActionType, NodeHelp>> = {
   reply: {
-    body: "Posts an agent message on the ticket. Weave in ticket context with {{subject}}, {{body}}, or an earlier step's output like {{rag.answer}}.",
+    body: "Posts a message to the customer on the ticket. Weave in ticket context with {{subject}}, {{body}}, or an earlier step's output like {{rag.answer}}.",
     example: () => ({ action: { type: "reply", body: "Thanks for reaching out about “{{subject}}” — we're looking into it and will follow up shortly." } }),
   },
   run: {
@@ -1017,9 +1017,9 @@ const PALETTE: { group: string; items: PaletteItem[] }[] = [
   {
     group: "Support actions",
     items: [
-      { kind: "action", actionType: "assign", icon: UserRound, hue: ACCENT.support, label: "Assign to agent", desc: "Route the ticket to a teammate" },
+      { kind: "action", actionType: "assign", icon: UserRound, hue: ACCENT.support, label: "Assign to human agent", desc: "Route the ticket to a teammate" },
       { kind: "action", actionType: "set_status", icon: CircleDot, hue: ACCENT.support, label: "Set status", desc: "Open or close the ticket" },
-      { kind: "action", actionType: "reply", icon: MessageSquare, hue: ACCENT.support, label: "Post a reply", desc: "Send an agent message" },
+      { kind: "action", actionType: "reply", icon: MessageSquare, hue: ACCENT.support, label: "Post a reply", desc: "Send a message to the customer" },
       { kind: "action", actionType: "rag", icon: Sparkles, hue: ACCENT.support, label: "Answer from KB", desc: "Draft a grounded answer" },
     ],
   },

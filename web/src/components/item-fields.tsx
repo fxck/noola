@@ -59,7 +59,7 @@ export const ITEM_KINDS: ItemKindMeta[] = [
   { kind: "act", label: "Act (AI)", desc: "Do it — natural-language action", group: "AI browser", browser: true },
   { kind: "observe", label: "Observe (AI)", desc: "Find elements by description", group: "AI browser", browser: true },
   { kind: "extract", label: "Extract (AI)", desc: "Pull structured data out", group: "AI browser", browser: true },
-  { kind: "agent", label: "Browser agent (AI)", desc: "Let a model browse in a loop", group: "AI browser", browser: true },
+  { kind: "agent", label: "Browser AI agent", desc: "Let a model browse in a loop", group: "AI browser", browser: true },
 ];
 
 const META = Object.fromEntries(ITEM_KINDS.map((m) => [m.kind, m])) as Record<FlowItemKind, ItemKindMeta>;
@@ -365,6 +365,6 @@ export function ItemFields({
         </div>
       );
     case "agent":
-      return <TplField label="Goal for the browsing agent" value={s("instruction")} onChange={(v) => onChange({ instruction: v })} placeholder="find the cheapest flight and read its price" area />;
+      return <TplField label="Goal for the browser AI agent" value={s("instruction")} onChange={(v) => onChange({ instruction: v })} placeholder="find the cheapest flight and read its price" area />;
   }
 }

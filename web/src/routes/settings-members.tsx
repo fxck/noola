@@ -681,7 +681,7 @@ function RoutingDialog({
             ))}
           </div>
         )}
-        <p className="text-xs text-muted-foreground">Rules that demand skills only assign to agents who carry every one of them.</p>
+        <p className="text-xs text-muted-foreground">Rules that demand skills only assign to human agents who carry every one of them.</p>
       </div>
 
       {/* Out of office — removes the agent from all routing pools */}
