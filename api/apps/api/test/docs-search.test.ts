@@ -1,4 +1,7 @@
 import pg from "pg";
+import Fastify from "fastify";
+import publicApiRoutes from "../src/routes/public-api.js";
+import { createApiKey, revokeApiKey } from "../src/apikeys.js";
 import { getModelConfig, putModelConfig } from "../src/modelconfig.js";
 import { createArticle, deleteArticle, getPublicArticleBySlug, listPublicArticles, searchPublicArticles } from "../src/kb.js";
 import { ensureChunksCollection, ensureKbCollection } from "../src/search.js";
@@ -251,6 +254,45 @@ async function main() {
     } finally {
       await deleteAutomation(A, rule.id);
       await superPool.query("DELETE FROM tickets WHERE id = $1", [asked.ticketId]);
+    }
+
+    // ---- An API key answers from customer-facing articles unless it has answer:internal ----
+    const api = Fastify();
+    await api.register(publicApiRoutes);
+    const answerKey = await createApiKey(A, { name: "DSRCHVIS answer", scopes: ["answer"] });
+    const internalKey = await createApiKey(A, { name: "DSRCHVIS answer:internal", scopes: ["answer:internal"] });
+    const internalQuestion = "DSRCHVIS quota raised by hand for big accounts";
+    const hidden = ["DSRCHVIS quota internals", "DSRCHVIS quota draft"];
+    const restTitles = async (secret: string) => {
+      queries.push(internalQuestion);
+      const r = await api.inject({ method: "POST", url: "/v1/public/answer", headers: { "x-api-key": secret }, payload: { question: internalQuestion } });
+      return ((r.json() as { citations?: { title: string }[] }).citations ?? []).map((c) => c.title);
+    };
+    const mcpText = async (secret: string, name: string, args: Record<string, string>) => {
+      queries.push(Object.values(args)[0]);
+      const r = await api.inject({
+        method: "POST", url: "/v1/mcp", headers: { "x-api-key": secret },
+        payload: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } },
+      });
+      return (r.json() as { result?: { content?: { text: string }[] } }).result?.content?.[0]?.text ?? "";
+    };
+    try {
+      const plainRest = await restTitles(answerKey.secret);
+      check("the answer API skips internal and draft articles", !plainRest.some((t) => hidden.includes(t)), plainRest);
+      const fullRest = await restTitles(internalKey.secret);
+      check("the answer API uses internal articles with answer:internal", fullRest.includes("DSRCHVIS quota internals"), fullRest);
+      const plainSearch = await mcpText(answerKey.secret, "search_knowledge", { query: "DSRCHVIS quota" });
+      check("MCP search skips internal and draft articles", plainSearch.includes("DSRCHVIS quota limits") && !hidden.some((t) => plainSearch.includes(t)), plainSearch);
+      const fullSearch = await mcpText(internalKey.secret, "search_knowledge", { query: "DSRCHVIS quota" });
+      check("MCP search finds internal articles with answer:internal", fullSearch.includes("DSRCHVIS quota internals"), fullSearch);
+      const plainAnswer = await mcpText(answerKey.secret, "answer_question", { question: internalQuestion });
+      check("MCP answers skip internal and draft articles", plainAnswer !== "" && !hidden.some((t) => plainAnswer.includes(t)), plainAnswer);
+      const fullAnswer = await mcpText(internalKey.secret, "answer_question", { question: internalQuestion });
+      check("MCP answers use internal articles with answer:internal", fullAnswer.includes("DSRCHVIS quota internals"), fullAnswer);
+    } finally {
+      await revokeApiKey(A, answerKey.key.id);
+      await revokeApiKey(A, internalKey.key.id);
+      await api.close();
     }
 
     // ---- No sources found: an empty scope finds nothing every time ----

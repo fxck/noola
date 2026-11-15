@@ -12,6 +12,16 @@ import { API_SCOPES } from "@repo/contracts";
 export { API_SCOPES };
 export type ApiScope = (typeof API_SCOPES)[number];
 
+/** Whether a key carries a scope. `answer:internal` includes `answer`. */
+export function keyHasScope(scopes: readonly string[], scope: string): boolean {
+  return scopes.includes(scope) || (scope === "answer" && scopes.includes("answer:internal"));
+}
+
+/** Whether a key's answers may use what only human agents see: internal and draft articles, and past conversations. */
+export function answersWithInternalKnowledge(scopes: readonly string[]): boolean {
+  return scopes.includes("answer:internal");
+}
+
 export interface ApiKeyResolved {
   id: string;
   tenantId: string;

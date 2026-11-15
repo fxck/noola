@@ -287,6 +287,8 @@ await noola.submitCsat({ ticketId, rating: 5 });`}
                       <p className="mt-1 text-xs text-muted-foreground">
                         Connect an AI coding agent (Claude Desktop, Cursor…) to your knowledge + tickets.
                         Point it at the endpoint below with an API key as a Bearer token.
+                        Answers use internal articles and past conversations only when the key has{" "}
+                        <span className="font-mono">answer:internal</span>.
                       </p>
                       <pre className="mt-3 overflow-x-auto rounded-md border border-input bg-background p-3 text-micro leading-relaxed">
 {`{
