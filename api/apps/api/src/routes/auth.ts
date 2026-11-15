@@ -14,9 +14,8 @@ import {
   betterAuthAcceptInvite, betterAuthJoinViaLink,
 } from "../betterauth.js";
 import { listMembers, resolveMember } from "../members.js";
-import {
-  listAgentChannelIdentities, upsertAgentChannelIdentity, removeAgentChannelIdentity,
-} from "../discord-classify.js";
+import { isOrganizationPath, mayManage, NOT_YOURS_TO_MANAGE } from "../rbac.js";
+import { listAgentChannelIdentities, upsertAgentChannelIdentity, removeAgentChannelIdentity, refuseDiscordRelink } from "../discord-classify.js";
 import { listPendingInvites, getInvitePublic, createInviteLink, listInviteLinks, disableInviteLink, getLinkPublic } from "../invites.js";
 import { recordAudit } from "../audit.js";
 
@@ -263,7 +262,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
 
   // ---- better-auth — mounted at /ba/*, self-gated (AUTHORITATIVE) --------
   // better-auth is the sole auth authority. This catch-all exposes its native endpoints
-  // (sign-up, org management, invites, session listing, etc.); the app's own /auth/login,
+  // (sign-up, session listing, SSO, etc.), except organization management, which only the member routes do. The app's own /auth/login,
   // /auth/logout and the request resolver all delegate to it. A Web Request is reconstructed
   // from the Fastify request; the body is re-stringified from the already-parsed object, so
   // there is no raw-body conflict with the Slack route's parser.
@@ -272,6 +271,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     url: "/ba/*",
     async handler(request, reply) {
       const url = new URL(request.url, `http://${request.headers.host}`);
+      if (isOrganizationPath(url.pathname)) return reply.code(404).send({ error: "not found" });
       const headers = fromNodeHeaders(request.headers);
       const webReq = new Request(url.toString(), {
         method: request.method,
@@ -316,17 +316,21 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
   // Link/unlink a member's Discord account (the explicit teammate mark — outranks role inference
   // in customer channels, unlocks reaction-triage "assign to me" in the ops-mirror forum).
   // :id is the app user id; empty/null discordId clears the mark. Admin+ via the global RBAC gate.
+  // Linking rewrites earlier messages, so the caller links only themselves or members they manage.
   app.put("/members/:id/discord", tenanted(async (tenantId, req, reply) => {
     const userId = (req.params as { id: string }).id;
     const raw = ((req.body ?? {}) as { discordId?: string | null }).discordId;
     const discordId = (raw ?? "").toString().trim();
     const member = await resolveMember(tenantId, userId);
     if (!member) return reply.code(404).send({ error: "not a member of this workspace" });
+    if (userId !== req.session?.userId && !mayManage(req.session?.role, member.role)) return reply.code(403).send({ error: NOT_YOURS_TO_MANAGE });
     if (!discordId) {
       await removeAgentChannelIdentity(tenantId, userId, "discord");
     } else {
       if (!/^\d{5,25}$/.test(discordId))
         return reply.code(400).send({ error: "Use the numeric Discord user ID (right-click the user in Discord → Copy User ID; enable Developer Mode in Discord settings if you don't see it)." });
+      const refused = await refuseDiscordRelink(tenantId, req.session, userId, discordId);
+      if (refused) return reply.code(refused.status).send({ error: refused.error });
       await upsertAgentChannelIdentity(tenantId, userId, discordId);
     }
     void recordAudit(tenantId, {
@@ -350,7 +354,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post("/members/invites", tenanted(async (tenantId, req, reply) => {
     const parsed = InviteInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-    const out = await createEmailInvite(req.headers.authorization ?? "", tenantId, parsed.data.email, parsed.data.role);
+    const out = await createEmailInvite(req.headers.authorization ?? "", tenantId, parsed.data.email, parsed.data.role, req.session?.role ?? "");
     if (!out.ok) return reply.code(out.status).send({ error: out.error });
     return reply.code(201).send({ invitation: out.invitation });
   }));
@@ -368,6 +372,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!userId) return reply.code(400).send({ error: "missing tenant" });
     const parsed = InviteLinkInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    if (!mayManage(req.session?.role, parsed.data.role)) return reply.code(403).send({ error: NOT_YOURS_TO_MANAGE });
     const link = await createInviteLink(tenantId, userId, parsed.data);
     return reply.code(201).send({ link, url: `${webBase}/join/${link.token}` });
   }));
@@ -383,7 +388,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
   app.patch("/members/:id/role", tenanted(async (tenantId, req, reply) => {
     const parsed = MemberRoleInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-    const out = await changeMemberRole(req.headers.authorization ?? "", tenantId, (req.params as { id: string }).id, parsed.data.role);
+    const out = await changeMemberRole(req.headers.authorization ?? "", tenantId, (req.params as { id: string }).id, parsed.data.role, req.session?.role ?? "");
     if (!out.ok) return reply.code(out.status).send({ error: out.error });
     void recordAudit(tenantId, {
       actorId: req.session?.userId ?? null,
@@ -398,7 +403,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
 
   // Remove a member (admin). :id is the app user id; the last owner can't be removed.
   app.delete("/members/:id", tenanted(async (tenantId, req, reply) => {
-    const out = await removeMemberByUser(req.headers.authorization ?? "", tenantId, (req.params as { id: string }).id);
+    const out = await removeMemberByUser(req.headers.authorization ?? "", tenantId, (req.params as { id: string }).id, req.session?.role ?? "");
     if (!out.ok) return reply.code(out.status).send({ error: out.error });
     return { ok: true };
   }));

@@ -13,6 +13,7 @@ import { prodSecret } from "./prod-secret.js";
 import { projectOrganization, projectMember, unprojectMember } from "./projection.js";
 import { sendAuthEmail } from "./email.js";
 import { resolveMember, countOwners } from "./members.js";
+import { mayManage, NOT_YOURS_TO_MANAGE } from "./rbac.js";
 import { getInvitePublic, validateLink, redeemLinkMember } from "./invites.js";
 
 // ── better-auth (Track A #2, DUAL-RUN) ───────────────────────────────────────
@@ -506,13 +507,15 @@ export async function betterAuthSignup(
 const asHeaders = (authorization: string) => ({ authorization }) as unknown as Headers;
 
 /** Create an email invitation (fires sendInvitationEmail → Mailpit). Role is the validated
- *  invite enum (owner is never invitable). */
+ *  invite enum (owner is never invitable), and it must rank below the inviter's unless they are an owner. */
 export async function createEmailInvite(
   authorization: string,
   orgId: string,
   email: string,
   role: "admin" | "agent" | "viewer",
+  actorRole: string,
 ): Promise<{ ok: true; invitation: { id: string; email: string; role: string; status: string } } | { ok: false; status: number; error: string }> {
+  if (!mayManage(actorRole, role)) return { ok: false, status: 403, error: NOT_YOURS_TO_MANAGE };
   try {
     const inv = (await auth.api.createInvitation({
       body: { email, role, organizationId: orgId },
@@ -537,15 +540,18 @@ export async function cancelEmailInvite(authorization: string, invitationId: str
 }
 
 /** Change a member's role. Guards the last owner; the afterUpdateMemberRole hook re-projects
- *  the (mapped) role into the app roster. `userId` is the app user id (member is resolved here). */
+ *  the (mapped) role into the app roster. `userId` is the app user id (member is resolved here).
+ *  The actor must outrank both the member's role and the new one, unless they are an owner. */
 export async function changeMemberRole(
   authorization: string,
   orgId: string,
   userId: string,
   role: string,
+  actorRole: string,
 ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
   const m = await resolveMember(orgId, userId);
   if (!m) return { ok: false, status: 404, error: "member not found" };
+  if (!mayManage(actorRole, m.role) || !mayManage(actorRole, role)) return { ok: false, status: 403, error: NOT_YOURS_TO_MANAGE };
   if (m.role === "owner" && role !== "owner" && (await countOwners(orgId)) <= 1) {
     return { ok: false, status: 400, error: "cannot demote the last owner" };
   }
@@ -561,14 +567,16 @@ export async function changeMemberRole(
 }
 
 /** Remove a member. Guards the last owner; the afterRemoveMember hook unprojects the roster row
- *  (their assigned tickets fall to unassigned via ON DELETE SET NULL). */
+ *  (their assigned tickets fall to unassigned via ON DELETE SET NULL). The actor must outrank them, unless they are an owner. */
 export async function removeMemberByUser(
   authorization: string,
   orgId: string,
   userId: string,
+  actorRole: string,
 ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
   const m = await resolveMember(orgId, userId);
   if (!m) return { ok: false, status: 404, error: "member not found" };
+  if (!mayManage(actorRole, m.role)) return { ok: false, status: 403, error: NOT_YOURS_TO_MANAGE };
   if (m.role === "owner" && (await countOwners(orgId)) <= 1) {
     return { ok: false, status: 400, error: "cannot remove the last owner" };
   }

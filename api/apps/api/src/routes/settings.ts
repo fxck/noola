@@ -22,7 +22,7 @@ import {
   listDiscordChannelAccounts, setDiscordChannelAccount, unsetDiscordChannelAccount,
 } from "../discord.js";
 import { listBots, registerBot, deleteBot } from "../discord-bots.js";
-import { setDiscordClassification, upsertAgentChannelIdentity } from "../discord-classify.js";
+import { setDiscordClassification, upsertAgentChannelIdentity, refuseDiscordRelink } from "../discord-classify.js";
 import { linkEmailRoute, handleInboundEmail, tenantSupportAddress } from "../email.js";
 import {
   listSendingDomains, addSendingDomain, refreshSendingDomain, deleteSendingDomain,
@@ -60,7 +60,8 @@ import { channelCatalog } from "../channels/registry.js";
 import { verifyWhatsAppChallenge, handleWhatsAppWebhook } from "../whatsapp.js";
 import { listChannelConnections, saveChannelConnection, deleteChannelConnection, ChannelSecretsUnavailableError } from "../channel-connections.js";
 import { getPolicies, putPolicies, ipAllowed, isInternalIp, TRACE_RETENTION_DEFAULT_DAYS, type TenantPolicies } from "../governance.js";
-import { roleAtLeast } from "../rbac.js";
+import { mayManage, NOT_YOURS_TO_MANAGE, roleAtLeast } from "../rbac.js";
+import { resolveMember } from "../members.js";
 
 // Operational settings + inbound channels + ticket search: the BYO model config, the autoreply
 // policy/queue/backlog, draft-trace outcomes, Discord/email/Slack channel connections, and the
@@ -421,6 +422,11 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const b = (req.body ?? {}) as { userId?: unknown; externalId?: unknown };
     if (typeof b.userId !== "string" || !b.userId) return reply.code(400).send({ error: "userId required" });
     if (typeof b.externalId !== "string" || !b.externalId) return reply.code(400).send({ error: "externalId required" });
+    const member = await resolveMember(tenantId, b.userId);
+    if (!member) return reply.code(404).send({ error: "not a member of this workspace" });
+    if (b.userId !== req.session?.userId && !mayManage(req.session?.role, member.role)) return reply.code(403).send({ error: NOT_YOURS_TO_MANAGE });
+    const refused = await refuseDiscordRelink(tenantId, req.session, b.userId, b.externalId);
+    if (refused) return reply.code(refused.status).send({ error: refused.error });
     await upsertAgentChannelIdentity(tenantId, b.userId, b.externalId);
     return reply.code(201).send({ ok: true, userId: b.userId, externalId: b.externalId });
   }));

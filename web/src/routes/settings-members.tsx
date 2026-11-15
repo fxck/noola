@@ -41,7 +41,10 @@ import {
   changeMemberRole,
   removeMember,
   setMemberDiscordId,
+  mayManage,
+  ROLE_RANK,
 } from "@/lib/members";
+import type { ApiError } from "@/lib/api";
 import {
   type AgentUser,
   type UserRoutingResult,
@@ -51,7 +54,6 @@ import {
 } from "@/lib/tickets";
 import { cn } from "@/lib/utils";
 
-const RANK: Record<string, number> = { viewer: 0, agent: 1, admin: 2, owner: 3 };
 const ROLE_OPTIONS: { value: MemberRole; label: string }[] = [
   { value: "owner", label: "Owner" },
   { value: "admin", label: "Admin" },
@@ -68,13 +70,22 @@ const ROLE_DESC: Record<MemberRole, string> = {
 };
 const INVITE_ROLE_OPTIONS = ROLE_OPTIONS.filter((o) => o.value !== "owner") as { value: InviteRole; label: string }[];
 
+const NOT_MANAGEABLE = "Only an owner can change admins and owners.";
+
 function statusFromError(e: unknown): number | undefined {
   return (e as { status?: number } | undefined)?.status;
 }
 
+/** The server's 403 message, for when its role rule and the page disagree. */
+function forbidden(e: unknown): string | undefined {
+  return statusFromError(e) === 403 ? (e as ApiError).detail ?? "You can only manage members, and give roles, below your own role." : undefined;
+}
+
 export function SettingsMembersPage() {
   const { user } = useAuth();
-  const isAdmin = (RANK[user?.role ?? ""] ?? -1) >= RANK.admin;
+  const isAdmin = (ROLE_RANK[user?.role ?? ""] ?? -1) >= ROLE_RANK.admin;
+  const roleOptions = useMemo(() => ROLE_OPTIONS.filter((o) => mayManage(user?.role, o.value)), [user?.role]);
+  const inviteOptions = useMemo(() => INVITE_ROLE_OPTIONS.filter((o) => mayManage(user?.role, o.value)), [user?.role]);
 
   const [members, setMembers] = useState<Member[] | null>(null);
   const [invites, setInvites] = useState<PendingInvite[]>([]);
@@ -121,6 +132,10 @@ export function SettingsMembersPage() {
 
   const ownerCount = useMemo(() => (members ?? []).filter((m) => m.role === "owner").length, [members]);
   const joinBase = typeof window !== "undefined" ? window.location.origin : "";
+  // A picked role that the current user can't give falls back to the first one they can.
+  const grantable = (role: InviteRole) => (inviteOptions.some((o) => o.value === role) ? role : inviteOptions[0]?.value);
+  const emailRole = grantable(inviteRole);
+  const newLinkRole = grantable(linkRole);
 
   async function copy(text: string, label: string) {
     try {
@@ -133,10 +148,10 @@ export function SettingsMembersPage() {
 
   async function onInvite() {
     const email = inviteEmail.trim();
-    if (!email) return;
+    if (!email || !emailRole) return;
     setInviting(true);
     try {
-      await inviteMember(email, inviteRole);
+      await inviteMember(email, emailRole);
       // Honest success: without SMTP the email silently no-ops — point at the copyable link.
       const inst = await fetchInstanceConfig();
       toast.success(
@@ -148,20 +163,21 @@ export function SettingsMembersPage() {
       await load(true);
     } catch (e) {
       const s = statusFromError(e);
-      toast.error(s === 409 ? "That person is already a member or has a pending invite." : "Couldn't send the invitation.");
+      toast.error(forbidden(e) ?? (s === 409 ? "That person is already a member or has a pending invite." : "Couldn't send the invitation."));
     } finally {
       setInviting(false);
     }
   }
 
   async function onCreateLink() {
+    if (!newLinkRole) return;
     setCreatingLink(true);
     try {
-      const { url } = await createInviteLink({ role: linkRole });
+      const { url } = await createInviteLink({ role: newLinkRole });
       await copy(url || `${joinBase}/join/`, "Invite link");
       await load(true);
-    } catch {
-      toast.error("Couldn't create an invite link.");
+    } catch (e) {
+      toast.error(forbidden(e) ?? "Couldn't create an invite link.");
     } finally {
       setCreatingLink(false);
     }
@@ -193,7 +209,7 @@ export function SettingsMembersPage() {
       setMembers((ms) => (ms ?? []).map((x) => (x.userId === m.userId ? { ...x, role } : x)));
       toast.success(`${m.name || m.email} is now ${role}.`);
     } catch (e) {
-      toast.error(statusFromError(e) === 400 ? "A workspace must keep at least one owner." : "Couldn't change the role.");
+      toast.error(forbidden(e) ?? (statusFromError(e) === 400 ? "A workspace must keep at least one owner." : "Couldn't change the role."));
     } finally {
       setRoleBusy(null);
     }
@@ -208,7 +224,7 @@ export function SettingsMembersPage() {
       toast.success(`${removeTarget.name || removeTarget.email} was removed.`);
       setRemoveTarget(null);
     } catch (e) {
-      toast.error(statusFromError(e) === 400 ? "A workspace must keep at least one owner." : "Couldn't remove the member.");
+      toast.error(forbidden(e) ?? (statusFromError(e) === 400 ? "A workspace must keep at least one owner." : "Couldn't remove the member."));
     } finally {
       setRemoving(false);
     }
@@ -258,8 +274,8 @@ export function SettingsMembersPage() {
               </div>
             ) : (
               <div className="space-y-6">
-                {/* ── invite controls (admin only) ── */}
-                {isAdmin && (
+                {/* ── invite controls (admin only, hidden when no role can be given) ── */}
+                {isAdmin && emailRole && newLinkRole && (
                   <div className="space-y-4 rounded-xl border bg-card p-5 shadow-sm">
                     <div>
                       <h2 className="text-sm font-semibold">Invite by e-mail</h2>
@@ -274,7 +290,7 @@ export function SettingsMembersPage() {
                           autoComplete="off"
                         />
                         <div className="w-full sm:w-36">
-                          <Combobox value={inviteRole} onChange={(v) => setInviteRole(v as InviteRole)} options={INVITE_ROLE_OPTIONS} />
+                          <Combobox value={emailRole} onChange={(v) => setInviteRole(v as InviteRole)} options={inviteOptions} />
                         </div>
                         <Button onClick={() => void onInvite()} disabled={inviting || !inviteEmail.trim()}>
                           {inviting ? <Loader2 className="animate-spin" /> : <UserPlus />}
@@ -288,7 +304,7 @@ export function SettingsMembersPage() {
                       <p className="mt-1 text-xs text-muted-foreground">Anyone with the link can join with the chosen role.</p>
                       <div className="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-center">
                         <div className="w-full sm:w-36">
-                          <Combobox value={linkRole} onChange={(v) => setLinkRole(v as InviteRole)} options={INVITE_ROLE_OPTIONS} />
+                          <Combobox value={newLinkRole} onChange={(v) => setLinkRole(v as InviteRole)} options={inviteOptions} />
                         </div>
                         <Button variant="outline" onClick={() => void onCreateLink()} disabled={creatingLink}>
                           {creatingLink ? <Loader2 className="animate-spin" /> : <Link2 />}
@@ -358,7 +374,7 @@ export function SettingsMembersPage() {
                   <ul className="divide-y">
                     {(members ?? []).map((m) => {
                       const isSelf = m.userId === user?.id;
-                      const canEdit = isAdmin && !isSelf;
+                      const canEdit = !isSelf && mayManage(user?.role, m.role);
                       const lastOwner = m.role === "owner" && ownerCount <= 1;
                       const routing = routingUsers.get(m.userId);
                       const skills = routing?.skills ?? [];
@@ -437,16 +453,18 @@ export function SettingsMembersPage() {
                           <div className="flex shrink-0 items-center gap-1">
                             {isAdmin && (
                               <>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className={cn("size-8 hover:text-foreground", m.discordId ? "text-foreground" : "text-muted-foreground")}
-                                  title={m.discordId ? `Discord linked (${m.discordId})` : "Link Discord account"}
-                                  aria-label={`Discord link for ${m.name || m.email}`}
-                                  onClick={() => setDiscordTarget(m)}
-                                >
-                                  <Hash className="size-4" />
-                                </Button>
+                                {(isSelf || canEdit) && (
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className={cn("size-8 hover:text-foreground", m.discordId ? "text-foreground" : "text-muted-foreground")}
+                                    title={m.discordId ? `Discord linked (${m.discordId})` : "Link Discord account"}
+                                    aria-label={`Discord link for ${m.name || m.email}`}
+                                    onClick={() => setDiscordTarget(m)}
+                                  >
+                                    <Hash className="size-4" />
+                                  </Button>
+                                )}
                                 <Button
                                   variant="ghost"
                                   size="icon"
@@ -465,7 +483,7 @@ export function SettingsMembersPage() {
                                   <Combobox
                                     value={m.role}
                                     onChange={(v) => void onRoleChange(m, v as MemberRole)}
-                                    options={ROLE_OPTIONS}
+                                    options={roleOptions}
                                   />
                                 </div>
                                 <Button
@@ -480,6 +498,11 @@ export function SettingsMembersPage() {
                                   <Trash2 className="size-4" />
                                 </Button>
                               </>
+                            ) : isAdmin && !isSelf ? (
+                              // The disabled button takes no pointer events, so hovering it shows the wrapper's title.
+                              <div className="w-32" title={NOT_MANAGEABLE}>
+                                <Combobox value={m.role} onChange={() => {}} options={ROLE_OPTIONS} className="pointer-events-none" disabled />
+                              </div>
                             ) : (
                               <span className={cn("text-xs capitalize text-muted-foreground", m.role === "owner" && "font-medium")}>
                                 {m.role}

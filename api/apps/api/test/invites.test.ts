@@ -52,7 +52,7 @@ async function main() {
   const bearer = `Bearer ${owner.token}`;
 
   // ==== D1: email invitation ====
-  const inv = await createEmailInvite(bearer, orgId, INVITEE, "agent");
+  const inv = await createEmailInvite(bearer, orgId, INVITEE, "agent", "owner");
   check("createEmailInvite succeeds", inv.ok === true);
   if (!inv.ok) { await bail(); return; }
   check("invitation lands pending in the org", (await listPendingInvites(orgId)).some((i) => i.email === INVITEE && i.status === "pending"));
@@ -70,22 +70,33 @@ async function main() {
   check("invitee was reverse-projected into the app users roster", projU.rows[0]?.role === "agent");
 
   // ==== member management ====
-  const promote = await changeMemberRole(bearer, orgId, inviteeUserId, "admin");
+  const promote = await changeMemberRole(bearer, orgId, inviteeUserId, "admin", "owner");
   check("owner promotes invitee to admin", promote.ok === true);
+  // An admin manages only members below them, and gives only roles below their own.
+  const adminDemotesOwner = await changeMemberRole(bearer, orgId, owner.user.id, "viewer", "admin");
+  check("an admin cannot change an owner's role", adminDemotesOwner.ok === false && !adminDemotesOwner.ok && adminDemotesOwner.status === 403);
+  const adminTouchesAdmin = await changeMemberRole(bearer, orgId, inviteeUserId, "viewer", "admin");
+  check("an admin cannot change another admin's role", adminTouchesAdmin.ok === false && !adminTouchesAdmin.ok && adminTouchesAdmin.status === 403);
+  const adminRemovesOwner = await removeMemberByUser(bearer, orgId, owner.user.id, "admin");
+  check("an admin cannot remove an owner", adminRemovesOwner.ok === false && !adminRemovesOwner.ok && adminRemovesOwner.status === 403);
+  const adminInvitesAdmin = await createEmailInvite(bearer, orgId, "invtest-admin@invtest.local", "admin", "admin");
+  check("an admin cannot invite an admin", adminInvitesAdmin.ok === false && !adminInvitesAdmin.ok && adminInvitesAdmin.status === 403);
+  const agentInvites = await createEmailInvite(bearer, orgId, "invtest-agent@invtest.local", "viewer", "agent");
+  check("a human agent cannot invite anyone", agentInvites.ok === false && !agentInvites.ok && agentInvites.status === 403);
   const projU2 = await superPool.query("SELECT role FROM users WHERE tenant_id = $1 AND id = $2", [orgId, inviteeUserId]);
   check("role change re-projected into the app roster (agent→admin)", projU2.rows[0]?.role === "admin");
 
-  const demoteOwner = await changeMemberRole(bearer, orgId, owner.user.id, "agent");
+  const demoteOwner = await changeMemberRole(bearer, orgId, owner.user.id, "agent", "owner");
   check("last-owner demote is blocked", demoteOwner.ok === false && !demoteOwner.ok && demoteOwner.status === 400);
-  const removeOwner = await removeMemberByUser(bearer, orgId, owner.user.id);
+  const removeOwner = await removeMemberByUser(bearer, orgId, owner.user.id, "owner");
   check("last-owner removal is blocked", removeOwner.ok === false && !removeOwner.ok && removeOwner.status === 400);
 
-  const rm = await removeMemberByUser(bearer, orgId, inviteeUserId);
+  const rm = await removeMemberByUser(bearer, orgId, inviteeUserId, "owner");
   check("owner removes the invitee", rm.ok === true);
   const projU3 = await superPool.query("SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2", [orgId, inviteeUserId]);
   check("removed member is unprojected from the app roster", projU3.rowCount === 0);
 
-  const cancelInv = await createEmailInvite(bearer, orgId, "invtest-cancel@invtest.local", "viewer");
+  const cancelInv = await createEmailInvite(bearer, orgId, "invtest-cancel@invtest.local", "viewer", "owner");
   check("second invite for cancel test created", cancelInv.ok === true);
   if (cancelInv.ok) {
     const cx = await cancelEmailInvite(bearer, cancelInv.invitation.id);
