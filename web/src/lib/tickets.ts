@@ -37,6 +37,12 @@ export interface Ticket {
   /** When marked as spam, the time it was hidden (ISO) — drops it from every open queue and into the
    *  Spam review lane until restored; else null/absent. Drives the "Not spam" restore affordance. */
   spam_at?: string | null;
+  /** Who hid it: an agent or the AI spam check. Null on rows that aren't spam. */
+  spam_source?: "agent" | "ai" | null;
+  /** Null on older agent marks, which count as spam (see `spamKindOf`). */
+  spam_kind?: "spam" | "outreach" | null;
+  /** The AI's one-line reason for hiding it. */
+  spam_reason?: string | null;
   /** Keyword-classified customer sentiment (positive/neutral/negative), or null/absent. */
   sentiment?: string | null;
   /** The contact this conversation belongs to (omnichannel unification), or null. */
@@ -105,9 +111,10 @@ export async function markTicketRead(id: string): Promise<void> {
   await api(`/tickets/${id}/read`, { method: "POST" });
 }
 
-/** What "Mark all as read" covers: an inbox lane (a team lane is `teamId`) or the table's filters. */
+/** What "Mark all as read" covers: an inbox lane (a team lane is `teamId`) or the table's filters.
+ *  `spamKind` narrows the Spam lane to the kind that its filter shows. */
 export type MarkAllReadTarget =
-  | { scope: "view"; view: ViewKey; teamId?: string }
+  | { scope: "view"; view: ViewKey; teamId?: string; spamKind?: SpamKind }
   | { scope: "table"; query: TicketQuery };
 
 /** Mark every ticket of a lane or table filter read for the current agent. The server resolves the tickets. */
@@ -621,6 +628,12 @@ export async function markTicketSpam(
     method: "POST",
     body: JSON.stringify(opts ?? {}),
   });
+}
+
+export type SpamKind = "spam" | "outreach";
+
+export function spamKindOf(t: Ticket): SpamKind {
+  return t.spam_kind === "outreach" ? "outreach" : "spam";
 }
 
 /** Restore a spam-hidden ticket (the "not spam" undo): un-hides it, restores its lead and removes the

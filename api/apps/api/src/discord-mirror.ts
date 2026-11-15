@@ -411,7 +411,7 @@ export async function backfillMirrors(tenantId: string): Promise<{ mirrored: num
   const rows = await withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT t.id FROM tickets t
-        WHERE t.status = 'open' AND t.channel_type IS DISTINCT FROM 'discord'
+        WHERE t.status = 'open' AND t.spam_at IS NULL AND t.channel_type IS DISTINCT FROM 'discord'
           AND NOT EXISTS (SELECT 1 FROM ticket_mirror m WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id)
         ORDER BY t.updated_at DESC LIMIT $1`,
       [BACKFILL_CAP],

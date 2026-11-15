@@ -29,6 +29,10 @@ export interface TicketRow {
   closed_at: string | null;
   /** When the ticket was soft-hidden as spam (null = live). Drives the Spam view + Restore footer. */
   spam_at: string | null;
+  /** Who hid the ticket as spam ('agent' | 'ai'), its kind ('spam' | 'outreach') and the AI's reason. */
+  spam_source: string | null;
+  spam_kind: string | null;
+  spam_reason: string | null;
   /** First agent reply time (min agent-message created_at) — drives first-response SLA. */
   first_response_at: string | null;
   /** Tenant-defined ticket type (taxonomy), or null. Name/color hydrated from ticket_types. */
@@ -69,7 +73,7 @@ export interface TicketRow {
 // subquery (min agent-message time) so SLA state can be computed without a second round-trip.
 const TICKET_COLS = `t.id, t.subject, t.status, t.channel_type, t.external_channel_id,
               t.whose_turn, t.assignee_id, u.name AS assignee_name, u.avatar_url AS assignee_avatar_url, t.priority, t.tags,
-              t.created_at, t.updated_at, t.closed_at, t.spam_at,
+              t.created_at, t.updated_at, t.closed_at, t.spam_at, t.spam_source, t.spam_kind, t.spam_reason,
               (SELECT min(m.created_at) FROM messages m
                  WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id
                    AND m.author_type = 'agent') AS first_response_at,
@@ -548,18 +552,25 @@ export async function setTicketStatus(
   return out;
 }
 
-/** Soft-hide (spam=true) or restore (spam=false) a ticket. Returns the ticket's contact + the
- *  sender's handle on its channel (contact email for email; the channel identity otherwise) so the
- *  spam route can block that sender and drop the lead without re-querying. null = ticket not found. */
+/** Soft-hide (spam=true) or restore (spam=false) a ticket, as an agent's spam mark. null = ticket not found.
+ *  Returns the ticket's contact and the sender's handle on its channel, so the spam route can block the sender and drop the lead. */
 export async function setTicketSpam(
   tenantId: string,
   ticketId: string,
   spam: boolean,
-): Promise<{ ticketId: string; contactId: string | null; channelType: string; senderHandle: string | null } | null> {
+): Promise<{ ticketId: string; contactId: string | null; channelType: string; senderHandle: string | null; wasAi: boolean } | null> {
   return withTenant(tenantId, async (c) => {
+    const before = await c.query("SELECT spam_source FROM tickets WHERE id = $1 FOR UPDATE", [ticketId]);
+    const wasAi = before.rows[0]?.spam_source === "ai";
     const r = await c.query(
-      `UPDATE tickets SET spam_at = ${spam ? "now()" : "NULL"}, updated_at = now()
-        WHERE id = $1 RETURNING id, contact_id, channel_type`,
+      spam
+        // A ticket that the AI hid keeps its source, so restoring it still runs the ticket.created automations that it skipped.
+        ? `UPDATE tickets SET spam_source = CASE WHEN spam_at IS NOT NULL AND spam_source = 'ai' THEN 'ai' ELSE 'agent' END,
+                              spam_reason = CASE WHEN spam_at IS NOT NULL AND spam_source = 'ai' THEN spam_reason END,
+                              spam_kind = 'spam', spam_at = COALESCE(spam_at, now()), updated_at = now()
+            WHERE id = $1 RETURNING id, contact_id, channel_type`
+        : `UPDATE tickets SET spam_at = NULL, spam_source = NULL, spam_kind = NULL, spam_reason = NULL, updated_at = now()
+            WHERE id = $1 RETURNING id, contact_id, channel_type`,
       [ticketId],
     );
     if (!r.rowCount) return null;
@@ -579,7 +590,7 @@ export async function setTicketSpam(
         senderHandle = idr.rowCount ? (idr.rows[0].external_id as string) : null;
       }
     }
-    return { ticketId: row.id, contactId, channelType, senderHandle };
+    return { ticketId: row.id, contactId, channelType, senderHandle, wasAi };
   });
 }
 

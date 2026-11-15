@@ -38,6 +38,7 @@ import { SettingsAiPage } from "@/routes/settings-ai";
 import { SettingsAutoreplyPage } from "@/routes/settings-autoreply";
 import { SettingsTranslationPage } from "@/routes/settings-translation";
 import { SettingsDocsSearchPage } from "@/routes/settings-docs-search";
+import { SettingsSpamPage } from "@/routes/settings-spam";
 import { SettingsTagRulesPage } from "@/routes/settings-tag-rules";
 import { SettingsClassificationPage } from "@/routes/settings-classification";
 import { SettingsDiscordMirrorPage } from "@/routes/settings-discord-mirror";
@@ -540,6 +541,15 @@ const settingsDocsSearchRoute = createRoute({
   component: SettingsDocsSearchPage,
 });
 
+const settingsSpamRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/spam",
+  beforeLoad: ({ context }) => {
+    if (!context.auth.isAuthed) throw redirect({ to: "/login" });
+  },
+  component: SettingsSpamPage,
+});
+
 const settingsTagRulesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/tag-rules",
@@ -806,6 +816,7 @@ const routeTree = rootRoute.addChildren([
   settingsAutoreplyRoute,
   settingsTranslationRoute,
   settingsDocsSearchRoute,
+  settingsSpamRoute,
   settingsTagRulesRoute,
   settingsClassificationRoute,
   settingsDiscordMirrorRoute,

@@ -1,5 +1,5 @@
-import { ChevronUp, ChevronsUp, CornerUpLeft, UserRound } from "lucide-react";
-import { type Ticket, type TicketPriority, relativeTime } from "@/lib/tickets";
+import { Bot, ChevronUp, ChevronsUp, CornerUpLeft, UserRound } from "lucide-react";
+import { type Ticket, type TicketPriority, relativeTime, spamKindOf } from "@/lib/tickets";
 import { Avatar } from "@/components/ui/avatar";
 import { avatarSrc } from "@/lib/avatar-upload";
 import { SlaBadge } from "@/components/sla-badge";
@@ -147,6 +147,15 @@ export function TicketRow({
             {ticket.preview && ticket.preview.trim() !== ticket.subject.trim() ? ticket.preview : ""}
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
+            {ticket.spam_at && ticket.spam_source === "ai" && (
+              <span
+                className="flex items-center gap-0.5 text-micro text-muted-foreground"
+                title={ticket.spam_reason ?? undefined}
+              >
+                <Bot className="size-3 shrink-0" aria-hidden />
+                AI · {spamKindOf(ticket)}
+              </span>
+            )}
             {nerd && ticket.message_count != null && (
               <span
                 className="font-mono text-micro tabular-nums text-muted-foreground/70"

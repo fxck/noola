@@ -406,12 +406,14 @@ export const SpamTicketInput = z.object({
 export type SpamTicketInput = z.infer<typeof SpamTicketInput>;
 
 /** POST /tickets/read-all marks one list read for the current agent, as the server resolves it.
- *  `view` is an inbox lane, with `teamId` for a team lane, and `table` is the tickets table's filters. */
+ *  `view` is an inbox lane, with `teamId` for a team lane, and `table` is the tickets table's filters.
+ *  `spamKind` narrows the Spam lane to spam or outreach. */
 export const MarkAllReadInput = z.discriminatedUnion("scope", [
   z.object({
     scope: z.literal("view"),
     view: z.enum(["all", "needs_reply", "approval", "unassigned", "my", "closed", "spam", "outbound"]).default("all"),
     teamId: z.guid().optional(),
+    spamKind: z.enum(["spam", "outreach"]).optional(),
   }),
   z.object({
     scope: z.literal("table"),
@@ -441,6 +443,16 @@ export const BlockSenderInput = z.object({
   reason: z.string().max(280).nullish(),
 });
 export type BlockSenderInput = z.infer<typeof BlockSenderInput>;
+
+/** PUT /settings/spam: the AI spam check on new emails, its extra rules and system prompt, and the auto-block threshold (0 = off).
+ *  An omitted field keeps its saved value. A null or empty prompt goes back to the built-in one. */
+export const SpamSettingsInput = z.object({
+  aiEnabled: z.boolean().optional(),
+  rules: z.string().max(4000).optional(),
+  prompt: z.string().max(8000).nullable().optional(),
+  blockAfter: z.number().int().min(0).max(100).optional(),
+});
+export type SpamSettingsInput = z.infer<typeof SpamSettingsInput>;
 
 /** Routing v2 — per-agent routing signals (admin). `reassign` (with outOfOffice: true) also
  *  re-routes the agent's open tickets: team tickets round-robin to eligible teammates,

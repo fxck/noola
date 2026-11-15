@@ -693,3 +693,34 @@ export async function addBlockedSender(input: {
 export async function removeBlockedSender(id: string): Promise<void> {
   await api(`/blocklist/${id}`, { method: "DELETE" });
 }
+
+// ── Spam detection ───────────────────────────────────────────────────────────
+
+export const SPAM_RULES_MAX = 4000;
+export const SPAM_PROMPT_MAX = 8000;
+export const SPAM_BLOCK_AFTER_MAX = 100;
+
+export interface SpamSettings {
+  aiEnabled: boolean;
+  rules: string;
+  /** Null uses the default prompt. */
+  prompt: string | null;
+  /** Spam conversations from one sender before they are blocked. 0 never blocks. */
+  blockAfter: number;
+}
+
+export interface SpamSettingsResponse {
+  settings: SpamSettings;
+  defaultPrompt: string;
+  /** Always added after the prompt and the extra rules, so the answer can be read. */
+  replyFormat: string;
+}
+
+export async function fetchSpamSettings(): Promise<SpamSettingsResponse> {
+  return api<SpamSettingsResponse>("/settings/spam");
+}
+
+/** Admin only. An omitted field keeps its saved value, and a null or empty prompt goes back to the default. */
+export async function saveSpamSettings(input: Partial<SpamSettings>): Promise<SpamSettingsResponse> {
+  return api<SpamSettingsResponse>("/settings/spam", { method: "PUT", body: JSON.stringify(input) });
+}

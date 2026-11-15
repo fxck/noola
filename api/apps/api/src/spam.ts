@@ -1,6 +1,8 @@
 import { setTicketSpam } from "./tickets.js";
 import { setContactSpam, contactLiveTicketCount } from "./contacts.js";
+import { withTenant } from "@repo/db";
 import { blockSender, unblockByHandle, type BlockScope } from "./blocklist.js";
+import { getSpamSettings } from "./spam-check.js";
 
 // The one "mark as spam" orchestration, shared by the web route (POST /tickets/:id/spam) and the
 // Discord ops-mirror 🚫 reaction — so both do exactly the same thing: soft-hide the ticket, block the
@@ -29,6 +31,8 @@ export async function markConversationSpam(
       reason: "marked spam", createdBy: opts.actorId ?? null,
     }).catch(() => null);
     blocked = row?.handle ?? null;
+  } else if (out.senderHandle) {
+    blocked = await blockRepeatSender(tenantId, out.channelType, out.senderHandle).catch(() => null);
   }
 
   // Drop the lead only when this spam ticket was the contact's ONLY conversation.
@@ -48,10 +52,38 @@ export async function markConversationSpam(
   return { ticketId: out.ticketId, blocked, leadDropped };
 }
 
+async function announceRestoredTicket(tenantId: string, ticketId: string): Promise<void> {
+  const seed = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT t.subject, t.channel_type, m.id AS message_id, m.body
+         FROM tickets t
+         LEFT JOIN LATERAL (SELECT id, body FROM messages
+                             WHERE tenant_id = t.tenant_id AND ticket_id = t.id AND author_type = 'customer'
+                             ORDER BY created_at LIMIT 1) m ON true
+        WHERE t.id = $1`,
+      [ticketId],
+    );
+    const t = r.rows[0];
+    return t && { ticketId, messageId: t.message_id, subject: t.subject, body: t.body ?? "", channelType: t.channel_type, authorType: "customer" };
+  });
+  if (!seed) return;
+  const { emitDomainEvent } = await import("./automations.js");
+  emitDomainEvent(tenantId, "ticket.created", seed);
+  const { fireEvent } = await import("./webhooks.js");
+  void fireEvent(tenantId, "ticket.created", { ticketId, subject: seed.subject, channelType: seed.channelType });
+  if (seed.messageId) {
+    void fireEvent(tenantId, "message.created", {
+      messageId: seed.messageId, ticketId, subject: seed.subject, body: seed.body, authorType: "customer",
+    });
+  }
+}
+
 /** The full reverse: un-hide the ticket, restore its lead, and remove the sender block. */
 export async function unmarkConversationSpam(tenantId: string, ticketId: string): Promise<{ ticketId: string } | null> {
   const out = await setTicketSpam(tenantId, ticketId, false);
   if (!out) return null;
+  // The spam check hid the ticket before the ticket.created automations, mirroring and webhooks saw it.
+  if (out.wasAi) await announceRestoredTicket(tenantId, ticketId).catch(() => {});
   if (out.contactId) await setContactSpam(tenantId, out.contactId, false).catch(() => {});
   if (out.senderHandle) await unblockByHandle(tenantId, out.channelType, out.senderHandle).catch(() => {});
 
@@ -61,4 +93,27 @@ export async function unmarkConversationSpam(tenantId: string, ticketId: string)
     .catch(() => {});
 
   return { ticketId: out.ticketId };
+}
+
+/**
+ * Blocks an email sender or widget user once the workspace's threshold of their conversations is spam. Outreach doesn't count.
+ * Returns the blocked handle, or null when the sender stays unblocked.
+ */
+export async function blockRepeatSender(tenantId: string, channelType: string, handle: string): Promise<string | null> {
+  if (channelType !== "email" && channelType !== "widget") return null;
+  const { blockAfter } = await getSpamSettings(tenantId);
+  if (blockAfter <= 0) return null;
+  const spam = await withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT count(*)::int AS n FROM tickets t
+         JOIN contacts c ON c.tenant_id = t.tenant_id AND c.id = t.contact_id
+        WHERE t.spam_at IS NOT NULL AND COALESCE(t.spam_kind, 'spam') = 'spam'
+          AND lower(CASE WHEN $1 = 'email' THEN c.email ELSE COALESCE(NULLIF(c.external_id, ''), NULLIF(c.email, '')) END) = lower($2)`,
+      [channelType, handle],
+    );
+    return r.rows[0].n as number;
+  });
+  if (spam < blockAfter) return null;
+  const row = await blockSender(tenantId, { channelType, scope: "address", handle, reason: `${spam} spam conversations`, createdBy: null });
+  return row?.handle ?? null;
 }

@@ -50,7 +50,7 @@ export function TicketTracesDialog({ ticketId, onClose }: { ticketId: string; on
             <Sparkles className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
               <h2 className="text-sm font-semibold text-foreground">AI traces</h2>
-              <p className="text-micro text-muted-foreground">Every AI draft on this conversation, including drafts that sent nothing.</p>
+              <p className="text-micro text-muted-foreground">Every AI draft and spam check on this conversation, including drafts that sent nothing.</p>
             </div>
           </div>
           <button
@@ -71,7 +71,7 @@ export function TicketTracesDialog({ ticketId, onClose }: { ticketId: string; on
               <div className="mx-auto h-4 w-40 rounded bg-muted/60 motion-safe:animate-pulse" />
             </div>
           ) : traces.length === 0 ? (
-            <p className="px-5 py-8 text-center text-sm text-muted-foreground">The AI has not drafted anything on this conversation.</p>
+            <p className="px-5 py-8 text-center text-sm text-muted-foreground">The AI has not drafted or checked anything on this conversation.</p>
           ) : (
             <TraceList traces={traces} showTicket={false} onOpen={setOpenTrace} />
           )}

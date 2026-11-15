@@ -9,6 +9,9 @@ import { tenantEmailProviderCreds, tenantReplyAddress, type EmailProviderName } 
 import { resolveFromIdentity } from "./email-sender.js";
 import { publicApiBase } from "./env.js";
 import { isSenderBlocked } from "./blocklist.js";
+import { screenEmail } from "./spam-check.js";
+import { recordSpamCheckTrace } from "./trace.js";
+import { blockRepeatSender } from "./spam.js";
 import { stripInboundQuote } from "./email-quote.js";
 
 // The email channel — the second real channel after Discord, riding the same
@@ -296,7 +299,7 @@ async function finishInboundEmail(result: IngestResult, m: InboundEmail, quoted?
   // Ingest deferred the Discord ops-mirror relay when this email had attachments (deferMirror), so the
   // mirror waits for the files. Now that they're persisted, fire the relay — it no-ops if the ticket
   // isn't mirrored. No attachments → ingest already relayed inline, so we skip here.
-  if (m.attachments?.length) {
+  if (m.attachments?.length && !result.spam) {
     void import("./discord-mirror.js")
       .then((mm) => mm.relayTicketMessage(result.tenantId, result.ticketId, result.messageId))
       .catch(() => {});
@@ -372,6 +375,11 @@ export async function handleInboundEmail(
     }
   }
 
+  // A reply to a broadcast is never spam, so only other emails go through the spam check.
+  const check = parsed.broadcastRecipientId
+    ? null
+    : await screenEmail(tenantId, { fromName: m.fromName ?? "", fromAddress: m.from.toLowerCase(), subject: m.subject ?? "", body });
+  const spam = check?.mark ?? null;
   const result = await ingestInbound({
     tenantId,
     body,
@@ -384,7 +392,16 @@ export async function handleInboundEmail(
     identity: { email: m.from.toLowerCase(), name: m.fromName ?? null },
     deferMirror: !!m.attachments?.length,
     meta: { to: parsed.base },
+    spam,
   });
+  if (check && !result.replay) {
+    await recordSpamCheckTrace({
+      tenantId, ticketId: result.ticketId, messageId: result.messageId, email: check.email, answer: check.answer,
+      verdict: check.verdict?.kind ?? "failed", reason: check.verdict?.reason ?? check.error ?? "",
+      model: check.model, effort: check.effort, tokensIn: check.tokensIn, tokensOut: check.tokensOut, latencyMs: check.latencyMs,
+    });
+  }
+  if (spam && result.ticketCreated && spam.kind === "spam") await blockRepeatSender(tenantId, "email", m.from.toLowerCase()).catch(() => {});
   // A replayed (idempotency-deduped) message already carried its files/cc/quote the first time.
   if (!result.replay) await finishInboundEmail(result, m, quoted);
   // Broadcast lazy-promotion FALLBACK: only for a `+b.` reply whose recipient had NO eager conversation

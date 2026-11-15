@@ -175,7 +175,7 @@ export function AiTracesPage() {
           <EmptyState
             icon={ScanSearch}
             title="No traces"
-            description={hasFilters ? "Adjust the filters or clear them to see everything." : "The AI has not drafted anything yet."}
+            description={hasFilters ? "Adjust the filters or clear them to see everything." : "The AI has not drafted a reply or checked an email yet."}
           />
         )}
       </div>
