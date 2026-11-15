@@ -67,6 +67,8 @@ export interface IngestInput {
   meta?: Record<string, unknown>;
   /** The spam check's verdict, which hides a ticket that this message creates. */
   spam?: SpamMark | null;
+  /** The spam check's verdict on a ticket that this message creates, kept for the spam analytics. */
+  spamCheck?: "legit" | "spam" | "outreach" | "failed" | null;
 }
 
 export interface IngestResult {
@@ -237,10 +239,11 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
       } else {
         const spam = isCustomer ? input.spam ?? null : null;
         const ins = await c.query(
-          `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id, spam_at, spam_source, spam_kind, spam_reason)
-           VALUES (current_tenant(), $1, $2, $3, $4, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END, CASE WHEN $5::text IS NULL THEN NULL ELSE 'ai' END, $5, $6)
+          `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id, spam_at, spam_source, spam_kind, spam_reason, spam_check)
+           VALUES (current_tenant(), $1, $2, $3, $4, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END, CASE WHEN $5::text IS NULL THEN NULL ELSE 'ai' END, $5, $6, $7)
            RETURNING id`,
-          [subject, channelType, input.externalChannelId ?? null, contactId, spam?.kind ?? null, spam ? spam.reason : null],
+          [subject, channelType, input.externalChannelId ?? null, contactId, spam?.kind ?? null, spam ? spam.reason : null,
+           isCustomer ? input.spamCheck ?? null : null],
         );
         ticketId = ins.rows[0].id;
         ticketCreated = true;

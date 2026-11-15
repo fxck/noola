@@ -18,6 +18,7 @@ const { unreadCounts, markTicketRead } = await import("../src/reads.js");
 const { createWidgetKey, deleteWidgetKey, setIdentitySecret, updateWidgetKey, computeUserHash } = await import("../src/widget.js");
 const widgetRoutes = (await import("../src/routes/widget.js")).default;
 const { createWebhook, deleteWebhook } = await import("../src/webhooks.js");
+const { getSpamReport, getContainment } = await import("../src/analytics.js");
 
 const A = "33333333-3333-3333-3333-333333333333"; // TestCo (dedicated test tenant)
 const ENDPOINT = "https://llm.spamtest.invalid/v1";
@@ -266,6 +267,35 @@ async function main() {
       chatMarks.push((await markConversationSpam(A, id, { actorId: null }))?.blocked ?? null);
     }
     check("two spam marks ban an e-mail-only widget visitor", chatMarks[0] === null && chatMarks[1] === addr("chat2"), chatMarks);
+
+    // ---- Spam analytics: one email the AI hides, one it misses, one it hides wrongly ----
+    const r0 = await getSpamReport(A, 1);
+    const cont0 = await getContainment(A, 1);
+    await email(addr("a-spam"), "spam");
+    const missed = await email(addr("a-missed"), "legit");
+    await markConversationSpam(A, missed!.ticketId, { actorId: null });
+    const wrong = await email(addr("a-wrong"), "outreach");
+    await unmarkConversationSpam(A, wrong!.ticketId);
+    // A team mark on a ticket that the AI never checked is not a miss.
+    const unchecked = (await superPool.query(
+      "INSERT INTO tickets (tenant_id, subject, channel_type) VALUES ($1, 'SPAMTEST unchecked', 'discord') RETURNING id", [A],
+    )).rows[0].id as string;
+    await markConversationSpam(A, unchecked, { actorId: null });
+    const r1 = await getSpamReport(A, 1);
+    const cont1 = await getContainment(A, 1);
+    const d = (k: keyof typeof r1.totals) => (r1.totals[k] as number) - (r0.totals[k] as number);
+    check("the spam report counts what the AI hid, what it missed and what was restored",
+      d("created") === 4 && d("checked") === 3 && d("hidden") === 3 && d("byAi") === 1 && d("byTeam") === 2 &&
+      d("missedByAi") === 1 && d("restored") === 1 && d("restoredFromAi") === 1 && d("outreach") === 0,
+      { created: d("created"), checked: d("checked"), hidden: d("hidden"), byAi: d("byAi"), byTeam: d("byTeam"), missed: d("missedByAi"), restored: d("restored"), fromAi: d("restoredFromAi") });
+    // A merge keeps the restored ticket in the report, and a fractional window is rounded down.
+    await superPool.query("UPDATE tickets SET merged_into = $2 WHERE id = $1", [wrong!.ticketId, missed!.ticketId]);
+    const r2 = await getSpamReport(A, 1.5);
+    check("a merged ticket stays in the spam report", r2.windowWeeks === 1 && r2.totals.restoredFromAi === r1.totals.restoredFromAi, { weeks: r2.windowWeeks, before: r1.totals.restoredFromAi, after: r2.totals.restoredFromAi });
+    await superPool.query("UPDATE tickets SET merged_into = NULL WHERE id = $1", [wrong!.ticketId]);
+    check("containment counts the AI's spam on its own, the restored ticket as untouched, and leaves the team's marks out",
+      cont1.totals.aiSpam - cont0.totals.aiSpam === 1 && cont1.totals.untouched - cont0.totals.untouched === 1 && cont1.totals.created - cont0.totals.created === 1,
+      { aiSpam: cont1.totals.aiSpam - cont0.totals.aiSpam, untouched: cont1.totals.untouched - cont0.totals.untouched, created: cont1.totals.created - cont0.totals.created });
 
     // ---- Unread counts per lane ----
     const user = (await superPool.query("SELECT id FROM users WHERE tenant_id = $1 LIMIT 1", [A])).rows[0]?.id as string;

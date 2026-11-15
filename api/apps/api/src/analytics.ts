@@ -563,6 +563,8 @@ export interface ContainmentWeek {
   aiAssisted: number;
   humanOnly: number;
   untouched: number;
+  /** Tickets that the AI spam check hid and that stayed hidden. They stay out of the containment %. */
+  aiSpam: number;
   containment: number | null; // % of handled (aiResolved+aiAssisted+humanOnly) resolved by AI alone
 }
 
@@ -575,6 +577,7 @@ export interface ContainmentReport {
     aiAssisted: number;
     humanOnly: number;
     untouched: number;
+    aiSpam: number;
     containment: number | null;
     deflectionShare: number | null; // deflected / (deflected + created)
   };
@@ -582,18 +585,19 @@ export interface ContainmentReport {
 }
 
 export async function getContainment(tenantId: string, weeks = 8): Promise<ContainmentReport> {
-  const windowWeeks = Math.min(Math.max(weeks, 1), 26);
+  const windowWeeks = Math.min(Math.max(Math.floor(weeks), 1), 26);
   return withTenant(tenantId, async (c) => {
     // Per-ticket AI/human involvement, bucketed per creation week. auto=true marks an
     // AI-sent message; a human agent message is agent-authored AND NOT auto (approval-queue
     // sends count as human — a person reviewed and pressed send).
     const tickR = await c.query(
       `SELECT to_char(date_trunc('week', t.created_at), 'YYYY-MM-DD') AS week,
-              count(*)::int AS created,
-              count(*) FILTER (WHERE has_auto AND NOT has_human AND t.status = 'closed')::int AS ai_resolved,
-              count(*) FILTER (WHERE has_auto AND has_human)::int AS ai_assisted,
-              count(*) FILTER (WHERE has_human AND NOT has_auto)::int AS human_only,
-              count(*) FILTER (WHERE NOT has_human AND NOT (has_auto AND t.status = 'closed'))::int AS untouched
+              count(*) FILTER (WHERE t.spam_at IS NULL)::int AS created,
+              count(*) FILTER (WHERE t.spam_at IS NULL AND has_auto AND NOT has_human AND t.status = 'closed')::int AS ai_resolved,
+              count(*) FILTER (WHERE t.spam_at IS NULL AND has_auto AND has_human)::int AS ai_assisted,
+              count(*) FILTER (WHERE t.spam_at IS NULL AND has_human AND NOT has_auto)::int AS human_only,
+              count(*) FILTER (WHERE t.spam_at IS NULL AND NOT has_human AND NOT (has_auto AND t.status = 'closed'))::int AS untouched,
+              count(*) FILTER (WHERE t.spam_at IS NOT NULL)::int AS ai_spam
          FROM tickets t
          CROSS JOIN LATERAL (
            SELECT COALESCE(bool_or(m.auto), false) AS has_auto,
@@ -602,6 +606,8 @@ export async function getContainment(tenantId: string, weeks = 8): Promise<Conta
          ) inv
         WHERE t.created_at > now() - make_interval(weeks => $1)
           AND t.merged_into IS NULL
+          -- The team's spam marks are not the AI's work, so only the spam that the AI hid counts.
+          AND (t.spam_at IS NULL OR t.spam_source = 'ai')
         GROUP BY 1 ORDER BY 1`,
       [windowWeeks],
     );
@@ -637,6 +643,7 @@ export async function getContainment(tenantId: string, weeks = 8): Promise<Conta
         deflected: deflByWeek.get(week) ?? 0,
         aiResolved, aiAssisted, humanOnly,
         untouched: num(t?.untouched),
+        aiSpam: num(t?.ai_spam),
         containment: rate(aiResolved, aiAssisted, humanOnly),
       };
     });
@@ -645,9 +652,9 @@ export async function getContainment(tenantId: string, weeks = 8): Promise<Conta
       (a, w) => ({
         deflected: a.deflected + w.deflected, created: a.created,
         aiResolved: a.aiResolved + w.aiResolved, aiAssisted: a.aiAssisted + w.aiAssisted,
-        humanOnly: a.humanOnly + w.humanOnly, untouched: a.untouched + w.untouched,
+        humanOnly: a.humanOnly + w.humanOnly, untouched: a.untouched + w.untouched, aiSpam: a.aiSpam + w.aiSpam,
       }),
-      { deflected: 0, created: 0, aiResolved: 0, aiAssisted: 0, humanOnly: 0, untouched: 0 },
+      { deflected: 0, created: 0, aiResolved: 0, aiAssisted: 0, humanOnly: 0, untouched: 0, aiSpam: 0 },
     );
     const created = tickR.rows.reduce((a, x) => a + num(x.created), 0);
     return {
@@ -658,6 +665,86 @@ export async function getContainment(tenantId: string, weeks = 8): Promise<Conta
         containment: rate(tot.aiResolved, tot.aiAssisted, tot.humanOnly),
         deflectionShare:
           tot.deflected + created > 0 ? Math.round((tot.deflected / (tot.deflected + created)) * 1000) / 10 : null,
+      },
+      byWeek,
+    };
+  });
+}
+
+// ── Spam (the AI spam check and the team's marks) ────────────────────────────
+
+export interface SpamWeek {
+  week: string;
+  /** Tickets hidden as spam, outreach included. */
+  hidden: number;
+  outreach: number;
+  byAi: number;
+  byTeam: number;
+  /** Emails that the AI judged legit and the team marked as spam. */
+  missedByAi: number;
+  /** Hidden tickets that someone marked as not spam. */
+  restored: number;
+  /** Of those, the ones that the AI hid. */
+  restoredFromAi: number;
+  /** Emails that the spam check gave a verdict on. A failed check is not counted. */
+  checked: number;
+}
+
+export interface SpamReport {
+  windowWeeks: number;
+  totals: Omit<SpamWeek, "week"> & {
+    /** Tickets created in the window, spam included, without the conversations that a broadcast opened and nobody answered. */
+    created: number;
+    perWeek: number;
+    perDay: number;
+    /** Hidden tickets as a % of all created, null with none created. */
+    share: number | null;
+  };
+  byWeek: SpamWeek[];
+}
+
+/**
+ * Spam volume and the spam check's accuracy, weekly by the ticket's creation.
+ * Missed means the AI judged an email legit and the team later marked it as spam.
+ * A team mark on a ticket that the AI never checked is not a miss.
+ */
+export async function getSpamReport(tenantId: string, weeks = 8): Promise<SpamReport> {
+  const windowWeeks = Math.min(Math.max(Math.floor(weeks), 1), 26);
+  return withTenant(tenantId, async (c) => {
+    const r = await c.query(
+      `SELECT to_char(date_trunc('week', t.created_at), 'YYYY-MM-DD') AS week,
+              count(*) FILTER (WHERE NOT t.outbound_pending)::int AS created,
+              count(*) FILTER (WHERE t.spam_at IS NOT NULL)::int AS hidden,
+              count(*) FILTER (WHERE t.spam_at IS NOT NULL AND t.spam_kind = 'outreach')::int AS outreach,
+              count(*) FILTER (WHERE t.spam_at IS NOT NULL AND t.spam_source = 'ai')::int AS by_ai,
+              count(*) FILTER (WHERE t.spam_at IS NOT NULL AND t.spam_source IS DISTINCT FROM 'ai')::int AS by_team,
+              count(*) FILTER (WHERE t.spam_at IS NOT NULL AND t.spam_source IS DISTINCT FROM 'ai' AND t.spam_check = 'legit')::int AS missed_by_ai,
+              count(*) FILTER (WHERE t.spam_at IS NULL AND t.spam_restored_at IS NOT NULL)::int AS restored,
+              count(*) FILTER (WHERE t.spam_at IS NULL AND t.spam_restored_at IS NOT NULL AND t.spam_check IN ('spam', 'outreach'))::int AS restored_from_ai,
+              count(*) FILTER (WHERE t.spam_check IN ('legit', 'spam', 'outreach'))::int AS checked
+         FROM tickets t
+        -- A merged ticket stays in, as each ticket is one email that the AI or the team judged.
+        WHERE t.created_at > now() - make_interval(weeks => $1)
+        GROUP BY 1 ORDER BY 1`,
+      [windowWeeks],
+    );
+    const byWeek: SpamWeek[] = r.rows.map((x) => ({
+      week: x.week as string,
+      hidden: num(x.hidden), outreach: num(x.outreach), byAi: num(x.by_ai), byTeam: num(x.by_team),
+      missedByAi: num(x.missed_by_ai), restored: num(x.restored), restoredFromAi: num(x.restored_from_ai), checked: num(x.checked),
+    }));
+    const sum = (k: keyof Omit<SpamWeek, "week">) => byWeek.reduce((a, w) => a + w[k], 0);
+    const created = r.rows.reduce((a, x) => a + num(x.created), 0);
+    const hidden = sum("hidden");
+    return {
+      windowWeeks,
+      totals: {
+        hidden, outreach: sum("outreach"), byAi: sum("byAi"), byTeam: sum("byTeam"), missedByAi: sum("missedByAi"),
+        restored: sum("restored"), restoredFromAi: sum("restoredFromAi"), checked: sum("checked"),
+        created,
+        perWeek: Math.round((hidden / windowWeeks) * 10) / 10,
+        perDay: Math.round((hidden / (windowWeeks * 7)) * 10) / 10,
+        share: created > 0 ? Math.round((hidden / created) * 1000) / 10 : null,
       },
       byWeek,
     };

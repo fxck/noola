@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { TAB_BASE, TAB_ON, TAB_OFF } from "@/components/ui/segmented";
 import { cn } from "@/lib/utils";
-import { type ContainmentReport, fetchContainment } from "@/lib/analytics";
+import { type ContainmentReport, type ContainmentWeek, fetchContainment } from "@/lib/analytics";
 
 // The Containment section of the Analytics hub — the headline AI-support question:
 // of everything customers asked, how much did AI absorb? Two lanes: deflected
@@ -34,11 +34,18 @@ const BUCKETS = [
   { key: "aiAssisted", label: "AI-assisted", cls: "bg-primary/45" },
   { key: "humanOnly", label: "Human only", cls: "bg-foreground/30" },
   { key: "untouched", label: "No reply yet", cls: "bg-foreground/10" },
+  { key: "aiSpam", label: "Filtered as spam by AI", cls: "bg-warning/40" },
 ] as const;
+
+type Counts = Pick<ContainmentWeek, (typeof BUCKETS)[number]["key"]>;
+
+function bucketSum(c: Counts): number {
+  return c.aiResolved + c.aiAssisted + c.humanOnly + c.untouched + c.aiSpam;
+}
 
 /** Horizontal stacked composition of the handled/created ticket volume. */
 function FunnelBar({ totals }: { totals: ContainmentReport["totals"] }) {
-  const sum = totals.aiResolved + totals.aiAssisted + totals.humanOnly + totals.untouched;
+  const sum = bucketSum(totals);
   if (sum === 0) {
     return (
       <div className="flex h-10 items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
@@ -71,14 +78,17 @@ function FunnelBar({ totals }: { totals: ContainmentReport["totals"] }) {
           </span>
         ))}
       </div>
+      {totals.aiSpam > 0 && (
+        <p className="mt-2 text-xs text-muted-foreground">Spam filtered by AI is not part of the containment %.</p>
+      )}
     </div>
   );
 }
 
 /** Weekly stacked columns of the handled buckets, with the containment % on hover. */
 function WeeklyChart({ data }: { data: ContainmentReport["byWeek"] }) {
-  const max = Math.max(...data.map((w) => w.aiResolved + w.aiAssisted + w.humanOnly + w.untouched), 1);
-  const hasData = data.some((w) => w.aiResolved + w.aiAssisted + w.humanOnly + w.untouched > 0);
+  const max = Math.max(...data.map(bucketSum), 1);
+  const hasData = data.some((w) => bucketSum(w) > 0);
   if (!hasData) {
     return (
       <div className="flex h-32 items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
@@ -90,12 +100,12 @@ function WeeklyChart({ data }: { data: ContainmentReport["byWeek"] }) {
     <div>
       <div className="flex h-32 items-stretch gap-1.5">
         {data.map((w) => {
-          const total = w.aiResolved + w.aiAssisted + w.humanOnly + w.untouched;
+          const total = bucketSum(w);
           return (
             <div key={w.week} className="group relative flex flex-1 flex-col items-center justify-end">
               {total > 0 && (
                 <>
-                  {/* stack renders top-down: untouched sits on top, AI-resolved at the base */}
+                  {/* stack renders top-down: AI spam sits on top, AI-resolved at the base */}
                   <div className="flex w-full flex-col-reverse overflow-hidden rounded-t" style={{ height: `${Math.max((total / max) * 100, 4)}%` }}>
                     {BUCKETS.map((b) => {
                       const v = w[b.key];
@@ -104,7 +114,8 @@ function WeeklyChart({ data }: { data: ContainmentReport["byWeek"] }) {
                     })}
                   </div>
                   <div className="pointer-events-none absolute -top-6 whitespace-nowrap rounded bg-foreground px-1.5 py-0.5 text-micro font-medium tabular-nums text-background opacity-0 transition-opacity group-hover:opacity-100">
-                    {w.containment != null ? `${w.containment}% contained` : "no handled tickets"} · {total} ticket{total === 1 ? "" : "s"} · wk {w.week.slice(5)}
+                    {w.containment != null ? `${w.containment}% contained` : "no handled tickets"} · {total - w.aiSpam} ticket{total - w.aiSpam === 1 ? "" : "s"}
+                    {w.aiSpam > 0 && ` · ${w.aiSpam} spam`} · wk {w.week.slice(5)}
                   </div>
                 </>
               )}
@@ -171,7 +182,7 @@ export function ContainmentView() {
               <Button variant="outline" size="sm" onClick={() => load(weeks)}>Try again</Button>
             </div>
           ) : data && t ? (
-            t.created === 0 && t.deflected === 0 ? (
+            t.created === 0 && t.deflected === 0 && t.aiSpam === 0 ? (
               <EmptyState
                 icon={Bot}
                 title="No conversations in this window"
@@ -185,7 +196,7 @@ export function ContainmentView() {
                     icon={Wand2}
                     label="Containment"
                     value={t.containment != null ? `${t.containment}%` : "—"}
-                    sub="handled conversations closed by AI alone"
+                    sub="handled conversations closed by AI alone, spam not counted"
                   />
                   <Kpi
                     icon={Bot}

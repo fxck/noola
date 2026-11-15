@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { PersonaInput, KnowledgeGapUpdateInput, ReportConfigInput } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
-import { getOverview, getWorkload, getSlaReport, getOpsDashboard, getCsatReport, getContainment } from "../analytics.js";
+import { getOverview, getWorkload, getSlaReport, getOpsDashboard, getCsatReport, getContainment, getSpamReport } from "../analytics.js";
 import { listTopics, ticketsForTopic, reclassifyGeneral } from "../topics.js";
 import { listScores, qaSummary, scoreTicket, backfillScores, qaByAgent, qaCsatCorrelation } from "../qa.js";
 import { runSimulation, listSimulations, getSimulation } from "../simulate.js";
@@ -31,6 +31,13 @@ export default async function insightRoutes(app: FastifyInstance): Promise<void>
     const q = (req.query as { weeks?: string }) ?? {};
     const weeks = q.weeks && !Number.isNaN(Number(q.weeks)) ? Number(q.weeks) : 8;
     return { containment: await getContainment(tenantId, weeks) };
+  }));
+
+  // Spam volume and the AI spam check's accuracy (viewer+) over ?weeks (default 8).
+  app.get("/analytics/spam", tenanted(async (tenantId, req) => {
+    const q = (req.query as { weeks?: string }) ?? {};
+    const weeks = q.weeks && !Number.isNaN(Number(q.weeks)) ? Number(q.weeks) : 8;
+    return { spam: await getSpamReport(tenantId, weeks) };
   }));
 
   // CSAT trends + agent leaderboard (viewer+) over ?weeks (default 12).
