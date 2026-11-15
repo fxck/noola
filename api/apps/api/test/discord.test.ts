@@ -15,6 +15,7 @@ import {
   classifyDiscordAuthor,
   setDiscordClassification,
   upsertAgentChannelIdentity,
+  refuseDiscordRelink,
 } from "../src/discord-classify.js";
 import { listTickets } from "../src/tickets.js";
 import { putPolicy, evaluateAutoreply } from "../src/autoreply.js";
@@ -431,6 +432,21 @@ async function main() {
       await upsertAgentChannelIdentity(A, seatId, "disctest-teammate-late");
       const again = await superPool.query("SELECT author_id FROM messages WHERE idempotency_key = 'discord:disctest-late-2'");
       check("linking the same id again changes nothing", again.rows[0]?.author_id === seatId);
+    }
+  }
+
+  // 16c - an id that another member holds moves only when the caller manages that member.
+  {
+    const members = (await superPool.query(`SELECT "userId" AS id, role FROM "member" WHERE "organizationId" = $1`, [A])).rows as Array<{ id: string; role: string }>;
+    const owner = members.find((m) => m.role === "owner");
+    const other = members.find((m) => m.role !== "owner");
+    if (owner && other) {
+      await upsertAgentChannelIdentity(A, owner.id, "disctest-owner-id");
+      const byAdmin = await refuseDiscordRelink(A, { userId: other.id, role: "admin" }, other.id, "disctest-owner-id");
+      check("an admin cannot take an owner's Discord id", byAdmin?.status === 409, byAdmin);
+      check("an owner can move it", (await refuseDiscordRelink(A, { userId: owner.id, role: "owner" }, other.id, "disctest-owner-id")) === null);
+      check("linking the id to its own holder is fine", (await refuseDiscordRelink(A, { userId: other.id, role: "admin" }, owner.id, "disctest-owner-id")) === null);
+      check("an id nobody holds is free", (await refuseDiscordRelink(A, { userId: other.id, role: "admin" }, other.id, "disctest-free-id")) === null);
     }
   }
 

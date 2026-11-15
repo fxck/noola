@@ -43,6 +43,19 @@ export interface InviteLink {
 export type InviteRole = "admin" | "agent" | "viewer";
 export type MemberRole = "owner" | InviteRole;
 
+export const ROLE_RANK: Record<string, number> = { viewer: 0, agent: 1, admin: 2, owner: 3 };
+
+/**
+ * Whether `actor` may manage a member who holds `role`, or give someone `role`. Mirrors `mayManage` in the api's rbac.ts.
+ * An owner manages everyone. Anyone else manages only roles ranked below their own, and only admins manage anyone.
+ */
+export function mayManage(actor: string | undefined | null, role: string | undefined | null): boolean {
+  if (actor === "owner") return true;
+  const mine = ROLE_RANK[actor ?? ""] ?? -1;
+  const theirs = ROLE_RANK[role ?? ""] ?? 99;
+  return mine >= ROLE_RANK.admin && theirs < mine;
+}
+
 /** The org's member roster (member ⋈ user). */
 export async function fetchMembers(): Promise<Member[]> {
   return (await api<{ members: Member[] }>("/members")).members;

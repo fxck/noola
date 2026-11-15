@@ -1,4 +1,4 @@
-import { roleAtLeast, routeFloor, ADMIN_ROUTES, ROLE_RANK } from "../src/rbac.js";
+import { roleAtLeast, routeFloor, ADMIN_ROUTES, ROLE_RANK, mayManage, isOrganizationPath, mayGrantScopes } from "../src/rbac.js";
 
 // RBAC policy seam: the role hierarchy comparison and the per-route floor that the global gate
 // (server.ts) enforces. Pure logic — no DB, no HTTP. The end-to-end 403 is exercised in the
@@ -45,7 +45,24 @@ check("member + invite management floors at admin",
   routeFloor("DELETE", "/members/invites/:id") === "admin" &&
   routeFloor("POST", "/members/invite-links") === "admin" &&
   routeFloor("PATCH", "/members/:id/role") === "admin" &&
-  routeFloor("DELETE", "/members/:id") === "admin");
+  routeFloor("DELETE", "/members/:id") === "admin" &&
+  routeFloor("PUT", "/members/:id/discord") === "admin");
+
+// Managing members: an owner manages everyone, anyone else only roles below their own.
+check("an owner manages and grants every role, owners included",
+  ["owner", "admin", "agent", "viewer"].every((r) => mayManage("owner", r)));
+check("an admin manages human agents and read-only members",
+  mayManage("admin", "agent") && mayManage("admin", "viewer"));
+check("an admin never touches admins or owners", !mayManage("admin", "admin") && !mayManage("admin", "owner"));
+check("a human agent and a read-only member manage no one",
+  ["owner", "admin", "agent", "viewer"].every((r) => !mayManage("agent", r) && !mayManage("viewer", r)));
+check("an unknown role on either side manages nothing", !mayManage(undefined, "viewer") && !mayManage("admin", "boss") && !mayManage("boss", "viewer"));
+check("the better-auth proxy refuses every organization endpoint",
+  ["/ba/organization", "/ba/organization/invite-member", "/ba/organization/update-member-role", "/ba/ORGANIZATION/remove-member"].every(isOrganizationPath));
+check("the better-auth proxy keeps sign-in, sessions and SSO",
+  !["/ba/sign-in/email", "/ba/get-session", "/ba/sso/callback/x", "/ba/organizations-x"].some(isOrganizationPath));
+check("only an owner creates a SCIM key", mayGrantScopes("owner", ["scim"]) && !mayGrantScopes("admin", ["answer", "scim"]));
+check("an admin creates keys without SCIM", mayGrantScopes("admin", ["answer", "tickets:read"]));
 check("GET /members (roster read) stays agent-visible (viewer floor)",
   routeFloor("GET", "/members") === "viewer");
 check("broadcast compose is agent but send is admin (send has higher blast radius)",

@@ -1,4 +1,6 @@
 import { relayPool, withTenant } from "@repo/db";
+import { resolveMember } from "./members.js";
+import { mayManage } from "./rbac.js";
 
 /**
  * Discord author classification (Phase 2). Turns a raw MESSAGE_CREATE author into a Noola
@@ -238,6 +240,28 @@ const REATTRIBUTE_SQL = `
     DELETE FROM knowledge_gap_questions q WHERE q.ticket_id IN (SELECT ticket_id FROM moved)
     RETURNING q.id)
   DELETE FROM gap_reviews r WHERE r.ticket_id IN (SELECT ticket_id FROM moved)`;
+
+/**
+ * Why linking `discordId` to `userId` is refused, or null when it is allowed.
+ * An id that another member holds moves off them, so the caller must manage that member too.
+ */
+export async function refuseDiscordRelink(
+  tenantId: string,
+  caller: { userId?: string; role?: string | null } | null | undefined,
+  userId: string,
+  discordId: string,
+): Promise<{ status: 403 | 409; error: string } | null> {
+  const holder = await withTenant(tenantId, async (c) =>
+    (await c.query(
+      "SELECT user_id FROM agent_channel_identities WHERE channel_type = 'discord' AND lower(external_id) = lower($1) LIMIT 1",
+      [discordId],
+    )).rows[0]?.user_id as string | undefined,
+  );
+  if (!holder || holder === userId || holder === caller?.userId) return null;
+  const held = await resolveMember(tenantId, holder);
+  if (held && !mayManage(caller?.role, held.role)) return { status: 409, error: "That ID is already linked to another member." };
+  return null;
+}
 
 /** Unmark a teammate's channel identity (Settings → Members "clear Discord ID"). */
 export async function removeAgentChannelIdentity(

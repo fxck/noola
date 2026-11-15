@@ -13,6 +13,29 @@
 
 export const ROLE_RANK: Record<string, number> = { viewer: 0, agent: 1, admin: 2, owner: 3 };
 
+/**
+ * Whether a member with `actor` may manage a member who holds `role`, or give someone `role`.
+ * An owner manages everyone. Anyone else manages only roles ranked below their own, so an admin never touches admins or owners.
+ */
+export function mayManage(actor: string | undefined | null, role: string | undefined | null): boolean {
+  if (actor === "owner") return true;
+  const mine = ROLE_RANK[actor ?? ""] ?? -1;
+  const theirs = ROLE_RANK[role ?? ""] ?? 99;
+  return mine >= ROLE_RANK.admin && theirs < mine;
+}
+
+export const NOT_YOURS_TO_MANAGE = "You can only manage members, and give roles, below your own role.";
+
+/** Whether a better-auth path manages the organization. The app's member routes do that, so the raw proxy refuses it. */
+export function isOrganizationPath(pathname: string): boolean {
+  return /^\/ba\/organization(\/|$)/i.test(pathname);
+}
+
+/** Whether `role` may create an API key with these scopes. A SCIM key provisions members with any role, so only an owner creates one. */
+export function mayGrantScopes(role: string | undefined | null, scopes: readonly string[]): boolean {
+  return !scopes.includes("scim") || role === "owner";
+}
+
 /** True when `role` ranks at least `min` in the hierarchy. An unknown role ranks below
  *  everything (deny-by-default); an unknown `min` is treated as unsatisfiable. */
 export function roleAtLeast(role: string | undefined | null, min: string): boolean {
@@ -57,6 +80,7 @@ export const ADMIN_ROUTES = new Set<string>([
   "DELETE /members/invite-links/:token",
   "PATCH /members/:id/role",
   "DELETE /members/:id",
+  "PUT /members/:id/discord",
   // Integrations (secret-bearing connectors) — reads stay viewer+, config locks to admin
   "POST /integrations",
   "PATCH /integrations/:id",

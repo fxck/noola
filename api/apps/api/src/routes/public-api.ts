@@ -24,6 +24,7 @@ import {
   publicSyncCompany, publicSyncCompaniesBulk, publicGetCompany, publicRemoveCompany, publicPutTechnologies, technologyOverview,
 } from "../public-accounts.js";
 import { listTopics } from "../subscription-topics.js";
+import { mayGrantScopes } from "../rbac.js";
 
 const PUBLIC_RATE_LIMIT = 120; // requests per key per minute
 
@@ -425,6 +426,7 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
   app.post("/api-keys", tenanted(async (tenantId, req, reply) => {
     const parsed = ApiKeyInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    if (!mayGrantScopes(req.session?.role, parsed.data.scopes)) return reply.code(403).send({ error: "Only an owner can create a SCIM key." });
     const { key, secret } = await createApiKey(
       tenantId,
       { name: parsed.data.name, scopes: parsed.data.scopes },
