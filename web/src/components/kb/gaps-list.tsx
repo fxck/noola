@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { ArrowUpRight, Check, ChevronLeft, Copy, FileText, PenLine, RotateCcw, X } from "lucide-react";
+import { ArrowUpRight, Check, ChevronLeft, Copy, FileText, PenLine, RotateCcw, Sparkles, X } from "lucide-react";
 import {
   REVIEW_KIND_LABELS,
   isDocsGap,
@@ -14,6 +15,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { CollectionDot } from "./collection-common";
+import { GapDraftPanel } from "./gap-draft";
 
 // The KB's gap worklist: docs gaps grouped by the page to change, article gaps grouped by the collection to write into.
 
@@ -197,6 +199,7 @@ export function GapDetail({
   const article = articleId ? articles.find((a) => a.id === articleId) : undefined;
   const resolvedId = g.status === "resolved" ? g.resolvedArticleId : null;
   const resolvedBy = resolvedId ? articles.find((a) => a.id === resolvedId) : undefined;
+  const [drafting, setDrafting] = useState(false);
 
   return (
     <div className="mx-auto max-w-2xl p-4 sm:p-6">
@@ -264,6 +267,11 @@ export function GapDetail({
                 <Copy className="size-3.5" /> Copy suggestion
               </Button>
             )}
+            {!drafting && (
+              <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setDrafting(true)}>
+                <Sparkles className="size-3.5" /> Draft with AI
+              </Button>
+            )}
           </>
         )}
         {g.status !== "open" && (
@@ -282,6 +290,10 @@ export function GapDetail({
           </Button>
         )}
       </div>
+
+      {drafting && g.status === "open" && (
+        <GapDraftPanel gap={g} collections={collections} onClose={() => setDrafting(false)} />
+      )}
 
       <section className="mt-6 space-y-1.5">
         <h3 className="text-xs font-semibold text-muted-foreground">Suggestion</h3>

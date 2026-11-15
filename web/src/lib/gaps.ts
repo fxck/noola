@@ -88,3 +88,30 @@ export async function updateKnowledgeGap(
 ): Promise<{ gap: KnowledgeGap }> {
   return api(`/knowledge-gaps/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
 }
+
+/** For support_knowledge a help article in Markdown. For docs kinds, the title names the page and section to change. */
+export interface GapDraft {
+  title: string;
+  body: string;
+  /** What the team should confirm before the draft is published. */
+  openQuestions: string[];
+  model: string;
+}
+
+export const GAP_DRAFT_NOTES_MAX = 4000;
+/** The API takes this many earlier rounds per draft. */
+export const GAP_DRAFT_ROUNDS_MAX = 20;
+
+/** One round of drafting: the note the team sent and the open questions the draft came back with. */
+export interface GapDraftRound {
+  notes: string;
+  openQuestions: string[];
+}
+
+/** Takes 10 to 60 seconds. `rounds` holds the drafting so far, oldest first, and `previous` the draft it produced. */
+export async function draftGap(
+  id: string,
+  input: { notes?: string; rounds?: GapDraftRound[]; previous?: { title: string; body: string } },
+): Promise<GapDraft> {
+  return (await api<{ draft: GapDraft }>(`/knowledge-gaps/${id}/draft`, { method: "POST", body: JSON.stringify(input) })).draft;
+}

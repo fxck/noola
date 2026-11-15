@@ -1550,6 +1550,17 @@ export const KnowledgeGapUpdateInput = z.object({
   resolvedArticleId: z.guid().nullable().optional(),
 });
 export type KnowledgeGapUpdateInput = z.infer<typeof KnowledgeGapUpdateInput>;
+
+/** POST /knowledge-gaps/:id/draft: the new note, the earlier rounds of this drafting, oldest first, and the draft they produced. */
+export const GapDraftInput = z.object({
+  notes: z.string().max(4000).optional(),
+  rounds: z.array(z.object({
+    notes: z.string().max(4000),
+    openQuestions: z.array(z.string().max(500)).max(20),
+  })).max(20).optional(),
+  previous: z.object({ title: z.string().max(300), body: z.string().max(100000) }).optional(),
+});
+export type GapDraftInput = z.infer<typeof GapDraftInput>;
 export type AutomationAuthorInput = z.infer<typeof AutomationAuthorInput>;
 
 // ── Wave 4: conversational reach (multilingual + channel registry) ───────────
