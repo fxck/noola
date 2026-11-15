@@ -432,11 +432,11 @@ export const ParticipantInput = z.object({
 });
 export type ParticipantInput = z.infer<typeof ParticipantInput>;
 
-/** Add a sender to the blocklist (Settings manager). `handle` = an email address or bare domain;
+/** Add a sender to the blocklist (Settings manager). `handle` = an email address, a bare domain or an address with * wildcards;
  *  `scope` must agree (a 'domain' scope reduces a full address to its domain). */
 export const BlockSenderInput = z.object({
   handle: z.string().min(3).max(320),
-  scope: z.enum(["address", "domain"]).optional(),
+  scope: z.enum(["address", "domain", "pattern"]).optional(),
   channelType: z.string().max(32).optional(),
   reason: z.string().max(280).nullish(),
 });

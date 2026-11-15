@@ -7,8 +7,20 @@ import { withTenant } from "@repo/db";
 //   'domain'  → any local-part under the handle's domain (spam.example)
 // Handles are stored + compared lowercased. Keyed by channel_type so a blocked email address never
 // accidentally gags a same-string handle on another channel.
+//   'pattern' → an address with * wildcards (shop*@gmail.com), for senders that rotate numbered addresses
 
-export type BlockScope = "address" | "domain";
+export type BlockScope = "address" | "domain" | "pattern";
+
+// The LIKE pattern for a stored wildcard handle: LIKE's own wildcards are escaped and * matches anything.
+const PATTERN_LIKE = String.raw`replace(replace(replace(replace(lower(handle), '\', '\\'), '%', '\%'), '_', '\_'), '*', '%')`;
+
+/** True when the wildcards sit before a fixed domain, as in shop*@gmail.com. A pattern can't cover a whole TLD. */
+export function validPattern(pattern: string): boolean {
+  const at = pattern.lastIndexOf("@");
+  const local = pattern.slice(0, at);
+  const domain = pattern.slice(at + 1);
+  return at > 0 && local.includes("*") && /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain);
+}
 
 export interface BlockedSender {
   id: string;
@@ -39,7 +51,8 @@ export async function isSenderBlocked(tenantId: string, channelType: string, han
       `SELECT 1 FROM blocked_senders
         WHERE channel_type = $1
           AND ( (scope = 'address' AND lower(handle) = $2)
-             OR (scope = 'domain'  AND $3::text IS NOT NULL AND lower(handle) = $3) )
+             OR (scope = 'domain'  AND $3::text IS NOT NULL AND lower(handle) = $3)
+             OR (scope = 'pattern' AND $2 LIKE ${PATTERN_LIKE}) )
         LIMIT 1`,
       [channelType, lc, domain],
     );
@@ -53,7 +66,7 @@ function rowToBlocked(x: Record<string, unknown>): BlockedSender {
   return {
     id: x.id as string,
     channelType: x.channel_type as string,
-    scope: (x.scope === "domain" ? "domain" : "address"),
+    scope: x.scope === "domain" || x.scope === "pattern" ? x.scope : "address",
     handle: x.handle as string,
     reason: (x.reason as string | null) ?? null,
     createdBy: (x.created_by as string | null) ?? null,
@@ -76,10 +89,10 @@ export async function blockSender(
   input: { channelType?: string; scope?: BlockScope; handle: string; reason?: string | null; createdBy?: string | null },
 ): Promise<BlockedSender | null> {
   const channelType = input.channelType ?? "email";
-  const scope: BlockScope = input.scope === "domain" ? "domain" : "address";
+  const scope: BlockScope = input.scope === "domain" || input.scope === "pattern" ? input.scope : "address";
   let handle = input.handle.trim().toLowerCase();
   if (scope === "domain") handle = handleDomain(handle) ?? handle; // accept a full address, store the domain
-  if (!handle) return null;
+  if (!handle || (scope === "pattern" && !validPattern(handle))) return null;
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `INSERT INTO blocked_senders (tenant_id, channel_type, scope, handle, reason, created_by)

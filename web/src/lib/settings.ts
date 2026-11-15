@@ -661,13 +661,16 @@ export async function savePolicies(patch: TenantPoliciesPatch): Promise<TenantPo
 
 // ── Blocked senders (spam/block) ─────────────────────────────────────────────
 // The senders dropped before a ticket is ever created. "Mark as spam" adds entries here
-// automatically; admins can also manage the list by hand. A block is scoped to a single address
+// automatically; admins can also manage the list by hand. A block is scoped to a single address, a pattern
 // or a whole domain, per channel. Admin-only writes (a non-admin gets 403).
+
+/** `pattern` is an address with `*` wildcards, e.g. shop*@gmail.com. */
+export type BlockScope = "address" | "domain" | "pattern";
 
 export interface BlockedSender {
   id: string;
   channelType: string;
-  scope: "address" | "domain";
+  scope: BlockScope;
   handle: string;
   reason: string | null;
   createdBy: string | null;
@@ -680,7 +683,7 @@ export async function fetchBlocklist(): Promise<BlockedSender[]> {
 
 export async function addBlockedSender(input: {
   handle: string;
-  scope?: "address" | "domain";
+  scope?: BlockScope;
   channelType?: string;
   reason?: string | null;
 }): Promise<BlockedSender> {

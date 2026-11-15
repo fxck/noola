@@ -51,7 +51,7 @@ import {
   fetchSendingDomains, addSendingDomain, verifySendingDomain, deleteSendingDomain,
   type EmailProvider, type EmailProviderName, fetchEmailProvider, saveEmailProvider, rotateEmailProviderHandle, deleteEmailProvider,
   type EmailSenderSettings, fetchSenderMode, saveSenderMode,
-  type BlockedSender, fetchBlocklist, addBlockedSender, removeBlockedSender,
+  type BlockedSender, type BlockScope, fetchBlocklist, addBlockedSender, removeBlockedSender,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -1375,14 +1375,40 @@ function SendingDomainsSection({ isAdmin }: { isAdmin: boolean }) {
 }
 
 // ── Blocked senders ──────────────────────────────────────────────────────────
-// The senders dropped before a ticket is ever created — a single address or a whole domain. Populated
-// automatically by "Mark as spam" on a conversation, and manageable here by hand. Self-contained (own
-// state + fetch), gated to admins for writes like its sibling sections.
+// The senders dropped before a ticket is ever created: a single address, a wildcard pattern or a whole
+// domain. Populated automatically by "Mark as spam" on a conversation, and manageable here by hand.
+// Self-contained (own state + fetch), gated to admins for writes like its sibling sections.
+
+const BLOCK_SCOPES: BlockScope[] = ["address", "domain", "pattern"];
+
+const BLOCK_PLACEHOLDER: Record<BlockScope, string> = {
+  address: "spammer@example.com",
+  domain: "spammer.com",
+  pattern: "shop*@gmail.com",
+};
+
+/** A blocked handle as the list shows it, with the wildcards highlighted. */
+function BlockedHandle({ b }: { b: BlockedSender }) {
+  if (b.scope !== "pattern") return <>{b.handle}</>;
+  return (
+    <>
+      {b.handle.split(/(\*)/).map((part, i) =>
+        part === "*" ? (
+          <span key={i} className="font-semibold text-primary">
+            *
+          </span>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
 
 function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
   const [blocked, setBlocked] = useState<BlockedSender[] | null>(null);
   const [handle, setHandle] = useState("");
-  const [scope, setScope] = useState<"address" | "domain">("address");
+  const [scope, setScope] = useState<BlockScope>("address");
   const [reason, setReason] = useState("");
   const [adding, setAdding] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<BlockedSender | null>(null);
@@ -1407,7 +1433,11 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
     } catch (e) {
       const s = (e as { status?: number }).status;
       toast.error(
-        s === 403 ? "Only admins can manage blocked senders." : (e as { detail?: string }).detail || "Couldn't block that sender.",
+        s === 403
+          ? "Only admins can manage blocked senders."
+          : s === 400 && scope === "pattern"
+            ? "Not a valid pattern. Put * before a fixed domain, e.g. shop*@gmail.com"
+            : (e as { detail?: string }).detail || "Couldn't block that sender.",
       );
     } finally {
       setAdding(false);
@@ -1440,7 +1470,7 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
         <h2 className="text-sm font-semibold text-foreground">Blocked senders</h2>
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
-        Addresses and domains dropped before a ticket is ever created — no conversation, no lead, no
+        Addresses, domains and patterns dropped before a ticket is ever created: no conversation, no lead, no
         notification. Marking a conversation as spam adds its sender here automatically.
       </p>
 
@@ -1448,7 +1478,7 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
         {blocked.map((b) => (
           <div key={b.id} className="flex items-center gap-3 rounded-lg border px-4 py-3">
             <span className="min-w-0 flex-1 truncate font-mono text-sm text-foreground" title={b.handle}>
-              {b.handle}
+              <BlockedHandle b={b} />
             </span>
             <Badge variant="outline" className="shrink-0 capitalize">
               {b.scope}
@@ -1486,10 +1516,10 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
       {isAdmin && (
         <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="flex-1 space-y-1.5">
-            <Label htmlFor="block-handle">Address or domain</Label>
+            <Label htmlFor="block-handle">Address, domain or pattern</Label>
             <Input
               id="block-handle"
-              placeholder={scope === "domain" ? "spammer.com" : "spammer@example.com"}
+              placeholder={BLOCK_PLACEHOLDER[scope]}
               value={handle}
               onChange={(e) => setHandle(e.target.value)}
               onKeyDown={(e) => {
@@ -1497,8 +1527,8 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
               }}
             />
           </div>
-          <div className="grid grid-cols-2 gap-1.5">
-            {(["address", "domain"] as const).map((s) => (
+          <div className="grid grid-cols-3 gap-1.5">
+            {BLOCK_SCOPES.map((s) => (
               <button
                 key={s}
                 type="button"
@@ -1527,6 +1557,9 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
           </Button>
         </div>
       )}
+      {isAdmin && scope === "pattern" && (
+        <p className="mt-1.5 text-xs text-muted-foreground">Use * for any characters before the @, with a fixed domain, e.g. shop*@gmail.com</p>
+      )}
 
       <ConfirmDialog
         open={!!removeTarget}
@@ -1534,8 +1567,10 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
         message={
           removeTarget ? (
             <>
-              <span className="font-mono text-foreground">{removeTarget.handle}</span> will be able to reach the inbox again —
-              new messages will create tickets.
+              <span className="font-mono text-foreground">
+                <BlockedHandle b={removeTarget} />
+              </span>{" "}
+              will be able to reach the inbox again. New messages will create tickets.
             </>
           ) : undefined
         }

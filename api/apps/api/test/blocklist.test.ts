@@ -1,13 +1,13 @@
 import pg from "pg";
 
 // Sender blocklist + ticket-spam soft-hide. Exercises the enforcement lib (block/list/isBlocked/
-// unblock for both address + domain scopes), the inbound guard (a blocked sender drops to null before
+// unblock for address, domain and wildcard pattern scopes), the inbound guard (a blocked sender drops to null before
 // any ticket/lead), and the spam view filter (setTicketSpam hides a ticket from every view except the
 // dedicated Spam view, and unspam restores it). DB-backed, on the dedicated TestCo tenant.
 
 process.env.MODEL_KEY_SECRET = process.env.MODEL_KEY_SECRET || "test-model-key-secret-🔑";
 
-const { blockSender, listBlockedSenders, isSenderBlocked, unblockSender, unblockByHandle, handleDomain } =
+const { blockSender, listBlockedSenders, isSenderBlocked, unblockSender, unblockByHandle, handleDomain, validPattern } =
   await import("../src/blocklist.js");
 const { setTicketSpam, listTickets } = await import("../src/tickets.js");
 const { handleInboundEmail } = await import("../src/email.js");
@@ -82,6 +82,16 @@ async function main() {
       check("unblockSender by id returns true", gone === true);
       check("domain sender no longer blocked", !(await isSenderBlocked(A, "email", "whoever@junk.example")));
     }
+
+    // ---- wildcard patterns: * before a fixed domain ----
+    check("a pattern needs a * before a fixed domain", validPattern("shop*@gmail.com") && !validPattern("*@*.com") && !validPattern("shop*@*") && !validPattern("shop@gmail.com") && !validPattern("*shop*"));
+    check("an invalid pattern isn't stored", (await blockSender(A, { scope: "pattern", handle: "*@*.example" })) === null);
+    await blockSender(A, { scope: "pattern", handle: "Shop*@BlockTest.example" });
+    check("a pattern blocks the numbered addresses", await isSenderBlocked(A, "email", "shop17@blocktest.example"));
+    check("a pattern doesn't block other addresses", !(await isSenderBlocked(A, "email", "other@blocktest.example")));
+    await blockSender(A, { scope: "pattern", handle: "a_b*@blocktest.example" });
+    check("an underscore in a pattern is a plain character", !(await isSenderBlocked(A, "email", "axb1@blocktest.example")) && (await isSenderBlocked(A, "email", "a_b1@blocktest.example")));
+    await superPool.query("DELETE FROM blocked_senders WHERE tenant_id = $1 AND scope = 'pattern'", [A]);
 
     // ---- spam soft-hide: a ticket leaves every view except Spam, and unspam restores it ----
     const ticketId = await withTenant(A, async (c) => {
