@@ -1388,8 +1388,15 @@ const BLOCK_PLACEHOLDER: Record<BlockScope, string> = {
   pattern: "shop*@gmail.com",
 };
 
-/** A blocked handle as the list shows it, with the wildcards highlighted. */
+/** A blocked handle as the list shows it: wildcards highlighted, a widget block named as a chat user. */
 function BlockedHandle({ b }: { b: BlockedSender }) {
+  if (b.channelType === "widget")
+    return (
+      <>
+        <span className="font-sans text-muted-foreground">Chat user </span>
+        {b.handle}
+      </>
+    );
   if (b.scope !== "pattern") return <>{b.handle}</>;
   return (
     <>
@@ -1496,7 +1503,8 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
         Addresses, domains and patterns dropped before a ticket is ever created: no conversation, no lead, no
-        notification. Marking a conversation as spam adds its sender here automatically.
+        notification. Marking a conversation as spam adds its sender here automatically. Banned chat users can no
+        longer send chat messages.
       </p>
 
       {blockAfter != null && (
@@ -1545,7 +1553,7 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
               <BlockedHandle b={b} />
             </span>
             <Badge variant="outline" className="shrink-0 capitalize">
-              {b.scope}
+              {b.channelType === "widget" ? "chat ban" : b.scope}
             </Badge>
             {b.reason && (
               <span className="hidden min-w-0 max-w-[12rem] truncate text-xs text-muted-foreground sm:block" title={b.reason}>
@@ -1634,7 +1642,9 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
               <span className="font-mono text-foreground">
                 <BlockedHandle b={removeTarget} />
               </span>{" "}
-              will be able to reach the inbox again. New messages will create tickets.
+              {removeTarget.channelType === "widget"
+                ? "will be able to send chat messages again."
+                : "will be able to reach the inbox again. New messages will create tickets."}
             </>
           ) : undefined
         }

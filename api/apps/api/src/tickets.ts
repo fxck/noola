@@ -582,6 +582,10 @@ export async function setTicketSpam(
       if (channelType === "email") {
         const e = await c.query("SELECT NULLIF(email,'') AS h FROM contacts WHERE id = $1", [contactId]);
         senderHandle = e.rowCount ? ((e.rows[0].h as string | null) ?? null) : null;
+      } else if (channelType === "widget") {
+        // A widget conversation id changes with every conversation, so the block holds the visitor's user id, or their e-mail without one.
+        const e = await c.query("SELECT COALESCE(NULLIF(external_id,''), NULLIF(email,'')) AS h FROM contacts WHERE id = $1", [contactId]);
+        senderHandle = e.rowCount ? ((e.rows[0].h as string | null) ?? null) : null;
       } else {
         const idr = await c.query(
           "SELECT external_id FROM contact_identities WHERE contact_id = $1 AND channel_type = $2 ORDER BY created_at DESC LIMIT 1",

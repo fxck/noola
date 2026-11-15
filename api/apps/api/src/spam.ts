@@ -27,7 +27,8 @@ export async function markConversationSpam(
   let blocked: string | null = null;
   if (opts.block && out.senderHandle) {
     const row = await blockSender(tenantId, {
-      channelType: out.channelType, scope: opts.blockScope ?? "address", handle: out.senderHandle,
+      // Only an e-mail address has a domain worth blocking. A widget ban holds a user id or the visitor's own e-mail.
+      channelType: out.channelType, scope: out.channelType === "email" ? opts.blockScope ?? "address" : "address", handle: out.senderHandle,
       reason: "marked spam", createdBy: opts.actorId ?? null,
     }).catch(() => null);
     blocked = row?.handle ?? null;
@@ -78,6 +79,18 @@ async function announceRestoredTicket(tenantId: string, ticketId: string): Promi
   }
 }
 
+/** A widget ban can hold the visitor's e-mail from before they had a user id, so both are lifted. */
+async function senderHandles(
+  tenantId: string,
+  out: { channelType: string; contactId: string | null; senderHandle: string | null },
+): Promise<string[]> {
+  if (out.channelType !== "widget" || !out.contactId) return out.senderHandle ? [out.senderHandle] : [];
+  const r = await withTenant(tenantId, (c) =>
+    c.query("SELECT NULLIF(external_id, '') AS id, NULLIF(email, '') AS email FROM contacts WHERE id = $1", [out.contactId]),
+  );
+  return [r.rows[0]?.id, r.rows[0]?.email].filter((h): h is string => !!h);
+}
+
 /** The full reverse: un-hide the ticket, restore its lead, and remove the sender block. */
 export async function unmarkConversationSpam(tenantId: string, ticketId: string): Promise<{ ticketId: string } | null> {
   const out = await setTicketSpam(tenantId, ticketId, false);
@@ -85,7 +98,7 @@ export async function unmarkConversationSpam(tenantId: string, ticketId: string)
   // The spam check hid the ticket before the ticket.created automations, mirroring and webhooks saw it.
   if (out.wasAi) await announceRestoredTicket(tenantId, ticketId).catch(() => {});
   if (out.contactId) await setContactSpam(tenantId, out.contactId, false).catch(() => {});
-  if (out.senderHandle) await unblockByHandle(tenantId, out.channelType, out.senderHandle).catch(() => {});
+  for (const handle of await senderHandles(tenantId, out)) await unblockByHandle(tenantId, out.channelType, handle).catch(() => {});
 
   // Reopen the ops-mirror post on restore (best-effort, fire-and-forget) — the inverse of the spam hook.
   void import("./discord-mirror.js")

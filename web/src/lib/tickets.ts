@@ -619,7 +619,10 @@ export async function setTicketOpen(ticketId: string, open: boolean): Promise<vo
 }
 
 /** Mark a ticket as spam: hides it (into the Spam view), optionally blocks the sender (by address or
- *  whole domain) and drops the lead the ticket auto-created. All reversible via `unspamTicket`. */
+ *  whole domain) and drops the lead the ticket auto-created. All reversible via `unspamTicket`.
+ *  Outside email the server blocks the exact sender and ignores `blockScope`.
+ *  On a widget ticket that bans the visitor from the chat.
+ *  `blocked` can be set without `block` when the server blocks a repeat spammer by itself. */
 export async function markTicketSpam(
   ticketId: string,
   opts?: { block?: boolean; blockScope?: "address" | "domain"; dropLead?: boolean },

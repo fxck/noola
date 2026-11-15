@@ -1354,13 +1354,23 @@ export const WIDGET_JS = String.raw`(function () {
     if (!c.escalated && text) { streamAiAnswer(convId, body, unbusy); return; }
 
     fetch(API + '/public/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (r) { if (!r.ok) return httpError(r); return r.json(); })
       // Render nothing by hand — pull the persisted turn(s) from the server so the widget shows
       // exactly what the agent console shows (single source of truth, no duplicate/again bubbles).
       .then(function () { hydrateThread(convId); })
-      .catch(function () { appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); })
+      .catch(function (e) { appendMsg(convId, { role: 'ai', body: failText(e), at: Date.now() }); })
       .finally(unbusy);
   }
+
+  // A failed request, carrying the server's message when the team banned this visitor from the chat.
+  function httpError(r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      var e = new Error('HTTP ' + r.status);
+      if (j && j.error === 'chat_unavailable') e.userMessage = j.message;
+      throw e;
+    });
+  }
+  function failText(e) { return (e && e.userMessage) || 'Sorry — something went wrong. Please try again.'; }
 
   // ---- SSE streaming of the AI answer -------------------------------------
   // Read a POST Server-Sent-Events response frame-by-frame. Handlers: onEvent(name,data) per SSE
@@ -1368,7 +1378,7 @@ export const WIDGET_JS = String.raw`(function () {
   function streamSSE(url, body, h) {
     fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
       .then(function (res) {
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!res.ok) return httpError(res);
         var ct = res.headers.get('content-type') || '';
         if (ct.indexOf('text/event-stream') === -1) {
           return res.json().then(function (j) { if (h.onJson) h.onJson(j); }).catch(function () { if (h.onError) h.onError(); });
@@ -1456,19 +1466,19 @@ export const WIDGET_JS = String.raw`(function () {
       hydrateThread(convId);                       // after a handoff this shows the human queue
       if (done) done();
     }
-    function fail() {
+    function fail(e) {
       if (doneCalled) return; doneCalled = true; streamingConv = null;
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking);
       if (acc) { if (bubble) { bubble.classList.remove('streaming'); bubble.innerHTML = md(acc); } commit(null); }
-      else { if (bubbleRow && bubbleRow.parentNode) bubbleRow.parentNode.removeChild(bubbleRow); appendMsg(convId, { role: 'ai', body: 'Sorry — something went wrong. Please try again.', at: Date.now() }); }
+      else { if (bubbleRow && bubbleRow.parentNode) bubbleRow.parentNode.removeChild(bubbleRow); appendMsg(convId, { role: 'ai', body: failText(e), at: Date.now() }); }
       if (done) done();
     }
     streamSSE(API + '/public/ask/stream', body, {
       onEvent: function (event, data) {
         if (event === 'delta') { if (data && data.t) onDelta(data.t); }
         else if (event === 'done') { if (data && !data.messageId && (data.quiet || data.handoff)) drop(); else finish(data && data.messageId); }
-        else if (event === 'error') fail();
+        else if (event === 'error') fail(null);
       },
       onJson: function () { streamingConv = null; if (thinking && thinking.parentNode) thinking.parentNode.removeChild(thinking); hydrateThread(convId); if (done) done(); },
       onError: fail

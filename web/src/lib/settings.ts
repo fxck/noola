@@ -669,6 +669,7 @@ export type BlockScope = "address" | "domain" | "pattern";
 
 export interface BlockedSender {
   id: string;
+  /** On `widget` the handle is the banned visitor's user id, or their e-mail when they have none. */
   channelType: string;
   scope: BlockScope;
   handle: string;

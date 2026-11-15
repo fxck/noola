@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Ticket } from "@/lib/tickets";
 import { markTicketSpam } from "@/lib/tickets";
 import { FormDialog } from "@/components/ui/form-dialog";
@@ -23,6 +23,7 @@ function domainOf(address: string): string | null {
 /**
  * The "Mark as spam" confirm dialog: hides the ticket, optionally blocks the sender (by exact
  * address or their whole domain) and drops the auto-created lead — all reversible from the Spam view.
+ * On a widget ticket the block is a ban of the visitor's user from the chat.
  */
 export function SpamDialog({
   ticket,
@@ -35,8 +36,15 @@ export function SpamDialog({
   onClose: () => void;
   onSpammed: () => void;
 }) {
-  const [block, setBlock] = useState(true);
+  const isWidget = ticket.channel_type === "widget";
+  const [block, setBlock] = useState(!isWidget);
   const [blockScope, setBlockScope] = useState<"address" | "domain">("address");
+  // The dialog stays mounted across tickets, so each open starts from the defaults for this channel.
+  useEffect(() => {
+    if (!open) return;
+    setBlock(!isWidget);
+    setBlockScope("address");
+  }, [open, isWidget]);
   const [dropLead, setDropLead] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -46,8 +54,20 @@ export function SpamDialog({
   async function onConfirm() {
     setBusy(true);
     try {
-      await markTicketSpam(ticket.id, { block, blockScope, dropLead });
-      toast.success("Marked as spam");
+      const r = await markTicketSpam(ticket.id, isWidget ? { block, dropLead } : { block, blockScope, dropLead });
+      if (block && !r.blocked)
+        toast.info(
+          isWidget
+            ? "Marked as spam. This visitor has no account or e-mail to ban."
+            : "Marked as spam. There is no sender address to block.",
+        );
+      else toast.success("Marked as spam");
+      if (r.blocked && !block)
+        toast.info(
+          isWidget
+            ? "This user was banned from the chat automatically after repeated spam."
+            : `${r.blocked} was blocked automatically after repeated spam.`,
+        );
       onSpammed();
       onClose();
     } catch {
@@ -61,7 +81,11 @@ export function SpamDialog({
     <FormDialog
       open={open}
       title="Mark as spam"
-      description="Hides this conversation, blocks the sender, and removes the lead it created. Everything here is reversible from the Spam view."
+      description={
+        isWidget
+          ? "Hides this conversation and removes the lead it created. Everything here is reversible from the Spam view."
+          : "Hides this conversation, blocks the sender, and removes the lead it created. Everything here is reversible from the Spam view."
+      }
       onClose={onClose}
       onSubmit={() => void onConfirm()}
       submitLabel="Mark as spam"
@@ -74,43 +98,55 @@ export function SpamDialog({
           </p>
         )}
 
-        {/* Block the sender + scope */}
-        <div className="space-y-2">
+        {isWidget ? (
           <label className="flex cursor-pointer items-start gap-2.5">
             <Checkbox checked={block} onCheckedChange={setBlock} className="mt-0.5" />
             <span className="min-w-0">
-              <span className="block text-sm font-medium text-foreground">Block this sender</span>
+              <span className="block text-sm font-medium text-foreground">Ban this user from the chat</span>
               <span className="block text-xs text-muted-foreground">
-                Future messages from them are dropped before a ticket is ever created.
+                They can no longer send chat messages. Their account itself is not banned.
               </span>
             </span>
           </label>
+        ) : (
+          /* Block the sender + scope */
+          <div className="space-y-2">
+            <label className="flex cursor-pointer items-start gap-2.5">
+              <Checkbox checked={block} onCheckedChange={setBlock} className="mt-0.5" />
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-foreground">Block this sender</span>
+                <span className="block text-xs text-muted-foreground">
+                  Future messages from them are dropped before a ticket is ever created.
+                </span>
+              </span>
+            </label>
 
-          {block && (
-            <div className="ml-6 grid gap-1.5 sm:grid-cols-2">
-              {(["address", "domain"] as const).map((s) => {
-                const label = s === "address" ? "This address" : "The whole domain";
-                const value = s === "address" ? address : domain;
-                return (
-                  <button
-                    key={s}
-                    type="button"
-                    onClick={() => setBlockScope(s)}
-                    className={cn(
-                      "rounded-lg border px-3 py-2 text-left transition-colors",
-                      blockScope === s ? "border-primary bg-primary/5" : "text-muted-foreground hover:bg-muted",
-                    )}
-                  >
-                    <span className="block text-xs font-medium text-foreground">{label}</span>
-                    <span className="block truncate font-mono text-micro text-muted-foreground" title={value ?? undefined}>
-                      {value ?? "—"}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
+            {block && (
+              <div className="ml-6 grid gap-1.5 sm:grid-cols-2">
+                {(["address", "domain"] as const).map((s) => {
+                  const label = s === "address" ? "This address" : "The whole domain";
+                  const value = s === "address" ? address : domain;
+                  return (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => setBlockScope(s)}
+                      className={cn(
+                        "rounded-lg border px-3 py-2 text-left transition-colors",
+                        blockScope === s ? "border-primary bg-primary/5" : "text-muted-foreground hover:bg-muted",
+                      )}
+                    >
+                      <span className="block text-xs font-medium text-foreground">{label}</span>
+                      <span className="block truncate font-mono text-micro text-muted-foreground" title={value ?? undefined}>
+                        {value ?? "—"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Drop the auto-created lead */}
         <label className="flex cursor-pointer items-start gap-2.5">
