@@ -66,6 +66,7 @@
     "test:reply-all-cc": "tsx apps/api/test/reply-all-cc.test.ts",
     "test:blocklist": "tsx apps/api/test/blocklist.test.ts",
     "test:spam-detection": "tsx apps/api/test/spam-detection.test.ts",
+    "test:gap-review": "tsx apps/api/test/gap-review.test.ts",
     "test:participants": "tsx apps/api/test/participants.test.ts",
     "test:resend-inbound": "tsx apps/api/test/resend-inbound.test.ts",
     "test:sendgrid-inbound": "tsx apps/api/test/sendgrid-inbound.test.ts",

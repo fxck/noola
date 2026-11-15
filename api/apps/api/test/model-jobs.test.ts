@@ -125,7 +125,6 @@ async function main() {
     globalThis.fetch = realFetch;
     await putModelConfig(A, { provider: "managed" });
     await superPool.query("DELETE FROM draft_traces WHERE tenant_id = $1 AND query = $2", [A, QUERY]);
-    await superPool.query("DELETE FROM knowledge_gaps WHERE tenant_id = $1 AND question = $2", [A, QUERY]);
     await superPool.end();
   }
 

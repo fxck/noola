@@ -3,8 +3,11 @@ import { api, type ApiError } from "@/lib/api";
 // The admin AI trace viewer: what the model wrote for each draft on a ticket and what Noola did with it.
 // Traces hold customer text and raw model output, so the server answers only admins and owners.
 
-/** A spam check traces one checked email: `query` is the email, `draft` the raw answer, the gate the verdict. */
-export type TraceKind = "draft" | "spam_check";
+/**
+ * A spam check traces one checked email: `query` is the email, `draft` the raw answer, the gate the verdict.
+ * A gap review traces one closed conversation: `draft` is the review as JSON, the gate the conversation kind and "N gaps".
+ */
+export type TraceKind = "draft" | "spam_check" | "gap_review";
 
 export interface TraceSummary {
   id: string;
@@ -88,7 +91,7 @@ export async function fetchTicketTraces(ticketId: string): Promise<TraceSummary[
 }
 
 /** What Noola did with a draft, as the workspace list filters it. Mirrors TRACE_CATEGORIES on the server. */
-export type TraceCategory = "sent" | "held" | "note_only" | "no_reply" | "handoff" | "no_sources" | "no_decision" | "spam_check";
+export type TraceCategory = "sent" | "held" | "note_only" | "no_reply" | "handoff" | "no_sources" | "no_decision" | "spam_check" | "gap_review";
 
 export const TRACE_CATEGORIES: { value: TraceCategory; label: string }[] = [
   { value: "sent", label: "Sent a reply" },
@@ -99,6 +102,7 @@ export const TRACE_CATEGORIES: { value: TraceCategory; label: string }[] = [
   { value: "no_sources", label: "No sources found" },
   { value: "no_decision", label: "No decision recorded" },
   { value: "spam_check", label: "Spam checks" },
+  { value: "gap_review", label: "Gap reviews" },
 ];
 
 export function isTraceCategory(v: unknown): v is TraceCategory {
@@ -172,6 +176,18 @@ const SPAM_VERDICTS: Record<string, { label: string; tone: TraceTone }> = {
 /** A spam check's verdict, from its gate outcome. */
 export function spamVerdictLabel(outcome: string | null): { label: string; tone: TraceTone } {
   return (outcome && SPAM_VERDICTS[outcome]) || { label: outcome ?? "No verdict", tone: "none" };
+}
+
+const CONVERSATION_KINDS: Record<string, string> = {
+  questions: "Has questions",
+  account_issue: "Account issue",
+  feedback: "Feedback",
+  no_question: "No question",
+};
+
+/** A gap review's conversation kind, from its gate outcome. */
+export function gapConversationLabel(outcome: string | null): string {
+  return (outcome && CONVERSATION_KINDS[outcome]) || outcome || "Not reviewed";
 }
 
 /** A short plain-English label for a gate or decision outcome, with the tone to show it in. */

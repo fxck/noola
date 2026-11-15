@@ -122,6 +122,10 @@ export interface CompleteOptions {
   rejectTruncated?: boolean;
   /** Receives the token counts that the provider reports, for a caller that traces the call. */
   onUsage?: (usage: { tokensIn: number | null; tokensOut: number | null }) => void;
+  /** How long the call may take, 25 seconds unless set. Background jobs that nobody waits for can allow more. */
+  timeoutMs?: number;
+  /** The output limit for a model that does not think, where the default fits a support reply. Thinking models keep theirs. */
+  maxTokens?: number;
 }
 
 // Business-risk classification for the autoreply gate — a deterministic backstop
@@ -393,11 +397,11 @@ export class HttpChatModelDriver implements ModelServingDriver {
 
   // OpenAI's reasoning models, the only ones that take a thinking level, reject max_tokens and a set temperature.
   // A custom OpenAI-compatible endpoint never gets a level, as its support for one is unknown.
-  private openaiLimits(): Record<string, unknown> {
+  private openaiLimits(maxTokens?: number): Record<string, unknown> {
     if (this.effort && this.opts.provider === "openai") {
-      return { max_completion_tokens: REASONING_MAX_TOKENS, reasoning_effort: this.effort };
+      return { max_completion_tokens: Math.max(REASONING_MAX_TOKENS, maxTokens ?? 0), reasoning_effort: this.effort };
     }
-    return { max_tokens: DRAFT_MAX_TOKENS, temperature: 0.3 };
+    return { max_tokens: maxTokens ?? DRAFT_MAX_TOKENS, temperature: 0.3 };
   }
 
   classifyWhoseTurn(input: WhoseTurnInput): Promise<WhoseTurn> {
@@ -459,12 +463,12 @@ export class HttpChatModelDriver implements ModelServingDriver {
    *  no source-grounding system prompt (the caller owns the whole prompt). */
   async complete(system: string, user: string, opts: CompleteOptions = {}): Promise<string> {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 25_000);
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 25_000);
     try {
       const r =
         this.opts.provider === "anthropic"
           ? await this.anthropic(system, user, undefined, ctrl.signal)
-          : await this.openaiCompatible(system, user, undefined, ctrl.signal);
+          : await this.openaiCompatible(system, user, undefined, ctrl.signal, opts.maxTokens);
       opts.onUsage?.({ tokensIn: r.tokensIn ?? null, tokensOut: r.tokensOut ?? null });
       if (opts.rejectTruncated && r.truncated) throw new Error("completion stopped at the output limit");
       return r.text.trim();
@@ -506,6 +510,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
     user: string,
     images: DraftImage[] | undefined,
     signal: AbortSignal,
+    maxTokens?: number,
   ): Promise<{ text: string; tokensIn?: number; tokensOut?: number; truncated: boolean }> {
     const res = await fetch(`${this.base()}/chat/completions`, {
       method: "POST",
@@ -513,7 +518,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
       headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.apiKey}` },
       body: JSON.stringify({
         model: this.opts.model,
-        ...this.openaiLimits(),
+        ...this.openaiLimits(maxTokens),
         messages: [
           { role: "system", content: system },
           { role: "user", content: openaiUserContent(user, images) },

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { spamVerdictLabel, traceOutcomeLabel, type TraceSummary, type TraceTone } from "@/lib/traces";
+import { gapConversationLabel, spamVerdictLabel, traceOutcomeLabel, type TraceSummary, type TraceTone } from "@/lib/traces";
 import { relativeTime } from "@/lib/tickets";
 import { shortModel } from "@/lib/model-cost";
 import { compactNum, fmtMs } from "@/components/live/nerd-stats";
@@ -38,13 +38,19 @@ export function TraceList({
       <tbody>
         {traces.map((t) => {
           const spamCheck = t.kind === "spam_check";
+          const gapReview = t.kind === "gap_review";
           const verdict = spamCheck ? spamVerdictLabel(t.gateOutcome) : null;
           // A draft that found no sources has no gate decision, so the filter's label comes from the model.
           const { label, tone } = verdict
             ? { label: `Spam check: ${verdict.label}`, tone: verdict.tone }
-            : t.model === "grounding-guard"
-              ? { label: "No sources found", tone: "held" as const }
-              : traceOutcomeLabel(t.gateOutcome, t.gateReason);
+            : gapReview
+              ? {
+                  label: `Gap review: ${t.gateOutcome === "questions" && t.gateReason ? t.gateReason : gapConversationLabel(t.gateOutcome)}`,
+                  tone: "none" as const,
+                }
+              : t.model === "grounding-guard"
+                ? { label: "No sources found", tone: "held" as const }
+                : traceOutcomeLabel(t.gateOutcome, t.gateReason);
           const lines = t.query.split("\n");
           // A spam check's query opens with a From line, so the subject says more.
           const subject = spamCheck ? lines.find((l) => l.startsWith("Subject:"))?.slice(8).trim() : undefined;
@@ -73,7 +79,7 @@ export function TraceList({
               </td>
               <td className={cn("whitespace-nowrap px-3 py-2 align-top", TONE[tone])}>
                 {label}
-                {t.sourceCount === 0 && t.model !== "grounding-guard" && !spamCheck && <span className="text-muted-foreground"> · no sources</span>}
+                {t.sourceCount === 0 && t.model !== "grounding-guard" && !spamCheck && !gapReview && <span className="text-muted-foreground"> · no sources</span>}
               </td>
               <td className={cn(WIDE, "max-w-40 truncate px-3 py-2 align-top font-mono text-xs text-muted-foreground")} title={t.model}>
                 {shortModel(t.model)}{t.effort && ` · ${t.effort}`}

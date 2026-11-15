@@ -21,6 +21,7 @@ import { backfillSeedFlows } from "./seedflows.js";
 import { runScheduledAutomations } from "./automations.js";
 import { detectSlaBreaches } from "./sla.js";
 import { runScheduledSourceRefresh } from "./sources.js";
+import { runGapReviewSweep } from "./gaps.js";
 import { wakeSnoozedTickets } from "./tickets.js";
 import { runBroadcastScheduler } from "./broadcast-scheduler.js";
 import { runZeropsCatalogScheduler } from "./zerops-catalog.js";
@@ -497,6 +498,8 @@ setInterval(() => void detectSlaBreaches(app.log), 60_000);
 // elapsed (across all tenants), so a docs URL / repo stays live in the KB. Overlap-guarded; a
 // per-source failure never stops the sweep; no-op when no source has a refresh interval set.
 setInterval(() => void runScheduledSourceRefresh(app.log), 60_000);
+// Closed conversations are reviewed for knowledge gaps in the workspaces that switched it on.
+setInterval(() => void runGapReviewSweep(app.log), 60_000);
 // Snooze wake: every minute, resurface snoozed tickets whose wake time has passed (clear the flag,
 // flip whose_turn to 'us'). Cross-tenant; overlap-guarded; no-op when nothing is due.
 setInterval(() => void wakeSnoozedTickets(app.log), 60_000);

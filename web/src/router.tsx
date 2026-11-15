@@ -39,6 +39,7 @@ import { SettingsAutoreplyPage } from "@/routes/settings-autoreply";
 import { SettingsTranslationPage } from "@/routes/settings-translation";
 import { SettingsDocsSearchPage } from "@/routes/settings-docs-search";
 import { SettingsSpamPage } from "@/routes/settings-spam";
+import { SettingsGapsPage } from "@/routes/settings-gaps";
 import { SettingsTagRulesPage } from "@/routes/settings-tag-rules";
 import { SettingsClassificationPage } from "@/routes/settings-classification";
 import { SettingsDiscordMirrorPage } from "@/routes/settings-discord-mirror";
@@ -225,9 +226,8 @@ const kbRoute = createRoute({
 const kbNewRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/kb/new",
-  // Carries the active collection so a new article defaults into it, and —
-  // when seeded from a knowledge gap — the gap's question (title prefill) +
-  // gap id (auto-resolved once the article saves).
+  // Carries the active collection, so a new article defaults into it.
+  // From a knowledge gap it also carries the suggested title and the gap id, which resolves once the article saves.
   validateSearch: (
     search: Record<string, unknown>,
   ): { collection?: string; title?: string; gap?: string } => ({
@@ -550,6 +550,15 @@ const settingsSpamRoute = createRoute({
   component: SettingsSpamPage,
 });
 
+const settingsGapsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/gaps",
+  beforeLoad: ({ context }) => {
+    if (!context.auth.isAuthed) throw redirect({ to: "/login" });
+  },
+  component: SettingsGapsPage,
+});
+
 const settingsTagRulesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/tag-rules",
@@ -817,6 +826,7 @@ const routeTree = rootRoute.addChildren([
   settingsTranslationRoute,
   settingsDocsSearchRoute,
   settingsSpamRoute,
+  settingsGapsRoute,
   settingsTagRulesRoute,
   settingsClassificationRoute,
   settingsDiscordMirrorRoute,
