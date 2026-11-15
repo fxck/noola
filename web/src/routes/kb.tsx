@@ -1531,6 +1531,12 @@ export function ArticleEditor({
               options={(["internal", "ai", "public"] as const).map((v) => ({ value: v, label: VISIBILITY_LABEL[v] }))}
             />
             <p className="text-xs text-muted-foreground">{metaHint}</p>
+            {visibility === "ai" && (
+              <p className="flex gap-1.5 text-xs text-warning">
+                <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
+                Customers can see its title and first lines when an answer cites it.
+              </p>
+            )}
             {language?.canTranslate && body.trim() && (
               <Button
                 variant="outline"
