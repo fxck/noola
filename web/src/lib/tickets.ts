@@ -89,6 +89,17 @@ export async function fetchUnreadTicketIds(): Promise<string[]> {
   return (await api<{ ids: string[] }>("/tickets/unread")).ids;
 }
 
+export interface UnreadCounts {
+  /** Per inbox lane for the current agent, Spam included. Closed is always 0. */
+  counts: Record<ViewKey, number>;
+  /** Per team id, the unread count of that team's lane. */
+  teams: Record<string, number>;
+}
+
+export async function fetchUnreadCounts(): Promise<UnreadCounts> {
+  return api<UnreadCounts>("/tickets/unread-counts");
+}
+
 /** Mark a ticket read for the current agent (on open). Best-effort. */
 export async function markTicketRead(id: string): Promise<void> {
   await api(`/tickets/${id}/read`, { method: "POST" });

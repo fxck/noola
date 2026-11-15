@@ -37,6 +37,7 @@ function ViewItem({
   icon: Icon,
   leading,
   count,
+  unread = 0,
   active,
   emphasize,
   onClick,
@@ -47,6 +48,8 @@ function ViewItem({
   /** Non-icon identity mark (team emoji / hue dot) — used when `icon` is absent. */
   leading?: ReactNode;
   count: number;
+  /** Unread conversations in the lane - when above 0 it replaces the muted total. */
+  unread?: number;
   active: boolean;
   emphasize?: boolean;
   onClick: () => void;
@@ -79,16 +82,26 @@ function ViewItem({
         leading
       )}
       <span className={cn("truncate", chip ? "" : "min-w-0 flex-1 text-left")}>{label}</span>
-      {/* Quiet count — plain tabular text, no pill (STRUCTURE.md §4). */}
-      {count > 0 && (
+      {/* Unread is the one highlighted pill. The total stays quiet tabular text (STRUCTURE.md §4). */}
+      {unread > 0 ? (
         <span
-          className={cn(
-            "ml-1 shrink-0 text-xs tabular-nums",
-            emphasize ? "font-medium text-warning" : "text-muted-foreground",
-          )}
+          className="ml-1 shrink-0 rounded-full bg-primary px-1.5 text-micro font-semibold leading-4 tabular-nums text-primary-foreground"
+          title={`${unread} unread`}
+          aria-label={`${unread} unread`}
         >
-          {count}
+          {unread}
         </span>
+      ) : (
+        count > 0 && (
+          <span
+            className={cn(
+              "ml-1 shrink-0 text-xs tabular-nums",
+              emphasize ? "font-medium text-warning" : "text-muted-foreground",
+            )}
+          >
+            {count}
+          </span>
+        )
       )}
     </button>
   );
@@ -102,19 +115,25 @@ function ViewItem({
 export function ViewsRail({
   view,
   counts,
+  unread = {},
   onSelect,
   teams = [],
   teamCounts = {},
+  teamUnread = {},
   activeTeamId = null,
   onSelectTeam,
 }: {
   view: ViewKey;
   counts: Record<ViewKey, number>;
+  /** Unread conversations per lane for the current agent. */
+  unread?: Partial<Record<ViewKey, number>>;
   onSelect: (v: ViewKey) => void;
   /** Team lanes ([] / omitted = no Teams section at all). */
   teams?: Team[];
   /** Open-ticket count per team id, live from the fetched rows. */
   teamCounts?: Record<string, number>;
+  /** Unread conversations per team id. */
+  teamUnread?: Record<string, number>;
   activeTeamId?: string | null;
   onSelectTeam?: (teamId: string) => void;
 }) {
@@ -130,6 +149,7 @@ export function ViewsRail({
             label={v.label}
             icon={v.icon}
             count={counts[v.key]}
+            unread={unread[v.key]}
             active={view === v.key && !activeTeamId}
             emphasize={v.key === "needs_reply" || v.key === "approval"}
             onClick={() => onSelect(v.key)}
@@ -146,6 +166,7 @@ export function ViewsRail({
                 label={team.name}
                 leading={<TeamMark team={team} />}
                 count={teamCounts[team.id] ?? 0}
+                unread={teamUnread[team.id]}
                 active={activeTeamId === team.id}
                 onClick={() => onSelectTeam?.(team.id)}
               />
@@ -162,17 +183,21 @@ export function ViewsRail({
 export function ViewsChips({
   view,
   counts,
+  unread = {},
   onSelect,
   teams = [],
   teamCounts = {},
+  teamUnread = {},
   activeTeamId = null,
   onSelectTeam,
 }: {
   view: ViewKey;
   counts: Record<ViewKey, number>;
+  unread?: Partial<Record<ViewKey, number>>;
   onSelect: (v: ViewKey) => void;
   teams?: Team[];
   teamCounts?: Record<string, number>;
+  teamUnread?: Record<string, number>;
   activeTeamId?: string | null;
   onSelectTeam?: (teamId: string) => void;
 }) {
@@ -185,6 +210,7 @@ export function ViewsChips({
           label={v.label}
           icon={v.icon}
           count={counts[v.key]}
+          unread={unread[v.key]}
           active={view === v.key && !activeTeamId}
           emphasize={v.key === "needs_reply" || v.key === "approval"}
           onClick={() => onSelect(v.key)}
@@ -197,6 +223,7 @@ export function ViewsChips({
           label={team.name}
           leading={<TeamMark team={team} />}
           count={teamCounts[team.id] ?? 0}
+          unread={teamUnread[team.id]}
           active={activeTeamId === team.id}
           onClick={() => onSelectTeam?.(team.id)}
         />

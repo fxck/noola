@@ -11,7 +11,8 @@ import {
   snoozeTicket, mergeTicket, TICKET_PRIORITIES, viewFilter, tableFilter,
   type View, type TicketQuery, type TicketPriority, type TicketRow, type TicketFilter,
 } from "../tickets.js";
-import { markTicketRead, markTicketsRead, unreadTicketIds } from "../reads.js";
+import { markTicketRead, markTicketsRead, unreadCounts, unreadTicketIds } from "../reads.js";
+import { listTeams } from "../teams.js";
 import { listLinks, linkTickets, unlinkTickets } from "../links.js";
 import { summarizeTicket } from "../summarize.js";
 import { draftArticleFromTicket } from "../article.js";
@@ -83,6 +84,23 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     const userId = req.session?.userId;
     if (!userId) return reply.code(400).send({ error: "missing tenant" });
     return { ids: await unreadTicketIds(tenantId, userId) };
+  }));
+
+  // Unread conversations per inbox lane, Spam included, and per team lane, for the sidebar.
+  // Closed has no count, as its list has no unread dots to clear it with.
+  app.get("/tickets/unread-counts", tenanted(async (tenantId, req, reply) => {
+    const userId = req.session?.userId;
+    if (!userId) return reply.code(400).send({ error: "missing tenant" });
+    const lane = (view: View) => inboxLaneFilter(view, userId);
+    const teams = await listTeams(tenantId);
+    const [counts, teamCounts] = await Promise.all([
+      unreadCounts(tenantId, userId, {
+        all: lane("all"), needs_reply: lane("needs_reply"), approval: lane("approval"), unassigned: lane("unassigned"),
+        my: lane("my"), closed: null, spam: lane("spam"), outbound: lane("outbound"),
+      }),
+      unreadCounts(tenantId, userId, Object.fromEntries(teams.map((t) => [t.id, inboxLaneFilter("all", userId, t.id)]))),
+    ]);
+    return { counts, teams: teamCounts };
   }));
 
   app.post("/tickets/:id/read", tenanted(async (tenantId, req, reply) => {
