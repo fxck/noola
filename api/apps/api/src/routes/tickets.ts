@@ -48,6 +48,12 @@ function inboxLaneFilter(view: View, userId: string, teamId?: string): TicketFil
   return all && { ...all, where: `${all.where} AND t.whose_turn = 'us'` };
 }
 
+/** Narrows the Spam lane to one kind. A spam mark without a kind is spam. */
+function withSpamKind(filter: TicketFilter | null, kind: "spam" | "outreach" | undefined): TicketFilter | null {
+  if (!filter || !kind) return filter;
+  return { ...filter, where: `${filter.where} AND COALESCE(t.spam_kind, 'spam') = $${filter.params.length + 1}`, params: [...filter.params, kind] };
+}
+
 // The core inbox/ticket surfaces: the list (Views + deep-table), per-agent unread, snooze, merge,
 // related links, thread summarize / draft-article, detail, patch (priority/tags/type), the agent
 // picker, assign, close/reopen (with survey + knowledge-index side effects), and the message thread.
@@ -118,7 +124,7 @@ export default async function ticketRoutes(app: FastifyInstance): Promise<void> 
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     const input = parsed.data;
     const filter = input.scope === "view"
-      ? inboxLaneFilter(input.view, userId, input.teamId)
+      ? withSpamKind(inboxLaneFilter(input.view, userId, input.teamId), input.view === "spam" ? input.spamKind : undefined)
       : tableFilter({
           ...tableStatus(input.status),
           priority: input.priority?.length ? input.priority : undefined,

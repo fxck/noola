@@ -610,7 +610,7 @@ export async function getContainment(tenantId: string, weeks = 8): Promise<Conta
       `SELECT week, sum(n)::int AS n FROM (
          SELECT to_char(date_trunc('week', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week, count(*) AS n
            FROM draft_traces
-          WHERE source = 'live' AND ticket_id IS NULL
+          WHERE kind = 'draft' AND source = 'live' AND ticket_id IS NULL
             AND created_at > now() - make_interval(weeks => $1)
           GROUP BY 1
          UNION ALL

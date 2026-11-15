@@ -2,6 +2,7 @@ import { withTenant } from "@repo/db";
 import { EVENT_TYPES } from "@repo/contracts";
 import { modelDriver } from "./model.js";
 import { resolveContactForInbound } from "./contacts.js";
+import type { SpamMark } from "./spam-check.js";
 
 export interface IngestInput {
   tenantId: string;
@@ -64,6 +65,8 @@ export interface IngestInput {
   deferMirror?: boolean;
   /** Stored on the new message, e.g. the support address an inbound e-mail was sent to. */
   meta?: Record<string, unknown>;
+  /** The spam check's verdict, which hides a ticket that this message creates. */
+  spam?: SpamMark | null;
 }
 
 export interface IngestResult {
@@ -79,6 +82,8 @@ export interface IngestResult {
   contactId: string | null;
   /** True when THIS ingest created a brand-new ticket (drives the ticket.created webhook). */
   ticketCreated: boolean;
+  /** True when the ticket is hidden as spam, so nothing reacts to the message. */
+  spam: boolean;
 }
 
 /**
@@ -118,6 +123,7 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
           channelType: r.channel_type, externalChannelId: r.external_channel_id,
           contactId: r.contact_id ?? null,
           ticketCreated: false,
+          spam: false,
         };
       }
     }
@@ -219,19 +225,37 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
       // §5.7 carve-out: a Discord thread-ticket (external_thread_id set) is never swept into a
       // contact-unified email/widget conversation, and vice-versa.
       const open = await c.query(
-        "SELECT id, subject FROM tickets WHERE contact_id = $1 AND status = 'open' AND external_thread_id IS NULL ORDER BY updated_at DESC LIMIT 1",
+        // A ticket that the AI hid takes no follow-ups, so the spam check judges each new email.
+        `SELECT id, subject FROM tickets
+          WHERE contact_id = $1 AND status = 'open' AND external_thread_id IS NULL AND spam_source IS DISTINCT FROM 'ai'
+          ORDER BY updated_at DESC LIMIT 1`,
         [contactId],
       );
       if (open.rowCount) {
         ticketId = open.rows[0].id;
         subject = open.rows[0].subject;
       } else {
+        const spam = isCustomer ? input.spam ?? null : null;
         const ins = await c.query(
-          "INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id) VALUES (current_tenant(), $1, $2, $3, $4) RETURNING id",
-          [subject, channelType, input.externalChannelId ?? null, contactId],
+          `INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id, spam_at, spam_source, spam_kind, spam_reason)
+           VALUES (current_tenant(), $1, $2, $3, $4, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END, CASE WHEN $5::text IS NULL THEN NULL ELSE 'ai' END, $5, $6)
+           RETURNING id`,
+          [subject, channelType, input.externalChannelId ?? null, contactId, spam?.kind ?? null, spam ? spam.reason : null],
         );
         ticketId = ins.rows[0].id;
         ticketCreated = true;
+        // A conversation that isn't spam shows the contact again.
+        if (!spam) {
+          await c.query("UPDATE contacts SET spam_at = NULL, updated_at = now() WHERE id = $1 AND spam_at IS NOT NULL", [contactId]);
+        } else {
+          // The lead that this email created is hidden too, unless the contact has a conversation that isn't spam.
+          await c.query(
+            `UPDATE contacts SET spam_at = now(), updated_at = now()
+              WHERE id = $1 AND spam_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.tenant_id = contacts.tenant_id AND t.contact_id = contacts.id AND t.spam_at IS NULL)`,
+            [contactId],
+          );
+        }
       }
     }
 
@@ -272,6 +296,7 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
           channelType: r.channel_type, externalChannelId: r.external_channel_id,
           contactId: r.contact_id ?? null,
           ticketCreated: false,
+          spam: false,
         };
       }
       throw e;
@@ -291,7 +316,7 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
     // thread's reply target is the stable thread id, so there is nothing to hop (§5.7, step I.4).
     const isCustomerUpd = input.authorType === "customer";
     const retarget = isCustomerUpd && (input.threadingPolicy ?? "contact") !== "thread";
-    await c.query(
+    const upd = await c.query(
       `UPDATE tickets
           SET updated_at = now(),
               whose_turn = $2,
@@ -300,7 +325,8 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
               -- A customer reply promotes an eager outbound conversation (broadcast/one-to-one, 0117)
               -- out of the Outbound lane into the active inbox. No-op on a normal ticket.
               outbound_pending    = CASE WHEN $6::boolean THEN false ELSE outbound_pending END
-        WHERE id = $1`,
+        WHERE id = $1
+        RETURNING spam_at IS NOT NULL AS spam`,
       [ticketId, whoseTurn, retarget, msgChannelType, msgExternal, isCustomerUpd],
     );
 
@@ -348,8 +374,12 @@ export async function ingestInbound(input: IngestInput): Promise<IngestResult> {
       channelType: msgChannelType, externalChannelId: msgExternal,
       contactId,
       ticketCreated,
+      spam: upd.rows[0]?.spam === true,
     };
   });
+
+  // A customer message on a spam ticket stays hidden: no autoreply, webhook, automation, mirror post or AI labels.
+  if (result.spam && input.authorType === "customer") return result;
 
   // Autoreply evaluation — post-commit, fire-and-forget, off unless the tenant opted
   // in. Only fresh inbound customer messages are candidates; agent messages (incl.

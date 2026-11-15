@@ -52,6 +52,7 @@ import {
   type EmailProvider, type EmailProviderName, fetchEmailProvider, saveEmailProvider, rotateEmailProviderHandle, deleteEmailProvider,
   type EmailSenderSettings, fetchSenderMode, saveSenderMode,
   type BlockedSender, type BlockScope, fetchBlocklist, addBlockedSender, removeBlockedSender,
+  fetchSpamSettings, saveSpamSettings, SPAM_BLOCK_AFTER_MAX,
 } from "@/lib/settings";
 import { Link } from "@tanstack/react-router";
 
@@ -1413,12 +1414,36 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
   const [adding, setAdding] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<BlockedSender | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [blockAfter, setBlockAfter] = useState<number | null>(null);
+  const [blockAfterInput, setBlockAfterInput] = useState("");
+  const [savingBlockAfter, setSavingBlockAfter] = useState(false);
 
   useEffect(() => {
     void fetchBlocklist()
       .then(setBlocked)
       .catch(() => setBlocked([]));
+    void fetchSpamSettings()
+      .then((r) => {
+        setBlockAfter(r.settings.blockAfter);
+        setBlockAfterInput(String(r.settings.blockAfter));
+      })
+      .catch(() => setBlockAfter(null));
   }, []);
+
+  async function onSaveBlockAfter() {
+    setSavingBlockAfter(true);
+    try {
+      const n = (await saveSpamSettings({ blockAfter: Number(blockAfterInput) })).settings.blockAfter;
+      setBlockAfter(n);
+      setBlockAfterInput(String(n));
+      toast.success(n > 0 ? "Auto-block saved." : "Senders are no longer blocked automatically.");
+    } catch (e) {
+      const s = (e as { status?: number }).status;
+      toast.error(s === 403 ? "Only admins can change auto-block." : "Couldn't save auto-block.");
+    } finally {
+      setSavingBlockAfter(false);
+    }
+  }
 
   async function onAdd() {
     const h = handle.trim().toLowerCase();
@@ -1473,6 +1498,45 @@ function BlockedSendersSection({ isAdmin }: { isAdmin: boolean }) {
         Addresses, domains and patterns dropped before a ticket is ever created: no conversation, no lead, no
         notification. Marking a conversation as spam adds its sender here automatically.
       </p>
+
+      {blockAfter != null && (
+        <div className="mb-3 space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Label htmlFor="spam-block-after">Block a sender after</Label>
+            <Input
+              id="spam-block-after"
+              inputMode="numeric"
+              placeholder="0"
+              className="h-8 w-16"
+              value={blockAfterInput}
+              disabled={!isAdmin || savingBlockAfter}
+              onChange={(e) => setBlockAfterInput(e.target.value.replace(/\D/g, ""))}
+            />
+            <span className="text-sm text-foreground">spam conversations</span>
+            {isAdmin && blockAfterInput !== String(blockAfter) && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8"
+                disabled={savingBlockAfter || blockAfterInput === "" || Number(blockAfterInput) > SPAM_BLOCK_AFTER_MAX}
+                onClick={() => void onSaveBlockAfter()}
+              >
+                Save
+              </Button>
+            )}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Counts conversations that your team or the AI marks as spam. Use 0 to never block. Outreach never counts.
+          </p>
+          <p className="text-xs text-muted-foreground">
+            The AI check on new emails is set under{" "}
+            <Link to="/settings/spam" className="font-medium text-foreground underline-offset-4 hover:underline">
+              Spam detection
+            </Link>
+            .
+          </p>
+        </div>
+      )}
 
       <div className="space-y-2">
         {blocked.map((b) => (

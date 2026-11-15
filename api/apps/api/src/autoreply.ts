@@ -941,7 +941,7 @@ async function latestCustomerMessage(tenantId: string, ticketId: string): Promis
          FROM messages m
          JOIN tickets t ON t.id = m.ticket_id AND t.tenant_id = m.tenant_id
         WHERE m.ticket_id = $1 AND m.author_type = 'customer'
-          AND t.status = 'open' AND t.whose_turn = 'us' AND t.support_mode = 'staffed'
+          AND t.status = 'open' AND t.whose_turn = 'us' AND t.support_mode = 'staffed' AND t.spam_at IS NULL
         ORDER BY m.created_at DESC
         LIMIT 1`,
       [ticketId],
@@ -963,7 +963,7 @@ export async function enqueueBacklog(tenantId: string): Promise<number> {
       `INSERT INTO autoreply_jobs (tenant_id, ticket_id)
          SELECT current_tenant(), t.id
            FROM tickets t
-          WHERE t.status = 'open' AND t.whose_turn = 'us' AND t.support_mode = 'staffed'
+          WHERE t.status = 'open' AND t.whose_turn = 'us' AND t.support_mode = 'staffed' AND t.spam_at IS NULL
        ON CONFLICT (tenant_id, ticket_id) WHERE status IN ('queued','processing')
          DO NOTHING
        RETURNING id`,

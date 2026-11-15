@@ -173,11 +173,11 @@ export async function runTraceRetentionSweep(log: Log): Promise<void> {
             `WITH gone AS (
                DELETE FROM draft_traces WHERE id IN (
                  SELECT id FROM draft_traces WHERE created_at < now() - make_interval(days => $1) LIMIT $2)
-               RETURNING created_at, source, ticket_id),
+               RETURNING created_at, source, ticket_id, kind),
              counted AS (
                INSERT INTO draft_trace_counts (tenant_id, day, drafts, deflected)
-               SELECT current_tenant(), (created_at AT TIME ZONE 'UTC')::date, count(*),
-                      count(*) FILTER (WHERE source = 'live' AND ticket_id IS NULL)
+               SELECT current_tenant(), (created_at AT TIME ZONE 'UTC')::date, count(*) FILTER (WHERE kind = 'draft'),
+                      count(*) FILTER (WHERE kind = 'draft' AND source = 'live' AND ticket_id IS NULL)
                  FROM gone GROUP BY 2
                ON CONFLICT (tenant_id, day) DO UPDATE
                  SET drafts = draft_trace_counts.drafts + EXCLUDED.drafts,

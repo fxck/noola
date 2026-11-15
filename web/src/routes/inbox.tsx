@@ -6,6 +6,7 @@ import {
   type Ticket,
   type ViewKey,
   type AgentUser,
+  type SpamKind,
   fetchOpenTickets,
   fetchOutboundTickets,
   fetchClosedTickets,
@@ -16,6 +17,7 @@ import {
   viewCounts,
   fetchUnreadTicketIds,
   fetchUnreadCounts,
+  spamKindOf,
   fetchTicket,
   markTicketRead,
   markAllTicketsRead,
@@ -33,6 +35,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { RowsSkeleton } from "@/components/ui/skeleton";
 import { Menu, MenuItem } from "@/components/ui/menu";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { NoolaMark } from "@/components/noola-mark";
 import { ViewsRail, ViewsChips, VIEWS } from "@/components/inbox/views-rail";
 import { TicketRow } from "@/components/inbox/ticket-row";
@@ -47,7 +50,7 @@ const EMPTY_COPY: Record<ViewKey, string> = {
   unassigned: "Every open ticket has an owner.",
   my: "Nothing is assigned to you right now.",
   closed: "No closed tickets yet.",
-  spam: "No spam. Senders you mark as spam land here for review.",
+  spam: "No spam. Conversations you or the AI mark as spam land here for review.",
   outbound: "Nothing outbound is awaiting a reply. Broadcasts and messages you start land here until the contact replies.",
 };
 
@@ -328,6 +331,13 @@ export function InboxPage() {
   );
   const searchMode = query.trim().length > 0;
   const [sort, setSort] = useState<SortKey>("recent");
+  const [spamFilter, setSpamFilter] = useState<SpamKind | "all">("all");
+  const spamKindCounts = useMemo(() => {
+    const out: Record<SpamKind, number> = { spam: 0, outreach: 0 };
+    for (const t of spam) out[spamKindOf(t)]++;
+    return out;
+  }, [spam]);
+  const filteringSpam = !searchMode && !teamId && view === "spam" && spamFilter !== "all";
   // Live open-ticket count per team lane, straight from the fetched rows.
   const teamCounts = useMemo(() => {
     const out: Record<string, number> = {};
@@ -342,8 +352,9 @@ export function InboxPage() {
     if (searchMode) return searchResults ?? [];
     if (activeTeam)
       return sortTickets((open ?? []).filter((t) => t.team_id === activeTeam.id), sort);
-    return sortTickets(filterByView(view, open ?? [], closed, myId, approvalIds, spam, outbound), sort);
-  }, [searchMode, searchResults, activeTeam, view, open, closed, spam, outbound, myId, sort]);
+    const rows = filterByView(view, open ?? [], closed, myId, approvalIds, spam, outbound);
+    return sortTickets(filteringSpam ? rows.filter((t) => spamKindOf(t) === spamFilter) : rows, sort);
+  }, [searchMode, searchResults, activeTeam, view, open, closed, spam, outbound, myId, sort, filteringSpam, spamFilter]);
 
   const listed = useMemo(
     () => [...(open ?? []), ...closed, ...spam, ...outbound, ...(searchResults ?? [])].find((t) => t.id === selectedId) ?? null,
@@ -396,17 +407,21 @@ export function InboxPage() {
 
   const [markingRead, setMarkingRead] = useState(false);
   const laneUnread = activeTeam ? (teamUnread[activeTeam.id] ?? 0) : (unreadCounts[view] ?? 0);
-  const canMarkAllRead = laneUnread > 0 || list.some((t) => unreadIds.has(t.id));
+  // The lane count covers both kinds of spam, so a Spam or Outreach filter goes by its listed rows.
+  const canMarkAllRead = (!filteringSpam && laneUnread > 0) || list.some((t) => unreadIds.has(t.id));
   async function markAllRead() {
     if (markingRead) return;
     setMarkingRead(true);
     const shown = new Set(list.map((t) => t.id));
     setUnreadIds((prev) => new Set([...prev].filter((id) => !shown.has(id))));
+    // With a Spam or Outreach filter, the other kind stays unread, so the refresh below sets the count.
     if (activeTeam) setTeamUnread((prev) => ({ ...prev, [activeTeam.id]: 0 }));
-    else setUnreadCounts((prev) => ({ ...prev, [view]: 0 }));
+    else if (!filteringSpam) setUnreadCounts((prev) => ({ ...prev, [view]: 0 }));
     try {
       await markAllTicketsRead(
-        activeTeam ? { scope: "view", view: "all", teamId: activeTeam.id } : { scope: "view", view },
+        activeTeam
+          ? { scope: "view", view: "all", teamId: activeTeam.id }
+          : { scope: "view", view, ...(filteringSpam ? { spamKind: spamFilter } : {}) },
       );
     } catch {
       toast.error("Couldn't mark the conversations as read.");
@@ -639,6 +654,21 @@ export function InboxPage() {
               />
             </div>
           </div>
+          {!searchMode && !activeTeam && view === "spam" && (
+            <div className="shrink-0 px-3 pb-2">
+              <SegmentedControl
+                size="sm"
+                aria-label="Filter spam"
+                value={spamFilter}
+                onValueChange={setSpamFilter}
+                options={[
+                  { value: "all", label: "All" },
+                  { value: "spam", label: "Spam", badge: spamKindCounts.spam },
+                  { value: "outreach", label: "Outreach", badge: spamKindCounts.outreach },
+                ]}
+              />
+            </div>
+          )}
 
           <div className="min-h-0 flex-1 overflow-y-auto">
             {loading && open === null ? (
@@ -668,7 +698,9 @@ export function InboxPage() {
                   description={
                     activeTeam
                       ? `Nothing open in ${activeTeam.name}'s lane right now.`
-                      : EMPTY_COPY[view]
+                      : filteringSpam
+                        ? `No ${spamFilter} here.`
+                        : EMPTY_COPY[view]
                   }
                   action={
                     // First-run path to the one channel that works with zero external creds:

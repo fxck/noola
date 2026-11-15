@@ -2,10 +2,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Bot, ShieldAlert, Sparkles, X } from "lucide-react";
 import { Link } from "@tanstack/react-router";
-import { fetchTrace, isTraceGone, traceOutcomeLabel, type TraceDetail, type TraceSource } from "@/lib/traces";
+import { fetchTrace, isTraceGone, spamVerdictLabel, traceOutcomeLabel, type TraceDetail, type TraceSource, type TraceTone } from "@/lib/traces";
 import { relativeTime } from "@/lib/tickets";
 import { estimateCost, fmtCost, isLocalModel, shortModel } from "@/lib/model-cost";
 import { CopyId, compactNum, fmtMs, fmtScore } from "@/components/live/nerd-stats";
+import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
 // One AI trace for an admin: what the customer wrote, what the model wrote word for word, and what Noola did with it.
@@ -243,7 +244,11 @@ export function TraceDialog({ traceId, onClose }: { traceId: string; onClose: ()
             <Sparkles className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
               <h2 className="text-sm font-semibold text-foreground">AI trace</h2>
-              <p className="text-micro text-muted-foreground">What the model wrote for this draft, and what Noola did with it.</p>
+              <p className="text-micro text-muted-foreground">
+                {trace?.kind === "spam_check"
+                  ? "The email the model checked for spam, and its verdict."
+                  : "What the model wrote for this draft, and what Noola did with it."}
+              </p>
             </div>
           </div>
           <button
@@ -267,6 +272,8 @@ export function TraceDialog({ traceId, onClose }: { traceId: string; onClose: ()
             <div className="px-5 py-8">
               <div className="mx-auto h-4 w-40 rounded bg-muted/60 motion-safe:animate-pulse" />
             </div>
+          ) : trace.kind === "spam_check" ? (
+            <SpamCheckBody t={trace} />
           ) : (
             <TraceBody t={trace} />
           )}
@@ -277,9 +284,71 @@ export function TraceDialog({ traceId, onClose }: { traceId: string; onClose: ()
   );
 }
 
-function TraceBody({ t }: { t: TraceDetail }) {
+/** The facts every trace has: when it ran, the model, and what the call cost. */
+function RunFacts({ t }: { t: TraceDetail }) {
   const local = isLocalModel(t.model);
   const cost = estimateCost(t.model, t.tokensIn, t.tokensOut);
+  return (
+    <>
+      <Fact label="Ran">
+        <span title={new Date(t.createdAt).toLocaleString()}>{relativeTime(t.createdAt)}</span>
+      </Fact>
+      <Fact label="Model">
+        <span title={t.model}>{shortModel(t.model)}{t.effort && ` · ${t.effort}`}</span>
+      </Fact>
+      <Fact label="Tokens">
+        {t.tokensIn == null && t.tokensOut == null ? "—" : `${compactNum(t.tokensIn ?? 0)} in · ${compactNum(t.tokensOut ?? 0)} out`}
+      </Fact>
+      <Fact label="Latency">{fmtMs(t.latencyMs)}</Fact>
+      <Fact label="Est. cost">
+        <span title="estimated from public list prices">{local ? "$0 · local" : cost != null ? `~${fmtCost(cost)}` : "~$?"}</span>
+      </Fact>
+    </>
+  );
+}
+
+const VERDICT_BADGE: Record<TraceTone, "success" | "warning" | "muted"> = { sent: "success", held: "warning", none: "muted" };
+
+function SpamCheckBody({ t }: { t: TraceDetail }) {
+  const verdict = spamVerdictLabel(t.gateOutcome);
+  return (
+    <div className="space-y-5 px-5 py-4">
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
+        <RunFacts t={t} />
+      </dl>
+
+      <Section title="Spam check">
+        <div className="flex items-start gap-2 text-sm">
+          <Badge variant={t.gateOutcome === "failed" ? "destructive" : VERDICT_BADGE[verdict.tone]} className="mt-px shrink-0">
+            {verdict.label}
+          </Badge>
+          <span className="min-w-0 break-words text-foreground">
+            {t.gateReason || <span className="text-muted-foreground">No reason given.</span>}
+          </span>
+        </div>
+      </Section>
+
+      <Section title="Email it read">
+        <p className="whitespace-pre-wrap break-words rounded-lg border bg-muted/30 px-3 py-2 text-sm text-foreground">
+          {t.query || <span className="text-muted-foreground">(empty)</span>}
+        </p>
+      </Section>
+
+      <Section title="Model's raw answer">
+        <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed text-foreground">
+          {t.draft || <span className="text-muted-foreground">(empty)</span>}
+        </pre>
+      </Section>
+
+      <div className="flex items-center gap-2 border-t pt-3 font-mono text-micro text-muted-foreground">
+        <span>trace</span>
+        <CopyId value={t.id} />
+      </div>
+    </div>
+  );
+}
+
+function TraceBody({ t }: { t: TraceDetail }) {
   const action = actionReason(t);
   const { tone } = traceOutcomeLabel(action.outcome, action.reason);
   const sources = [...t.sources].sort((a, b) => a.rank - b.rank);
@@ -287,19 +356,7 @@ function TraceBody({ t }: { t: TraceDetail }) {
   return (
     <div className="space-y-5 px-5 py-4">
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
-        <Fact label="Ran">
-          <span title={new Date(t.createdAt).toLocaleString()}>{relativeTime(t.createdAt)}</span>
-        </Fact>
-        <Fact label="Model">
-          <span title={t.model}>{shortModel(t.model)}{t.effort && ` · ${t.effort}`}</span>
-        </Fact>
-        <Fact label="Tokens">
-          {t.tokensIn == null && t.tokensOut == null ? "—" : `${compactNum(t.tokensIn ?? 0)} in · ${compactNum(t.tokensOut ?? 0)} out`}
-        </Fact>
-        <Fact label="Latency">{fmtMs(t.latencyMs)}</Fact>
-        <Fact label="Est. cost">
-          <span title="estimated from public list prices">{local ? "$0 · local" : cost != null ? `~${fmtCost(cost)}` : "~$?"}</span>
-        </Fact>
+        <RunFacts t={t} />
         {t.confidence != null && <Fact label="Confidence">{fmtScore(t.confidence)}</Fact>}
         {t.humanOutcome && <Fact label="Agent verdict">{HUMAN_OUTCOMES[t.humanOutcome] ?? t.humanOutcome}</Fact>}
         {t.riskTags.length > 0 && <Fact label="Risk tags">{t.riskTags.join(", ")}</Fact>}

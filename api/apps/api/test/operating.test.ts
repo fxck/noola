@@ -156,6 +156,20 @@ async function main() {
   asUser = TESTCO_U2;
   await readAll({ scope: "view", view: "needs_reply" });
   check("read-all in Needs reply marks a community thread that the lane shows", (await readBy(TESTCO_U2)).includes("OPTEST-V6"));
+  // The Spam lane's Spam and Outreach filters each mark only their own kind.
+  const v7 = await mk("OPTEST-V7");
+  const v8 = await mk("OPTEST-V8");
+  subjectOf[v7] = "OPTEST-V7";
+  subjectOf[v8] = "OPTEST-V8";
+  await superPool.query("UPDATE tickets SET spam_at = now(), spam_source = 'ai', spam_kind = 'outreach' WHERE id = $1", [v7]);
+  await superPool.query("UPDATE tickets SET spam_at = now(), spam_source = 'ai', spam_kind = 'spam' WHERE id = $1", [v8]);
+  // A mark from before the spam kinds existed has no kind, and counts as spam.
+  await superPool.query("UPDATE tickets SET spam_kind = NULL WHERE id = $1", [v5]);
+  const spamRead = async () => (await readBy(TESTCO_U2)).filter((s) => ["OPTEST-V5", "OPTEST-V7", "OPTEST-V8"].includes(s));
+  await readAll({ scope: "view", view: "spam", spamKind: "outreach" });
+  check("read-all in Spam with the Outreach filter marks only outreach", eq(await spamRead(), ["OPTEST-V7"]), await spamRead());
+  await readAll({ scope: "view", view: "spam", spamKind: "spam" });
+  check("read-all in Spam with the Spam filter marks the spam, a mark without a kind included", eq(await spamRead(), ["OPTEST-V5", "OPTEST-V7", "OPTEST-V8"]), await spamRead());
   await app.close();
 
   await clean();

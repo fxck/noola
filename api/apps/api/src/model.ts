@@ -120,6 +120,8 @@ export interface ModelServingDriver {
 export interface CompleteOptions {
   /** Throw when the model stops at its output limit, for callers that must never use a cut-off answer. */
   rejectTruncated?: boolean;
+  /** Receives the token counts that the provider reports, for a caller that traces the call. */
+  onUsage?: (usage: { tokensIn: number | null; tokensOut: number | null }) => void;
 }
 
 // Business-risk classification for the autoreply gate — a deterministic backstop
@@ -463,6 +465,7 @@ export class HttpChatModelDriver implements ModelServingDriver {
         this.opts.provider === "anthropic"
           ? await this.anthropic(system, user, undefined, ctrl.signal)
           : await this.openaiCompatible(system, user, undefined, ctrl.signal);
+      opts.onUsage?.({ tokensIn: r.tokensIn ?? null, tokensOut: r.tokensOut ?? null });
       if (opts.rejectTruncated && r.truncated) throw new Error("completion stopped at the output limit");
       return r.text.trim();
     } finally {

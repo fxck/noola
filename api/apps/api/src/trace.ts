@@ -80,6 +80,41 @@ export async function recordDraftTrace(input: DraftTraceInput): Promise<string |
   }
 }
 
+/**
+ * Records a spam check as a trace: the email as the query, the model's answer as the draft, and the verdict and reason as the gate.
+ * Best-effort like recordDraftTrace, so a failure never stops the email.
+ */
+export async function recordSpamCheckTrace(input: {
+  tenantId: string;
+  ticketId: string;
+  messageId: string;
+  email: string;
+  answer: string;
+  verdict: string;
+  reason: string;
+  model: string;
+  effort: string | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  latencyMs: number;
+}): Promise<string | null> {
+  try {
+    return await withTenant(input.tenantId, async (c) => {
+      const r = await c.query(
+        `INSERT INTO draft_traces
+           (tenant_id, kind, ticket_id, message_id, query, draft, model, effort, tokens_in, tokens_out, latency_ms, gate_outcome, gate_reason, source)
+         VALUES (current_tenant(), 'spam_check', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'live')
+         RETURNING id`,
+        [input.ticketId, input.messageId, input.email, input.answer, input.model, input.effort,
+         input.tokensIn, input.tokensOut, input.latencyMs, input.verdict, input.reason],
+      );
+      return r.rows[0].id as string;
+    });
+  } catch {
+    return null;
+  }
+}
+
 /** Stamp the gate decision onto a trace after autoreply evaluates it (best-effort). */
 export async function updateTraceGate(
   tenantId: string,
@@ -198,6 +233,8 @@ function buildOtlpSpan(traceId: string, input: DraftTraceInput): unknown {
 
 export interface TraceSummary {
   id: string;
+  /** 'draft' for a drafted reply, 'spam_check' for a spam check, whose gate holds the verdict and reason. */
+  kind: string;
   createdAt: string;
   ticketId: string | null;
   messageId: string | null;
@@ -229,24 +266,24 @@ export interface TraceDetail extends TraceSummary {
   decisions: { outcome: string; reason: string; source: string; sentMessageId: string | null; createdAt: string }[];
 }
 
-const SUMMARY_COLS = `t.id, t.created_at, t.ticket_id, t.message_id, t.model, t.effort, left(t.query, 200) AS query, left(t.draft, 200) AS draft_preview,
+const SUMMARY_COLS = `t.id, t.kind, t.created_at, t.ticket_id, t.message_id, t.model, t.effort, left(t.query, 200) AS query, left(t.draft, 200) AS draft_preview,
   t.gate_outcome, t.gate_reason, jsonb_array_length(t.sources) AS source_count, t.tokens_in, t.tokens_out, t.latency_ms`;
 
 type SummaryRow = {
-  id: string; created_at: Date; ticket_id: string | null; message_id: string | null; model: string; effort: string | null; query: string; draft_preview: string;
+  id: string; kind: string; created_at: Date; ticket_id: string | null; message_id: string | null; model: string; effort: string | null; query: string; draft_preview: string;
   gate_outcome: string | null; gate_reason: string | null; source_count: number;
   tokens_in: number | null; tokens_out: number | null; latency_ms: number | null;
 };
 
 function toSummary(r: SummaryRow): TraceSummary {
   return {
-    id: r.id, createdAt: r.created_at.toISOString(), ticketId: r.ticket_id, messageId: r.message_id, model: r.model, effort: r.effort, query: r.query,
+    id: r.id, kind: r.kind, createdAt: r.created_at.toISOString(), ticketId: r.ticket_id, messageId: r.message_id, model: r.model, effort: r.effort, query: r.query,
     draftPreview: r.draft_preview, gateOutcome: r.gate_outcome, gateReason: r.gate_reason, sourceCount: r.source_count,
     tokensIn: r.tokens_in, tokensOut: r.tokens_out, latencyMs: r.latency_ms,
   };
 }
 
-/** Every AI draft on a ticket, newest first, including drafts that sent nothing. */
+/** Every AI draft and spam check on a ticket, newest first, including drafts that sent nothing. */
 export async function listTicketTraces(tenantId: string, ticketId: string): Promise<TraceSummary[]> {
   const r = await withTenant(tenantId, (c) =>
     c.query<SummaryRow>(`SELECT ${SUMMARY_COLS} FROM draft_traces t WHERE t.ticket_id = $1 ORDER BY t.created_at DESC, t.id DESC LIMIT 200`, [ticketId]),
@@ -255,11 +292,12 @@ export async function listTicketTraces(tenantId: string, ticketId: string): Prom
 }
 
 /** What Noola did with a draft, as the workspace trace list filters it. The web's TRACE_CATEGORIES mirror this list. */
-export const TRACE_CATEGORIES = ["sent", "held", "note_only", "no_reply", "handoff", "no_sources", "no_decision"] as const;
+export const TRACE_CATEGORIES = ["sent", "held", "note_only", "no_reply", "handoff", "no_sources", "no_decision", "spam_check"] as const;
 export type TraceCategory = (typeof TRACE_CATEGORIES)[number];
 
 // The first matching branch wins, so a grounding-guard deflection counts as "no_sources" even when the widget sent it.
 const CATEGORY_SQL = `CASE
+  WHEN t.kind = 'spam_check' THEN 'spam_check'
   WHEN t.model = 'grounding-guard' THEN 'no_sources'
   WHEN t.gate_outcome = 'auto_sent' THEN 'sent'
   WHEN t.gate_reason IN ('no_reply_needed', 'no_reply_suggested') THEN 'no_reply'
@@ -328,7 +366,7 @@ export async function listTraces(tenantId: string, f: TraceListQuery): Promise<{
     conds.push(sql.replace("?", `$${params.length}`));
   };
   // No sources found also matches a draft the model wrote without sources, which the categories file under what it did.
-  if (f.outcome === "no_sources") conds.push("(t.model = 'grounding-guard' OR jsonb_array_length(t.sources) = 0)");
+  if (f.outcome === "no_sources") conds.push("t.kind = 'draft' AND (t.model = 'grounding-guard' OR jsonb_array_length(t.sources) = 0)");
   else if (f.outcome) where(`${CATEGORY_SQL} = ?`, f.outcome);
   if (f.q) where("t.query ILIKE ?", `%${f.q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
   if (f.from) where("t.created_at >= ?", f.from);

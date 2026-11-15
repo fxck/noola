@@ -15,6 +15,7 @@ const DESCRIPTIONS: Record<SettingsSection, string> = {
   autoreply: "How much the AI does on its own — draft, or send automatically.",
   translation: "Detect each customer's language and bridge the conversation.",
   "docs-search": "How the AI searches your docs before it answers.",
+  spam: "How the AI spots spam and outreach in new emails.",
   classification: "Topics, Slack reaction shortcuts, and the safety guardrails that hold risky messages.",
   routing: "Rules that assign incoming conversations to the right people.",
   macros: "Saved replies your team can insert in one click.",

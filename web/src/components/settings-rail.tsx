@@ -1,11 +1,11 @@
 import { Link } from "@tanstack/react-router";
-import { Brain, Sparkles, Bot, Plug, Webhook as WebhookIcon, Users, UsersRound, KeyRound, MessageSquareText, MessageCircle, MessagesSquare, Timer, ListChecks, Tags, Tag, Route, Star, ShieldCheck, ScrollText, Languages, FileSearch, CircleUser, LayoutTemplate, LayoutGrid, Shapes, Hash, Building2 } from "lucide-react";
+import { Brain, Sparkles, Bot, Plug, Webhook as WebhookIcon, Users, UsersRound, KeyRound, MessageSquareText, MessageCircle, MessagesSquare, Timer, ListChecks, Tags, Tag, Route, Star, ShieldCheck, ScrollText, Languages, FileSearch, ShieldBan, CircleUser, LayoutTemplate, LayoutGrid, Shapes, Hash, Building2 } from "lucide-react";
 import type { ComponentType } from "react";
 
 // The shared Settings section rail — grouped (the owner's "IA overload" complaint
 // applied inside Settings hardest; 18 flat rows read as noise). Channels merged
 // into Integrations ("Channels & integrations"); /settings/channels redirects.
-export type SettingsSection = "overview" | "profile" | "ai" | "model" | "persona" | "autoreply" | "translation" | "docs-search" | "classification" | "routing" | "macros" | "sla" | "surveys" | "custom-fields" | "ticket-types" | "tag-rules" | "integrations" | "channels" | "messenger" | "email-templates" | "webhooks" | "discord-mirror" | "api-keys" | "sso" | "workspace" | "members" | "teams" | "audit";
+export type SettingsSection = "overview" | "profile" | "ai" | "model" | "persona" | "autoreply" | "translation" | "docs-search" | "spam" | "classification" | "routing" | "macros" | "sla" | "surveys" | "custom-fields" | "ticket-types" | "tag-rules" | "integrations" | "channels" | "messenger" | "email-templates" | "webhooks" | "discord-mirror" | "api-keys" | "sso" | "workspace" | "members" | "teams" | "audit";
 
 export type SettingsItem = { key: SettingsSection; to: string; label: string; Icon: ComponentType<{ className?: string }> };
 
@@ -24,6 +24,7 @@ export const SETTINGS_GROUPS: { label: string; items: SettingsItem[] }[] = [
       { key: "autoreply", to: "/settings/autoreply", label: "Autoreply", Icon: Bot },
       { key: "translation", to: "/settings/translation", label: "Translation", Icon: Languages },
       { key: "docs-search", to: "/settings/docs-search", label: "Docs search", Icon: FileSearch },
+      { key: "spam", to: "/settings/spam", label: "Spam detection", Icon: ShieldBan },
       { key: "classification", to: "/settings/classification", label: "Classification", Icon: Shapes },
     ],
   },

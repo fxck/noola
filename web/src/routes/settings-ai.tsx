@@ -9,11 +9,12 @@ import {
   MessageCircle,
   ScrollText,
   ShieldAlert,
+  ShieldBan,
   Sparkles,
 } from "lucide-react";
 import { SettingsPage } from "@/components/settings-page";
 import { type AiOverview, fetchAiOverview } from "@/lib/ai";
-import { type DocsSearchResponse, fetchDocsSearchSettings } from "@/lib/settings";
+import { type DocsSearchResponse, type SpamSettingsResponse, fetchDocsSearchSettings, fetchSpamSettings } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 
 // The AI governance hub (Wave 5 item 22) — one read-only surface that packages the
@@ -79,14 +80,20 @@ function Line({ label, value, tone }: { label: string; value: string; tone?: "wa
 export function SettingsAiPage() {
   const [data, setData] = useState<AiOverview | null>(null);
   const [docsSearch, setDocsSearch] = useState<DocsSearchResponse | null>(null);
+  const [spam, setSpam] = useState<SpamSettingsResponse | null>(null);
   const [loadError, setLoadError] = useState(false);
 
   const load = useRef(async () => {
     setLoadError(false);
     try {
-      const [overview, search] = await Promise.all([fetchAiOverview(), fetchDocsSearchSettings().catch(() => null)]);
+      const [overview, search, spamSettings] = await Promise.all([
+        fetchAiOverview(),
+        fetchDocsSearchSettings().catch(() => null),
+        fetchSpamSettings().catch(() => null),
+      ]);
       setData(overview);
       setDocsSearch(search);
+      setSpam(spamSettings);
     } catch {
       setLoadError(true);
     }
@@ -158,6 +165,24 @@ export function SettingsAiPage() {
                     ) : (
                       <p className="text-xs text-muted-foreground">
                         How the AI turns a customer's message into a search of your docs.
+                      </p>
+                    )}
+                  </GovernCard>
+
+                  <GovernCard icon={ShieldBan} title="Spam detection" to="/settings/spam">
+                    {spam ? (
+                      <>
+                        <Line label="Check new emails" value={spam.settings.aiEnabled ? "On" : "Off"} />
+                        <Line label="Extra rules" value={spam.settings.rules.trim() ? "Set" : "None"} />
+                        <Line label="Prompt" value={spam.settings.prompt == null ? "Default" : "Custom"} />
+                        <Line
+                          label="Auto-block"
+                          value={spam.settings.blockAfter > 0 ? `After ${spam.settings.blockAfter} spam conversations` : "Off"}
+                        />
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        How the AI sorts new emails from unknown senders into the inbox or the Spam folder.
                       </p>
                     )}
                   </GovernCard>

@@ -14,6 +14,7 @@ import {
   setTicketOpen,
   unspamTicket,
   relativeTime,
+  spamKindOf,
 } from "@/lib/tickets";
 import { toast } from "@/components/ui/toaster";
 import type { ApiError } from "@/lib/api";
@@ -35,6 +36,15 @@ import { TicketPresence } from "@/components/live/ticket-presence";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import { useLocalFlag } from "@/lib/use-local-flag";
 import { cn } from "@/lib/utils";
+
+function spamNotice(t: Ticket): string {
+  if (t.spam_source === "ai") {
+    const reason = t.spam_reason?.trim();
+    return `Hidden as ${spamKindOf(t)} by AI${reason ? `: ${reason}` : "."}`;
+  }
+  if (t.spam_source === "agent") return "Marked as spam by a teammate.";
+  return "Marked as spam. Hidden from the inbox.";
+}
 
 // ── day separators ───────────────────────────────────────────────────────────
 // A conversation that spans days needs the calendar marked — quietly. The label
@@ -480,7 +490,7 @@ export function ThreadPane({
           ticket replaces the composer with a prominent restore ("Not spam"). */}
       {isSpam ? (
         <footer className="flex flex-wrap items-center justify-center gap-3 border-t bg-muted/30 px-4 py-4 text-sm text-muted-foreground">
-          <span>Marked as spam — hidden from the inbox.</span>
+          <span className="max-w-xl text-center">{spamNotice(ticket)}</span>
           <Button
             variant="outline"
             size="sm"

@@ -3,8 +3,12 @@ import { api, type ApiError } from "@/lib/api";
 // The admin AI trace viewer: what the model wrote for each draft on a ticket and what Noola did with it.
 // Traces hold customer text and raw model output, so the server answers only admins and owners.
 
+/** A spam check traces one checked email: `query` is the email, `draft` the raw answer, the gate the verdict. */
+export type TraceKind = "draft" | "spam_check";
+
 export interface TraceSummary {
   id: string;
+  kind: TraceKind;
   createdAt: string;
   /** Null for a public answer that never became a ticket, or an eval run. */
   ticketId: string | null;
@@ -84,7 +88,7 @@ export async function fetchTicketTraces(ticketId: string): Promise<TraceSummary[
 }
 
 /** What Noola did with a draft, as the workspace list filters it. Mirrors TRACE_CATEGORIES on the server. */
-export type TraceCategory = "sent" | "held" | "note_only" | "no_reply" | "handoff" | "no_sources" | "no_decision";
+export type TraceCategory = "sent" | "held" | "note_only" | "no_reply" | "handoff" | "no_sources" | "no_decision" | "spam_check";
 
 export const TRACE_CATEGORIES: { value: TraceCategory; label: string }[] = [
   { value: "sent", label: "Sent a reply" },
@@ -94,6 +98,7 @@ export const TRACE_CATEGORIES: { value: TraceCategory; label: string }[] = [
   { value: "handoff", label: "Handed over" },
   { value: "no_sources", label: "No sources found" },
   { value: "no_decision", label: "No decision recorded" },
+  { value: "spam_check", label: "Spam checks" },
 ];
 
 export function isTraceCategory(v: unknown): v is TraceCategory {
@@ -156,6 +161,18 @@ const REASON_LABELS: Record<string, { label: string; tone: TraceTone }> = {
   kill: { label: "Held: AI switched off", tone: "held" },
   channel_skipped: { label: "Skipped on this channel", tone: "none" },
 };
+
+const SPAM_VERDICTS: Record<string, { label: string; tone: TraceTone }> = {
+  legit: { label: "Legit", tone: "sent" },
+  spam: { label: "Spam", tone: "held" },
+  outreach: { label: "Outreach", tone: "held" },
+  failed: { label: "Failed", tone: "none" },
+};
+
+/** A spam check's verdict, from its gate outcome. */
+export function spamVerdictLabel(outcome: string | null): { label: string; tone: TraceTone } {
+  return (outcome && SPAM_VERDICTS[outcome]) || { label: outcome ?? "No verdict", tone: "none" };
+}
 
 /** A short plain-English label for a gate or decision outcome, with the tone to show it in. */
 export function traceOutcomeLabel(outcome: string | null, reason: string | null): { label: string; tone: TraceTone } {

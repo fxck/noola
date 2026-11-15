@@ -4,7 +4,7 @@ import { authPool, withTenant } from "@repo/db";
 import { putBuffer } from "../storage.js";
 import {
   ModelConfigInput, AutoreplyPolicyInput, DiscordLinkInput, DiscordBotInput, EmailLinkInput, SlackConnectionInput,
-  TranslationSettingsInput, DocsSearchSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
+  TranslationSettingsInput, DocsSearchSettingsInput, SpamSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { getModelConfig, listAvailableModels, putModelConfig, testModelConfig } from "../modelconfig.js";
@@ -14,6 +14,7 @@ import {
   enqueueBacklog, drainJobs, listJobs,
 } from "../autoreply.js";
 import { getDocsSearchSettings, putDocsSearchSettings, DEFAULT_SEARCH_PROMPT, SEARCH_REPLY_FORMAT } from "../docs-search.js";
+import { getSpamSettings, putSpamSettings, DEFAULT_SPAM_PROMPT, SPAM_REPLY_FORMAT } from "../spam-check.js";
 import { patchTraceOutcome, getTrace, listTicketTraces, listTraces, parseTraceListQuery, type TraceListQuery } from "../trace.js";
 import {
   linkGuild, listDiscordChannelBindings, replaceDiscordChannelBindings,
@@ -108,6 +109,17 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const parsed = DocsSearchSettingsInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     return { settings: await putDocsSearchSettings(tenantId, parsed.data), defaultPrompt: DEFAULT_SEARCH_PROMPT, replyFormat: SEARCH_REPLY_FORMAT };
+  }));
+
+  // The AI spam check on new emails and the repeat-sender auto-block.
+  app.get("/settings/spam", tenanted(async (tenantId) => ({
+    settings: await getSpamSettings(tenantId), defaultPrompt: DEFAULT_SPAM_PROMPT, replyFormat: SPAM_REPLY_FORMAT,
+  })));
+
+  app.put("/settings/spam", tenanted(async (tenantId, req, reply) => {
+    const parsed = SpamSettingsInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return { settings: await putSpamSettings(tenantId, parsed.data), defaultPrompt: DEFAULT_SPAM_PROMPT, replyFormat: SPAM_REPLY_FORMAT };
   }));
 
   // ---- Settings: auto-tagging rules (STUDIO-SEEDED-FLOWS.md #1) -------------
