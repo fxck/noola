@@ -16,6 +16,7 @@ const DESCRIPTIONS: Record<SettingsSection, string> = {
   translation: "Detect each customer's language and bridge the conversation.",
   "docs-search": "How the AI searches your docs before it answers.",
   spam: "How the AI spots spam and outreach in new emails.",
+  gaps: "Find the questions in closed conversations that your docs and help articles miss.",
   classification: "Topics, Slack reaction shortcuts, and the safety guardrails that hold risky messages.",
   routing: "Rules that assign incoming conversations to the right people.",
   macros: "Saved replies your team can insert in one click.",

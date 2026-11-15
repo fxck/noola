@@ -4,7 +4,7 @@ import { authPool, withTenant } from "@repo/db";
 import { putBuffer } from "../storage.js";
 import {
   ModelConfigInput, AutoreplyPolicyInput, DiscordLinkInput, DiscordBotInput, EmailLinkInput, SlackConnectionInput,
-  TranslationSettingsInput, DocsSearchSettingsInput, SpamSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
+  TranslationSettingsInput, DocsSearchSettingsInput, SpamSettingsInput, GapSettingsInput, TagRulesConfigInput, ClassificationConfigInput, DiscordMirrorConfigInput, DiscordChannelsConfigInput,
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { getModelConfig, listAvailableModels, putModelConfig, testModelConfig } from "../modelconfig.js";
@@ -15,6 +15,7 @@ import {
 } from "../autoreply.js";
 import { getDocsSearchSettings, putDocsSearchSettings, DEFAULT_SEARCH_PROMPT, SEARCH_REPLY_FORMAT } from "../docs-search.js";
 import { getSpamSettings, putSpamSettings, DEFAULT_SPAM_PROMPT, SPAM_REPLY_FORMAT } from "../spam-check.js";
+import { getGapSettings, putGapSettings, NeedsHostedModel } from "../gaps.js";
 import { patchTraceOutcome, getTrace, listTicketTraces, listTraces, parseTraceListQuery, type TraceListQuery } from "../trace.js";
 import {
   linkGuild, listDiscordChannelBindings, replaceDiscordChannelBindings,
@@ -120,6 +121,20 @@ export default async function settingsRoutes(app: FastifyInstance): Promise<void
     const parsed = SpamSettingsInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     return { settings: await putSpamSettings(tenantId, parsed.data), defaultPrompt: DEFAULT_SPAM_PROMPT, replyFormat: SPAM_REPLY_FORMAT };
+  }));
+
+  // The model review of closed conversations that files knowledge gaps.
+  app.get("/settings/gaps", tenanted(async (tenantId) => ({ settings: await getGapSettings(tenantId) })));
+
+  app.put("/settings/gaps", tenanted(async (tenantId, req, reply) => {
+    const parsed = GapSettingsInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    try {
+      return { settings: await putGapSettings(tenantId, parsed.data) };
+    } catch (e) {
+      if (e instanceof NeedsHostedModel) return reply.code(400).send({ error: "needs_hosted_model", message: e.message });
+      throw e;
+    }
   }));
 
   // ---- Settings: auto-tagging rules (STUDIO-SEEDED-FLOWS.md #1) -------------

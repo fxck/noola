@@ -9,7 +9,6 @@ import { hydrateThreads, type ThreadHit } from "./threads.js";
 import { vectorHits, type VectorCollection } from "./vector.js";
 import { keywordHits, type RetrievalCollection } from "./search.js";
 import { recordDraftTrace } from "./trace.js";
-import { isContentGap, recordKnowledgeGap } from "./gaps.js";
 import { searchQueryFor } from "./docs-search.js";
 
 // Copilot: the retrieval-augmented suggested reply. Given a ticket (or a bare
@@ -120,6 +119,24 @@ async function rankSources(tenantId: string, text: string, surfaces: Surface[], 
   vecList.forEach((c, i) => ranks.set(candidateKey(c), { meaning: i + 1 }));
   kwList.forEach((c, i) => ranks.set(candidateKey(c), { keyword: i + 1, ...ranks.get(candidateKey(c)) }));
   return { ...rrfMerge([vecList, kwList], candidateKey), ranks };
+}
+
+/** The articles and documentation passages that rank highest for a text, for reviews that write no answer. */
+export async function findSources(
+  tenantId: string,
+  text: string,
+  opts: { kinds?: Array<"kb" | "document">; limit?: number } = {},
+): Promise<Candidate[]> {
+  const kinds = new Set(opts.kinds ?? ["kb", "document"]);
+  const surfaces: Surface[] = [];
+  if (kinds.has("kb")) {
+    surfaces.push({ collection: "kb", hydrate: async (ids) => (await hydrateArticles(tenantId, ids)).map((a) => ({ kind: "kb", id: a.id, item: a })) });
+  }
+  if (kinds.has("document")) {
+    surfaces.push({ collection: "chunks", hydrate: async (ids) => (await hydrateChunks(tenantId, ids)).map((ch) => ({ kind: "document", id: ch.id, item: ch })) });
+  }
+  const ranked = await rankSources(tenantId, text, surfaces, (await embeddingDriver.embed([text]))?.[0] ?? null);
+  return ranked.items.slice(0, opts.limit ?? 6);
 }
 
 const MAX_OF_KIND: Record<SourceKind, number> = { kb: MAX_ARTICLES, thread: MAX_THREADS, document: MAX_CHUNKS };
@@ -640,17 +657,6 @@ async function prepareDraft(
       confidence: result.confidence ?? null, tokensIn: result.tokensIn ?? null,
       tokensOut: result.tokensOut ?? null, latencyMs: Date.now() - started, source,
     });
-    // Content-gap detection: weak retrieval means the KB couldn't answer this — record it
-    // (clustered, best-effort) so it surfaces in the Sources worklist and routes back to authoring.
-    // A message the model chose not to answer, such as a thank-you, asked nothing the docs could miss.
-    const parsed = result.outcomes === true && hasOutcomeTag(result.text) ? parseDraftOutcome(result.text) : null;
-    const noReply = parsed?.kind === "ok" && parsed.noReply;
-    if (isContentGap(retrieval.agreement, retrieval.topScore) && !noReply) {
-      void recordKnowledgeGap(tenantId, {
-        query, confidence: result.confidence ?? null, topScore: retrieval.topScore,
-        agreement: retrieval.agreement, source, ticketId,
-      });
-    }
     return {
       draft: result.text, citations, model, basedOn: clip(query, 160),
       retrieval, confidence: result.confidence ?? null, traceId,

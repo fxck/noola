@@ -50,7 +50,7 @@ export function TicketTracesDialog({ ticketId, onClose }: { ticketId: string; on
             <Sparkles className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
               <h2 className="text-sm font-semibold text-foreground">AI traces</h2>
-              <p className="text-micro text-muted-foreground">Every AI draft and spam check on this conversation, including drafts that sent nothing.</p>
+              <p className="text-micro text-muted-foreground">Every AI draft, spam check and gap review on this conversation, including drafts that sent nothing.</p>
             </div>
           </div>
           <button

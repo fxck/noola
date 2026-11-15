@@ -115,6 +115,41 @@ export async function recordSpamCheckTrace(input: {
   }
 }
 
+/**
+ * Record a gap review of a closed conversation (best-effort).
+ * The draft holds the review as JSON, and the gate holds the conversation kind and how many gaps it raised.
+ */
+export async function recordGapReviewTrace(input: {
+  tenantId: string;
+  ticketId: string;
+  query: string;
+  review: unknown;
+  sources: Array<{ kind: string; id: string; title: string; url: string | null }>;
+  conversation: string;
+  gaps: number;
+  model: string;
+  effort: string | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  latencyMs: number;
+}): Promise<string | null> {
+  try {
+    return await withTenant(input.tenantId, async (c) => {
+      const r = await c.query(
+        `INSERT INTO draft_traces
+           (tenant_id, kind, ticket_id, query, draft, sources, model, effort, tokens_in, tokens_out, latency_ms, gate_outcome, gate_reason, source)
+         VALUES (current_tenant(), 'gap_review', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'live')
+         RETURNING id`,
+        [input.ticketId, input.query, JSON.stringify(input.review), JSON.stringify(input.sources.map((s, rank) => ({ kind: s.kind, id: s.id, title: s.title, ...(s.url ? { url: s.url } : {}), score: 0, rank }))),
+         input.model, input.effort, input.tokensIn, input.tokensOut, input.latencyMs, input.conversation, `${input.gaps} ${input.gaps === 1 ? "gap" : "gaps"}`],
+      );
+      return r.rows[0].id as string;
+    });
+  } catch {
+    return null;
+  }
+}
+
 /** Stamp the gate decision onto a trace after autoreply evaluates it (best-effort). */
 export async function updateTraceGate(
   tenantId: string,
@@ -233,7 +268,7 @@ function buildOtlpSpan(traceId: string, input: DraftTraceInput): unknown {
 
 export interface TraceSummary {
   id: string;
-  /** 'draft' for a drafted reply, 'spam_check' for a spam check, whose gate holds the verdict and reason. */
+  /** 'draft' for a drafted reply, 'spam_check' for a spam check, whose gate holds the verdict and reason, 'gap_review' for a gap review. */
   kind: string;
   createdAt: string;
   ticketId: string | null;
@@ -292,12 +327,13 @@ export async function listTicketTraces(tenantId: string, ticketId: string): Prom
 }
 
 /** What Noola did with a draft, as the workspace trace list filters it. The web's TRACE_CATEGORIES mirror this list. */
-export const TRACE_CATEGORIES = ["sent", "held", "note_only", "no_reply", "handoff", "no_sources", "no_decision", "spam_check"] as const;
+export const TRACE_CATEGORIES = ["sent", "held", "note_only", "no_reply", "handoff", "no_sources", "no_decision", "spam_check", "gap_review"] as const;
 export type TraceCategory = (typeof TRACE_CATEGORIES)[number];
 
 // The first matching branch wins, so a grounding-guard deflection counts as "no_sources" even when the widget sent it.
 const CATEGORY_SQL = `CASE
   WHEN t.kind = 'spam_check' THEN 'spam_check'
+  WHEN t.kind = 'gap_review' THEN 'gap_review'
   WHEN t.model = 'grounding-guard' THEN 'no_sources'
   WHEN t.gate_outcome = 'auto_sent' THEN 'sent'
   WHEN t.gate_reason IN ('no_reply_needed', 'no_reply_suggested') THEN 'no_reply'

@@ -298,15 +298,7 @@ async function main() {
     // ---- No sources found: an empty scope finds nothing every time ----
     const sourceless = (q: string, outcomes: boolean) => {
       queries.push(q);
-      // Live traffic, since eval runs never record knowledge gaps.
       return suggestForQuery(A, q, { audience: "public", forceScope: [], outcomes });
-    };
-    // A gap is recorded in the background, so this waits a moment for it before counting.
-    const gaps = async (q: string) => {
-      const count = async () =>
-        (await superPool.query("SELECT count(*)::int AS n FROM knowledge_gaps WHERE tenant_id = $1 AND question = $2", [A, q])).rows[0].n as number;
-      for (let i = 0; i < 20 && (await count()) === 0; i++) await new Promise((r) => setTimeout(r, 100));
-      return count();
     };
     draftReply = "<no_reply/>";
     const thanks = await sourceless("ok děkuji DSRCH", true);
@@ -318,10 +310,7 @@ async function main() {
     await sourceless("ok díky DSRCH", true);
     check("a workspace's own handoff rules replace the default", lastDraftSystem.includes("DSRCH hand off everything about billing.") && !lastDraftSystem.includes(DEFAULT_HANDOFF_RULES), lastDraftSystem.slice(0, 400));
     await putPersona(A, { handoffRules: null });
-    check("a thank-you the model leaves unanswered is not a knowledge gap", (await gaps("ok děkuji DSRCH")) === 0);
     draftReply = "I don't have that information, a teammate will help. <handoff/>";
-    await sourceless("what is the DSRCH quota", true);
-    check("an unanswered question without sources is still a knowledge gap", (await gaps("what is the DSRCH quota")) === 1);
     const untagged = await sourceless("what is the DSRCH limit", false);
     check("without answer tags the fixed reply goes out", untagged.model === "grounding-guard", untagged.model);
     draftFails = true;
@@ -354,7 +343,6 @@ async function main() {
     for (const id of articles) await deleteArticle(A, id);
     for (const id of documents) await deleteDocument(A, id);
     await superPool.query("DELETE FROM draft_traces WHERE tenant_id = $1 AND query = ANY($2)", [A, queries]);
-    await superPool.query("DELETE FROM knowledge_gaps WHERE tenant_id = $1 AND question = ANY($2)", [A, queries]);
     await superPool.end();
   }
 

@@ -73,6 +73,7 @@ export function CollectionRail({
   collections,
   counts,
   gapCount = 0,
+  showGaps = false,
   selected,
   loading,
   onSelect,
@@ -83,8 +84,10 @@ export function CollectionRail({
 }: {
   collections: KbCollection[];
   counts: RailCounts;
-  /** Open knowledge gaps — shows the "Gaps" worklist entry while > 0. */
+  /** Open knowledge gaps, for the "Gaps" entry's badge. */
   gapCount?: number;
+  /** Shows the "Gaps" entry even without open gaps, as when the review is on. */
+  showGaps?: boolean;
   selected: string | undefined;
   loading?: boolean;
   onSelect: (collection: string | undefined) => void;
@@ -206,7 +209,7 @@ export function CollectionRail({
           active={selected === "none"}
           onClick={() => onSelect("none")}
         />
-        {(gapCount > 0 || selected === "gaps") && (
+        {(showGaps || gapCount > 0 || selected === "gaps") && (
           <SpecialRow
             icon={Lightbulb}
             label="Gaps"

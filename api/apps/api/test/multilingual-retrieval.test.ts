@@ -127,7 +127,6 @@ async function main() {
     await putDocsSearchSettings(A, searchBefore);
     if (articleId) await deleteArticle(A, articleId);
     await superPool.query("DELETE FROM draft_traces WHERE tenant_id = $1 AND query = ANY($2)", [A, [CZECH, SLOW, TRANSLATED]]);
-    await superPool.query("DELETE FROM knowledge_gaps WHERE tenant_id = $1 AND question = ANY($2)", [A, [CZECH, SLOW, TRANSLATED]]);
     await superPool.end();
   }
 

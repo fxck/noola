@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { getRouteApi, useNavigate } from "@tanstack/react-router";
+import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import {
   Search,
   Plus,
@@ -39,7 +39,7 @@ import {
 } from "@/lib/kb";
 import { localeName } from "@/lib/settings";
 import type { ApiError } from "@/lib/api";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { RowsSkeleton } from "@/components/ui/skeleton";
@@ -57,8 +57,17 @@ import { cn } from "@/lib/utils";
 import { useNerdMode } from "@/lib/nerd-mode";
 import { compactNum } from "@/components/live/nerd-stats";
 import { CollectionRail, type RailCounts } from "@/components/kb/collection-rail";
-import { GapsList } from "@/components/kb/gaps-list";
-import { fetchKnowledgeGaps, updateKnowledgeGap, type KnowledgeGap } from "@/lib/gaps";
+import { GapDetail, GapsList, GapsSummary, gapTab, groupGaps, type GapTab } from "@/components/kb/gaps-list";
+import {
+  fetchKnowledgeGaps,
+  matchCollection,
+  updateKnowledgeGap,
+  type GapStatus,
+  type KnowledgeGap,
+  type KnowledgeGapList,
+} from "@/lib/gaps";
+import { fetchGapSettings } from "@/lib/settings";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { CollectionDialog } from "@/components/kb/collection-dialog";
 import { MoveToMenu } from "@/components/kb/move-menu";
 import { CollectionDot, collectionOptions } from "@/components/kb/collection-common";
@@ -68,6 +77,24 @@ import { shortcut } from "@/lib/platform";
 const EMBED_DIM = 384;
 
 const kbRoute = getRouteApi("/kb");
+
+const GAP_STATUS_OPTIONS: ComboOption[] = [
+  { value: "open", label: "Open" },
+  { value: "resolved", label: "Resolved" },
+  { value: "dismissed", label: "Dismissed" },
+];
+
+// The preview pane shows at xl and up. Below it, a row opens its own page or detail instead.
+const isWide = () => typeof window !== "undefined" && window.matchMedia("(min-width: 1280px)").matches;
+
+function TabLabel({ short, long }: { short: string; long: string }) {
+  return (
+    <>
+      <span className="sm:hidden">{short}</span>
+      <span className="hidden sm:inline">{long}</span>
+    </>
+  );
+}
 
 // A dialog target: create a new collection, or edit an existing one.
 type DialogState = { mode: "create" } | { mode: "edit"; collection: KbCollection };
@@ -179,9 +206,36 @@ export function KbPage() {
   };
   const searchRef = useRef<HTMLInputElement>(null);
 
-  // Open knowledge gaps — the content-loop worklist, surfaced as a rail entry
-  // (its action is "write an article", so it lives here, not on Sources).
-  const [gaps, setGaps] = useState<KnowledgeGap[]>([]);
+  // Knowledge gaps from the conversation review. The open count drives the rail badge whatever status the list shows.
+  const [gapList, setGapList] = useState<KnowledgeGapList | null>(null);
+  const [gapOpenCount, setGapOpenCount] = useState(0);
+  const [gapStatus, setGapStatus] = useState<GapStatus>("open");
+  const [gapTabValue, setGapTabValue] = useState<GapTab>("docs");
+  const [gapId, setGapId] = useState<string | null>(null);
+  const [gapError, setGapError] = useState(false);
+  const [gapReview, setGapReview] = useState<"loading" | "on" | "off" | "unknown">("loading");
+  const gapStatusRef = useRef(gapStatus);
+  const gapRequest = useRef(0);
+  const gapTabPicked = useRef(false);
+
+  // Only the latest request's result is used, so a slow answer for an earlier status filter can't replace the list.
+  const loadGaps = useRef(async (status: GapStatus) => {
+    const request = ++gapRequest.current;
+    try {
+      const r = await fetchKnowledgeGaps(status);
+      if (request !== gapRequest.current) return;
+      setGapList(r);
+      setGapOpenCount(r.openCount);
+      setGapError(false);
+      // The first list opens on the docs tab unless only articles have gaps.
+      if (!gapTabPicked.current) {
+        gapTabPicked.current = true;
+        if (r.gaps.length > 0 && r.gaps.every((g) => gapTab(g) === "articles")) setGapTabValue("articles");
+      }
+    } catch {
+      if (request === gapRequest.current) setGapError(true);
+    }
+  }).current;
 
   const load = useRef(async () => {
     try {
@@ -192,30 +246,14 @@ export function KbPage() {
     } catch {
       setError(true);
     }
-    // Non-fatal — the Gaps entry simply hides if this endpoint is unavailable.
-    try {
-      setGaps((await fetchKnowledgeGaps("open")).gaps);
-    } catch {
-      setGaps([]);
-    }
+    await loadGaps(gapStatusRef.current);
   }).current;
-
-  // Optimistic gap triage — the worklist only shows open gaps.
-  const triageGap = async (id: string, status: "resolved" | "dismissed") => {
-    setGaps((g) => g.filter((x) => x.id !== id));
-    try {
-      await updateKnowledgeGap(id, { status });
-    } catch {
-      void load(); // reconcile on failure
-    }
-  };
-
-  // Seed a new article from a gap: title prefilled, gap auto-resolved on save.
-  const writeGapArticle = (g: KnowledgeGap) =>
-    void navigate({ to: "/kb/new", search: { title: g.question, gap: g.id } });
 
   useEffect(() => {
     void load();
+    fetchGapSettings()
+      .then((r) => setGapReview(r.settings.enabled ? "on" : "off"))
+      .catch(() => setGapReview("unknown"));
   }, [load]);
 
   // Live: another agent editing the KB (or ingest completing) refreshes both lists.
@@ -339,7 +377,56 @@ export function KbPage() {
     return { docs: docs.length, chunks, chars };
   }, [articles]);
 
-  // The collection a freshly created article should default into.
+  const gapGroups = useMemo(() => {
+    const inTab = (gapList?.gaps ?? []).filter((g) => gapTab(g) === gapTabValue);
+    return groupGaps(inTab, gapTabValue, collections ?? []);
+  }, [gapList, gapTabValue, collections]);
+  const gapOrder = useMemo(() => gapGroups.flatMap((g) => g.gaps), [gapGroups]);
+  const selectedGap = useMemo(() => gapOrder.find((g) => g.id === gapId) ?? null, [gapOrder, gapId]);
+  const gapTabCounts = useMemo(() => {
+    const all = gapList?.gaps ?? [];
+    const docs = all.filter((g) => gapTab(g) === "docs").length;
+    return { docs, articles: all.length - docs };
+  }, [gapList]);
+
+  const changeGapStatus = (status: GapStatus) => {
+    if (status === gapStatusRef.current) return;
+    gapStatusRef.current = status;
+    setGapStatus(status);
+    setGapList(null);
+    setGapError(false);
+    setGapId(null);
+    void loadGaps(status);
+  };
+
+  // Optimistic: the gap leaves the list, since the list shows one status. On wide layouts the next gap opens.
+  const triageGap = async (g: KnowledgeGap, status: GapStatus) => {
+    const i = gapOrder.findIndex((x) => x.id === g.id);
+    if (gapId === g.id) setGapId(isWide() ? (gapOrder[i + 1] ?? gapOrder[i - 1])?.id ?? null : null);
+    setGapList((cur) => cur && { ...cur, gaps: cur.gaps.filter((x) => x.id !== g.id) });
+    setGapOpenCount((n) => n + (status === "open" ? 1 : 0) - (g.status === "open" ? 1 : 0));
+    try {
+      await updateKnowledgeGap(g.id, { status });
+    } catch {
+      toast.error("Couldn't update the gap. Please try again.");
+      void loadGaps(gapStatusRef.current);
+    }
+  };
+
+  // The new article starts with the suggested title and collection, and resolves the gap when it saves.
+  const writeGapArticle = (g: KnowledgeGap) => {
+    const title = g.questions.find((q) => q.title?.trim())?.title ?? g.question;
+    const collection = matchCollection(g.collection, collections ?? []);
+    void navigate({ to: "/kb/new", search: { title, gap: g.id, ...(collection ? { collection: collection.id } : {}) } });
+  };
+
+  const copySuggestion = (text: string) =>
+    void navigator.clipboard.writeText(text).then(
+      () => toast.success("Suggestion copied."),
+      () => toast.error("Couldn't copy the suggestion."),
+    );
+
+  const showGaps = gapOpenCount > 0 || gapReview === "on" || selected === "gaps";
 
   const gapsMode = !searchMode && selected === "gaps";
   const heading = searchMode
@@ -359,18 +446,27 @@ export function KbPage() {
       : searchMode
         ? `${searchHits} ${searchHits === 1 ? "result" : "results"}`
         : gapsMode
-          ? `${gaps.length} open ${gaps.length === 1 ? "question" : "questions"}`
+          ? gapList
+            ? `${gapList.gaps.length} ${gapStatus}`
+            : "loading…"
           : selected === undefined
             ? `${counts.all}`
             : `${scopedCount}`;
 
   const mobileOptions = useMemo<ComboOption[]>(
-    () => [{ value: "all", label: "All articles", icon: Layers }, ...collectionOptions(collections ?? [])],
-    [collections],
+    () => [
+      { value: "all", label: "All articles", icon: Layers },
+      ...(showGaps ? [{ value: "gaps", label: "Gaps", icon: Lightbulb }] : []),
+      ...collectionOptions(collections ?? []),
+    ],
+    [collections, showGaps],
   );
 
-  const selectCollection = (c: string | undefined) =>
+  // The Gaps view has no search box, so a leftover query would hide it behind search results.
+  const selectCollection = (c: string | undefined) => {
+    if (c === "gaps") setQuery("");
     void navigate({ to: "/kb", search: { collection: c } });
+  };
   const openArticle = (a: KbArticle) =>
     void navigate({ to: "/kb/$articleId", params: { articleId: a.id } });
   const editArticle = (a: KbArticle) =>
@@ -392,7 +488,7 @@ export function KbPage() {
   // Rows preview in place on wide layouts (the right pane is visible ≥ xl); on
   // narrower widths there's no preview slot, so a click opens the routed page.
   const activate = (a: KbArticle) => {
-    if (typeof window !== "undefined" && window.matchMedia("(min-width: 1280px)").matches) {
+    if (isWide()) {
       selectArticle(a.id);
     } else {
       openArticle(a);
@@ -517,9 +613,7 @@ export function KbPage() {
       );
     }
 
-    if (gapsMode) {
-      return <GapsList gaps={gaps} onWrite={writeGapArticle} onTriage={(id, s) => void triageGap(id, s)} />;
-    }
+    if (gapsMode) return renderGaps();
 
     if (searchMode) {
       if (searching && searchHits === 0) {
@@ -623,6 +717,105 @@ export function KbPage() {
     );
   }
 
+  function renderGaps() {
+    if (!gapList) {
+      if (!gapError) return <RowsSkeleton rows={6} />;
+      return (
+        <ErrorState
+          description="Couldn't load the knowledge gaps."
+          onRetry={() => {
+            setGapError(false);
+            void loadGaps(gapStatusRef.current);
+          }}
+        />
+      );
+    }
+    const offNote = gapReview === "off" && (
+      <p className="px-4 pt-2 text-xs text-muted-foreground lg:px-6">
+        Knowledge gap review is off, so no new gaps come in.{" "}
+        <Link to="/settings/gaps" className="font-medium text-foreground underline-offset-4 hover:underline">
+          Turn it on
+        </Link>
+      </p>
+    );
+    if (gapOrder.length > 0) {
+      return (
+        <>
+          {offNote}
+          <GapsSummary summary={gapList.summary} />
+          <GapsList groups={gapGroups} selectedId={gapId} onSelect={(g) => setGapId(g.id)} />
+        </>
+      );
+    }
+    if (gapStatus !== "open") {
+      return <EmptyState icon={Lightbulb} title={`No ${gapStatus} gaps here.`} />;
+    }
+    // Every claim about the review waits for its settings.
+    if (gapList.gaps.length === 0) {
+      if (gapReview === "loading") return <RowsSkeleton rows={6} />;
+      if (gapReview === "off") {
+        return (
+          <EmptyState
+            icon={Lightbulb}
+            title="Knowledge gap review is off"
+            description="Turn it on, and the AI reviews closed conversations for questions that your docs or help articles miss."
+            action={
+              <Link to="/settings/gaps" className={buttonVariants({ variant: "outline", size: "sm" })}>
+                Open settings
+              </Link>
+            }
+          />
+        );
+      }
+      if (gapList.summary.reviewed === 0) {
+        return gapReview === "on" ? (
+          <EmptyState
+            icon={Lightbulb}
+            title="No conversations reviewed yet"
+            description="The review works through conversations closed in the last 180 days, then each new one about 10 minutes after it closes."
+          />
+        ) : (
+          <EmptyState icon={Lightbulb} title="No knowledge gaps yet" description="Gaps show up here once closed conversations are reviewed." />
+        );
+      }
+    }
+    return (
+      <>
+        {offNote}
+        <GapsSummary summary={gapList.summary} />
+        <EmptyState
+          icon={Lightbulb}
+          title={gapTabValue === "docs" ? "No docs to improve" : "No articles to write"}
+          description="Reviewed conversations raised none."
+        />
+      </>
+    );
+  }
+
+  // On phones the filter moves beside the tabs, because the header has no room next to the collection picker.
+  const gapStatusFilter = (
+    <Combobox
+      value={gapStatus}
+      onChange={(v) => changeGapStatus(v as GapStatus)}
+      options={GAP_STATUS_OPTIONS}
+      className="h-8 w-28"
+      align="end"
+    />
+  );
+
+  const gapDetail = (g: KnowledgeGap, onBack?: () => void) => (
+    <GapDetail
+      key={g.id}
+      gap={g}
+      collections={collections ?? []}
+      articles={articles ?? []}
+      onBack={onBack}
+      onWrite={() => writeGapArticle(g)}
+      onCopy={copySuggestion}
+      onTriage={(status) => void triageGap(g, status)}
+    />
+  );
+
   return (
     <>
       {/* ── pane header (h-12, §3) ─────────────────────────────── */}
@@ -632,14 +825,17 @@ export function KbPage() {
           <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{countLabel}</span>
           {/* mobile collection picker (the rail is hidden below md); search + new live in the
               list column's own header now, aligned above the articles they act on. */}
-          <div className="ml-auto flex items-center gap-1.5 md:hidden">
-            <Combobox
-              value={selected ?? "all"}
-              onChange={(v) => selectCollection(v === "all" ? undefined : v)}
-              options={mobileOptions}
-              className="h-8 w-36"
-              align="start"
-            />
+          <div className="ml-auto flex items-center gap-1.5">
+            {gapsMode && <div className="hidden sm:block">{gapStatusFilter}</div>}
+            <div className="md:hidden">
+              <Combobox
+                value={selected ?? "all"}
+                onChange={(v) => selectCollection(v === "all" ? undefined : v)}
+                options={mobileOptions}
+                className="h-8 w-36"
+                align="start"
+              />
+            </div>
           </div>
         </header>
         {nerd && (
@@ -682,7 +878,8 @@ export function KbPage() {
           collections={collections ?? []}
           loading={collections === null}
           counts={counts}
-          gapCount={gaps.length}
+          gapCount={gapOpenCount}
+          showGaps={showGaps}
           selected={selected}
           onSelect={selectCollection}
           onNew={() => setDialog({ mode: "create" })}
@@ -691,41 +888,72 @@ export function KbPage() {
         />
         {/* article list — capped to a reading column once the preview is present */}
         <div className="flex min-h-0 w-full flex-col xl:w-96 xl:shrink-0 xl:border-r">
-          {/* list controls sit ABOVE the list they act on (not floating in the full-width header) */}
-          <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border/50 px-3">
-            <div className="relative flex-1">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                ref={searchRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search articles…"
-                className="h-8 w-full pl-8 text-sm"
-                aria-label="Search articles"
-              />
+          {gapsMode && selectedGap && (
+            <div className="min-h-0 flex-1 overflow-y-auto xl:hidden">{gapDetail(selectedGap, () => setGapId(null))}</div>
+          )}
+          <div className={cn("flex min-h-0 flex-1 flex-col", gapsMode && selectedGap && "hidden xl:flex")}>
+            {/* list controls sit ABOVE the list they act on (not floating in the full-width header) */}
+            <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border/50 px-3">
+              {gapsMode ? (
+                <>
+                  <SegmentedControl
+                    aria-label="Gap kind"
+                    size="sm"
+                    value={gapTabValue}
+                    onValueChange={(v) => {
+                      gapTabPicked.current = true;
+                      setGapTabValue(v);
+                      setGapId(null);
+                    }}
+                    options={[
+                      { value: "docs", label: <TabLabel short="Docs" long="Docs to improve" />, badge: gapTabCounts.docs },
+                      { value: "articles", label: <TabLabel short="Articles" long="Articles to write" />, badge: gapTabCounts.articles },
+                    ]}
+                  />
+                  <div className="ml-auto sm:hidden">{gapStatusFilter}</div>
+                </>
+              ) : (
+                <>
+                  <div className="relative flex-1">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      ref={searchRef}
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      placeholder="Search articles…"
+                      className="h-8 w-full pl-8 text-sm"
+                      aria-label="Search articles"
+                    />
+                  </div>
+                  <Button size="sm" variant="brand" className="h-8 shrink-0 gap-1.5 text-xs" onClick={goNew}>
+                    <Plus className="size-3.5" /> <span className="hidden sm:inline">New</span>
+                  </Button>
+                </>
+              )}
             </div>
-            <Button size="sm" variant="brand" className="h-8 shrink-0 gap-1.5 text-xs" onClick={goNew}>
-              <Plus className="size-3.5" /> <span className="hidden sm:inline">New</span>
-            </Button>
+            <div className="min-h-0 flex-1 overflow-y-auto">{renderList()}</div>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">{renderList()}</div>
         </div>
-        {/* live preview — the read view of the selected article (wide only) */}
+        {/* live preview - the read view of the selected article or gap (wide only) */}
         <div className="hidden min-h-0 flex-1 overflow-y-auto xl:block">
-          {selectedArticle ? (
+          {gapsMode ? (
+            selectedGap ? (
+              gapDetail(selectedGap)
+            ) : (
+              <EmptyState
+                icon={Lightbulb}
+                title="Select a gap"
+                description="Pick a question to see the conversations that asked it and what to change."
+                className="h-full"
+              />
+            )
+          ) : selectedArticle ? (
             <ArticlePreview
               key={selectedArticle.id}
               a={selectedArticle}
               collections={collections ?? []}
               onOpen={() => openArticle(selectedArticle)}
               onEdit={() => editArticle(selectedArticle)}
-            />
-          ) : gapsMode ? (
-            <EmptyState
-              icon={Lightbulb}
-              title="Close the loop"
-              description="Write article seeds a new article from the question — the gap resolves itself when the article saves."
-              className="h-full"
             />
           ) : (
             <EmptyState

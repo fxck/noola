@@ -2,7 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Bot, ShieldAlert, Sparkles, X } from "lucide-react";
 import { Link } from "@tanstack/react-router";
-import { fetchTrace, isTraceGone, spamVerdictLabel, traceOutcomeLabel, type TraceDetail, type TraceSource, type TraceTone } from "@/lib/traces";
+import { REVIEW_KIND_LABELS, type GapReviewKind } from "@/lib/gaps";
+import { fetchTrace, gapConversationLabel, isTraceGone, spamVerdictLabel, traceOutcomeLabel, type TraceDetail, type TraceSource, type TraceTone } from "@/lib/traces";
 import { relativeTime } from "@/lib/tickets";
 import { estimateCost, fmtCost, isLocalModel, shortModel } from "@/lib/model-cost";
 import { CopyId, compactNum, fmtMs, fmtScore } from "@/components/live/nerd-stats";
@@ -247,7 +248,9 @@ export function TraceDialog({ traceId, onClose }: { traceId: string; onClose: ()
               <p className="text-micro text-muted-foreground">
                 {trace?.kind === "spam_check"
                   ? "The email the model checked for spam, and its verdict."
-                  : "What the model wrote for this draft, and what Noola did with it."}
+                  : trace?.kind === "gap_review"
+                    ? "The closed conversation the model reviewed, and the questions it found."
+                    : "What the model wrote for this draft, and what Noola did with it."}
               </p>
             </div>
           </div>
@@ -274,6 +277,8 @@ export function TraceDialog({ traceId, onClose }: { traceId: string; onClose: ()
             </div>
           ) : trace.kind === "spam_check" ? (
             <SpamCheckBody t={trace} />
+          ) : trace.kind === "gap_review" ? (
+            <GapReviewBody t={trace} />
           ) : (
             <TraceBody t={trace} />
           )}
@@ -345,6 +350,192 @@ function SpamCheckBody({ t }: { t: TraceDetail }) {
         <CopyId value={t.id} />
       </div>
     </div>
+  );
+}
+
+interface ReviewedQuestion {
+  question: string;
+  search: string | null;
+  kind: string | null;
+  answer: string | null;
+  page: string | null;
+  article: string | null;
+  suggestion: string | null;
+  title: string | null;
+  collection: string | null;
+}
+
+const text = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
+const records = (v: unknown): Record<string, unknown>[] =>
+  Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => !!x && typeof x === "object") : [];
+
+interface FoundQuestion {
+  question: string;
+  search: string | null;
+}
+
+/** Reads the review JSON, or returns null when it is not the expected shape. */
+function parseGapReview(draft: string): { conversation: string | null; reviews: ReviewedQuestion[]; unreviewed: FoundQuestion[] } | null {
+  let o: unknown;
+  try {
+    o = JSON.parse(draft);
+  } catch {
+    return null;
+  }
+  if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+  const r = o as Record<string, unknown>;
+  const found: FoundQuestion[] = records(r.questions).map((f) => ({ question: text(f.question) ?? "", search: text(f.search) }));
+  // The review can leave out a listed question, so a search joins its review only by the same question text.
+  const reviews = records(r.reviews).map((v) => {
+    const question = text(v.question) ?? "";
+    const i = question ? found.findIndex((f) => f.question.trim() === question.trim()) : -1;
+    const search = i >= 0 ? found.splice(i, 1)[0].search : null;
+    return {
+      question,
+      search,
+      kind: text(v.kind),
+      answer: text(v.answer),
+      page: text(v.page),
+      article: text(v.article),
+      suggestion: text(v.suggestion),
+      title: text(v.title),
+      collection: text(v.collection),
+    };
+  });
+  return { conversation: text(r.conversation), reviews, unreviewed: found };
+}
+
+const isWebUrl = (url: string) => /^https?:\/\//i.test(url);
+
+const GAP_KIND_BADGE: Record<string, "warning" | "success" | "muted"> = {
+  answered: "success",
+  docs_missing: "warning",
+  docs_unclear: "warning",
+  support_knowledge: "warning",
+};
+
+function GapReviewBody({ t }: { t: TraceDetail }) {
+  const review = parseGapReview(t.draft);
+  const seen = new Set<string>();
+  const sources = [...t.sources]
+    .sort((a, b) => a.rank - b.rank)
+    .filter((s) => {
+      const key = `${s.kind}:${s.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  return (
+    <div className="space-y-5 px-5 py-4">
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
+        <RunFacts t={t} />
+        <Fact label="Conversation">{gapConversationLabel(t.gateOutcome ?? review?.conversation ?? null)}</Fact>
+        {t.gateReason && <Fact label="Filed">{t.gateReason}</Fact>}
+      </dl>
+
+      <Section title="Subject or first message">
+        <p className="whitespace-pre-wrap break-words rounded-lg border bg-muted/30 px-3 py-2 text-sm text-foreground">
+          {t.query || <span className="text-muted-foreground">(empty)</span>}
+        </p>
+      </Section>
+
+      {review ? (
+        <Section title="Questions">
+          {review.reviews.length === 0 && review.unreviewed.length === 0 ? (
+            <p className="text-xs text-muted-foreground">The model found no reusable questions.</p>
+          ) : (
+            <ul className="space-y-2">
+              {review.reviews.map((q, i) => (
+                <li key={i} className="space-y-1.5 rounded-lg border px-3 py-2 text-xs">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="min-w-0 break-words text-sm font-medium text-foreground">{q.question || "(no question)"}</p>
+                    <Badge variant={(q.kind && GAP_KIND_BADGE[q.kind]) || "muted"} className="shrink-0">
+                      {(q.kind && REVIEW_KIND_LABELS[q.kind as GapReviewKind]) || q.kind || "Not reviewed"}
+                    </Badge>
+                  </div>
+                  {q.search && <ReviewLine label="Searched as">{q.search}</ReviewLine>}
+                  {q.answer && <ReviewLine label="Team answered">{q.answer}</ReviewLine>}
+                  {q.page && (
+                    <ReviewLine label="Page">
+                      {isWebUrl(q.page) ? (
+                        <a href={q.page} target="_blank" rel="noreferrer" className="break-all text-primary underline-offset-2 hover:underline">
+                          {q.page}
+                        </a>
+                      ) : (
+                        <span className="break-all">{q.page}</span>
+                      )}
+                    </ReviewLine>
+                  )}
+                  {q.article && (
+                    <ReviewLine label="Article">
+                      <Link to="/kb/$articleId" params={{ articleId: q.article }} className="text-primary underline-offset-2 hover:underline">
+                        Open the article
+                      </Link>
+                    </ReviewLine>
+                  )}
+                  {q.title && <ReviewLine label="Article title">{q.title}</ReviewLine>}
+                  {q.collection && <ReviewLine label="Collection">{q.collection}</ReviewLine>}
+                  {q.suggestion && <ReviewLine label="Suggestion">{q.suggestion}</ReviewLine>}
+                </li>
+              ))}
+              {review.unreviewed.map((q, i) => (
+                <li key={`found-${i}`} className="space-y-1.5 rounded-lg border border-dashed px-3 py-2 text-xs">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="min-w-0 break-words text-sm font-medium text-foreground">{q.question || "(no question)"}</p>
+                    <Badge variant="muted" className="shrink-0">
+                      Not reviewed
+                    </Badge>
+                  </div>
+                  {q.search && <ReviewLine label="Searched as">{q.search}</ReviewLine>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </Section>
+      ) : (
+        <Section title="Review">
+          <p className="text-xs text-muted-foreground">The review isn't in the expected format, so it shows as recorded.</p>
+          <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border bg-muted/30 px-3 py-2 font-mono text-xs leading-relaxed text-foreground">
+            {t.draft || <span className="text-muted-foreground">(empty)</span>}
+          </pre>
+        </Section>
+      )}
+
+      <Section title="Searched sources">
+        {sources.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No sources were searched.</p>
+        ) : (
+          <div className="space-y-1">
+            <p className="text-xs text-muted-foreground">{sourcesSummary(sources)}</p>
+            <ul className="space-y-1.5">
+              {sources.map((s) => (
+                <li key={`${s.kind}:${s.id}`} className="flex min-w-0 items-center gap-2 text-xs">
+                  <span className="shrink-0 rounded border border-border px-1 py-px font-mono text-micro text-muted-foreground">
+                    {SOURCE_KINDS[s.kind] ?? s.kind}
+                  </span>
+                  <SourceTitle s={s} />
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </Section>
+
+      <div className="flex items-center gap-2 border-t pt-3 font-mono text-micro text-muted-foreground">
+        <span>trace</span>
+        <CopyId value={t.id} />
+      </div>
+    </div>
+  );
+}
+
+function ReviewLine({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <p className="whitespace-pre-wrap break-words text-foreground">
+      <span className="text-muted-foreground">{label}: </span>
+      {children}
+    </p>
   );
 }
 

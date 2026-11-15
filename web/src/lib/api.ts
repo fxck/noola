@@ -29,6 +29,8 @@ export interface ApiError extends Error {
   status: number;
   /** The server's `{ error }` message when present (e.g. a 422's friendly reason). */
   detail?: string;
+  /** The server's `{ message }`, a sentence that can be shown to people. */
+  serverMessage?: string;
 }
 
 export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -46,6 +48,7 @@ export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
     try {
       const body = await res.clone().json();
       if (body && typeof body.error === "string") err.detail = body.error;
+      if (body && typeof body.message === "string") err.serverMessage = body.message;
     } catch { /* non-JSON error body — leave detail unset */ }
     throw err;
   }

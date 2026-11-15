@@ -27,6 +27,7 @@ export const ADMIN_ROUTES = new Set<string>([
   "PUT /settings/model",
   "PUT /settings/docs-search",
   "PUT /settings/spam",
+  "PUT /settings/gaps",
   "GET /traces",
   "GET /traces/:id",
   "GET /tickets/:id/traces",

@@ -725,3 +725,23 @@ export async function fetchSpamSettings(): Promise<SpamSettingsResponse> {
 export async function saveSpamSettings(input: Partial<SpamSettings>): Promise<SpamSettingsResponse> {
   return api<SpamSettingsResponse>("/settings/spam", { method: "PUT", body: JSON.stringify(input) });
 }
+
+// ── Knowledge gaps ───────────────────────────────────────────────────────────
+
+export interface GapSettings {
+  /** The General model reviews each closed conversation for questions that the docs or the help articles miss. */
+  enabled: boolean;
+}
+
+export interface GapSettingsResponse {
+  settings: GapSettings;
+}
+
+export async function fetchGapSettings(): Promise<GapSettingsResponse> {
+  return api<GapSettingsResponse>("/settings/gaps");
+}
+
+/** Admin only. */
+export async function saveGapSettings(input: GapSettings): Promise<GapSettingsResponse> {
+  return api<GapSettingsResponse>("/settings/gaps", { method: "PUT", body: JSON.stringify(input) });
+}

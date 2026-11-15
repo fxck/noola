@@ -454,6 +454,10 @@ export const SpamSettingsInput = z.object({
 });
 export type SpamSettingsInput = z.infer<typeof SpamSettingsInput>;
 
+/** PUT /settings/gaps: whether the workspace's model reviews closed conversations for knowledge gaps. */
+export const GapSettingsInput = z.object({ enabled: z.boolean() });
+export type GapSettingsInput = z.infer<typeof GapSettingsInput>;
+
 /** Routing v2 — per-agent routing signals (admin). `reassign` (with outOfOffice: true) also
  *  re-routes the agent's open tickets: team tickets round-robin to eligible teammates,
  *  the rest go back to Unassigned. */
