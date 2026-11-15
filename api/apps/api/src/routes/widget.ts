@@ -20,7 +20,8 @@ import { suggestForQuery, suggestForQueryStream } from "../copilot.js";
 import { settleWidgetAnswer, suggestionMeta, traceWidgetReply } from "../autoreply.js";
 import { withoutOutcomeTags } from "../ai-outcome.js";
 import { wantsHuman, type DraftImage } from "../model.js";
-import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, trustedIdentity } from "../widget.js";
+import { resolveWidgetKey, originAllowed, listWidgetKeys, createWidgetKey, updateWidgetKey, deleteWidgetKey, setIdentitySecret, trustedIdentity, type WidgetKey } from "../widget.js";
+import { isSenderBlocked } from "../blocklist.js";
 import { upsertContact, bumpContactSeen, absorbAnonymousByHandles } from "../contacts.js";
 import { trackEvent } from "../contact-events.js";
 import { deriveContactContext } from "../enrich.js";
@@ -173,6 +174,17 @@ async function persistWidgetAttachments(
   return out;
 }
 
+/** True when the team banned this visitor from the chat, by user id or e-mail. With identity verification on, only a proven identity counts. */
+async function chatBanned(wk: WidgetKey, rid: { verified: boolean; userId?: string | null; email?: string | null }): Promise<boolean> {
+  if (wk.config.verifyIdentity && !rid.verified) return false;
+  for (const handle of [rid.userId, rid.email]) {
+    if (handle && (await isSenderBlocked(wk.tenantId, "widget", handle).catch(() => false))) return true;
+  }
+  return false;
+}
+
+const CHAT_UNAVAILABLE = { error: "chat_unavailable", message: "Chat isn't available for your account." };
+
 export default async function widgetRoutes(app: FastifyInstance): Promise<void> {
   // Synthetic inbound channel — stands in for a real channel; funnels through the shared
   // ingestInbound() core (see ingest.ts). A customer has no agent session by nature.
@@ -247,6 +259,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     // identified claim is DOWNGRADED to anonymous — dropped so the message can't be threaded into
     // someone else's contact/conversation.
     const rid = await trustedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    if (await chatBanned(wk, rid)) return reply.code(403).send(CHAT_UNAVAILABLE);
     let email = rid.email ?? undefined;
     let identName = name ?? null;
     if (wk.config.verifyIdentity && !rid.verified) {
@@ -400,6 +413,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
     }
     // Same identity-verification gate as /public/ask — drop an unverified identity claim.
     const rid = await trustedIdentity(wk, { userId, email: parsed.data.email, userHash, userJwt });
+    if (await chatBanned(wk, rid)) return reply.code(403).send(CHAT_UNAVAILABLE);
     let email = rid.email ?? undefined;
     let identName = name ?? null;
     if (wk.config.verifyIdentity && !rid.verified) {

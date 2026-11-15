@@ -1,6 +1,8 @@
+import fs from "node:fs";
+import Fastify from "fastify";
 import pg from "pg";
 
-// The AI spam check on new emails, the repeat-sender block and unread counts per lane.
+// The AI spam check on new emails, the repeat-sender block, the widget ban and unread counts per lane.
 // The model answers from a stubbed endpoint, and SPAMTEST data, TestCo's model config and spam settings are removed at the end.
 
 process.env.MODEL_KEY_SECRET = process.env.MODEL_KEY_SECRET || "test-model-key-secret-🔑";
@@ -13,6 +15,8 @@ const { handleInboundEmail } = await import("../src/email.js");
 const { getModelConfig, putModelConfig } = await import("../src/modelconfig.js");
 const { listTickets, viewFilter } = await import("../src/tickets.js");
 const { unreadCounts, markTicketRead } = await import("../src/reads.js");
+const { createWidgetKey, deleteWidgetKey, setIdentitySecret, updateWidgetKey, computeUserHash } = await import("../src/widget.js");
+const widgetRoutes = (await import("../src/routes/widget.js")).default;
 const { createWebhook, deleteWebhook } = await import("../src/webhooks.js");
 
 const A = "33333333-3333-3333-3333-333333333333"; // TestCo (dedicated test tenant)
@@ -64,6 +68,12 @@ async function main() {
       { spam_at: Date | null; spam_source: string | null; spam_kind: string | null; spam_reason: string | null; status: string };
   const inView = async (view: "all" | "spam", id: string) => (await listTickets(A, view)).some((t) => (t as { id: string }).id === id);
   const close = (id: string) => superPool.query("UPDATE tickets SET status = 'closed' WHERE id = $1", [id]);
+
+  const key = await createWidgetKey(A, { label: "SPAMTEST" });
+  const app = Fastify();
+  await app.register(widgetRoutes);
+  const ask = (body: Record<string, unknown>, url = "/public/ask") =>
+    app.inject({ method: "POST", url, payload: { key: key.publicKey, ...body } }).then((r) => ({ status: r.statusCode, body: r.json() as Record<string, unknown> }));
 
   try {
     // ---- The verdict parser and the prompt ----
@@ -197,6 +207,66 @@ async function main() {
     const m3 = await markConversationSpam(A, l3!.ticketId, { actorId: null });
     check("a second agent mark blocks the sender", m3?.blocked === addr("customer") && (await isSenderBlocked(A, "email", addr("customer"))), m3);
 
+    // ---- Widget ban ----
+    const banned = `SpamTest-User-${RUN}`;
+    await blockSender(A, { channelType: "widget", handle: banned });
+    const refused = await ask({ question: "SPAMTEST hello", clientMessageId: `spamtest-w1-${RUN}`, userId: banned });
+    check("a banned user's message is refused with the chat-unavailable answer", refused.status === 403 && refused.body.error === "chat_unavailable", refused);
+    const streamed = await ask({ question: "SPAMTEST hello", clientMessageId: `spamtest-w2-${RUN}`, userId: banned }, "/public/ask/stream");
+    check("the streaming lane refuses them too", streamed.status === 403 && streamed.body.error === "chat_unavailable", streamed);
+    const stored = await superPool.query("SELECT count(*)::int AS n FROM messages WHERE tenant_id = $1 AND idempotency_key LIKE $2", [A, `widget:spamtest-w%-${RUN}`]);
+    check("nothing from a banned user is stored", stored.rows[0].n === 0, stored.rows[0]);
+    const other = await ask({ question: "SPAMTEST hello", clientMessageId: `spamtest-w3-${RUN}`, userId: `other-${RUN}` });
+    check("another user can still write", other.status === 200, other.status);
+
+    const secret = "spamtest-secret";
+    await setIdentitySecret(A, key.publicKey, secret);
+    await updateWidgetKey(A, key.publicKey, { config: { verifyIdentity: true } as never });
+    const claimed = await ask({ question: "SPAMTEST hi", clientMessageId: `spamtest-w4-${RUN}`, userId: banned });
+    check("with verification on, an unproven claim of a banned id isn't refused", claimed.status === 200, claimed.status);
+    const proven = await ask({ question: "SPAMTEST hi", clientMessageId: `spamtest-w5-${RUN}`, userId: banned, userHash: computeUserHash(secret, banned) });
+    check("with verification on, the proven banned user is refused", proven.status === 403, proven.status);
+
+    // ---- Marking a widget conversation blocks its user, not the conversation ----
+    const wc = (await superPool.query(
+      "INSERT INTO contacts (tenant_id, name, external_id) VALUES ($1, 'SPAMTEST widget', $2) RETURNING id", [A, `Widget-User-${RUN}`],
+    )).rows[0].id as string;
+    const wt = (await superPool.query(
+      "INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id) VALUES ($1, 'SPAMTEST widget mark', 'widget', $2, $3) RETURNING id",
+      [A, `${RUN}-wconv`, wc],
+    )).rows[0].id as string;
+    // A whole-domain choice left over from an e-mail ticket must not reach a widget ban.
+    const wm = await markConversationSpam(A, wt, { block: true, blockScope: "domain", actorId: null });
+    check("marking a widget conversation bans its user", wm?.blocked === `widget-user-${RUN}` && (await isSenderBlocked(A, "widget", `Widget-User-${RUN}`)), wm);
+
+    const ec = (await superPool.query(
+      "INSERT INTO contacts (tenant_id, name, email) VALUES ($1, 'SPAMTEST widget', $2) RETURNING id", [A, addr("chat")],
+    )).rows[0].id as string;
+    const et = (await superPool.query(
+      "INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id) VALUES ($1, 'SPAMTEST widget mark', 'widget', $2, $3) RETURNING id",
+      [A, `${RUN}-econv`, ec],
+    )).rows[0].id as string;
+    const em = await markConversationSpam(A, et, { block: true, actorId: null });
+    check("marking an e-mail-only widget visitor bans their e-mail", em?.blocked === addr("chat"), em);
+    const proven2 = await ask({ question: "SPAMTEST hi", clientMessageId: `spamtest-w6-${RUN}`, email: addr("chat"), userHash: computeUserHash(secret, addr("chat")) });
+    check("a banned e-mail-only visitor is refused", proven2.status === 403, proven2.status);
+    await superPool.query("UPDATE contacts SET external_id = $2 WHERE id = $1", [ec, `Later-User-${RUN}`]);
+    await unmarkConversationSpam(A, et);
+    check("restoring lifts an e-mail ban after the visitor got a user id", !(await isSenderBlocked(A, "widget", addr("chat"))));
+
+    const ec2 = (await superPool.query(
+      "INSERT INTO contacts (tenant_id, name, email) VALUES ($1, 'SPAMTEST widget', $2) RETURNING id", [A, addr("chat2")],
+    )).rows[0].id as string;
+    const chatMarks: Array<string | null> = [];
+    for (const conv of ["a", "b"]) {
+      const id = (await superPool.query(
+        "INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id) VALUES ($1, 'SPAMTEST widget mark', 'widget', $2, $3) RETURNING id",
+        [A, `${RUN}-e2conv-${conv}`, ec2],
+      )).rows[0].id as string;
+      chatMarks.push((await markConversationSpam(A, id, { actorId: null }))?.blocked ?? null);
+    }
+    check("two spam marks ban an e-mail-only widget visitor", chatMarks[0] === null && chatMarks[1] === addr("chat2"), chatMarks);
+
     // ---- Unread counts per lane ----
     const user = (await superPool.query("SELECT id FROM users WHERE tenant_id = $1 LIMIT 1", [A])).rows[0]?.id as string;
     const counts = () => unreadCounts(A, user, { spam: viewFilter("spam"), all: viewFilter("all") });
@@ -207,9 +277,29 @@ async function main() {
     await markTicketRead(A, u1!.ticketId, user);
     check("reading it clears the count", (await counts()).spam === c0.spam);
 
+    // ---- The migration moves widget blocks from a conversation id to its user ----
+    const contact = (await superPool.query(
+      "INSERT INTO contacts (tenant_id, name, external_id) VALUES ($1, 'SPAMTEST widget', $2) RETURNING id", [A, `Conv-User-${RUN}`],
+    )).rows[0].id as string;
+    const conv = `${RUN}-conv`;
+    await superPool.query("INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id) VALUES ($1, 'SPAMTEST widget', 'widget', $2, $3)", [A, conv, contact]);
+    await superPool.query("INSERT INTO blocked_senders (tenant_id, channel_type, scope, handle) VALUES ($1, 'widget', 'address', $2)", [A, conv]);
+    await superPool.query(fs.readFileSync(new URL("../../../packages/db/migrations/0139_spam_detection.sql", import.meta.url), "utf8"));
+    const moved = await superPool.query("SELECT handle FROM blocked_senders WHERE tenant_id = $1 AND channel_type = 'widget' AND handle IN ($2, $3)", [A, conv, `conv-user-${RUN}`]);
+    check("the migration moves a conversation block to the user", moved.rows.length === 1 && moved.rows[0].handle === `conv-user-${RUN}`, moved.rows);
+    // A conversation id is chosen by the browser, so one can equal a banned user's id.
+    const other2 = (await superPool.query(
+      "INSERT INTO contacts (tenant_id, name, external_id) VALUES ($1, 'SPAMTEST widget', $2) RETURNING id", [A, `Other-User-${RUN}`],
+    )).rows[0].id as string;
+    await superPool.query("INSERT INTO tickets (tenant_id, subject, channel_type, external_channel_id, contact_id) VALUES ($1, 'SPAMTEST widget', 'widget', $2, $3)", [A, `conv-user-${RUN}`, other2]);
+    await superPool.query(fs.readFileSync(new URL("../../../packages/db/migrations/0139_spam_detection.sql", import.meta.url), "utf8"));
+    const kept = await superPool.query("SELECT handle FROM blocked_senders WHERE tenant_id = $1 AND channel_type = 'widget' AND handle IN ($2, $3)", [A, `conv-user-${RUN}`, `other-user-${RUN}`]);
+    check("a re-run leaves a user's block where it is", kept.rows.length === 1 && kept.rows[0].handle === `conv-user-${RUN}`, kept.rows);
   } finally {
     globalThis.fetch = realFetch;
     await putModelConfig(A, { provider: "managed" });
+    await deleteWidgetKey(A, key.publicKey);
+    await app.close();
     await superPool.query("DELETE FROM spam_settings WHERE tenant_id = $1", [A]);
     await superPool.query("DELETE FROM blocked_senders WHERE tenant_id = $1 AND (handle LIKE '%spamtest%' OR handle LIKE $2)", [A, `%${RUN}%`]);
     await superPool.query(

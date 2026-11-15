@@ -23,5 +23,26 @@ DROP POLICY IF EXISTS spam_settings_isolation ON spam_settings;
 CREATE POLICY spam_settings_isolation ON spam_settings
   USING (tenant_id = current_tenant()) WITH CHECK (tenant_id = current_tenant());
 
+-- A widget block holds the visitor's user id (contacts.external_id), which every conversation of theirs carries.
+-- Blocks that hold a widget conversation id move to that conversation's user. Blocks of anonymous visitors stay as they are.
+-- A handle that is already some contact's user id or e-mail is skipped, so a re-run never moves a block.
+INSERT INTO blocked_senders (tenant_id, channel_type, scope, handle, reason, created_by, created_at)
+SELECT DISTINCT ON (b.tenant_id, lower(c.external_id))
+       b.tenant_id, 'widget', 'address', lower(c.external_id), b.reason, b.created_by, b.created_at
+  FROM blocked_senders b
+  JOIN tickets t ON t.tenant_id = b.tenant_id AND t.channel_type = 'widget' AND lower(t.external_channel_id) = b.handle
+  JOIN contacts c ON c.tenant_id = t.tenant_id AND c.id = t.contact_id
+ WHERE b.channel_type = 'widget' AND c.external_id IS NOT NULL AND c.external_id <> ''
+   AND NOT EXISTS (SELECT 1 FROM contacts u WHERE u.tenant_id = b.tenant_id AND (lower(u.external_id) = b.handle OR lower(u.email) = b.handle))
+ ORDER BY b.tenant_id, lower(c.external_id), b.created_at
+ON CONFLICT (tenant_id, channel_type, scope, lower(handle)) DO NOTHING;
+
+DELETE FROM blocked_senders b
+ USING tickets t, contacts c
+ WHERE b.channel_type = 'widget'
+   AND t.tenant_id = b.tenant_id AND t.channel_type = 'widget' AND lower(t.external_channel_id) = b.handle
+   AND c.tenant_id = t.tenant_id AND c.id = t.contact_id AND c.external_id IS NOT NULL AND c.external_id <> ''
+   AND NOT EXISTS (SELECT 1 FROM contacts u WHERE u.tenant_id = b.tenant_id AND (lower(u.external_id) = b.handle OR lower(u.email) = b.handle));
+
 -- AI traces also record each spam check ('spam_check'), next to the drafted replies ('draft').
 ALTER TABLE draft_traces ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'draft';
