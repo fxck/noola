@@ -2,7 +2,7 @@ import { withTenant } from "@repo/db";
 import { modelDriver, embeddingDriver, clip, type DraftResult, type DraftSource, type DraftTurn, type DraftImage, type ModelServingDriver } from "./model.js";
 import { resolveModelDriver } from "./modelconfig.js";
 import { DEFAULT_PERSONA, getPersona, handoffRulesFor, personaPrompt } from "./persona.js";
-import { hydrateArticles, isPublicArticle, type KbArticle } from "./kb.js";
+import { hydrateArticles, isCustomerFacingArticle, type KbArticle } from "./kb.js";
 import { documentNames, hydrateChunks, passageContext, type ChunkHit } from "./documents.js";
 import { hasOutcomeTag, parseDraftOutcome } from "./ai-outcome.js";
 import { hydrateThreads, type ThreadHit } from "./threads.js";
@@ -318,7 +318,7 @@ export interface SuggestOpts {
   images?: DraftImage[];
   /** The ambient autoreply and the widget let a hosted model add a note for the team or decide that no reply is needed. */
   outcomes?: boolean;
-  /** The answer reaches the customer unreviewed. It uses only public articles, and past conversations only as `verifiedCustomer` allows. */
+  /** The answer reaches the customer unreviewed. It uses only published AI agents and public articles, and past conversations only as `verifiedCustomer` allows. */
   customerFacing?: boolean;
   /** The identity that the requester proved in a private channel. It unlocks the past conversations of a ticket contact who has it. */
   verifiedCustomer?: { userId: string | null; email: string | null };
@@ -513,9 +513,9 @@ async function prepareDraft(
   const scope = opts.forceScope
     ? new Set(opts.forceScope)
     : await audienceScope(tenantId, opts.audience ?? "agent");
-  // A customer-facing answer may only use articles that the help center shows.
+  // A customer-facing answer never uses internal or draft articles.
   const customerFacing = (opts.audience ?? "agent") === "public" || opts.customerFacing === true;
-  const visible = (articles: KbArticle[]) => (customerFacing ? articles.filter(isPublicArticle) : articles);
+  const visible = (articles: KbArticle[]) => (customerFacing ? articles.filter(isCustomerFacingArticle) : articles);
   // It never uses another customer's conversations, and its own customer's only when their identity is proven.
   const threadOwner = customerFacing ? (opts.verifiedCustomer && ticketId ? await provenContact(tenantId, ticketId, opts.verifiedCustomer) : null) : undefined;
   const surfaces: Surface[] = [];

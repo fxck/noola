@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   Lightbulb,
   Lock,
+  Bot,
   ArrowUpRight,
   MoreHorizontal,
   List as ListIcon,
@@ -24,6 +25,7 @@ import type { LexicalEditor } from "lexical";
 import {
   type KbArticle,
   type KbCollection,
+  type ArticleVisibility,
   fetchArticles,
   searchArticles,
   fetchArticle,
@@ -105,7 +107,7 @@ function PublishBadges({ a }: { a: KbArticle }) {
           {a.status === "published" ? "Live on help center" : "Public (unpublished)"}
         </Badge>
       ) : (
-        <Badge variant="muted">Internal</Badge>
+        <Badge variant="muted">{a.visibility === "ai" ? "AI agents" : "Internal"}</Badge>
       )}
     </>
   );
@@ -775,7 +777,7 @@ export function KbPage() {
 // A single article row — navigates to the routed article page, with a hover/focus
 // "Move to…" affordance (always visible on touch) for reassigning its collection.
 // Publish state renders as weight, not chips (§4): live = nothing (the norm),
-// internal = a small lock glyph, draft = muted title text.
+// internal = a small lock glyph, AI agents = a small bot glyph, draft = muted title text.
 // ─────────────────────────────────────────────────────────────────────────────
 function ArticleRow({
   a,
@@ -831,10 +833,14 @@ function ArticleRow({
               <Lock className="size-3 text-muted-foreground/70" aria-hidden />
             </span>
           )}
+          {a.visibility === "ai" && (
+            <span className="shrink-0" title="AI agents">
+              <Bot className="size-3 text-muted-foreground/70" aria-hidden />
+            </span>
+          )}
         </span>
-        {/* Internal articles never echo their body (may hold secrets); public ones
-            show a help-center snippet. Every article powers agent answers, so that
-            fact marks nothing and stays off the rows (§5 fact-once). */}
+        {/* Internal articles never show their body, because it may hold secrets.
+            Every article grounds AI answers, so the rows don't say it (§5 fact-once). */}
         {!internal && (
           <span className="truncate text-xs text-muted-foreground">{a.body.slice(0, 80) || "—"}</span>
         )}
@@ -1202,6 +1208,8 @@ export function ArticleDetail({
 // new articles default into `defaultCollectionId` (the current collection view).
 // ─────────────────────────────────────────────────────────────────────────────
 /** A compact segmented toggle (label + pill options). Used for the publish status / audience. */
+const VISIBILITY_LABEL: Record<ArticleVisibility, string> = { internal: "Internal", ai: "AI agents", public: "Public" };
+
 function Segmented({ label, value, onChange, options }: {
   label: string;
   value: string;
@@ -1219,7 +1227,7 @@ function Segmented({ label, value, onChange, options }: {
             onClick={() => onChange(o.value)}
             aria-pressed={value === o.value}
             className={cn(
-              "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+              "whitespace-nowrap rounded px-2.5 py-1 text-xs font-medium transition-colors",
               // Selected = neutral raised (ink on a lifted surface), not amber —
               // amber stays reserved for signal, never for a segmented choice.
               value === o.value
@@ -1279,9 +1287,7 @@ export function ArticleEditor({
   const [status, setStatus] = useState<"draft" | "published">(
     initial?.status === "draft" ? "draft" : "published",
   );
-  const [visibility, setVisibility] = useState<"internal" | "public">(
-    initial?.visibility === "public" ? "public" : "internal",
-  );
+  const [visibility, setVisibility] = useState<ArticleVisibility>(initial?.visibility ?? "internal");
   const [collections, setCollections] = useState<KbCollection[]>([]);
   const [saving, setSaving] = useState(false);
   const [metaOpen, setMetaOpen] = useState(false);
@@ -1420,7 +1426,7 @@ export function ArticleEditor({
       body !== (initial.body ?? "") ||
       collectionId !== initial.collection_id ||
       status !== (initial.status === "draft" ? "draft" : "published") ||
-      visibility !== (initial.visibility === "public" ? "public" : "internal")
+      visibility !== (initial.visibility ?? "internal")
     : title.trim() !== "" || body.trim() !== "";
   const words = body.trim() ? body.trim().split(/\s+/).length : 0;
 
@@ -1452,15 +1458,13 @@ export function ArticleEditor({
   const collectionName = collectionId
     ? collections.find((c) => c.id === collectionId)?.name ?? "Collection"
     : "Uncategorized";
-  const metaSummary = `${status === "draft" ? "Draft" : "Published"} · ${
-    visibility === "public" ? "Public" : "Internal"
-  } · ${collectionName}`;
-  const metaHint =
-    visibility === "public" && status === "published"
-      ? "Live on your help center."
-      : visibility === "public"
-        ? "Publish to show on the help center."
-        : "Internal — powers agent answers only.";
+  const metaSummary = `${status === "draft" ? "Draft" : "Published"} · ${VISIBILITY_LABEL[visibility]} · ${collectionName}`;
+  const published = status === "published";
+  const metaHint = {
+    public: published ? "Live on your help center. Human and AI agents use it in answers." : "Publish to show on the help center.",
+    ai: published ? "Not on the help center. AI agents use it in answers to customers." : "Publish so AI agents use it in answers to customers.",
+    internal: "Only for human agents. AI agents use it only in drafts that a human agent reviews.",
+  }[visibility];
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-background">
@@ -1524,8 +1528,8 @@ export function ArticleEditor({
             <Segmented
               label="Audience"
               value={visibility}
-              onChange={(v) => setVisibility(v as "internal" | "public")}
-              options={[{ value: "internal", label: "Internal" }, { value: "public", label: "Public" }]}
+              onChange={(v) => setVisibility(v as ArticleVisibility)}
+              options={(["internal", "ai", "public"] as const).map((v) => ({ value: v, label: VISIBILITY_LABEL[v] }))}
             />
             <p className="text-xs text-muted-foreground">{metaHint}</p>
             {language?.canTranslate && body.trim() && (

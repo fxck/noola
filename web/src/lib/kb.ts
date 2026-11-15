@@ -3,16 +3,18 @@ import { api } from "@/lib/api";
 // Knowledge Base client. Tenant is server-authoritative from the session token;
 // these just carry the payload. Mirrors the api's KbArticle shape.
 
+/** Who an article reaches: internal = human agents' drafts, ai = also AI agents' answers to customers, public = also the help center. */
+export type ArticleVisibility = "internal" | "ai" | "public";
+
 export interface KbArticle {
   id: string;
   title: string;
   body: string;
   /** The collection this article belongs to, or null = uncategorized. */
   collection_id: string | null;
-  /** KB-CMS lifecycle. status: draft|published; visibility: internal (agent grounding only) | public
-   *  (also on the help center). slug is the public URL key. Older rows may omit these. */
+  /** KB-CMS lifecycle. status: draft|published. slug is the public URL key. Older rows may omit these. */
   status?: string;
-  visibility?: string;
+  visibility?: ArticleVisibility;
   slug?: string | null;
   published_at?: string | null;
   created_at: string;
@@ -28,7 +30,7 @@ export interface KbArticlePatch {
   body?: string;
   collection_id?: string | null;
   status?: "draft" | "published";
-  visibility?: "internal" | "public";
+  visibility?: ArticleVisibility;
 }
 
 /** A KB collection ("folder") grouping articles. `article_count` is present on list. */
@@ -66,7 +68,7 @@ export async function createArticle(
   title: string,
   body: string,
   collectionId?: string | null,
-  opts?: { status?: "draft" | "published"; visibility?: "internal" | "public" },
+  opts?: { status?: "draft" | "published"; visibility?: ArticleVisibility },
 ): Promise<KbArticle> {
   const payload: KbArticlePatch = { title, body, ...opts };
   if (collectionId !== undefined) payload.collection_id = collectionId;
