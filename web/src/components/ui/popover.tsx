@@ -1,9 +1,13 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 
 /** Gap between the trigger and the panel, on whichever side the panel lands. */
 const GAP = 6;
+
+// Every popover is portaled to <body>, so a nested one's panel is outside its parent's panel in the DOM.
+// An open nested panel registers with its ancestors here, so a click inside it does not close them.
+const NestedPanels = createContext<((panel: HTMLElement) => () => void) | null>(null);
 
 /**
  * A small portal-based popover anchored to its trigger. Closes on outside-click
@@ -39,6 +43,23 @@ export function Popover({
   const contentRef = useRef<HTMLDivElement>(null);
   const [rect, setRect] = useState<DOMRect | null>(null);
   const [flip, setFlip] = useState(false);
+  const nested = useRef(new Set<HTMLElement>());
+  const registerWithParent = useContext(NestedPanels);
+  const registerNested = useRef((panel: HTMLElement) => {
+    nested.current.add(panel);
+    const unregister = registerWithParent?.(panel);
+    return () => {
+      nested.current.delete(panel);
+      unregister?.();
+    };
+  }).current;
+
+  const mounted = open && rect !== null;
+  useEffect(() => {
+    const panel = contentRef.current;
+    if (!mounted || !panel || !registerWithParent) return;
+    return registerWithParent(panel);
+  }, [mounted, registerWithParent]);
 
   useLayoutEffect(() => {
     if (!open) {
@@ -73,6 +94,7 @@ export function Popover({
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node;
       if (triggerRef.current?.contains(t) || contentRef.current?.contains(t)) return;
+      for (const panel of nested.current) if (panel.contains(t)) return;
       onOpenChange(false);
     };
     const onKey = (e: KeyboardEvent) => {
@@ -125,7 +147,7 @@ export function Popover({
               className,
             )}
           >
-            {children}
+            <NestedPanels.Provider value={registerNested}>{children}</NestedPanels.Provider>
           </div>,
           document.body,
         )}
