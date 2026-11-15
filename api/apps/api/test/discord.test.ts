@@ -87,6 +87,8 @@ async function main() {
     await superPool.query("DELETE FROM message_attachments WHERE storage_key LIKE 'disctest-%'");
     await superPool.query("DELETE FROM messages WHERE body LIKE 'DISCTEST%'");
     await superPool.query("DELETE FROM messages WHERE idempotency_key LIKE 'discord:disctest-%'");
+    await superPool.query("DELETE FROM ticket_mirror_messages WHERE discord_message_id LIKE 'disctest-%'");
+    await superPool.query("DELETE FROM ticket_notes WHERE body LIKE 'DISCTEST%'");
     await superPool.query("DELETE FROM tickets WHERE external_channel_id LIKE 'disctest-%'");
     await superPool.query("DELETE FROM tickets WHERE external_thread_id LIKE 'disctest-%'");
     await superPool.query("DELETE FROM outbox WHERE payload->'data'->>'body' LIKE 'DISCTEST%'");
@@ -358,6 +360,77 @@ async function main() {
         check("teammate mark resolves the Noola seat (author_id set)", m.rows[0]?.author_id === seatId);
         check("explicit mark outranks the responder role (author_kind='agent')", m.rows[0]?.author_kind === "agent");
       });
+    }
+  }
+
+  // 16b - a teammate who links their Discord id later gets their earlier messages, which were stored as a customer's.
+  {
+    const u = await superPool.query("SELECT id FROM users WHERE tenant_id = $1 LIMIT 1", [A]);
+    const seatId = u.rows[0]?.id as string | undefined;
+    if (seatId) {
+      const asked = await handleInboundMessage(thread({
+        threadId: "disctest-thread-late", authorId: "disctest-customer-late", authorDisplayName: "Asker",
+        discordMessageId: "disctest-late-1", content: "DISCTEST late question",
+      }));
+      await handleInboundMessage(thread({
+        threadId: "disctest-thread-late", authorId: "disctest-teammate-late", authorDisplayName: "LateLinker",
+        discordMessageId: "disctest-late-2", content: "DISCTEST late teammate answer",
+      }));
+      const ticketId = asked!.ticketId;
+      const before = await superPool.query("SELECT author_type FROM messages WHERE idempotency_key = 'discord:disctest-late-2'");
+      check("an unlinked teammate without a team role is stored as a customer", before.rows[0]?.author_type === "customer");
+      await superPool.query("INSERT INTO gap_reviews (tenant_id, ticket_id, conversation) VALUES ($1, $2, 'questions')", [A, ticketId]);
+      const gapId = (await superPool.query(
+        "INSERT INTO knowledge_gaps (tenant_id, question, kind) VALUES ($1, 'DISCTEST late gap', 'docs_missing') RETURNING id", [A],
+      )).rows[0].id as string;
+      await superPool.query("INSERT INTO knowledge_gap_questions (tenant_id, gap_id, ticket_id, question, kind) VALUES ($1, $2, $3, 'DISCTEST late gap', 'docs_missing')", [A, gapId, ticketId]);
+      // In a second conversation the customer writes after the teammate, so it still waits on the team.
+      await handleInboundMessage(thread({
+        threadId: "disctest-thread-late2", authorId: "disctest-teammate-late", authorDisplayName: "LateLinker",
+        discordMessageId: "disctest-late2-1", content: "DISCTEST late teammate first",
+      }));
+      const later = await handleInboundMessage(thread({
+        threadId: "disctest-thread-late2", authorId: "disctest-customer-late", authorDisplayName: "Asker",
+        discordMessageId: "disctest-late2-2", content: "DISCTEST late customer last",
+      }));
+      // A team-role reply that has no seat yet, and a note that the teammate wrote in the mirror post.
+      await superPool.query(
+        `INSERT INTO messages (tenant_id, ticket_id, author_type, author_kind, author_external_id, author_external_name, body, idempotency_key, channel_type, created_at)
+         VALUES ($1, $2, 'agent', 'agent', 'disctest-teammate-late', 'LateLinker', 'DISCTEST seatless team reply', 'discord:disctest-late-3', 'discord', now() - interval '1 hour')`,
+        [A, ticketId],
+      );
+      const noteId = (await superPool.query(
+        "INSERT INTO ticket_notes (tenant_id, ticket_id, author_name, body) VALUES ($1, $2, 'LateLinker (Discord)', 'DISCTEST mirror note') RETURNING id", [A, ticketId],
+      )).rows[0].id as string;
+      await superPool.query(
+        `INSERT INTO ticket_mirror_messages (discord_message_id, tenant_id, ticket_id, post_thread_id, author_discord_id, author_display_name, body, note_id)
+         VALUES ('disctest-late-note', $1, $2, 'disctest-post-late', 'disctest-teammate-late', 'LateLinker', 'DISCTEST mirror note', $3)`,
+        [A, ticketId, noteId],
+      );
+      await upsertAgentChannelIdentity(A, seatId, "disctest-teammate-late");
+      const after = await superPool.query(
+        "SELECT idempotency_key, author_type, author_kind, author_id, author_contact_id FROM messages WHERE ticket_id = $1 ORDER BY created_at", [ticketId],
+      );
+      const teammate = after.rows.find((m) => m.idempotency_key === "discord:disctest-late-2");
+      const customer = after.rows.find((m) => m.idempotency_key === "discord:disctest-late-1");
+      check("linking the id turns the earlier message into the teammate's reply",
+        teammate?.author_type === "agent" && teammate.author_kind === "agent" && teammate.author_id === seatId && teammate.author_contact_id !== null, teammate);
+      check("the customer's own message stays the customer's", customer?.author_type === "customer", customer);
+      const t = await superPool.query("SELECT whose_turn FROM tickets WHERE id = $1", [ticketId]);
+      check("the conversation now waits on the customer", t.rows[0]?.whose_turn === "customer", t.rows[0]);
+      const t2 = await superPool.query("SELECT whose_turn FROM tickets WHERE id = $1", [later!.ticketId]);
+      check("a conversation where the customer wrote last still waits on the team", t2.rows[0]?.whose_turn === "us", t2.rows[0]);
+      const reviews = await superPool.query("SELECT 1 FROM gap_reviews WHERE ticket_id = $1", [ticketId]);
+      const filed = await superPool.query("SELECT 1 FROM knowledge_gap_questions WHERE ticket_id = $1", [ticketId]);
+      check("the conversation's gap review starts over", reviews.rowCount === 0 && filed.rowCount === 0);
+      await superPool.query("DELETE FROM knowledge_gaps WHERE id = $1", [gapId]);
+      const seated = await superPool.query("SELECT author_id, author_kind FROM messages WHERE idempotency_key = 'discord:disctest-late-3'");
+      check("a team reply without a seat gets the teammate", seated.rows[0]?.author_id === seatId && seated.rows[0]?.author_kind === "agent", seated.rows[0]);
+      const note = await superPool.query("SELECT author_id FROM ticket_notes WHERE id = $1", [noteId]);
+      check("a mirror note that the teammate wrote gets the teammate", note.rows[0]?.author_id === seatId, note.rows[0]);
+      await upsertAgentChannelIdentity(A, seatId, "disctest-teammate-late");
+      const again = await superPool.query("SELECT author_id FROM messages WHERE idempotency_key = 'discord:disctest-late-2'");
+      check("linking the same id again changes nothing", again.rows[0]?.author_id === seatId);
     }
   }
 

@@ -171,6 +171,7 @@ export async function setDiscordClassification(
 /**
  * Console/command seam (§9) — mark a Discord user as a teammate (maps their Discord id → a Noola
  * user seat). Idempotent on the (tenant, channel, external id) unique index. RLS-scoped (app_user).
+ * Their earlier Discord messages and mirror notes that have no Noola seat become theirs, see `REATTRIBUTE_SQL`.
  */
 export async function upsertAgentChannelIdentity(
   tenantId: string,
@@ -178,6 +179,13 @@ export async function upsertAgentChannelIdentity(
   externalId: string,
   channelType = "discord",
 ): Promise<void> {
+  // The mirror's message log has no row security, so its notes are looked up on the relay pool, by tenant.
+  const notes = channelType === "discord"
+    ? (await relayPool.query(
+        "SELECT note_id FROM ticket_mirror_messages WHERE tenant_id = $1 AND lower(author_discord_id) = lower($2) AND note_id IS NOT NULL",
+        [tenantId, externalId],
+      )).rows.map((r) => r.note_id as string)
+    : [];
   await withTenant(tenantId, async (c) => {
     // One identity per (user, channel): replacing a member's Discord id drops the old row first,
     // and the unique handle index means claiming another member's id steals it (last write wins).
@@ -192,8 +200,44 @@ export async function upsertAgentChannelIdentity(
        DO UPDATE SET user_id = EXCLUDED.user_id`,
       [userId, channelType, externalId],
     );
+    if (channelType === "discord") await c.query(REATTRIBUTE_SQL, [userId, externalId, notes]);
   });
 }
+
+/**
+ * A newly linked teammate's earlier Discord messages and mirror notes become theirs, and a moved conversation's gap review starts over.
+ * All parts read the rows from before the statement, so the latest message is matched by its old author.
+ */
+const REATTRIBUTE_SQL = `
+  WITH moved AS (
+    UPDATE messages m
+       SET author_type = 'agent', author_kind = 'agent', author_id = $1
+      FROM tickets t
+     WHERE t.tenant_id = m.tenant_id AND t.id = m.ticket_id AND t.channel_type = 'discord'
+       AND m.author_type = 'customer' AND lower(m.author_external_id) = lower($2)
+    RETURNING m.ticket_id),
+  seated AS (
+    UPDATE messages m
+       SET author_kind = 'agent', author_id = $1
+      FROM tickets t
+     WHERE t.tenant_id = m.tenant_id AND t.id = m.ticket_id AND t.channel_type = 'discord'
+       AND m.author_type = 'agent' AND m.author_id IS NULL AND NOT m.auto AND lower(m.author_external_id) = lower($2)
+    RETURNING m.id),
+  noted AS (
+    UPDATE ticket_notes n SET author_id = $1 WHERE n.id = ANY($3::uuid[]) AND n.author_id IS NULL
+    RETURNING n.id),
+  waiting AS (
+    UPDATE tickets t SET whose_turn = 'customer'
+     WHERE t.id IN (SELECT ticket_id FROM moved) AND t.status = 'open'
+       AND EXISTS (SELECT 1 FROM (SELECT l.author_type, l.author_external_id FROM messages l
+                                    WHERE l.tenant_id = t.tenant_id AND l.ticket_id = t.id AND l.deleted_at IS NULL
+                                    ORDER BY l.created_at DESC LIMIT 1) latest
+                    WHERE latest.author_type = 'customer' AND lower(latest.author_external_id) = lower($2))
+    RETURNING t.id),
+  unfiled AS (
+    DELETE FROM knowledge_gap_questions q WHERE q.ticket_id IN (SELECT ticket_id FROM moved)
+    RETURNING q.id)
+  DELETE FROM gap_reviews r WHERE r.ticket_id IN (SELECT ticket_id FROM moved)`;
 
 /** Unmark a teammate's channel identity (Settings → Members "clear Discord ID"). */
 export async function removeAgentChannelIdentity(
