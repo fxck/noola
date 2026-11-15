@@ -1,5 +1,6 @@
 import { suggestForQuery } from "./copilot.js";
-import { searchArticles } from "./kb.js";
+import { isCustomerFacingArticle, searchArticles } from "./kb.js";
+import { answersWithInternalKnowledge, keyHasScope } from "./apikeys.js";
 import { ingestInbound } from "./ingest.js";
 import { queryTickets } from "./tickets.js";
 
@@ -40,7 +41,8 @@ const TOOLS: McpTool[] = [
       required: ["query"],
     },
     run: async (key, args) => {
-      const articles = await searchArticles(key.tenantId, str(args.query));
+      const found = await searchArticles(key.tenantId, str(args.query));
+      const articles = answersWithInternalKnowledge(key.scopes) ? found : found.filter(isCustomerFacingArticle);
       if (articles.length === 0) return "No matching articles.";
       return articles
         .slice(0, 8)
@@ -59,7 +61,7 @@ const TOOLS: McpTool[] = [
       required: ["question"],
     },
     run: async (key, args) => {
-      const s = await suggestForQuery(key.tenantId, str(args.question), {});
+      const s = await suggestForQuery(key.tenantId, str(args.question), { audience: answersWithInternalKnowledge(key.scopes) ? "agent" : "public" });
       const cites = s.citations.map((c) => `- ${c.title}`).join("\n");
       const uncertain = s.citations.length === 0 || (s.confidence ?? 0) < 0.5;
       return `${s.draft}\n\n${cites ? `Sources:\n${cites}` : "(no sources)"}${uncertain ? "\n\n[uncertain — consider routing to a human]" : ""}`;
@@ -167,7 +169,7 @@ export async function handleMcp(body: JsonRpcRequest, key: ResolvedKey): Promise
       const args = (params?.arguments as Record<string, unknown>) ?? {};
       const tool = TOOLS.find((t) => t.name === name);
       if (!tool) return error(id, -32602, `unknown tool: ${name}`);
-      if (!key.scopes.includes(tool.scope)) {
+      if (!keyHasScope(key.scopes, tool.scope)) {
         // Tool errors are surfaced in-band (isError), not as protocol errors.
         return result(id, {
           content: [{ type: "text", text: `API key missing '${tool.scope}' scope for ${name}.` }],

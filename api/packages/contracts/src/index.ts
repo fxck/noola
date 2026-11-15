@@ -208,7 +208,7 @@ export const SegmentInput = z.object({
 export type SegmentInput = z.infer<typeof SegmentInput>;
 
 // --- Public API keys (Wave A extensibility spine) ---
-export const API_SCOPES = ["answer", "tickets:read", "tickets:write", "events:write", "scim", "contacts:read", "contacts:write", "accounts:read", "accounts:write"] as const;
+export const API_SCOPES = ["answer", "answer:internal", "tickets:read", "tickets:write", "events:write", "scim", "contacts:read", "contacts:write", "accounts:read", "accounts:write"] as const;
 export const ApiKeyInput = z.object({
   name: z.string().max(120).optional(),
   scopes: z.array(z.enum(API_SCOPES)).max(16).default([]),

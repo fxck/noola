@@ -6,7 +6,7 @@ import {
 } from "@repo/contracts";
 import { tenanted } from "../http/tenant.js";
 import { rateLimit } from "../ratelimit.js";
-import { resolveApiKey, listApiKeys, createApiKey, revokeApiKey } from "../apikeys.js";
+import { resolveApiKey, listApiKeys, createApiKey, revokeApiKey, keyHasScope, answersWithInternalKnowledge } from "../apikeys.js";
 import { suggestForQuery } from "../copilot.js";
 import { ingestInbound } from "../ingest.js";
 import { trackEvent } from "../contact-events.js";
@@ -51,7 +51,7 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
       reply.code(401).send({ error: "invalid api key" });
       return null;
     }
-    if (!resolved.scopes.includes(scope)) {
+    if (!keyHasScope(resolved.scopes, scope)) {
       reply.code(403).send({ error: `api key missing '${scope}' scope` });
       return null;
     }
@@ -77,7 +77,7 @@ export default async function publicApiRoutes(app: FastifyInstance): Promise<voi
     const parsed = PublicAnswerInput.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
     try {
-      const s = await suggestForQuery(key.tenantId, parsed.data.question, { audience: "public" });
+      const s = await suggestForQuery(key.tenantId, parsed.data.question, { audience: answersWithInternalKnowledge(key.scopes) ? "agent" : "public" });
       // "uncertain": nothing corroborated the answer, or the model's confidence is low — a caller
       // uses it to decide whether to show the answer or route to a human.
       const uncertain = s.citations.length === 0 || (s.confidence ?? 0) < 0.5;

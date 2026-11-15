@@ -223,7 +223,7 @@ export function buildOpenApiSpec(serverUrl?: string) {
         post: {
           summary: "Ask a question — grounded, cited AI answer",
           operationId: "answer",
-          description: "Scope: `answer`.",
+          description: "Scope: `answer`. With `answer:internal`, the answer also uses internal and draft articles and past conversations.",
           requestBody: jsonBody({ $ref: "#/components/schemas/AnswerRequest" }),
           responses: {
             "200": jsonResp("The answer + citations", { $ref: "#/components/schemas/AnswerResponse" }),
