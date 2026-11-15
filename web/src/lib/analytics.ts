@@ -129,6 +129,8 @@ export interface ContainmentWeek {
   aiAssisted: number;
   humanOnly: number;
   untouched: number;
+  /** Tickets the AI hid as spam that stayed hidden. Not part of `containment`. */
+  aiSpam: number;
   containment: number | null;
 }
 
@@ -141,6 +143,7 @@ export interface ContainmentReport {
     aiAssisted: number;
     humanOnly: number;
     untouched: number;
+    aiSpam: number;
     containment: number | null;
     deflectionShare: number | null;
   };
@@ -149,4 +152,41 @@ export interface ContainmentReport {
 
 export async function fetchContainment(weeks = 8): Promise<ContainmentReport> {
   return (await api<{ containment: ContainmentReport }>(`/analytics/containment?weeks=${weeks}`)).containment;
+}
+
+// ── Spam ─────────────────────────────────────────────────────────────────────
+// Weekly by the ticket's creation. Mirrors the api's SpamReport.
+
+export interface SpamWeek {
+  week: string;
+  /** Tickets hidden as spam, outreach included. */
+  hidden: number;
+  outreach: number;
+  byAi: number;
+  byTeam: number;
+  /** Emails that the AI judged legit and the team marked as spam. */
+  missedByAi: number;
+  /** Hidden tickets that someone marked as not spam. */
+  restored: number;
+  /** Of those, the ones that the AI hid. */
+  restoredFromAi: number;
+  /** Emails that the spam check judged. */
+  checked: number;
+}
+
+export interface SpamReport {
+  windowWeeks: number;
+  totals: Omit<SpamWeek, "week"> & {
+    /** Tickets created in the window, spam included, without unanswered broadcast conversations. */
+    created: number;
+    perWeek: number;
+    perDay: number;
+    /** Hidden tickets as a % of all created, null with none created. */
+    share: number | null;
+  };
+  byWeek: SpamWeek[];
+}
+
+export async function fetchSpamReport(weeks = 8): Promise<SpamReport> {
+  return (await api<{ spam: SpamReport }>(`/analytics/spam?weeks=${weeks}`)).spam;
 }

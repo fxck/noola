@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
-import { BarChart3, AlertTriangle, Download, Inbox, CheckCircle2, Bot, Clock, Hash, ClipboardCheck, Gauge, Timer, UserX, Activity, Star, FileBarChart, type LucideIcon } from "lucide-react";
+import { BarChart3, AlertTriangle, Download, Inbox, CheckCircle2, Bot, Clock, Hash, ClipboardCheck, Gauge, Timer, UserX, Activity, Star, FileBarChart, ShieldBan, type LucideIcon } from "lucide-react";
 import { TopicsView } from "@/routes/topics";
 import { QualityView } from "@/routes/qa";
 import { Spinner } from "@/components/ui/spinner";
@@ -14,6 +14,7 @@ import { OpsView } from "@/components/analytics/ops-view";
 import { CsatView } from "@/components/analytics/csat-view";
 import { ReportsView } from "@/components/analytics/reports-view";
 import { ContainmentView } from "@/components/analytics/containment-view";
+import { SpamView } from "@/components/analytics/spam-view";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { TAB_BASE, TAB_ON, TAB_OFF } from "@/components/ui/segmented";
@@ -899,12 +900,13 @@ function SlaView() {
 // ─────────────────────────────────────────────────────────────────────────────
 const analyticsRouteApi = getRouteApi("/analytics");
 
-export type AnalyticsSection = "overview" | "ops" | "containment" | "topics" | "quality" | "workload" | "sla" | "csat" | "reports";
+export type AnalyticsSection = "overview" | "ops" | "containment" | "spam" | "topics" | "quality" | "workload" | "sla" | "csat" | "reports";
 
 const SECTIONS: { key: AnalyticsSection; label: string; icon: LucideIcon }[] = [
   { key: "overview", label: "Overview", icon: BarChart3 },
   { key: "ops", label: "Ops", icon: Activity },
   { key: "containment", label: "Containment", icon: Bot },
+  { key: "spam", label: "Spam", icon: ShieldBan },
   { key: "workload", label: "Workload", icon: Gauge },
   { key: "sla", label: "SLA", icon: Timer },
   { key: "csat", label: "CSAT", icon: Star },
@@ -916,7 +918,7 @@ const SECTIONS: { key: AnalyticsSection; label: string; icon: LucideIcon }[] = [
 export function AnalyticsPage() {
   const navigate = useNavigate();
   const { view } = analyticsRouteApi.useSearch();
-  const section: AnalyticsSection = view === "topics" || view === "quality" || view === "workload" || view === "sla" || view === "ops" || view === "containment" || view === "csat" || view === "reports" ? view : "overview";
+  const section: AnalyticsSection = view === "topics" || view === "quality" || view === "workload" || view === "sla" || view === "ops" || view === "containment" || view === "spam" || view === "csat" || view === "reports" ? view : "overview";
   const select = (key: AnalyticsSection) =>
     void navigate({ to: "/analytics", search: key === "overview" ? {} : { view: key } });
 
@@ -966,7 +968,7 @@ export function AnalyticsPage() {
               </button>
             ))}
           </div>
-          {section === "overview" ? <OverviewView /> : section === "ops" ? <OpsView /> : section === "containment" ? <ContainmentView /> : section === "topics" ? <TopicsView /> : section === "workload" ? <WorkloadView /> : section === "sla" ? <SlaView /> : section === "csat" ? <CsatView /> : section === "reports" ? <ReportsView /> : <QualityView />}
+          {section === "overview" ? <OverviewView /> : section === "ops" ? <OpsView /> : section === "containment" ? <ContainmentView /> : section === "spam" ? <SpamView /> : section === "topics" ? <TopicsView /> : section === "workload" ? <WorkloadView /> : section === "sla" ? <SlaView /> : section === "csat" ? <CsatView /> : section === "reports" ? <ReportsView /> : <QualityView />}
         </div>
       </div>
     </>

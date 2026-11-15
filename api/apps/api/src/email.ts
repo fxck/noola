@@ -393,6 +393,7 @@ export async function handleInboundEmail(
     deferMirror: !!m.attachments?.length,
     meta: { to: parsed.base },
     spam,
+    spamCheck: check ? check.verdict?.kind ?? "failed" : null,
   });
   if (check && !result.replay) {
     await recordSpamCheckTrace({

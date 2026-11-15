@@ -569,7 +569,8 @@ export async function setTicketSpam(
                               spam_reason = CASE WHEN spam_at IS NOT NULL AND spam_source = 'ai' THEN spam_reason END,
                               spam_kind = 'spam', spam_at = COALESCE(spam_at, now()), updated_at = now()
             WHERE id = $1 RETURNING id, contact_id, channel_type`
-        : `UPDATE tickets SET spam_at = NULL, spam_source = NULL, spam_kind = NULL, spam_reason = NULL, updated_at = now()
+        : `UPDATE tickets SET spam_at = NULL, spam_source = NULL, spam_kind = NULL, spam_reason = NULL, updated_at = now(),
+                              spam_restored_at = CASE WHEN spam_at IS NOT NULL THEN now() ELSE spam_restored_at END
             WHERE id = $1 RETURNING id, contact_id, channel_type`,
       [ticketId],
     );

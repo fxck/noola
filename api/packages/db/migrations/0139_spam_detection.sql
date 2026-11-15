@@ -3,6 +3,10 @@
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS spam_source text;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS spam_kind text;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS spam_reason text;
+-- spam_check: the spam check's verdict on the email that opened the ticket ('legit' | 'spam' | 'outreach' | 'failed').
+-- spam_restored_at: when someone last marked the ticket as not spam. Both feed the spam analytics.
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS spam_check text;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS spam_restored_at timestamptz;
 
 -- block_after: a sender is blocked once this many conversations from them are spam, 0 turns it off.
 CREATE TABLE IF NOT EXISTS spam_settings (

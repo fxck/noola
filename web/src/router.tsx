@@ -402,9 +402,9 @@ const analyticsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/analytics",
   // ?view selects the Insight section (overview when absent | topics | quality | workload | sla).
-  validateSearch: (search: Record<string, unknown>): { view?: "ops" | "containment" | "topics" | "quality" | "workload" | "sla" | "csat" | "reports" } => ({
+  validateSearch: (search: Record<string, unknown>): { view?: "ops" | "containment" | "spam" | "topics" | "quality" | "workload" | "sla" | "csat" | "reports" } => ({
     view:
-      search.view === "ops" || search.view === "containment" || search.view === "topics" || search.view === "quality" || search.view === "workload" || search.view === "sla" || search.view === "csat" || search.view === "reports"
+      search.view === "ops" || search.view === "containment" || search.view === "spam" || search.view === "topics" || search.view === "quality" || search.view === "workload" || search.view === "sla" || search.view === "csat" || search.view === "reports"
         ? search.view
         : undefined,
   }),
