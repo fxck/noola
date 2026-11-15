@@ -13,11 +13,18 @@ export interface KbArticle {
   body: string;
   collection_id: string | null;
   status: string;      // 'draft' | 'published'
-  visibility: string;  // 'internal' | 'public'
+  visibility: ArticleVisibility;
   slug: string | null;
   published_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Who an article reaches: internal = human agents' drafts, ai = also AI agents' answers to customers, public = also the help center. */
+export type ArticleVisibility = "internal" | "ai" | "public";
+
+function asVisibility(v: string | undefined): ArticleVisibility | null {
+  return v === "internal" || v === "ai" || v === "public" ? v : null;
 }
 
 const COLS = "id, title, body, collection_id, status, visibility, slug, published_at, created_at, updated_at";
@@ -95,6 +102,11 @@ export async function hydrateArticles(tenantId: string, ids: string[]): Promise<
   });
 }
 
+/** Whether AI answers that reach customers unreviewed may use an article. */
+export function isCustomerFacingArticle(a: KbArticle): boolean {
+  return a.status === "published" && (a.visibility === "public" || a.visibility === "ai");
+}
+
 export async function createArticle(
   tenantId: string,
   title: string,
@@ -103,7 +115,7 @@ export async function createArticle(
   opts?: { status?: string; visibility?: string },
 ): Promise<KbArticle> {
   const status = opts?.status === "draft" ? "draft" : "published";
-  const visibility = opts?.visibility === "public" ? "public" : "internal";
+  const visibility = asVisibility(opts?.visibility) ?? "internal";
   const a = await withTenant(tenantId, async (c) => {
     const slug = await uniqueSlug(c, slugify(title));
     const r = await c.query(
@@ -162,7 +174,7 @@ export async function updateArticle(
 ): Promise<KbArticle | null> {
   const setCollection = Object.prototype.hasOwnProperty.call(patch, "collection_id");
   const status = patch.status === "draft" || patch.status === "published" ? patch.status : null;
-  const visibility = patch.visibility === "internal" || patch.visibility === "public" ? patch.visibility : null;
+  const visibility = asVisibility(patch.visibility);
   const a = await withTenant(tenantId, async (c) => {
     // First publish stamps published_at; unpublish clears it. COALESCE keeps it stable otherwise.
     const r = await c.query(
@@ -189,13 +201,8 @@ export async function updateArticle(
 
 // ---- Public help-center surface -------------------------------------------
 // The published + public subset of the KB, served on the unauthenticated help center. Every function
-// here hard-filters `status = 'published' AND visibility = 'public'` so a draft or internal article
-// can never leak. Tenant is resolved from a widget key BEFORE these run (pre-context), then passed in.
-
-/** Whether customers may see an article, as the help center and public AI answers require. */
-export function isPublicArticle(a: KbArticle): boolean {
-  return a.status === "published" && a.visibility === "public";
-}
+// here hard-filters `status = 'published' AND visibility = 'public'` so a draft, internal or AI-only article
+// never shows. Tenant is resolved from a widget key BEFORE these run (pre-context), then passed in.
 
 /** Published, public articles for the help center, newest-published first, with collection name. */
 export async function listPublicArticles(tenantId: string, collectionId?: string): Promise<PublicArticle[]> {

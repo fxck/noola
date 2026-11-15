@@ -180,9 +180,9 @@ export const KbArticleInput = z.object({
   title: z.string().min(1).max(300).optional(),
   body: z.string().max(100000).optional(),
   collection_id: z.guid().nullable().optional(),
-  // KB-CMS lifecycle: draft vs published, and internal (agent grounding only) vs public (help center).
+  // Internal articles ground human agents' drafts, AI ones also AI agents' answers to customers, public ones also the help center.
   status: z.enum(["draft", "published"]).optional(),
-  visibility: z.enum(["internal", "public"]).optional(),
+  visibility: z.enum(["internal", "ai", "public"]).optional(),
 });
 export type KbArticleInput = z.infer<typeof KbArticleInput>;
 

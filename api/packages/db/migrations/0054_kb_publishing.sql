@@ -1,7 +1,7 @@
 -- KB-CMS lifecycle — give articles a publish state, an audience, and a stable public URL slug so a
 -- subset of the knowledge base can front a public help center. `status` gates draft vs live;
--- `visibility` gates who can see a live article (internal = agent grounding only; public = also on
--- the help center); `slug` is the public URL key. Existing articles default to published+internal, so
+-- `visibility` gates who can see a live article (internal = human agents' drafts only; ai = also AI agents'
+-- answers to customers; public = also the help center); `slug` is the public URL key. Existing articles default to published+internal, so
 -- nothing becomes public implicitly and agent grounding is unchanged — an admin opts an article into
 -- the help center by flipping visibility to 'public'.
 ALTER TABLE kb_articles ADD COLUMN IF NOT EXISTS status       text NOT NULL DEFAULT 'published';
@@ -12,7 +12,7 @@ ALTER TABLE kb_articles ADD COLUMN IF NOT EXISTS published_at timestamptz;
 ALTER TABLE kb_articles DROP CONSTRAINT IF EXISTS kb_articles_status_ck;
 ALTER TABLE kb_articles ADD CONSTRAINT kb_articles_status_ck CHECK (status IN ('draft', 'published'));
 ALTER TABLE kb_articles DROP CONSTRAINT IF EXISTS kb_articles_visibility_ck;
-ALTER TABLE kb_articles ADD CONSTRAINT kb_articles_visibility_ck CHECK (visibility IN ('internal', 'public'));
+ALTER TABLE kb_articles ADD CONSTRAINT kb_articles_visibility_ck CHECK (visibility IN ('internal', 'ai', 'public'));
 
 -- Backfill a slug for pre-existing rows: slugified title + a short id suffix to guarantee uniqueness
 -- without a dedupe pass. New articles get a clean, collision-checked slug from the app layer.

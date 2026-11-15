@@ -558,7 +558,7 @@ export default async function widgetRoutes(app: FastifyInstance): Promise<void> 
   // ---- Public help center (unauthenticated, widget-key-scoped) -----------
   // The published+public subset of the KB, served for an on-brand help center + support-form
   // deflection. Tenant resolves from a widget key (?key=); the kb.ts public queries hard-filter
-  // status='published' AND visibility='public' so drafts/internal articles can never leak.
+  // status='published' AND visibility='public' so drafts, internal and AI-only articles never show.
   async function tenantFromWidgetQuery(req: FastifyRequest): Promise<string | null> {
     const key = (req.query as { key?: string }).key;
     if (!key) return null;

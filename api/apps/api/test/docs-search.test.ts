@@ -1,6 +1,6 @@
 import pg from "pg";
 import { getModelConfig, putModelConfig } from "../src/modelconfig.js";
-import { createArticle, deleteArticle } from "../src/kb.js";
+import { createArticle, deleteArticle, getPublicArticleBySlug, listPublicArticles, searchPublicArticles } from "../src/kb.js";
 import { ensureChunksCollection, ensureKbCollection } from "../src/search.js";
 import { deleteDocument, ingestDocument } from "../src/documents.js";
 import { DEFAULT_HANDOFF_RULES } from "../src/ai-outcome.js";
@@ -215,18 +215,25 @@ async function main() {
     check("the page's passage about the limit is cited", paged.citations.some((c) => c.id === pageDoc.id), paged.citations);
     check("the draft reads the whole page around the cited passage", lastDraftSystem.includes("zorblat limit is 42") && lastDraftSystem.includes("Paragraph 1 of the DSRCHPAGE guide"), lastDraftSystem.slice(-1500));
 
-    // ---- Customers only see articles that the help center shows ----
+    // ---- Customer-facing answers use only published AI agents and public articles ----
     const internal = (await createArticle(A, "DSRCHVIS quota internals", "The DSRCHVIS quota is raised by hand for big accounts.", null, { visibility: "internal" })).id;
     const draft = (await createArticle(A, "DSRCHVIS quota draft", "The DSRCHVIS quota draft text.", null, { visibility: "public", status: "draft" })).id;
-    articles.push(internal, draft);
+    const forAi = await createArticle(A, "DSRCHVIS quota limits", "The DSRCHVIS quota allows ten projects per account.", null, { visibility: "ai" });
+    articles.push(internal, draft, forAi.id);
     const forCustomer = await ask("DSRCHVIS quota");
     check("a customer-facing answer skips internal and draft articles", !forCustomer.citations.some((c) => c.id === internal || c.id === draft), forCustomer.citations);
-    queries.push("DSRCHVIS quota for an agent");
-    const forAgent = await suggestForQuery(A, "DSRCHVIS quota for an agent", { audience: "agent", forceScope: ["kb"], source: "eval" });
+    check("a customer-facing answer uses articles for AI agents", forCustomer.citations.some((c) => c.id === forAi.id), forCustomer.citations);
+    const helpCenter = await listPublicArticles(A);
+    const helpSearch = await searchPublicArticles(A, "DSRCHVIS quota");
+    check("the help center never shows articles for AI agents",
+      !helpCenter.some((a) => a.slug === forAi.slug) && !helpSearch.some((a) => a.slug === forAi.slug) && (await getPublicArticleBySlug(A, forAi.slug!)) === null);
+    queries.push("DSRCHVIS quota raised by hand for big accounts");
+    const forAgent = await suggestForQuery(A, "DSRCHVIS quota raised by hand for big accounts", { audience: "agent", forceScope: ["kb"], source: "eval" });
     check("an agent's draft still finds internal articles", forAgent.citations.some((c) => c.id === internal), forAgent.citations);
     queries.push("DSRCHVIS quota sent unreviewed");
     const unreviewed = await suggestForQuery(A, "DSRCHVIS quota sent unreviewed", { audience: "agent", forceScope: ["kb"], source: "eval", customerFacing: true });
     check("an answer sent without review skips internal and draft articles", !unreviewed.citations.some((c) => c.id === internal || c.id === draft), unreviewed.citations);
+    check("an answer sent without review uses articles for AI agents", unreviewed.citations.some((c) => c.id === forAi.id), unreviewed.citations);
     // An automation's draft can reach the customer through a later reply action, so it is customer-facing too.
     const asked = await ingestInbound({ tenantId: A, authorType: "customer", subject: "DSRCHVIS automation", body: "DSRCHVIS quota" });
     queries.push("DSRCHVIS quota");
@@ -240,6 +247,7 @@ async function main() {
         "SELECT e->>'id' AS id FROM draft_traces t, jsonb_array_elements(t.sources) e WHERE t.ticket_id = $1 AND e->>'kind' = 'kb'", [asked.ticketId],
       )).rows.map((r) => r.id as string);
       check("an automation's draft skips internal and draft articles", !ragSources.includes(internal) && !ragSources.includes(draft), ragSources);
+      check("an automation's draft uses articles for AI agents", ragSources.includes(forAi.id), ragSources);
     } finally {
       await deleteAutomation(A, rule.id);
       await superPool.query("DELETE FROM tickets WHERE id = $1", [asked.ticketId]);
