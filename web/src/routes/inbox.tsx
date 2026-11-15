@@ -15,6 +15,7 @@ import {
   filterByView,
   viewCounts,
   fetchUnreadTicketIds,
+  fetchUnreadCounts,
   fetchTicket,
   markTicketRead,
   markAllTicketsRead,
@@ -150,6 +151,22 @@ export function InboxPage() {
   // Per-agent unread set (open tickets with an unseen customer message). Fetched alongside the
   // lists; opening a ticket clears it optimistically and marks it read server-side.
   const [unreadIds, setUnreadIds] = useState<Set<string>>(() => new Set());
+  const [unreadCounts, setUnreadCounts] = useState<Partial<Record<ViewKey, number>>>({});
+  const [teamUnread, setTeamUnread] = useState<Record<string, number>>({});
+  const unreadSeqRef = useRef(0);
+  const unreadIdsRef = useRef(unreadIds);
+  const spamRef = useRef(spam);
+  // Best-effort, so a failed fetch keeps the previous numbers.
+  function refreshUnreadCounts() {
+    const seq = ++unreadSeqRef.current;
+    void fetchUnreadCounts()
+      .then((r) => {
+        if (seq !== unreadSeqRef.current) return;
+        setUnreadCounts(r.counts);
+        setTeamUnread(r.teams);
+      })
+      .catch(() => {});
+  }
   // Selection is URL-tracked (`/?ticket=<id>`) so a conversation is shareable and
   // survives reload — the table and the inbox open the exact same thread surface.
   const select = (id: string | null, opts?: { read?: boolean }) => {
@@ -157,13 +174,17 @@ export function InboxPage() {
     // survives until a real open (mouse click / Enter).
     const read = opts?.read ?? true;
     if (id && read) {
+      // unreadIds holds only open tickets, so a spam ticket can be unread without being in it.
+      const mayBeUnread = unreadIdsRef.current.has(id) || spamRef.current.some((t) => t.id === id);
       setUnreadIds((prev) => {
         if (!prev.has(id)) return prev;
         const next = new Set(prev);
         next.delete(id);
         return next;
       });
-      void markTicketRead(id).catch(() => {});
+      void markTicketRead(id).then(() => {
+        if (mayBeUnread) refreshUnreadCounts();
+      }, () => {});
     }
     void navigate({ search: (s) => ({ ...s, ticket: id ?? undefined }) });
   };
@@ -194,6 +215,7 @@ export function InboxPage() {
       void fetchUnreadTicketIds()
         .then((ids) => setUnreadIds(new Set(ids)))
         .catch(() => {});
+      refreshUnreadCounts();
     } catch {
       setError(true);
     } finally {
@@ -216,6 +238,8 @@ export function InboxPage() {
   const selectedRef = useRef(selectedId);
   useEffect(() => {
     loadRef.current = load;
+    unreadIdsRef.current = unreadIds;
+    spamRef.current = spam;
     selectedRef.current = selectedId;
   });
 
@@ -371,12 +395,15 @@ export function InboxPage() {
   const activeView = VIEWS.find((v) => v.key === view)!;
 
   const [markingRead, setMarkingRead] = useState(false);
-  const listHasUnread = list.some((t) => unreadIds.has(t.id));
+  const laneUnread = activeTeam ? (teamUnread[activeTeam.id] ?? 0) : (unreadCounts[view] ?? 0);
+  const canMarkAllRead = laneUnread > 0 || list.some((t) => unreadIds.has(t.id));
   async function markAllRead() {
     if (markingRead) return;
     setMarkingRead(true);
     const shown = new Set(list.map((t) => t.id));
     setUnreadIds((prev) => new Set([...prev].filter((id) => !shown.has(id))));
+    if (activeTeam) setTeamUnread((prev) => ({ ...prev, [activeTeam.id]: 0 }));
+    else setUnreadCounts((prev) => ({ ...prev, [view]: 0 }));
     try {
       await markAllTicketsRead(
         activeTeam ? { scope: "view", view: "all", teamId: activeTeam.id } : { scope: "view", view },
@@ -388,6 +415,7 @@ export function InboxPage() {
       void fetchUnreadTicketIds()
         .then((ids) => setUnreadIds(new Set(ids)))
         .catch(() => {});
+      refreshUnreadCounts();
     }
   }
 
@@ -507,9 +535,11 @@ export function InboxPage() {
       <ViewsChips
         view={view}
         counts={counts}
+        unread={unreadCounts}
         onSelect={selectView}
         teams={teams}
         teamCounts={teamCounts}
+        teamUnread={teamUnread}
         activeTeamId={activeTeam?.id ?? null}
         onSelectTeam={selectTeam}
       />
@@ -526,9 +556,11 @@ export function InboxPage() {
           <ViewsRail
             view={view}
             counts={counts}
+            unread={unreadCounts}
             onSelect={selectView}
             teams={teams}
             teamCounts={teamCounts}
+            teamUnread={teamUnread}
             activeTeamId={activeTeam?.id ?? null}
             onSelectTeam={selectTeam}
           />
@@ -552,7 +584,7 @@ export function InboxPage() {
                 <button
                   type="button"
                   onClick={() => void markAllRead()}
-                  disabled={markingRead || !listHasUnread}
+                  disabled={markingRead || !canMarkAllRead}
                   title="Mark all as read"
                   aria-label="Mark all as read"
                   className="flex h-7 items-center rounded-md px-1.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:pointer-events-none disabled:opacity-40"

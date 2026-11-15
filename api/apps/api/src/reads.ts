@@ -51,6 +51,36 @@ export async function markTicketsRead(
   });
 }
 
+/** The agent's unread tickets per filter, by the rule that markTicketsRead uses. A null filter counts 0. */
+export async function unreadCounts<K extends string>(
+  tenantId: string,
+  userId: string,
+  filters: Record<K, TicketFilter | null>,
+): Promise<Record<K, number>> {
+  return withTenant(tenantId, async (c) => {
+    const out = {} as Record<K, number>;
+    for (const [key, filter] of Object.entries(filters) as Array<[K, TicketFilter | null]>) {
+      if (!filter) {
+        out[key] = 0;
+        continue;
+      }
+      const params = [...filter.params, userId];
+      const r = await c.query(
+        `SELECT count(*)::int AS n
+           FROM tickets t
+           ${filter.where}
+            AND EXISTS (SELECT 1 FROM messages m
+                          LEFT JOIN ticket_reads r ON r.tenant_id = t.tenant_id AND r.ticket_id = t.id AND r.user_id = $${params.length}::uuid
+                         WHERE m.tenant_id = t.tenant_id AND m.ticket_id = t.id AND m.author_type = 'customer'
+                           AND m.created_at > COALESCE(r.last_read_at, '-infinity'))`,
+        params,
+      );
+      out[key] = r.rows[0].n as number;
+    }
+    return out;
+  });
+}
+
 /**
  * The set of OPEN ticket ids that are unread for `userId` — a customer message exists that is newer
  * than the agent's last read (or the agent has never opened the ticket). Bounded so a huge backlog
@@ -65,8 +95,10 @@ export async function unreadTicketIds(tenantId: string, userId: string, limit = 
          LEFT JOIN ticket_reads r
                 ON r.ticket_id = t.id AND r.tenant_id = t.tenant_id AND r.user_id = $1
         WHERE t.status = 'open'
-        GROUP BY t.id
+        GROUP BY t.id, t.spam_at
        HAVING max(m.created_at) > COALESCE(max(r.last_read_at), 'epoch'::timestamptz)
+        -- Hidden spam piles up unread, so inbox tickets come first and the newest within each.
+        ORDER BY (t.spam_at IS NULL) DESC, max(m.created_at) DESC
         LIMIT $2`,
       [userId, limit],
     );
