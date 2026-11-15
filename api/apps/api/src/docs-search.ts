@@ -67,8 +67,7 @@ export function renderSearchPrompt(prompt: string, values: { language: string; p
     .split("\n")
     .filter((line) => !(line.trim() === "{product}" && !product))
     .join("\n")
-    .replaceAll("{language}", values.language)
-    .replaceAll("{product}", product);
+    .replace(/\{language\}|\{product\}/g, (m) => (m === "{language}" ? values.language : product));
 }
 
 // Only a runaway reply is this long, whatever length the prompt asks for.
